@@ -1,0 +1,43 @@
+# Data (contains encrypted keys and user data)
+data/*.db
+data/*.sqlite
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Node
+node_modules/
+client/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (keep template, ignore local overrides)
+config.local.yaml
+
+# Log archives
+data/archives/
+
+# Logs
+*.log
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
