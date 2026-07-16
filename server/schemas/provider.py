@@ -9,12 +9,16 @@ class ProviderCreate(BaseModel):
     name: str
     base_url: str
     api_type: str = "openai_compat"
+    credential_type: str = "api_key"  # api_key / free_tier / oauth
+    oauth_code: Optional[str] = None   # 当 credential_type=oauth 时填 OAuthRegistry code（如 "claude_code"）
     headers: Optional[Dict[str, str]] = None
     description: Optional[str] = None
 class ProviderUpdate(BaseModel):
     name: Optional[str] = None
     base_url: Optional[str] = None
     api_type: Optional[str] = None
+    credential_type: Optional[str] = None
+    oauth_code: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
     description: Optional[str] = None
 class ProviderResponse(BaseModel):
@@ -22,6 +26,8 @@ class ProviderResponse(BaseModel):
     name: str
     base_url: str
     api_type: str
+    credential_type: str = "api_key"
+    oauth_code: Optional[str] = None
     headers: Optional[Dict[str, str]]
     description: Optional[str]
     class Config:
@@ -62,6 +68,8 @@ class ModelInfoResponse(BaseModel):
     # v2.0 新增
     priority_boost: int = 0
     auto_excluded: bool = False
+    # v3.4: per-model request overrides (CCSwitch style)
+    request_overrides: Optional[Dict[str, Any]] = None
     # 延迟信息（来自最新健康检查）
     latency_ms: Optional[float] = None
     health_status: Optional[str] = None
@@ -95,6 +103,7 @@ class ModelInfoResponse(BaseModel):
             provider_name=model.provider.name if hasattr(model, 'provider') and model.provider else "",
             priority_boost=getattr(model, 'priority_boost', 0),
             auto_excluded=getattr(model, 'auto_excluded', False),
+            request_overrides=getattr(model, 'request_overrides', None),
         )
 class ModelUpdate(BaseModel):
     auto_enabled: Optional[bool] = None
@@ -106,6 +115,8 @@ class ModelUpdate(BaseModel):
     # v2.0 新增
     priority_boost: Optional[int] = None
     auto_excluded: Optional[bool] = None
+    # v3.4: per-model request overrides (headers/body_patch/model_alias)
+    request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):
     added: int
     updated: int

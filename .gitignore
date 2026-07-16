@@ -1,6 +1,10 @@
 # Data (contains encrypted keys and user data)
-data/*.db
-data/*.sqlite
+data/
+*.db
+*.sqlite
+*.db-wal
+*.db-shm
+atomcode_config.json
 
 # Python
 __pycache__/
@@ -28,8 +32,9 @@ client/dist/
 .DS_Store
 Thumbs.db
 
-# Config (keep template, ignore local overrides)
+# Config (ignore real config with secrets; ship config.example.yaml instead)
 config.local.yaml
+config.yaml
 
 # Log archives
 data/archives/

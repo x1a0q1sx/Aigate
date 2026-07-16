@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from server.adapters.openai_compat import OpenAICompatAdapter
+from server.adapters.codex_responses import CodexResponsesAdapter
 from server.adapters.xyusec_pricing import (
     _extract_metrics_from_json,
     _extract_pricing_from_json,
@@ -13,12 +14,57 @@ from server.adapters.xyusec_pricing import (
 from server.api.v1_router import _format_sse_chunk
 from server.core.auto_router import AutoRouter, RouteResult
 from server.core.health_checker import HealthChecker
+from server.core.model_catalog import create_adapter_for_provider
+from server.schemas.chat import ChatCompletionRequest
 
 
 def test_openai_adapter_timeout_uses_seconds():
     adapter = OpenAICompatAdapter(timeout=60)
 
     assert adapter.timeout == 60
+
+
+def test_codex_responses_adapter_builds_responses_payload():
+    adapter = CodexResponsesAdapter(timeout=60)
+    request = ChatCompletionRequest(
+        model="gpt-5.5",
+        messages=[
+            {"role": "system", "content": "Be concise."},
+            {"role": "user", "content": "ping"},
+        ],
+        stream=False,
+        max_tokens=1,
+    )
+
+    payload = adapter._build_responses_payload(request)
+
+    assert payload["model"] == "gpt-5.5"
+    assert payload["stream"] is True
+    assert payload["store"] is False
+    assert payload["instructions"] == "Be concise."
+    assert payload["input"] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "ping"}],
+        }
+    ]
+    assert payload["reasoning"]["effort"] == "low"
+    assert payload["include"] == ["reasoning.encrypted_content"]
+
+
+def test_codex_responses_adapter_url_shapes():
+    adapter = CodexResponsesAdapter()
+
+    assert adapter._build_url("http://127.0.0.1:20128/v1") == "http://127.0.0.1:20128/v1/responses"
+    assert adapter._build_url("https://chatgpt.com/backend-api/codex/responses") == "https://chatgpt.com/backend-api/codex/responses"
+    assert adapter._build_url("https://example.com/v1/chat/completions") == "https://example.com/v1/responses"
+
+
+def test_model_catalog_creates_codex_responses_adapter():
+    adapter = create_adapter_for_provider("codex_responses")
+
+    assert isinstance(adapter, CodexResponsesAdapter)
 
 
 def test_format_sse_chunk_outputs_valid_json_and_routed_model():

@@ -179,7 +179,8 @@ async def fetch_provider_pricing(provider_base_url: str, timeout: int = 15) -> P
     pricing: Dict[str, dict] = {}
     metrics: Dict[str, dict] = {}
     errors = []
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    from server.core.proxy_pool import get_proxy_pool
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, **get_proxy_pool().proxied_kwargs()) as client:
         for url in (
             f"{origin}/api/pricing",
             f"{origin}/api/pricing?page=1&page_size=2000",

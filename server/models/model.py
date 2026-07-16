@@ -30,10 +30,15 @@ class Model(Base):
     capabilities = Column(JSON, nullable=True, default=dict)
     # v0.2 新增：人工手动冷却截止时间
     manual_cooldown_until = Column(DateTime, nullable=True)
+    # 自动失败冷却（真实请求失败触发）：持久化，重启后继续保留
+    auto_cooldown_until = Column(DateTime, nullable=True)
+    auto_fail_count = Column(Integer, nullable=False, default=0)
     # v2.0 新增：人工干预 auto 选举
     priority_boost = Column(Integer, nullable=False, default=0)    # 优先级加成 [-100, 100]
     auto_excluded = Column(Boolean, nullable=False, default=False)  # 是否强制排除
+    is_manual = Column(Boolean, nullable=False, default=False)      # 是否手动添加（刷新清理失效模型时保留，不被自动删除）
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    request_overrides = Column(JSON, nullable=True, default=dict)  # v3.4 per-model request customization
     @property
     def full_id(self) -> str:
         """返回 provider_id/model_id 格式"""

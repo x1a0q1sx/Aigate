@@ -33,10 +33,65 @@ class RateLimitConfig(BaseModel):
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     file: Optional[str] = None
+    verbose_diag: bool = False   # 请求诊断日志是否输出全部阶段（默认 False=精简，仅保留关键里程碑）
 class LogArchiveConfig(BaseModel):
     """请求日志每日归档策略"""
     enabled: bool = True
     archive_dir: str = "./data/archives"  # 归档文件目录
+class TokenSaverConfig(BaseModel):
+    """RTK Token Saver — 注入式 Prompt 压缩器配置"""
+    enabled: bool = True              # 总开关，默认开启
+    min_chars: int = 80               # 小于该长度的 system/user 不动
+    log_savings: bool = False         # 是否在请求日志里记录节省字符数（调试用）
+class ComboConfig(BaseModel):
+    """Combos 组合路由配置"""
+    enabled: bool = True
+    default_strategy: str = "fallback"   # fallback / round_robin / fusion
+    max_fallbacks: int = 5               # 单次 combo 调用最多重试几个模型
+
+
+class ProxyPoolConfig(BaseModel):
+    """HTTP 代理池配置"""
+    enabled: bool = False
+    strategy: str = "round_robin"           # round_robin / weighted / random
+    proxies: List[dict] = Field(default_factory=list)
+
+
+class ModelRefreshConfig(BaseModel):
+    """刷新模型列表时的网络超时（秒）。
+    刷新会顺序请求上游 /v1/models 与定价接口，上游慢或不可达时这里决定最多等多久。"""
+    timeout_seconds: int = 20               # 单次网络请求超时（list_models 与 pricing 各算一次）
+    remove_missing_models: bool = True      # 刷新时自动删除上游已下架、本地仍存在的自动同步模型（保留手动添加的 is_manual=True）
+
+
+class ArenaConfig(BaseModel):
+    """LMSys Arena 排行榜（智力评分同步）配置。
+    同步在启动时后台执行，不阻塞网关就绪。"""
+    sync_on_startup: bool = True            # 是否在启动时拉取 Arena 排行榜同步智力分（false 则完全跳过，避免外网不可达时徒劳重试）
+    timeout_seconds: int = 15               # 单次拉取超时（秒）
+
+
+# 注：配额追踪已合并到分析页，原 QuotaConfig 阈值配置已删除
+
+
+class TokenSaverExtraConfig(BaseModel):
+    """高级 token saver：Caveman / Ponytail（默认关闭，保守启用）"""
+    caveman_enabled: bool = False
+    ponytail_enabled: bool = False
+
+
+class HeadroomConfig(BaseModel):
+    """Headroom：保留部分 provider 额度（不入自动 routing 候选池）"""
+    enabled: bool = False
+    entries: List[dict] = Field(default_factory=list)   # [{provider_id, daily_token_limit, label}]
+
+class AuthConfig(BaseModel):
+    """管理面板登录认证"""
+    enabled: bool = True
+    username: str = "admin"
+    password_hash: str = ""          # bcrypt hash，首次启动自动生成默认密码
+    session_timeout_hours: int = 24  # session 有效时长
+
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -46,6 +101,14 @@ class Config(BaseModel):
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     log_archive: LogArchiveConfig = Field(default_factory=LogArchiveConfig)
+    token_saver: TokenSaverConfig = Field(default_factory=TokenSaverConfig)
+    combos: ComboConfig = Field(default_factory=ComboConfig)
+    proxy_pool: ProxyPoolConfig = Field(default_factory=ProxyPoolConfig)
+    model_refresh: ModelRefreshConfig = Field(default_factory=ModelRefreshConfig)
+    arena: ArenaConfig = Field(default_factory=ArenaConfig)
+    token_saver_extra: TokenSaverExtraConfig = Field(default_factory=TokenSaverExtraConfig)
+    headroom: HeadroomConfig = Field(default_factory=HeadroomConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""
     path = Path(config_path)
@@ -69,6 +132,16 @@ def ensure_encryption_key(config: Config, config_path: str) -> Config:
         import secrets
         config.security.aigate_api_key = "ak-" + secrets.token_urlsafe(32)
         changed = True
+    # 首次启动自动生成管理面板默认密码
+    if config.auth.enabled and not config.auth.password_hash:
+        import bcrypt
+        default_password = "aigate123"
+        config.auth.password_hash = bcrypt.hashpw(
+            default_password.encode(), bcrypt.gensalt()
+        ).decode()
+        changed = True
+        print(f"\n⚠️  管理面板默认登录: 用户名={config.auth.username} 密码={default_password}")
+        print(f"   请登录后立即在配置文件中修改密码！\n")
     if changed:
         # 保存回配置文件
         path = Path(config_path)

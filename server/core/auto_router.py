@@ -3,6 +3,7 @@ Auto 智能路由器
 选举最优模型，回退机制
 v2.0: 支持人工干预 priority_boost + auto_excluded
 """
+import itertools
 import random
 import time
 from typing import List, Optional, AsyncGenerator, Dict, Set
@@ -30,6 +31,8 @@ class RouteResult:
     provider: Optional[Provider] = None
     api_key: Optional[str] = None
     adapter: Optional[BaseAdapter] = None
+    # OAuth ????????? adapter????????
+    extra_headers: Optional[dict] = None
     fallback_count: int = 0
     error: Optional[str] = None
 class AutoRouter:
@@ -50,6 +53,9 @@ class AutoRouter:
         )
         self.config = config.auto_router
         self.ranking_service = RankingService()
+
+        # 并发分散：进程级原子递增计数器，让并发 auto 请求轮转起点
+        self._rr_counter = itertools.count()
 
         # session sticky 缓存: conversation_id -> (model_id, timestamp)
         self._sticky_cache: Dict[str, tuple[int, datetime]] = {}
@@ -169,24 +175,50 @@ class AutoRouter:
                         if not cached or cached.status not in ["unhealthy", "rate_limited"]:
                             # 可用
                             provider = await session.get(Provider, sticky_model.provider_id)
-                            # 获取 key
-                            result = await session.execute(
-                                select(ApiKey)
-                                .where(ApiKey.provider_id == provider.id, ApiKey.is_active == True)
-                                .limit(1)
-                            )
-                            key = result.scalar_one_or_none()
-                            if key and self.key_manager:
-                                api_key = self.key_manager._crypto.decrypt(key.key_encrypted)
-                                adapter = create_adapter_for_provider(provider.api_type)
-                                return RouteResult(
-                                    success=True,
-                                    model=sticky_model,
-                                    provider=provider,
-                                    api_key=api_key,
-                                    adapter=adapter,
-                                    fallback_count=0
+                            # Free Tier / OAuth — key 可空
+                            api_key = None
+                            if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
+                                if provider.credential_type == "oauth":
+                                    try:
+                                        from server.core.oauth_client import get_oauth_client
+                                        _oc = getattr(provider, "oauth_code", None) or provider.name
+                                        api_key = await get_oauth_client().pick_access_token(_oc, session)
+                                    except Exception:
+                                        api_key = None
+                                    if not api_key:
+                                        return None   # OAuth 未连接，放走
+                                else:
+                                    api_key = ""
+                            else:
+                                # 获取 key
+                                result = await session.execute(
+                                    select(ApiKey)
+                                    .where(ApiKey.provider_id == provider.id, ApiKey.is_active == True)
+                                    .limit(1)
                                 )
+                                key = result.scalar_one_or_none()
+                                if key and self.key_manager:
+                                    api_key = self.key_manager._crypto.decrypt(key.key_encrypted)
+                                else:
+                                    return None
+                            if not api_key and api_key != "":
+                                return None
+                            # 防 MissingGreenlet：provider 属性可能已过期
+                            try:
+                                await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
+                            except Exception:
+                                pass
+                            adapter = create_adapter_for_provider(provider.api_type)
+                            _extra = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+                            return RouteResult(
+                                success=True,
+                                model=sticky_model,
+                                provider=provider,
+                                api_key=api_key,
+                                adapter=adapter,
+                                fallback_count=0,
+                                extra_headers=_extra,
+                            )
         # 获取所有候选
         candidates = await self.model_catalog.get_auto_candidates(session)
         if not candidates:
@@ -206,36 +238,77 @@ class AutoRouter:
             return RouteResult(success=False, error="All candidates are unhealthy/rate-limited/excluded. Wait for refresh or add more models.")
         # v0.2: 用 RankingService 综合打分排序
         candidates = await self._rank_candidates(candidates, session)
+        # 并发分散：轮转起点，避免并发请求全打 ranking #1
+        if len(candidates) > 1:
+            idx = next(self._rr_counter) % len(candidates)
+            candidates = candidates[idx:] + candidates[:idx]
         # 遍历找第一个可用的
         for candidate in candidates:
             provider = await session.get(Provider, candidate.provider_id)
-            # 找一个 key
-            result = await session.execute(
-                select(ApiKey)
-                .where(ApiKey.provider_id == candidate.provider_id, ApiKey.is_active == True)
-                .limit(1)
-            )
-            key = result.scalar_one_or_none()
-            if not key or not self.key_manager:
-                continue
-            # 检查限流
-            can_use = await self.rate_limiter.check_limit(
-                session, candidate.id, key.id
-            )
-            if not can_use:
-                continue
-            # 可用！
-            api_key = self.key_manager._crypto.decrypt(key.key_encrypted)
+            # Free Tier / OAuth providers — key 可空
+            api_key = None
+            key = None
+            if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
+                if provider.credential_type == "oauth":
+                    try:
+                        from server.core.oauth_client import get_oauth_client
+                        _oc = getattr(provider, "oauth_code", None) or provider.name
+                        api_key = await get_oauth_client().pick_access_token(_oc, session)
+                    except Exception:
+                        api_key = None
+                    if not api_key:
+                        # OAuth 未连接，跳过此候选
+                        continue
+                else:
+                    api_key = ""
+                # 不需要 ApiKey 表也 OK
+                # 检查限流：rate_limiter 用 key.id，free/oauth 没有 key — 用 model.id 单独限流不约束
+                key_id_for_rate = None
+            else:
+                # 标准路径：从 ApiKey 表查（优先用 KeyRotator）
+                try:
+                    from server.core.key_rotator import get_key_rotator
+                    picked_pair = await get_key_rotator().pick_active_key(session, provider.id)
+                except Exception:
+                    picked_pair = None
+                if picked_pair:
+                    key_id_for_rate, api_key = picked_pair
+                    key = type("K", (), {"id": key_id_for_rate})()  # dummy conforms to .id
+                else:
+                    result = await session.execute(
+                        select(ApiKey)
+                        .where(ApiKey.provider_id == candidate.provider_id, ApiKey.is_active == True)
+                        .limit(1)
+                    )
+                    key = result.scalar_one_or_none()
+                    if not key or not self.key_manager:
+                        continue
+                    key_id_for_rate = key.id
+                    api_key = self.key_manager._crypto.decrypt(key.key_encrypted)
+                # 检查限流
+                can_use = await self.rate_limiter.check_limit(
+                    session, candidate.id, key_id_for_rate
+                )
+                if not can_use:
+                    continue
+            # 防 MissingGreenlet：rate_limiter 内部可能 commit/rollback 导致 provider 对象属性过期，
+            # 此处显式刷新需要的属性，避免后续 provider.api_type 触发隐式 lazy-load
+            try:
+                await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
+            except Exception:
+                pass  # 对象可能已 detached，后续 getattr 会用缓存值
             adapter = create_adapter_for_provider(provider.api_type)
             if conversation_id:
                 self._set_sticky(conversation_id, candidate.id)
+            _extra_a = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
             return RouteResult(
                 success=True,
                 model=candidate,
                 provider=provider,
                 api_key=api_key,
                 adapter=adapter,
-                fallback_count=0
+                fallback_count=0,
+                extra_headers=_extra_a,
             )
         print(f"[AUTO] get_best_candidate exhausted all candidates (rate-limited or no key)")
         return RouteResult(success=False, error="All candidates are rate-limited. Try again later.")
@@ -259,7 +332,8 @@ class AutoRouter:
                     provider=current.provider,
                     api_key=current.api_key,
                     adapter=current.adapter,
-                    fallback_count=fallback_count
+                    fallback_count=fallback_count,
+                    extra_headers=current.extra_headers,
                 )
             tried.append(current.model.id)
             if self.health_checker and current.model:

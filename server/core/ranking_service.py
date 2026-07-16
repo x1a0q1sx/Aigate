@@ -13,7 +13,6 @@ from server.models.provider import Provider
 from server.models.request_log import RequestLog
 from server.models.intelligence import IntelligenceStatic
 from server.models.routing_config import RoutingWeights, RoutingPin
-from server.models.health_check import HealthCheck
 @dataclass
 class ModelScore:
     model_id: int
@@ -25,7 +24,7 @@ class ModelScore:
     intel_score: float = 50.0
     intel_source: str = "估算"           # Arena / 手动 / 估算
     stab_score: Optional[float] = None
-    p50_ms: Optional[int] = None
+    avg_ms: Optional[float] = None
     success_rate: Optional[float] = None
     final_score: float = 0.0
     excluded_reason: Optional[str] = None
@@ -36,37 +35,134 @@ class ModelScore:
         return self.stab_score is not None
 
 # ──────── 智力分估算：模型知名度 / 定价 / 能力 ────────
-_TIER_HIGH = {"gpt-5", "gpt-5.4", "gpt-5.5", "claude-opus", "claude-fable",
-              "claude-sonnet-4-6", "gemini-3", "gemini-3.5", "glm-5", "qwen3",
-              "deepseek-v4", "kimi-k2", "mimo-v2.5-pro", "minimax-m3",
-              "grok-4.20", "step-3", "muse-spark"}
-_TIER_MID = {"deepseek-v3", "deepseek-v4-flash", "qwen2.5", "claude-sonnet-4-5",
-             "gpt-4o", "gemini-2.5", "minimax-m2", "kimi-k1", "deepseek-r1",
-             "step-2", "glm-4", "qwen3-0", "grok-3", "mistral-large"}
-_KNOWN_INTEL = {}  # {partial_name: int(score)}
-for k in _TIER_HIGH:
-    _KNOWN_INTEL[k] = 85
-for k in _TIER_MID:
-    _KNOWN_INTEL[k] = 70
+_CANONICAL_STRIP_PREFIXES = [
+    "anthropic/", "openai/", "google/", "xiaomi/", "baidu/", "bytedance/",
+    "moonshotai/", "moonshot/", "mistralai/", "deepseek-ai/", "deepseek/",
+    "stepfun-ai/", "z-ai/", "zai-org/", "nvidia/", "meta/", "microsoft/",
+    "inclusionai/", "sapiens-ai/", "bytedance/",
+]
+_CANONICAL_STRIP_SUFFIXES = [
+    "-20260210", "-20250929", "-20251001", "-20250805", "-20250514",
+    "-0309", "-preview", "-online", "-web", "-console", "-search",
+    "-deep-research", "-edit", "-latest",
+    "-32k", "-16k", "-8k", "-1m",
+    "-minimal",
+    # NOTE: -high/-medium/-low/-xhigh/-compact are EFFORT TIERS, not portals;
+    # do not strip them ? they affect intelligence.
+    "-nano", "-mini", "-lite", "-flash", "-turbo", "-air", "-express",
+]
+
+def canonicalize(model_id: str) -> str:
+    """Strip vendor prefixes / date suffixes / size tags / portal variants so
+    model-identity matching hits the correct intelligence_static pattern."""
+    s0 = model_id.strip().lower()
+    for p in _CANONICAL_STRIP_PREFIXES:
+        if s0.startswith(p):
+            s0 = s0[len(p):]
+            break
+    while True:
+        changed = False
+        for sfx in _CANONICAL_STRIP_SUFFIXES:
+            if s0.endswith(sfx):
+                s0 = s0[:-len(sfx)]
+                changed = True
+        if not changed:
+            break
+    s0 = s0.replace("-thinking", "").replace("-reasoning", "").replace("_", "-")
+    return s0.strip("-")
+
+
+_ARENA_ELO_LO, _ARENA_ELO_HI = 1400.0, 1510.0
+def _elo_to_intel_wide(elo: float) -> float:
+    """Arena ELO -> 55..100 wide spread, so close ranks actually differ."""
+    raw = 55.0 + (float(elo) - _ARENA_ELO_LO) / (_ARENA_ELO_HI - _ARENA_ELO_LO) * 45.0
+    return round(max(0.0, min(100.0, raw)), 2)
+
+
+def _resolve_intel_from_row(r) -> tuple:
+    """Read raw score from intelligence_static row; if it carries Arena ELO in
+    notes, re-map ELO to the wide 55-100 spread for better discrimination.
+    Returns (score, source).
+    """
+    src = "Arena" if (r.notes and "Arena" in r.notes) else "Manual"
+    if src == "Arena" and r.notes:
+        import re as _re
+        m = _re.search(r"score=(\d+(?:\.\d+)?)", r.notes)
+        if m:
+            try:
+                elo = float(m.group(1))
+                return _elo_to_intel_wide(elo), "Arena"
+            except Exception:
+                pass
+    return float(r.score), src
+
+
+_DEMOTE_KEYWORDS = [
+    ("flash", -15), ("lite", -15), ("mini", -15), ("small", -15),
+    ("nano", -15), ("scout", -20), ("haiku", -10),
+    ("embedding", -30), ("moderation", -30), ("tts", -30),
+    ("llada", -10), ("ling-", -10),
+]
+
+_DEMOTE_PARAM = [
+    ("-17b", -20), ("-7b", -20), ("-3b", -20), ("-4b", -25),
+    ("-14b", -15), ("-8b", -15),     ("-1b", -30), ("-0b", -30),
+]
+
+# 家族基线：无 Arena/手工评分时，按「已知强模型家族」给合理起始分，
+# 避免所有未匹配模型都挤在 ~58（那样大模型和小模型评分几乎无差别，显得不准）。
+# cap 92：不会超过 Arena 顶级（95-100），也不至于把免费小模型抬到顶流位置。
+_FAMILY_BASE = {
+    "claude-fable": 95, "claude-opus-4-8": 94, "claude-opus-4-7": 93,
+    "claude-opus-4-6": 92, "claude-opus-4-5": 91, "claude-opus-4": 90,
+    "claude-sonnet-5": 90, "claude-sonnet-4": 88, "claude-haiku": 80,
+    "gpt-5.6": 93, "gpt-5.5": 92, "gpt-5.4": 91, "gpt-5.2": 90,
+    "gpt-5.1": 89, "gpt-5": 88, "gpt-4.1": 87, "gpt-4o": 80,
+    "o3": 90, "o1": 88,
+    "gemini-3.5": 90, "gemini-3.1": 89, "gemini-3": 88, "gemini-2.5": 84,
+    "gemini-2.0": 80, "gemini-1.5": 75,
+    "deepseek-v4": 88, "deepseek-v3": 82, "deepseek-r": 84, "deepseek-chat": 78,
+    "grok-4.20": 90, "grok-4.1": 88, "grok-3": 82,
+    "qwen3.7": 86, "qwen3.6": 85, "qwen3.5": 84, "qwen3": 82, "qwen2.5": 78,
+    "glm-5": 84, "glm-4": 76,
+    "ernie-5": 84, "ernie-4": 78,
+    "doubao-seed-2.1": 80, "doubao-seed-2.0": 76,
+    "mistral-large": 76, "mistral": 72,
+    "llama-3.3": 75, "llama-3.1": 72, "llama-3": 70,
+    "phi-4": 70,
+}
 
 def estimate_intel(model_id: str, is_free: bool) -> float:
-    """未匹配 Arena 时，基于模型知名度和定价估算智力分"""
+    """Conservative fallback when no intelligence_static / Arena match.
+    Starts low and only applies reliable demotion/effort adjustments;
+    never inflates above 62 (real strong models should have Arena data).
+    """
     low = model_id.lower()
-    for prefix, score in _KNOWN_INTEL.items():
-        if prefix in low:
-            return float(score)
-    # 免费模型 + 5 基础分
-    base = 55.0 if is_free else 50.0
-    # 按参数规模微调
-    if "pro" in low or "max" in low or "large" in low:
+    base = 58.0
+    # 家族基线：取命中的最强家族分（已知强模型给合理起始分，而非一律 58）
+    for fam, fb in _FAMILY_BASE.items():
+        if fam in low:
+            base = max(base, fb)
+    # effort tier handling ? small +/- per tier
+    if "-xhigh" in low or "-reasoning" in low or "-reason" in low or "-console" in low or "-thinking" in low:
         base += 8
-    if "flash" in low or "lite" in low or "mini" in low or "small" in low:
-        base -= 5
-    if "thinking" in low or "reason" in low:
-        base += 3
-    return base
-
-
+    elif "-high" in low:
+        base += 6
+    elif "-medium" in low or "-standard" in low:
+        pass
+    elif "-low" in low or "-basic" in low or "-express" in low or "-air" in low:
+        base -= 6
+    # demote by capability keyword (only the strongest demotion)
+    for kw, penalty in _DEMOTE_KEYWORDS:
+        if kw in low:
+            base += penalty
+            break
+    # demote by parameter size
+    for kw, penalty in _DEMOTE_PARAM:
+        if kw in low:
+            base += penalty
+            break
+    return min(92.0, max(20.0, base))
 class RankingService:
     """综合打分服务（无状态，每次新建）"""
     def __init__(self, speed_window_seconds: int = 86400,
@@ -103,24 +199,37 @@ class RankingService:
             pat = r.pattern.replace("*", "%").replace("?", "_")
             try:
                 if self._like_match(model_id.lower(), pat.lower()):
-                    s = r.score
-                    src = "Arena" if r.notes and "Arena" in r.notes else "手动"
+                    s, src = _resolve_intel_from_row(r)
                     if best_score is None or s > best_score:
                         best_score = s
                         best_source = src
             except Exception:
                 continue
+        # canonical fallback: strip vendor/date/size/portal variants so misspelt id matches
+        if best_score is None:
+            canon = canonicalize(model_id)
+            for r in intel_rows:
+                try:
+                    canon_pattern = canonicalize(r.pattern)
+                    if canon == canon_pattern or self._like_match(canon, r.pattern.replace("*", "%").replace("?", "_").lower()):
+                        s, src = _resolve_intel_from_row(r)
+                        if best_score is None or s > best_score:
+                            best_score = s
+                            best_source = src + "-canonical"
+                except Exception:
+                    continue
         if best_score is not None:
-            return float(best_score), best_source or "手动"
-        return estimate_intel(model_id, is_free), "估算"
+            return float(best_score), best_source or "Manual"
+        return estimate_intel(model_id, is_free), "Estimate"
     @staticmethod
     def _like_match(s: str, pattern: str) -> bool:
         import re
         regex = "^" + re.escape(pattern).replace("%", ".*").replace("_", ".") + "$"
         return bool(re.match(regex, s))
     async def compute_speed_score(self, db: AsyncSession, model_id: int, model_id_str: str = None) -> tuple:
-        """返回 (speed_score 0-100, p50_ms or None)
-        优先生从 request_logs 取 success 记录的延迟，其次从 health_check 表取最近一次探测延迟"""
+        """返回 (speed_score 0-100, avg_ms or None)
+        仅取历史「成功调用」(request_logs.status='success') 的延迟求均值；
+        映射曲线高延迟也永不为 0：score = max(FLOOR, 100*REF/(REF+avg))，REF≈3000ms 对应 50 分。"""
         since = datetime.utcnow() - timedelta(seconds=self.speed_window_seconds)
         model = await db.get(Model, model_id)
         needle = (model.model_id if model else None) or model_id_str
@@ -132,27 +241,20 @@ class RankingService:
                 RequestLog.status == "success",
                 RequestLog.latency_ms.isnot(None),
                 RequestLog.routed_model == needle,
-            ).order_by(RequestLog.latency_ms)
+            )
         )).fetchall()
         latencies = [r[0] for r in rows if r[0] is not None]
         if not latencies:
-            # fallback: 从健康探测表取延迟（哪怕状态是 degraded/rate_limited 也算）
-            hc_rows = (await db.execute(
-                select(HealthCheck.latency_ms).where(
-                    HealthCheck.model_id == model_id,
-                    HealthCheck.latency_ms.isnot(None),
-                    HealthCheck.checked_at >= since,
-                ).order_by(HealthCheck.checked_at.desc()).limit(5)
-            )).fetchall()
-            latencies = [r[0] for r in hc_rows if r[0] is not None and r[0] > 0]
-        if not latencies:
             return 0.0, None
-        p50 = latencies[len(latencies) // 2]
-        speed = max(0.0, 100.0 - min(p50, 5000) / 50.0)
-        return round(speed, 2), int(p50)
+        avg = sum(latencies) / len(latencies)
+        REF = 3000.0   # 参考延迟：3000ms → 50 分
+        FLOOR = 5.0    # 高延迟也不低于此分（永不为 0）
+        score = 100.0 * REF / (REF + avg)
+        score = max(FLOOR, min(100.0, score))
+        return round(score, 2), round(avg, 1)
     async def compute_stab_score(self, db: AsyncSession, model_id: int, model_id_str: str = None) -> Optional[float]:
         """返回 stab_score (0-100) 或 None(样本不足)。
-        同时从 request_logs 和 health_check 取数据，优先 request_logs 作为主要判断依据"""
+        仅基于 request_logs 真实调用历史计算成功率（不依赖已停用的自动探测）。"""
         since = datetime.utcnow() - timedelta(seconds=self.stab_window_seconds)
         model = await db.get(Model, model_id)
         needle = (model.model_id if model else None) or model_id_str
@@ -164,33 +266,77 @@ class RankingService:
                 RequestLog.routed_model == needle,
             ).order_by(RequestLog.created_at.desc()).limit(200)
         )).fetchall()
-        # 也查健康探测记录
-        hc_rows = (await db.execute(
-            select(HealthCheck.status).where(
-                HealthCheck.model_id == model_id,
-                HealthCheck.checked_at >= since,
-            ).order_by(HealthCheck.checked_at.desc()).limit(200)
-        )).fetchall()
-        all_statuses = [r[0] for r in rows] + [r[0] for r in hc_rows]
+        all_statuses = [r[0] for r in rows]
         if not all_statuses:
-            return None
+            return 70.0  # baseline stability; unknown models enter Auto
         total = len(all_statuses)
-        success = sum(1 for s in all_statuses if s == "success" or s == "healthy")
+        success = sum(1 for r0 in all_statuses if r0 == "success" or r0 == "healthy")
         sr = success / total
-        # 连续失败惩罚（只看 request_logs 的连续失败）
         consecutive_fail = 0
-        for r in rows:
-            if r[0] != "success":
+        for r0 in all_statuses:
+            if r0 != "success":
                 consecutive_fail += 1
             else:
                 break
         penalty = 0
         if consecutive_fail >= 3:
             penalty = self.fail_penalty + max(0, consecutive_fail - 3) * 2
-        # 样本不足惩罚：少于 min_requests 时降权
         if total < self.min_requests:
-            penalty += (self.min_requests - total) * 15
+            penalty += (self.min_requests - total) * 10
         return round(max(0.0, sr * 100 - penalty), 2)
+    async def compute_model_health(
+        self, db: AsyncSession, model_id: int, model_id_str: str = None,
+        window_seconds: int = 86400,
+    ) -> dict:
+        """从 request_logs 真实调用历史推导单模型健康状态（替代已停用的自动探测）。
+
+        返回 {status, latency_ms, last_checked, error_message}
+        status ∈ healthy / degraded / rate_limited / unhealthy / unknown
+        """
+        since = datetime.utcnow() - timedelta(seconds=window_seconds)
+        model = await db.get(Model, model_id)
+        needle = (model.model_id if model else None) or model_id_str
+        if not needle:
+            return {"status": "unknown", "latency_ms": None, "last_checked": None, "error_message": None}
+        rows = (await db.execute(
+            select(
+                RequestLog.status, RequestLog.latency_ms, RequestLog.created_at,
+                RequestLog.error_type, RequestLog.http_status,
+            ).where(
+                RequestLog.created_at >= since,
+                RequestLog.routed_model == needle,
+            ).order_by(RequestLog.created_at.desc()).limit(200)
+        )).fetchall()
+        if not rows:
+            return {"status": "unknown", "latency_ms": None, "last_checked": None, "error_message": None}
+        total = len(rows)
+        success = sum(1 for r in rows if r[0] == "success")
+        latencies = [r[1] for r in rows if r[1] is not None]
+        avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else None
+        last = rows[0]  # 最新一条（已按时间倒序）
+        last_status, last_err_type, last_http = last[0], last[3], last[4]
+        last_checked = last[2].isoformat() if last[2] else None
+        sr = success / total
+        if last_status != "success":
+            if last_http == 429 or (last_err_type and "rate" in str(last_err_type).lower()):
+                status = "rate_limited"
+            else:
+                status = "unhealthy"
+        elif sr < 0.5:
+            status = "unhealthy"
+        elif sr < 0.9:
+            status = "degraded"
+        else:
+            status = "healthy"
+        err_msg = None
+        if status != "healthy":
+            err_msg = (last_err_type or (f"近期成功率 {sr*100:.0f}%"))
+        return {
+            "status": status,
+            "latency_ms": avg_latency,
+            "last_checked": last_checked,
+            "error_message": err_msg,
+        }
     async def rank_all(
         self, db: AsyncSession,
         models: List[Model],
@@ -232,22 +378,28 @@ class RankingService:
                 ms.excluded_reason = "健康冷却中"
                 scores.append(ms); continue
             # 计算三维
-            ms.speed_score, ms.p50_ms = await self.compute_speed_score(db, m.id, m.model_id)
+            ms.speed_score, ms.avg_ms = await self.compute_speed_score(db, m.id, m.model_id)
             ms.intel_score, ms.intel_source = self.compute_intel(m.model_id, list(intel_rows), m.is_free)
+            # manual boost lifts the effective intel tier (not final_score directly)
+            if m.priority_boost:
+                ms.intel_score = round(min(100.0, ms.intel_score + m.priority_boost * 0.3), 2)
+                ms.intel_source = (ms.intel_source or "") + "-boosted"
             ms.stab_score = await self.compute_stab_score(db, m.id, m.model_id)
-            # 稳定性不足 → 排除
-            if ms.stab_score is None:
-                ms.excluded_reason = "稳定性样本不足"
-                scores.append(ms); continue
-            # final_score
+            # stability is never None now (70 default), so models enter Auto
+            speed_norm = min(1.0, max(0.0, (ms.speed_score or 0.0) / 100.0))
+            stab_norm = min(1.0, max(0.0, (ms.stab_score or 70.0) / 100.0))
+            intel_eff = ms.intel_score
+            # 综合分：智力主导 + 速度/稳定性增量贡献。
+            # 原实现用「intel<65 硬阈值」把弱模型总分压到 <10 并在 65 处制造 60 分断崖，
+            # 且弱模型之间（intel 43~64）分数几乎无区分。现统一公式：
+            # 弱模型拿到其 intel 量级分数（保留区分度），强模型仍稳居前排，选举排序不变。
             ms.final_score = round(
-                weights["w_speed"] * ms.speed_score
-                + weights["w_intel"] * ms.intel_score
-                + weights["w_stab"] * ms.stab_score
-                , 2)
-            # priority_boost 加成（每 +1 加 0.5 分）
-            ms.final_score += m.priority_boost * 0.5
+                intel_eff
+                + (100.0 - intel_eff) * 0.25 * speed_norm
+                + stab_norm * 4.0
+            , 2)
             scores.append(ms)
+
         # 排序：排除的排后面；final_score 降序；tie-breaker free 优先
         def sort_key(s: ModelScore):
             excluded = 1 if s.excluded_reason else 0
@@ -270,9 +422,9 @@ class RankingService:
             if p50 is not None:
                 results.append({
                     "model_id": m.id, "provider": p.name,
-                    "model": m.model_id, "p50_ms": p50, "speed_score": speed,
+                    "model": m.model_id, "avg_ms": p50, "speed_score": speed,
                 })
-        results.sort(key=lambda x: x["p50_ms"])
+        results.sort(key=lambda x: x["avg_ms"])
         return results[:limit]
     async def rank_top_intel(self, db: AsyncSession, limit: int = 10) -> List[Dict[str, Any]]:
         models = (await db.execute(select(Model, Provider)

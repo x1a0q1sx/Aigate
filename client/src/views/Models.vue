@@ -64,7 +64,7 @@
             <td class="provider-col"><strong>{{ getProviderName(m.provider_id) }}</strong></td>
             <td>
               <div style="font-family: monospace; font-size: 12px;">{{ formatPrice(m.input_price) }}/{{ formatPrice(m.output_price) }} /M</div>
-              <div v-if="m.pricing_source" style="font-size: 11px; color: var(--gray-500);" :title="m.pricing_source">
+              <div v-if="m.pricing_source" style="font-size: 11px; color: var(--text-muted);" :title="m.pricing_source">
                 {{ pricingSourceHost(m.pricing_source) }}
               </div>
             </td>
@@ -72,8 +72,8 @@
               <span v-if="m.success_rate !== null && m.success_rate !== undefined" :style="{color: successRateColor(m.success_rate), fontWeight: 'bold'}">
                 {{ Number(m.success_rate).toFixed(2) }}%
               </span>
-              <span v-else style="color: #999;">-</span>
-              <div v-if="m.avg_ttft_ms" style="font-size: 11px; color: var(--gray-500);">TTFT {{ Math.round(m.avg_ttft_ms) }}ms</div>
+              <span v-else style="color: var(--text-muted);">-</span>
+              <div v-if="m.avg_ttft_ms" style="font-size: 11px; color: var(--text-muted);">TTFT {{ Math.round(m.avg_ttft_ms) }}ms</div>
             </td>
             <td>{{ m.is_free ? '🆓' : '💰' }}</td>
             <td>
@@ -93,7 +93,7 @@
               <span v-if="m.latency_ms" :style="{color: latencyColor(m.latency_ms), fontWeight: 'bold'}">
                 {{ Math.round(m.latency_ms || 0) }}ms
               </span>
-              <span v-else style="color: #999;">-</span>
+              <span v-else style="color: var(--text-muted);">-</span>
               <span v-if="m.health_status" :class="['badge', statusBadgeClass(m.health_status)]" style="margin-left: 4px; font-size: 10px;">
                 {{ statusEmoji(m.health_status) }}
               </span>
@@ -108,7 +108,7 @@
                 <button class="btn btn-sm" :class="m.auto_excluded ? 'btn-danger' : 'btn-outline'"
                         @click="toggleExclude(m)" title="排除/恢复">🚫</button>
               </div>
-              <span v-if="m.priority_boost !== 0" style="font-size: 11px;" :style="{color: m.priority_boost > 0 ? '#059669' : '#dc2626'}">
+              <span v-if="m.priority_boost !== 0" style="font-size: 11px;" :style="{color: m.priority_boost > 0 ? 'var(--success)' : 'var(--danger)'}">
                 {{ m.priority_boost > 0 ? '+' : '' }}{{ m.priority_boost }}
               </span>
             </td>
@@ -164,6 +164,20 @@
           <label>
             <input type="checkbox" v-model="editForm.auto_excluded" /> 强制排除 Auto 选举
           </label>
+        </div>
+
+        <div class="form-section-title">????</div>
+        <div class="form-group">
+          <label>??????</label>
+          <input v-model.trim="editForm.model_alias" placeholder="????????? ID" />
+        </div>
+        <div class="form-group">
+          <label>??? Headers (JSON)</label>
+          <textarea v-model="overrideHeadersText" rows="4" spellcheck="false" placeholder='{"anthropic-beta":"context-1m-2025-08-07"}'></textarea>
+        </div>
+        <div class="form-group">
+          <label>Body Patch (JSON)</label>
+          <textarea v-model="overrideBodyPatchText" rows="4" spellcheck="false" placeholder='{"max_tokens":1024}'></textarea>
         </div>
         <div class="modal-actions">
           <button class="btn btn-outline" @click="showEditModal = false">取消</button>
@@ -230,6 +244,8 @@ export default {
       showEditModal: false,
       saving: false,
       editForm: {},
+      overrideHeadersText: '',
+      overrideBodyPatchText: '',
       showAddModel: false,
       addingModel: false,
       addModelForm: { provider_id: null, model_id: '', display_name: '', input_price: 0, output_price: 0 }
@@ -242,15 +258,39 @@ export default {
     }
   },
   methods: {
+    parseJsonObject(text, label) {
+      const trimmed = (text || '').trim()
+      if (!trimmed) return {}
+      let parsed
+      try {
+        parsed = JSON.parse(trimmed)
+      } catch (e) {
+        throw new Error(`${label} ???? JSON: ${e.message}`)
+      }
+      if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+        throw new Error(`${label} ??? JSON ??`)
+      }
+      return parsed
+    },
+    cleanRequestOverrides() {
+      const headers = this.parseJsonObject(this.overrideHeadersText, 'Headers')
+      const bodyPatch = this.parseJsonObject(this.overrideBodyPatchText, 'Body Patch')
+      const out = {}
+      if (this.editForm.model_alias) out.model_alias = this.editForm.model_alias
+      if (Object.keys(headers).length) out.headers = headers
+      if (Object.keys(bodyPatch).length) out.body_patch = bodyPatch
+      return Object.keys(out).length ? out : null
+    },
     async load() {
       try {
         this.providers = await api.getProviders()
         const params = {}
         if (this.filterProvider) params.provider_id = this.filterProvider
-        if (this.filterFree) params.is_free = true
+        // ?????????????????????????
         if (this.filterAuto) params.auto_enabled = true
         if (this.searchQuery) params.q = this.searchQuery
-        this.models = await api.getModels(params)
+        const loadedModels = await api.getModels(params)
+        this.models = this.filterFree ? (loadedModels || []).filter(m => m.is_free) : (loadedModels || [])
         // 初始化 _pinging 标记
         this.models.forEach(m => { if (m._pinging === undefined) m._pinging = false })
       } catch (e) {
@@ -384,6 +424,7 @@ export default {
       }
     },
     editModel(m) {
+      const overrides = m.request_overrides || {}
       this.editForm = {
         id: m.id,
         model_id: m.model_id,
@@ -395,18 +436,24 @@ export default {
         auto_enabled: m.auto_enabled,
         enabled: m.enabled,
         priority_boost: m.priority_boost || 0,
-        auto_excluded: m.auto_excluded || false
+        auto_excluded: m.auto_excluded || false,
+        model_alias: overrides.model_alias || ''
       }
+      this.overrideHeadersText = overrides.headers ? JSON.stringify(overrides.headers, null, 2) : ''
+      this.overrideBodyPatchText = overrides.body_patch ? JSON.stringify(overrides.body_patch, null, 2) : ''
       this.showEditModal = true
     },
     async saveEdit() {
       this.saving = true
       try {
-        await api.updateModel(this.editForm.id, this.editForm)
+        const requestOverrides = this.cleanRequestOverrides()
+        const payload = { ...this.editForm, request_overrides: requestOverrides }
+        delete payload.model_alias
+        await api.updateModel(this.editForm.id, payload)
         this.showEditModal = false
         await this.load()
       } catch (e) {
-        alert('保存失败: ' + e.message)
+        alert('????: ' + e.message)
       } finally {
         this.saving = false
       }
@@ -468,7 +515,7 @@ export default {
   position: absolute;
   cursor: pointer;
   top: 0; left: 0; right: 0; bottom: 0;
-  background-color: #ccc;
+  background-color: var(--border-medium);
   transition: .3s;
   border-radius: 20px;
 }
@@ -477,14 +524,14 @@ export default {
   content: "";
   height: 14px; width: 14px;
   left: 3px; bottom: 3px;
-  background-color: white;
+  background-color: #ffffff;
   transition: .3s;
   border-radius: 50%;
 }
 input:checked + .slider { background-color: var(--primary); }
 input:checked + .slider:before { transform: translateX(16px); }
 .btn-sm { padding: 2px 6px; font-size: 12px; }
-.btn-warning { background: var(--warning); color: white; border-color: var(--warning); }
+.btn-warning { background: var(--warning); color: #ffffff; border-color: var(--warning); }
 .provider-col { min-width: 160px; max-width: 260px; white-space: nowrap; }
 .modal-overlay {
   position: fixed;
@@ -496,11 +543,15 @@ input:checked + .slider:before { transform: translateX(16px); }
   z-index: 1000;
 }
 .modal-content {
-  background: white;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-soft);
+  color: var(--text-primary);
   padding: 24px;
   border-radius: 12px;
-  width: 500px;
+  width: 640px;
   max-width: 90vw;
+  max-height: 88vh;
+  overflow-y: auto;
 }
 .modal-actions {
   display: flex;
@@ -508,4 +559,25 @@ input:checked + .slider:before { transform: translateX(16px); }
   gap: 12px;
   margin-top: 24px;
 }
+
+.form-section-title {
+  margin: 18px 0 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.form-group textarea {
+  width: 100%;
+  min-height: 88px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
 </style>

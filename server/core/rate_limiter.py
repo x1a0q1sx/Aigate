@@ -40,27 +40,52 @@ class RateLimiter:
                 state.window_start = self._get_window_start()
                 await session.commit()
             return state
-        # 查数据库
+        # 查数据库（limit(1)：即使历史存在重复行也不会 MultipleResultsFound）
         result = await session.execute(
             select(RateLimitState).where(
                 RateLimitState.model_id == model_id,
                 RateLimitState.key_id == key_id
-            )
+            ).limit(1)
         )
         state = result.scalar_one_or_none()
         if not state:
-            state = RateLimitState(
-                model_id=model_id,
-                key_id=key_id,
-                rpm_current=0,
-                rpd_current=0,
-                tpm_current=0,
-                tpd_current=0,
-                window_start=self._get_window_start()
+            # 并发安全插入：依赖 (model_id, key_id) 唯一索引，冲突则忽略，随后 re-query 取回已存在行
+            from sqlalchemy import insert
+            try:
+                stmt = insert(RateLimitState).values(
+                    model_id=model_id,
+                    key_id=key_id,
+                    rpm_current=0,
+                    rpd_current=0,
+                    tpm_current=0,
+                    tpd_current=0,
+                    window_start=self._get_window_start()
+                ).on_conflict_do_nothing(index_elements=["model_id", "key_id"])
+                await session.execute(stmt)
+                await session.commit()
+            except Exception:
+                # 唯一索引尚未就绪（未迁移）时的降级：回滚后直接查回
+                await session.rollback()
+            result = await session.execute(
+                select(RateLimitState).where(
+                    RateLimitState.model_id == model_id,
+                    RateLimitState.key_id == key_id
+                ).limit(1)
             )
-            session.add(state)
-            await session.commit()
-            await session.refresh(state)
+            state = result.scalar_one_or_none()
+            if not state:
+                state = RateLimitState(
+                    model_id=model_id,
+                    key_id=key_id,
+                    rpm_current=0,
+                    rpd_current=0,
+                    tpm_current=0,
+                    tpd_current=0,
+                    window_start=self._get_window_start()
+                )
+                session.add(state)
+                await session.commit()
+                await session.refresh(state)
         self._cache[cache_key] = state
         return state
     async def check_limit(

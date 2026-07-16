@@ -13,10 +13,14 @@ from server.models.model import Model
 from server.models.api_key import ApiKey
 from server.adapters.base_adapter import BaseAdapter, ModelInfo
 from server.adapters.openai_compat import OpenAICompatAdapter
+from server.adapters.codex_responses import CodexResponsesAdapter
 from server.adapters.anthropic_adapter import AnthropicAdapter
 from server.adapters.github_adapter import GitHubAdapter
+from server.adapters.image_adapter import ImageAdapter
+from server.adapters.atomcode_adapter import AtomCodeAdapter
 from server.adapters.xyusec_pricing import fetch_provider_pricing, match_model_metadata
 from .key_manager import KeyManager
+from server.config import get_config
 
 logger = logging.getLogger(__name__)
 # 内置价格参考表 (美元 / 百万 tokens)
@@ -56,16 +60,23 @@ def get_builtin_pricing(model_id: str) -> Optional[dict]:
         if key in model_id:
             return pricing
     return None
-def create_adapter_for_provider(api_type: str) -> BaseAdapter:
-    """根据 api_type 创建适配器"""
-    if api_type == "anthropic":
-        return AnthropicAdapter()
+def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) -> BaseAdapter:
+    """根据 api_type 创建适配器。
+    timeout 为可选项：传入时覆盖适配器默认超时（用于刷新模型等后台网络请求）。"""
+    if api_type in ("anthropic", "claude_code"):
+        return AnthropicAdapter(timeout=timeout) if timeout else AnthropicAdapter()
     elif api_type == "github":
-        return GitHubAdapter()
+        return GitHubAdapter(timeout=timeout) if timeout else GitHubAdapter()
+    elif api_type == "image":
+        return ImageAdapter(timeout=timeout) if timeout else ImageAdapter()
     elif api_type == "openai_compat":
-        return OpenAICompatAdapter()
+        return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
+    elif api_type == "codex_responses":
+        return CodexResponsesAdapter(timeout=timeout) if timeout else CodexResponsesAdapter()
+    elif api_type == "atomcode":
+        return AtomCodeAdapter(timeout=timeout) if timeout else AtomCodeAdapter()
     else:
-        return OpenAICompatAdapter()
+        return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
 class ModelCatalog:
     """模型目录服务"""
     def __init__(self):
@@ -98,9 +109,11 @@ class ModelCatalog:
         self,
         session: AsyncSession
     ) -> List[Model]:
-        """获取可以参与 auto 选举的候选模型"""
+        """获取可以参与 auto 选举的候选模型。
+        注意：free_tier / oauth 类供应商不需要 ApiKey 表里的密钥，
+        只要 enabled + auto_enabled + 未手动排除即可成为候选（否则免费模型永远进不了 auto）。"""
         query = (
-            select(Model)
+            select(Model, Provider)
             .join(Provider, Model.provider_id == Provider.id)
             .where(
                 Model.enabled == True,
@@ -110,9 +123,14 @@ class ModelCatalog:
             .order_by(Model.priority_boost.desc(), Model.is_free.desc(), Model.input_price.asc())
         )
         result = await session.execute(query)
-        candidates = list(result.scalars().all())
+        rows = result.all()
         valid = []
-        for model in candidates:
+        for model, provider in rows:
+            cred = getattr(provider, "credential_type", "api_key")
+            if cred in ("free_tier", "oauth"):
+                # 免费层 / OAuth 供应商无需 ApiKey 表中的密钥
+                valid.append(model)
+                continue
             key_result = await session.execute(
                 select(ApiKey).where(
                     ApiKey.provider_id == model.provider_id,
@@ -151,7 +169,8 @@ class ModelCatalog:
         success_rate: Optional[float] = None,
         is_free: Optional[bool] = None,
         priority_boost: Optional[int] = None,
-        auto_excluded: Optional[bool] = None
+        auto_excluded: Optional[bool] = None,
+        request_overrides: Optional[dict] = None
     ) -> Optional[Model]:
         """更新模型配置"""
         model = await self.get_by_id(session, model_id)
@@ -173,6 +192,8 @@ class ModelCatalog:
             model.priority_boost = max(-100, min(100, priority_boost))  # 限制范围
         if auto_excluded is not None:
             model.auto_excluded = auto_excluded
+        if request_overrides is not None:
+            model.request_overrides = request_overrides
         await session.commit()
         await session.refresh(model)
         return model
@@ -183,25 +204,87 @@ class ModelCatalog:
         key_manager: KeyManager
     ) -> dict:
         """从服务商拉取最新模型列表"""
-        result = await session.execute(
-            select(ApiKey).where(
-                ApiKey.provider_id == provider.id,
-                ApiKey.is_active == True
+        # v3.3：base_url 校验，防止空/非法 URL 导致 httpx 报错
+        base_url = (provider.base_url or "").strip()
+        if not base_url.startswith(("http://", "https://")):
+            return {"error": f"Invalid or missing base_url: '{base_url[:80]}'"}
+        # free_tier / oauth 无密钥的 provider 也跳过（不需要 key）
+        cred_type = getattr(provider, "credential_type", "api_key") or "api_key"
+        if cred_type in ("free_tier",):
+            # 免费层：尝试通过 free executor 拉取模型（仅 opencode 提供 /models 端点；
+            # mimo-free 无端点，保留手动管理）
+            from server.core.free_providers import get_free_executor, resolve_free_code
+            free_code = resolve_free_code(provider.name, getattr(provider, "oauth_code", None))
+            exec_ = get_free_executor(free_code) if free_code else None
+            if exec_ is not None:
+                try:
+                    fetched_ids = await exec_.list_models()
+                except Exception as e:
+                    logger.warning(f"free_tier list_models failed for {provider.name}: {e}")
+                    # 拉取失败：保留已有模型（不报错、不删除），避免误删手动种子模型
+                    total_rows = (await session.execute(
+                        select(Model).where(Model.provider_id == provider.id)
+                    )).scalars().all()
+                    return {
+                        "added": 0, "updated": 0, "removed": 0,
+                        "total": len(list(total_rows)), "pricing_updated": 0,
+                        "metric_updated": 0, "pricing_source": None,
+                        "pricing_error": f"free_tier fetch failed: {e}",
+                    }
+                if fetched_ids:
+                    added = 0
+                    updated = 0
+                    for mid in fetched_ids:
+                        ex = await session.execute(
+                            select(Model).where(Model.provider_id == provider.id, Model.model_id == mid)
+                        )
+                        if ex.scalar_one_or_none() is None:
+                            session.add(Model(
+                                provider_id=provider.id, model_id=mid, display_name=mid,
+                                enabled=True, auto_enabled=False, is_free=False,
+                                supports_streaming=True, priority_boost=0, auto_excluded=False,
+                                is_manual=False,
+                            ))
+                            added += 1
+                        else:
+                            updated += 1
+                    await session.commit()
+                    total_rows = (await session.execute(
+                        select(Model).where(Model.provider_id == provider.id)
+                    )).scalars().all()
+                    return {
+                        "added": added, "updated": updated, "removed": 0,
+                        "total": len(list(total_rows)), "pricing_updated": 0,
+                        "metric_updated": 0, "pricing_source": None, "pricing_error": None,
+                    }
+            return {"error": f"Skipping free_tier provider (models managed manually)"}
+        # 刷新网络超时（来自 config.yaml model_refresh.timeout_seconds）
+        refresh_timeout = get_config().model_refresh.timeout_seconds
+        # atomcode：鉴权由本地 daemon 完成，不需要 AIGate ApiKey 表密钥
+        if provider.api_type == "atomcode":
+            key = None
+        else:
+            result = await session.execute(
+                select(ApiKey).where(
+                    ApiKey.provider_id == provider.id,
+                    ApiKey.is_active == True
+                ).limit(1)
             )
-        )
-        key = result.scalar_one_or_none()
-        if not key:
-            return {"error": "No active API key for this provider"}
-        api_key = key_manager._crypto.decrypt(key.key_encrypted)
-        adapter = create_adapter_for_provider(provider.api_type)
+            key = result.scalar_one_or_none()
+            if not key:
+                return {"error": "No active API key for this provider"}
+        api_key = key_manager._crypto.decrypt(key.key_encrypted) if key else ""
+        adapter = create_adapter_for_provider(provider.api_type, timeout=refresh_timeout)
         extra_headers = provider.headers if provider.headers else None
+        list_ok = False
         try:
             models = await adapter.list_models(api_key, provider.base_url, extra_headers)
+            list_ok = True
         except Exception as e:
             models = []
             logger.warning(f"list_models failed for {provider.name}: {e}")
         # 获取定价信息（可用于模型名称回退）
-        pricing_result = await fetch_provider_pricing(provider.base_url)
+        pricing_result = await fetch_provider_pricing(provider.base_url, timeout=refresh_timeout)
         provider_metadata = pricing_result.pricing
         # 如果 list_models 失败或无结果，尝试从 pricing API 提取模型名
         if not models and provider_metadata:
@@ -232,8 +315,8 @@ class ModelCatalog:
                 pricing_updated += 1
             # 移除了 "auto-mark as free" 逻辑：当上游不返回定价时，不再自动标记免费
             # 用户可在管理面板手动设置价格
-            # 未匹配内置定价时保留适配器返回值，只有明确免费才 auto_enabled=True
-            auto_enabled = model_info.is_free
+            # 免费模型不再自动开启 auto（用户反馈不好使），默认 auto_enabled=False，需手动开启
+            auto_enabled = False
             existing = await session.execute(
                 select(Model).where(
                     Model.provider_id == provider.id,
@@ -264,7 +347,7 @@ class ModelCatalog:
                     existing_model.output_price = model_info.output_price
                 if not existing_model.is_free and model_info.is_free:
                     existing_model.is_free = True
-                    existing_model.auto_enabled = True
+                    # 不再自动开启 auto；免费模型需用户手动参与选举
                 updated += 1
             else:
                 new_model = Model(
@@ -292,6 +375,24 @@ class ModelCatalog:
                 if remote_metadata and remote_metadata.get("success_rate") is not None:
                     metric_updated += 1
                 added += 1
+        # 清理已从上游下架、但本地仍存在的自动同步模型（失效模型）
+        # 安全约束：仅在 list_models 成功(list_ok)且返回非空(models)时才清理，
+        # 避免上游临时故障/超时导致误删该 provider 全部模型；手动添加(is_manual=True)的模型始终保留
+        removed = 0
+        if get_config().model_refresh.remove_missing_models and list_ok and models:
+            fetched_ids = {m.model_id for m in models}
+            stale = (await session.execute(
+                select(Model).where(
+                    Model.provider_id == provider.id,
+                    Model.model_id.notin_(fetched_ids),
+                    Model.is_manual.is_(False),
+                )
+            )).scalars().all()
+            for m in stale:
+                await session.delete(m)
+                removed += 1
+            if stale:
+                logger.info(f"Removed {removed} stale model(s) for {provider.name} (not in upstream list)")
         await session.commit()
         total = await session.execute(
             select(Model).where(Model.provider_id == provider.id)
@@ -300,6 +401,7 @@ class ModelCatalog:
         return {
             "added": added,
             "updated": updated,
+            "removed": removed,
             "total": total_count,
             "pricing_updated": pricing_updated,
             "metric_updated": metric_updated,

@@ -72,7 +72,7 @@
             <td>
               <span v-if="item.priority_boost > 0" style="color: var(--success); font-weight: bold;">⬆️+{{ item.priority_boost }}</span>
               <span v-else-if="item.priority_boost < 0" style="color: var(--danger); font-weight: bold;">⬇️{{ item.priority_boost }}</span>
-              <span v-else style="color: #666;">-</span>
+              <span v-else style="color: var(--text-muted);">-</span>
               <span v-if="item.cooldown_until" :title="'冷却至 ' + item.cooldown_until" style="color: var(--warning); font-size: 11px; display: block; margin-top: 2px;">⏳ {{ cooldownText(item.cooldown_until) }}</span>
               <span v-else-if="item.fail_count > 0" style="color: var(--gray-500); font-size: 11px; display: block; margin-top: 2px;">❌×{{ item.fail_count }}</span>
             </td>
@@ -121,7 +121,7 @@ export default {
       try {
         const data = await api.getAutoRanking()
         this.ranking = data.ranking || []
-        this.totalCandidates = data.total_candidates || 0
+        this.totalCandidates = (typeof data.total_candidates === 'number') ? data.total_candidates : (data.ranking ? data.ranking.length : 0)
         const weights = data.weights || await api.getRoutingWeights()
         this.setWeights(weights)
       } catch (e) {
@@ -173,19 +173,19 @@ export default {
       return Number(value).toFixed(1)
     },
     speedColor(v) {
-      if (!v || v === 0) return '#999'
+      if (!v || v === 0) return 'var(--text-muted)'
       if (v >= 80) return 'var(--success)'
       if (v >= 50) return 'var(--warning)'
       return 'var(--danger)'
     },
     intelColor(v) {
-      if (!v) return '#999'
+      if (!v) return 'var(--text-muted)'
       if (v >= 80) return 'var(--success)'
       if (v >= 60) return 'var(--warning)'
       return 'var(--danger)'
     },
     stabColor(v) {
-      if (v === null || v === undefined) return '#999'
+      if (v === null || v === undefined) return 'var(--text-muted)'
       if (v >= 95) return 'var(--success)'
       if (v >= 80) return 'var(--warning)'
       return 'var(--danger)'

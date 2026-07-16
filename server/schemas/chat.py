@@ -25,6 +25,11 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Any] = None
+    # Codex / OpenAI Responses ???reasoning effort?none/low/medium/high/xhigh?
+    reasoning_effort: Optional[str] = None
+    reasoning: Optional[Dict[str, Any]] = None
+    # ?????????? adapter???????
+    extra: Optional[Dict[str, Any]] = None
     @property
     def is_auto(self) -> bool:
         """是否请求 auto 模型"""

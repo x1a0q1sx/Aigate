@@ -8,6 +8,14 @@ GitHub Models API 是 OpenAI 兼容格式，但认证方式不同：
 import time
 import json
 import httpx
+
+
+def _proxy_kwargs() -> dict:
+    """从代理池取 httpx 代理参数；代理池关闭时返回空 dict（即直连）"""
+    from server.core.proxy_pool import get_proxy_pool
+    return get_proxy_pool().proxied_kwargs()
+
+
 from typing import AsyncGenerator, List
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
@@ -45,6 +53,16 @@ class GitHubAdapter(BaseAdapter):
     """GitHub Models 适配器 (OpenAI 兼容 + GitHub Token 认证)"""
     def __init__(self, timeout: int = 60):
         self.timeout = timeout
+        self.last_proxy_url = None
+
+    def _proxy(self) -> dict:
+        """取代理参数并记下本次线请求实际使用的代理 URL（写入 ContextVar，供日志落库）。"""
+        pk = _proxy_kwargs()
+        url = pk.get("proxy")
+        self.last_proxy_url = url
+        from server.core.proxy_pool import CURRENT_PROXY_URL
+        CURRENT_PROXY_URL.set(url)
+        return pk
     def _build_url(self, base_url: str) -> str:
         """构建 chat completions URL"""
         base = base_url.rstrip('/')
@@ -76,7 +94,7 @@ class GitHubAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -90,7 +108,7 @@ class GitHubAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
             async with client.stream('POST', url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -114,7 +132,7 @@ class GitHubAdapter(BaseAdapter):
         """从 GitHub Models API 获取模型列表"""
         url = self._build_models_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -170,7 +188,7 @@ class GitHubAdapter(BaseAdapter):
         }
         start_time = time.time()
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, **self._proxy()) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:

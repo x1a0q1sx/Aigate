@@ -33,6 +33,8 @@ from .models.rate_limit import RateLimitState
 from .models.request_log import RequestLog
 from .models.intelligence import IntelligenceStatic
 from .models.routing_config import RoutingWeights, RoutingPin, AdminAuditLog
+from .models.combo import Combo
+from .models.oauth_token import OAuthToken
 from .config import get_config
 config = get_config()
 db_path = Path(config.database.path)
@@ -74,18 +76,89 @@ async def init_db():
     async with engine.begin() as conn:
         # 启用 WAL 模式：允许并发读写，避免 SQLITE_BUSY
         await conn.execute(text("PRAGMA journal_mode=WAL"))
+        # 启用外键约束：SQLite 默认不执行 ON DELETE CASCADE，必须显式开启
+        await conn.execute(text("PRAGMA foreign_keys=ON"))
         await conn.run_sync(Base.metadata.create_all)
+        # v3.0 增量迁移
+        for sql in [
+            "ALTER TABLE providers ADD COLUMN credential_type VARCHAR(20) DEFAULT 'api_key'",
+            # v3.1: oauth_code — 当 credential_type=oauth 时明确指向 oauth_registry code
+            "ALTER TABLE providers ADD COLUMN oauth_code VARCHAR(50) DEFAULT NULL",
+        ]:
+            try:
+                await conn.execute(text(sql))
+            except Exception:
+                pass
+        # 新增 combos 表
+        for sql in [
+            """CREATE TABLE IF NOT EXISTS combos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(100) NOT NULL UNIQUE,
+                description TEXT DEFAULT '',
+                strategy VARCHAR(20) DEFAULT 'fallback',
+                model_ids JSON NOT NULL,
+                priority INTEGER DEFAULT 0,
+                enabled BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_combos_name ON combos(name)",
+            """CREATE TABLE IF NOT EXISTS oauth_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_code VARCHAR(50) NOT NULL,
+                owner VARCHAR(100) NOT NULL DEFAULT '__default',
+                access_token_enc TEXT NOT NULL,
+                refresh_token_enc TEXT,
+                token_type VARCHAR(20) DEFAULT 'Bearer',
+                scope VARCHAR(500) DEFAULT '',
+                expires_at TIMESTAMP,
+                refresh_expires_at TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1,
+                last_refreshed_at TIMESTAMP,
+                last_error VARCHAR(500) DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_oauth_provider_owner ON oauth_tokens(provider_code, owner)",
+        ]:
+            try:
+                await conn.execute(text(sql))
+            except Exception:
+                pass
         # v1/v2 增量迁移
         for sql in [
             "ALTER TABLE models ADD COLUMN priority_boost INTEGER DEFAULT 0",
             "ALTER TABLE models ADD COLUMN auto_excluded BOOLEAN DEFAULT 0",
             "ALTER TABLE models ADD COLUMN manual_cooldown_until TIMESTAMP",
+            # v9: 自动失败冷却持久化，重启后继续保留冷却惩罚
+            "ALTER TABLE models ADD COLUMN auto_cooldown_until TIMESTAMP DEFAULT NULL",
+            "ALTER TABLE models ADD COLUMN auto_fail_count INTEGER DEFAULT 0",
             "ALTER TABLE models ADD COLUMN success_rate REAL",
             "ALTER TABLE models ADD COLUMN avg_latency_ms REAL",
             "ALTER TABLE models ADD COLUMN avg_ttft_ms REAL",
             "ALTER TABLE models ADD COLUMN avg_tps REAL",
             "ALTER TABLE models ADD COLUMN pricing_source VARCHAR(500) DEFAULT ''",
             "ALTER TABLE models ADD COLUMN pricing_updated_at TIMESTAMP",
+            # v3.4: per-model request overrides (CCSwitch ??)
+            "ALTER TABLE models ADD COLUMN request_overrides TEXT DEFAULT NULL",
+            "ALTER TABLE models ADD COLUMN is_manual BOOLEAN DEFAULT 0",
+            # 方案A：配额追踪并入分析，request_logs 作为唯一用量数据源
+            "ALTER TABLE request_logs ADD COLUMN routed_provider_id INTEGER",
+            "ALTER TABLE request_logs ADD COLUMN estimated_cost_usd REAL DEFAULT 0.0",
+            # v7: 记录请求是否走代理及实际代理 URL（详情页可见）
+            "ALTER TABLE request_logs ADD COLUMN used_proxy BOOLEAN DEFAULT 0",
+            "ALTER TABLE request_logs ADD COLUMN proxy_url VARCHAR(255) DEFAULT NULL",
+            # v7.1: 健康检查探测标记列，让列表/聚合查询用等值过滤+索引替代 NOT LIKE
+            "ALTER TABLE request_logs ADD COLUMN is_health_check BOOLEAN DEFAULT 0",
+            # v8: intelligence_static 增加 source 列（manual=手工校准 / arena=Arena 同步）
+            # 非破坏性同步：arena 同步只更新 source='arena' 的行，绝不覆盖手工校准
+            "ALTER TABLE intelligence_static ADD COLUMN source VARCHAR(20) DEFAULT 'arena'",
+            # 回填（幂等：仅把尚未标记的 hc-% 行置 1；列不存在时 except 跳过）
+            "UPDATE request_logs SET is_health_check=1 WHERE conversation_id LIKE 'hc-%' AND is_health_check=0",
+            # 删除旧的平行账本（数据已并入 request_logs）
+            "DROP TABLE IF EXISTS quota_usage",
+            # v8.1: 清理 rate_limits 历史重复行（并发创建导致 (model_id,key_id) 重复，会引发 MultipleResultsFound）
+            "DELETE FROM rate_limits WHERE id NOT IN (SELECT MIN(id) FROM rate_limits GROUP BY model_id, key_id)",
         ]:
             try:
                 await conn.execute(text(sql))
@@ -98,17 +171,21 @@ async def init_db():
         ))
         await conn.execute(text("INSERT OR IGNORE INTO routing_pin (id) VALUES (1)"))
         # v0.2 智力种子（避免重复灌）
+        # 标记为 source='manual'：原始手工校准基线，Arena 同步绝不覆盖
         for pattern, score, tier, notes in INTEL_SEEDS:
             await conn.execute(text(
-                "INSERT OR IGNORE INTO intelligence_static (pattern, score, tier, notes) "
-                "VALUES (:p, :s, :t, :n)"
+                "INSERT OR IGNORE INTO intelligence_static (pattern, score, tier, notes, source) "
+                "VALUES (:p, :s, :t, :n, 'manual')"
             ), {"p": pattern, "s": score, "t": tier, "n": notes})
         # 索引（SQLite CREATE INDEX IF NOT EXISTS）
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_request_logs_model_time ON request_logs(routed_model, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_request_logs_status_time ON request_logs(status, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_request_logs_conv_time ON request_logs(conversation_id, created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_request_logs_hc_time ON request_logs(is_health_check, created_at)",
             "CREATE INDEX IF NOT EXISTS idx_audit_time ON admin_audit_log(created_at)",
+            # v8.1: rate_limits 唯一约束，防止并发创建产生重复行（根治 MultipleResultsFound）
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_limits_model_key ON rate_limits(model_id, key_id)",
         ]:
             try:
                 await conn.execute(text(sql))

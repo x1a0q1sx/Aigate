@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import delete
 from server.db import AsyncSessionLocal
 from server.models.provider import Provider
 from server.models.api_key import ApiKey
@@ -46,6 +47,94 @@ async def get_db():
 # 实例化服务
 _key_manager = KeyManager(get_crypto_service())
 _model_catalog = ModelCatalog()
+@router.get("/token-saver")
+async def get_token_saver_config():
+    """读取 RTK Token Saver 配置 + 可用规则清单"""
+    from server.core.token_saver import list_rules
+    ts = getattr(config, 'token_saver', None)
+    return {
+        "enabled": getattr(ts, 'enabled', True) if ts else True,
+        "min_chars": getattr(ts, 'min_chars', 80) if ts else 80,
+        "rules": list_rules(),
+    }
+@router.put("/token-saver")
+async def update_token_saver_config(enabled: Optional[bool] = None, min_chars: Optional[int] = None):
+    """更新 RTK Token Saver 配置并持久化"""
+    if not hasattr(config, 'token_saver') or config.token_saver is None:
+        from server.config import TokenSaverConfig
+        config.token_saver = TokenSaverConfig()
+    if enabled is not None:
+        config.token_saver.enabled = enabled
+    if min_chars is not None:
+        config.token_saver.min_chars = max(0, min_chars)
+    save_config()
+    return {"ok": True, "enabled": config.token_saver.enabled, "min_chars": config.token_saver.min_chars}
+@router.post("/token-saver/preview")
+async def preview_token_saver(data: dict):
+    """Preview compression effects for the Token Saver UI."""
+    messages = data.get("messages") or []
+    if isinstance(data.get("text"), str) and not messages:
+        messages = [{"role": "user", "content": data.get("text", "")}]
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+    from server.core.compress_service import compress_messages
+    return compress_messages(
+        messages,
+        rtk_enabled=data.get("rtk_enabled"),
+        caveman_enabled=data.get("caveman_enabled"),
+        ponytail_enabled=data.get("ponytail_enabled"),
+    )
+
+@router.post("/atomcode/load-auth")
+async def atomcode_load_auth(path: Optional[str] = None):
+    """读取 ~/.atomcode/auth.toml（可由 query 参数 path 覆盖）并解析为 AtomCode 鉴权 JSON。
+
+    该文件由 AtomCode / AtomGit 桌面客户端本地写入，结构与适配器期望的 auth
+    字典一致（access_token 在顶层，[user] 段为嵌套对象）。解析后直接回传，
+    前端可一键填入 AtomCode 直连反代鉴权框，无需用户手动复制 JSON。
+    """
+    import os, tomllib
+    raw = path or os.path.expanduser("~/.atomcode/auth.toml")
+    ap = os.path.abspath(os.path.expanduser(raw))
+    if not os.path.exists(ap):
+        raise HTTPException(status_code=404, detail=f"未找到 AtomCode 鉴权文件: {ap}")
+    try:
+        with open(ap, "rb") as f:
+            auth = tomllib.load(f)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"解析 TOML 失败: {e}")
+    if not isinstance(auth, dict) or not auth.get("access_token"):
+        raise HTTPException(status_code=400, detail="auth.toml 缺少 access_token 字段")
+    return {"path": ap, "auth": auth}
+
+@router.get("/atomcode/exe-status")
+async def atomcode_exe_status():
+    """返回 atomcode 可执行文件探测状态，供前端判断是否需要提示用户配置。"""
+    from server.adapters.atomcode_daemon import atomcode_exe_status as _st
+    return _st()
+
+@router.post("/atomcode/set-exe-path")
+async def atomcode_set_exe_path(data: dict):
+    """持久化用户配置的 atomcode 可执行文件/目录，并立即拉起 daemon 做健康检查验证。
+
+    请求体: {"path": "安装目录 或 exe 绝对路径"}
+    """
+    from server.adapters.atomcode_daemon import save_atomcode_exe_path, get_manager
+    raw = data.get("path") if isinstance(data, dict) else None
+    try:
+        exe = save_atomcode_exe_path(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # 立即拉起 daemon 并做健康检查，给用户即时反馈（最多等待约 20s）
+    try:
+        client = await get_manager().get_client()
+        await client.is_running()
+    except Exception as e:
+        # 路径已保存，但 daemon 拉起失败：返回 200 + warning，便于前端提示但仍保留配置
+        return {"ok": True, "exe_path": exe, "daemon_running": False,
+                "warning": f"路径已保存，但 daemon 拉起/健康检查失败：{e}"}
+    return {"ok": True, "exe_path": exe, "daemon_running": True}
+
 @router.get("/providers")
 async def list_providers(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Provider).order_by(Provider.id))
@@ -57,6 +146,8 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         name=data.name,
         base_url=data.base_url,
         api_type=data.api_type,
+        credential_type=data.credential_type,
+        oauth_code=data.oauth_code,
         headers=data.headers or {},
         description=data.description or ""
     )
@@ -75,6 +166,10 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.base_url = data.base_url
     if data.api_type is not None:
         provider.api_type = data.api_type
+    if data.credential_type is not None:
+        provider.credential_type = data.credential_type
+    if data.oauth_code is not None:
+        provider.oauth_code = data.oauth_code
     if data.headers is not None:
         provider.headers = data.headers
     if data.description is not None:
@@ -87,6 +182,23 @@ async def delete_provider(provider_id: int, db: AsyncSession = Depends(get_db)):
     provider = await db.get(Provider, provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
+    # v3.3: SQLite 默认不执行外键约束，显式级联删除关联的 models / api_keys
+    # 防止删完 provider 后孤儿 model 行残留，导致模型列表混乱
+    from server.models.model import Model as _M
+    from server.models.api_key import ApiKey as _AK
+    await db.execute(delete(_AK).where(_AK.provider_id == provider_id))
+    await db.execute(delete(_M).where(_M.provider_id == provider_id))
+    # 清理该 provider 所有 model 在 HealthChecker 中的缓存（避免过时延迟数据干扰）
+    from server.main import get_health_checker
+    hc = get_health_checker()
+    if hc:
+        orphan_model_ids = [m.id for m in (await db.execute(
+            select(_M.id).where(_M.provider_id == provider_id)
+        )).scalars().all()]
+        for mid in orphan_model_ids:
+            hc._status_cache.pop(mid, None)
+            hc._cooling.pop(mid, None)
+            hc._fail_count.pop(mid, None)
     await db.delete(provider)
     await db.commit()
     return {"ok": True}
@@ -140,10 +252,17 @@ async def list_models(
     hc = get_health_checker()
     from server.models.provider import Provider as ProvModel
     models = await _model_catalog.list_models(db, provider_id, is_free, auto_enabled)
-    # 预加载 provider 关系
+    # 预加载 provider 关系；v3.3 跳过 provider 已被删除的孤儿 model
+    orphan_count = 0
+    valid_models = []
     for m in models:
         provider = await db.get(ProvModel, m.provider_id)
-        m.provider = provider if provider else None
+        if not provider:
+            orphan_count += 1
+            continue
+        m.provider = provider
+        valid_models.append(m)
+    models = valid_models
     result = []
     if q:
         needle = q.strip().lower()
@@ -174,11 +293,36 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         success_rate=data.success_rate,
         is_free=data.is_free,
         priority_boost=data.priority_boost,
-        auto_excluded=data.auto_excluded
+        auto_excluded=data.auto_excluded,
+        request_overrides=data.request_overrides
     )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     return ModelInfoResponse.from_orm(model)
+@router.delete("/models/orphans")
+async def delete_orphan_models(db: AsyncSession = Depends(get_db)):
+    """Delete model rows whose provider no longer exists."""
+    provider_ids = set((await db.execute(select(Provider.id))).scalars().all())
+    orphan_models = (await db.execute(select(Model).where(~Model.provider_id.in_(provider_ids)))).scalars().all()
+    orphan_ids = [m.id for m in orphan_models]
+    if not orphan_ids:
+        return {"ok": True, "deleted": 0}
+
+    from server.models.rate_limit import RateLimitState
+    await db.execute(delete(HealthCheck).where(HealthCheck.model_id.in_(orphan_ids)))
+    await db.execute(delete(RateLimitState).where(RateLimitState.model_id.in_(orphan_ids)))
+    await db.execute(delete(Model).where(Model.id.in_(orphan_ids)))
+
+    from server.main import get_health_checker
+    hc = get_health_checker()
+    if hc:
+        for mid in orphan_ids:
+            hc._status_cache.pop(mid, None)
+            hc._cooling.pop(mid, None)
+            hc._fail_count.pop(mid, None)
+
+    await db.commit()
+    return {"ok": True, "deleted": len(orphan_ids), "model_ids": orphan_ids}
 @router.delete("/models/{model_id}")
 async def delete_model(model_id: int, db: AsyncSession = Depends(get_db)):
     """删除指定模型"""
@@ -223,6 +367,14 @@ async def refresh_models(
         source = result.get("pricing_source")
         if source and source not in pricing_sources:
             pricing_sources.append(source)
+    # 刷新后主动清理所有 combo 中指向已失效(被上游移除)模型的脏条目
+    try:
+        from server.core.combo_router import prune_stale_combo_targets
+        pruned = await prune_stale_combo_targets(db)
+        if pruned:
+            logger.info("[组合路由] 模型刷新后共清理 %d 个 combo 的失效候选", pruned)
+    except Exception as e:
+        logger.warning("[组合路由] 模型刷新后 combo 清理失败：%s", e)
     return ModelsRefreshResponse(
         added=total_added,
         updated=total_updated,
@@ -262,6 +414,7 @@ async def add_model_to_provider(provider_id: int, data: ManualModelAdd, db: Asyn
         supports_streaming=True,
         context_length=4096,
         created_at=now,
+        is_manual=True,
     )
     db.add(model)
     await db.commit()
@@ -361,15 +514,7 @@ async def ping_single_model(model_id: int, db: AsyncSession = Depends(get_db)):
     provider = await db.get(Provider, model.provider_id)
     if not provider:
         raise HTTPException(status_code=404, detail="Provider not found")
-    # 获取 key
-    result = await db.execute(
-        select(ApiKey)
-        .where(ApiKey.provider_id == provider.id, ApiKey.is_active == True)
-        .limit(1)
-    )
-    key = result.scalar_one_or_none()
-    if not key:
-        raise HTTPException(status_code=400, detail="No active API key for this provider")
+    # free_tier / oauth 类服务商无 ApiKey（空密钥或走 OAuth token），由 hc.check_model 内部按凭据类型处理
     # 执行探测
     health_result = await hc.check_model(db, model, provider, _key_manager)
     return PingResult(
@@ -494,61 +639,44 @@ async def get_health(
     model_id: Optional[int] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """获取健康状态：只看 auto 模型，全局最近 20 条探测记录"""
-    auto_ids_subq = select(Model.id).where(Model.enabled == True, Model.auto_enabled == True, Model.auto_excluded == False)
-    # 清理非 auto 模型的旧探测记录
-    old_checks = await db.execute(
-        select(HealthCheck).where(~HealthCheck.model_id.in_(auto_ids_subq))
+    """获取健康状态：仅看 auto 模型，数据来自 request_logs 真实调用历史（不再自动探测）"""
+    from server.core.ranking_service import RankingService
+    _rs = RankingService()
+    result = await db.execute(
+        select(Model, Provider)
+        .join(Provider, Model.provider_id == Provider.id)
+        .where(Model.enabled == True, Model.auto_enabled == True, Model.auto_excluded == False)
     )
-    for old in old_checks.scalars().all():
-        await db.delete(old)
-    # 全局只保留最近 20 条（跨所有 auto 模型）
-    all_checks = (await db.execute(
-        select(HealthCheck).where(HealthCheck.model_id.in_(auto_ids_subq)).order_by(desc(HealthCheck.checked_at))
-    )).scalars().all()
-    if len(all_checks) > 20:
-        for old in all_checks[20:]:
-            await db.delete(old)
-    await db.commit()
-    if model_id:
-        query = (
-            select(HealthCheck)
-            .where(HealthCheck.model_id == model_id, HealthCheck.model_id.in_(auto_ids_subq))
-            .order_by(desc(HealthCheck.checked_at))
-            .limit(20)
-        )
-    else:
-        query = (
-            select(HealthCheck)
-            .where(HealthCheck.model_id.in_(auto_ids_subq))
-            .order_by(desc(HealthCheck.checked_at))
-            .limit(20)
-        )
-    result = await db.execute(query)
-    checks = list(result.scalars().all())
     items = []
-    for check in checks:
-        model = await db.get(Model, check.model_id)
-        provider = await db.get(Provider, model.provider_id) if model else None
-        model_full_id = f"{provider.name}/{model.model_id}" if provider and model else str(check.model_id)
+    for model, provider in result.all():
+        if model_id and model.id != model_id:
+            continue
+        h = await _rs.compute_model_health(db, model.id, model.model_id)
+        model_full_id = f"{provider.name}/{model.model_id}" if provider else str(model.id)
         items.append(HealthStatusItem(
-            model_id=check.model_id,
+            model_id=model.id,
             model_full_id=model_full_id,
-            status=check.status,
-            latency_ms=check.latency_ms,
-            last_checked=utc_iso(check.checked_at),
-            error_message=check.error_message
+            status=h["status"],
+            latency_ms=h["latency_ms"],
+            last_checked=h["last_checked"] or "",
+            error_message=h["error_message"],
         ))
     return HealthStatusResponse(items=items)
 @router.get("/dashboard")
 async def get_dashboard(db: AsyncSession = Depends(get_db)):
     """仪表盘汇总"""
-    from server.main import get_health_checker
-    hc = get_health_checker()
-    statuses = hc.get_all_cached_status()
+    from server.core.ranking_service import RankingService
+    _rs = RankingService()
+    auto_rows = (await db.execute(
+        select(Model, Provider)
+        .join(Provider, Model.provider_id == Provider.id)
+        .where(Model.enabled == True, Model.auto_enabled == True, Model.auto_excluded == False)
+    )).all()
     counts = {"healthy": 0, "degraded": 0, "rate_limited": 0, "unhealthy": 0}
-    for s in statuses.values():
-        counts[s.status] = counts.get(s.status, 0) + 1
+    for model, provider in auto_rows:
+        h = await _rs.compute_model_health(db, model.id, model.model_id)
+        if h["status"] in counts:
+            counts[h["status"]] += 1
     total_providers_result = await db.execute(select(func.count(Provider.id)))
     total_providers = total_providers_result.scalar_one() or 0
     total_keys_result = await db.execute(select(func.count(ApiKey.id)))
@@ -627,38 +755,12 @@ async def get_current_model(db: AsyncSession = Depends(get_db)):
         "provider": last.routed_provider,
         "time": last.created_at.isoformat() if last.created_at else None,
     }
-# ========== 健康探测配置 ==========
-class HealthConfigUpdate(BaseModel):
-    interval_minutes: Optional[int] = None
-@router.get("/health-config")
-async def get_health_config():
-    return {
-        "interval_minutes": config.health_check.interval_minutes,
-        "healthy_latency_threshold_ms": config.health_check.healthy_latency_threshold_ms,
-        "ping_timeout_seconds": config.health_check.ping_timeout_seconds,
-    }
-@router.put("/health-config")
-async def update_health_config(data: HealthConfigUpdate):
-    from server.main import get_health_checker
-    hc = get_health_checker()
-    if data.interval_minutes is not None and 1 <= data.interval_minutes <= 1440:
-        config.health_check.interval_minutes = data.interval_minutes
-        save_config()
-        # 重启调度器以应用新间隔
-        if hc:
-            hc.stop_scheduler()
-            from server.db import AsyncSessionLocal
-            from server.core.key_manager import KeyManager
-            from server.core.crypto_service import get_crypto_service
-            km = KeyManager(get_crypto_service())
-            await hc.start_scheduler(AsyncSessionLocal, km)
-    return {"ok": True, "interval_minutes": config.health_check.interval_minutes}
 @router.post("/playground")
 async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: AsyncSession = Depends(get_db)):
     """Playground 测试聊天（含请求日志写入）"""
     import time, uuid, json as _json_mod
     from server.schemas.chat import ChatCompletionRequest, ChatMessage
-    from server.api.v1_router import get_auto_router, _auto_route_with_runtime_fallback, _format_sse_chunk, _auto_request_with_cascade_fallback
+    from server.api.v1_router import get_auto_router, _auto_route_with_runtime_fallback, _format_sse_chunk, _auto_request_with_cascade_fallback, _proxy_log_fields
     from server.models.request_log import RequestLog as _RL
     ar = get_auto_router()
     conversation_id = str(uuid.uuid4())
@@ -672,6 +774,35 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     is_auto = request.is_auto
     made_by_cascade = False
     route_result = None
+
+    # ─── 日志写入辅助（提前定义到 try 之前，避免 free_tier / oauth 早期 miss 兜底 _write_log 未绑定） ───
+    async def _write_log(status, resp_dict, latency_ms, error_msg=None, *, _route_result=route_result, _conversation_id=conversation_id, _request=request, _raw_request=raw_request):
+        try:
+            from server.db import AsyncSessionLocal as _LogSession
+            usage = resp_dict.get("usage", {}) if resp_dict else {}
+            pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            req_s = _json_mod.dumps(_request.model_dump(), ensure_ascii=False)
+            resp_s = _json_mod.dumps(resp_dict, ensure_ascii=False)[:100000] if resp_dict else None
+            async with _LogSession() as _ldb:
+                _ldb.add(_RL(
+                    conversation_id=_conversation_id, requested_model=_request.model,
+                    routed_provider=_route_result.provider.name if (_route_result and _route_result.success) else None,
+                    routed_model=_route_result.model.model_id if (_route_result and _route_result.success) else None,
+                    status=status, latency_ms=latency_ms,
+                    prompt_tokens=int(pt) if pt else 0,
+                    completion_tokens=int(ct) if ct else 0,
+                    fallback_count=_route_result.fallback_count if _route_result else 0,
+                    user_ip=_raw_request.client.host if _raw_request.client else None,
+                    error_type="upstream_error" if error_msg else None,
+                    error_msg=(error_msg or "")[:500],
+                    request_body=req_s, response_body=resp_s,
+                    **_proxy_log_fields(),
+                ))
+                await _ldb.commit()
+        except Exception:
+            pass
+
     if not is_auto:
         if "/" in request.model:
             provider_name, model_id = request.model.split("/", 1)
@@ -682,22 +813,102 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
         provider = await db.get(Provider, model.provider_id)
-        result = await db.execute(
-            select(ApiKey)
-            .where(ApiKey.provider_id == provider.id, ApiKey.is_active == True)
-            .limit(1)
-        )
-        key = result.scalar_one_or_none()
-        if not key:
-            raise HTTPException(status_code=400, detail="No active API key")
-        api_key = _key_manager._crypto.decrypt(key.key_encrypted)
-        from server.core.model_catalog import create_adapter_for_provider
-        from server.core.auto_router import RouteResult
-        adapter = create_adapter_for_provider(provider.api_type)
-        route_result = RouteResult(
-            success=True, model=model, provider=provider,
-            api_key=api_key, adapter=adapter, fallback_count=0
-        )
+
+        # ─── v3.2 free_tier / OAuth 路径：playground 也走专用分支 ───
+        cred_type = getattr(provider, "credential_type", "api_key") or "api_key"
+        if cred_type == "free_tier":
+            # MiMo / OpenCode 等 9Router 来源免登录 provider — 走 free_providers executor
+            from server.core.free_providers import get_free_executor, resolve_free_code, _FREE_PROVIDERS_META as _FPM
+            free_code = resolve_free_code(provider.name, getattr(provider, "oauth_code", None))
+            free_exec = get_free_executor(free_code) if free_code else None
+            if free_exec:
+                free_req = request.model_copy(update={"model": model.model_id})
+                _send_dur = lambda: int((time.time() - _send_time) * 1000)
+                if data.stream:
+                    async def _playground_free_stream():
+                        try:
+                            async for ck in free_exec.execute_stream(free_req):
+                                yield _format_sse_chunk(ck, f"{provider.name}/{model.model_id}")
+                            yield b"data: [DONE]\n\n"
+                            await _write_log("success", None, _send_dur())
+                        except Exception as e:
+                            yield _format_sse_chunk({"error": f"free_provider_stream_failed: {e}"}, f"{provider.name}/{model.model_id}")
+                            yield b"data: [DONE]\n\n"
+                            await _write_log("error", None, _send_dur(), str(e)[:500])
+                    return StreamingResponse(_playground_free_stream(), media_type="text/event-stream")
+                try:
+                    upstream_result = await free_exec.execute_non_stream(free_req)
+                    if isinstance(upstream_result, dict) and "model" in upstream_result:
+                        upstream_result["model"] = f"{provider.name}/{model.model_id}"
+                    await _write_log("success", upstream_result, _send_dur())
+                    return upstream_result
+                except Exception as e:
+                    await _write_log("error", None, _send_dur(), str(e)[:500])
+                    return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {e}"})
+            # 没匹配上 free_code — 不再回退 adapter（避免 URL 被错误二次追加 / 403）
+            known_codes = ", ".join(f"'{c}' ({_FPM[c]['name']})" for c in _FPM)
+            await _write_log("error", None, 0,
+                f"free_tier provider '{provider.name}' has no matching executor "
+                f"(oauth_code={getattr(provider, 'oauth_code', None)!r})")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": f"free_tier provider '{provider.name}' has no matching executor. "
+                             f"请编辑该服务商，将 oauth_code 填为 {known_codes} 之一。"
+                },
+            )
+        elif cred_type == "oauth":
+            # OAuth 订阅 provider — 用 oauth_client.pick_access_token，未连接报 503
+            from server.core.oauth_client import get_oauth_client
+            oauth_code = getattr(provider, "oauth_code", None) or provider.name
+            try:
+                api_key = await get_oauth_client().pick_access_token(oauth_code, db)
+            except Exception:
+                api_key = None
+            if not api_key:
+                raise HTTPException(status_code=503, detail=f"OAuth provider '{oauth_code}' not connected")
+            from server.core.model_catalog import create_adapter_for_provider
+            from server.core.auto_router import RouteResult
+            adapter = create_adapter_for_provider(provider.api_type)
+            route_result = RouteResult(
+                success=True, model=model, provider=provider,
+                api_key=api_key, adapter=adapter, fallback_count=0
+            )
+        elif cred_type == "atomcode":
+            # AtomCode — 本地 daemon 自鉴权，无需 API key（playground / 模型页测试也走此分支）
+            from server.core.model_catalog import create_adapter_for_provider
+            from server.core.auto_router import RouteResult
+            adapter = create_adapter_for_provider(provider.api_type)
+            route_result = RouteResult(
+                success=True, model=model, provider=provider,
+                api_key="", adapter=adapter, fallback_count=0
+            )
+        else:
+            # 标准 API Key provider
+            result = await db.execute(
+                select(ApiKey)
+                .where(ApiKey.provider_id == provider.id, ApiKey.is_active == True)
+                .limit(1)
+            )
+            key = result.scalar_one_or_none()
+            if not key:
+                raise HTTPException(status_code=400, detail="No active API key")
+            api_key = _key_manager._crypto.decrypt(key.key_encrypted)
+            # v3.1 优先用 KeyRotator
+            try:
+                from server.core.key_rotator import get_key_rotator
+                picked = await get_key_rotator().pick_active_key(db, provider.id)
+                if picked:
+                    api_key = picked[1]
+            except Exception:
+                pass
+            from server.core.model_catalog import create_adapter_for_provider
+            from server.core.auto_router import RouteResult
+            adapter = create_adapter_for_provider(provider.api_type)
+            route_result = RouteResult(
+                success=True, model=model, provider=provider,
+                api_key=api_key, adapter=adapter, fallback_count=0
+            )
     elif data.stream:
         route_result, _ = await _auto_route_with_runtime_fallback(ar, db, request, conversation_id)
         if not route_result.success:
@@ -724,33 +935,6 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     model_id_full = f"{route_result.provider.name}/{route_result.model.model_id}"
     upstream_request = request.model_copy(update={"model": route_result.model.model_id})
     extra_headers = route_result.provider.headers if route_result.provider.headers else None
-
-    # ─── 日志写入辅助 ───
-    async def _write_log(status, resp_dict, latency_ms, error_msg=None):
-        try:
-            from server.db import AsyncSessionLocal as _LogSession
-            usage = resp_dict.get("usage", {}) if resp_dict else {}
-            pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-            req_s = _json_mod.dumps(request.model_dump(), ensure_ascii=False)
-            resp_s = _json_mod.dumps(resp_dict, ensure_ascii=False)[:100000] if resp_dict else None
-            async with _LogSession() as _ldb:
-                _ldb.add(_RL(
-                    conversation_id=conversation_id, requested_model=request.model,
-                    routed_provider=route_result.provider.name if (route_result and route_result.success) else None,
-                    routed_model=route_result.model.model_id if (route_result and route_result.success) else None,
-                    status=status, latency_ms=latency_ms,
-                    prompt_tokens=int(pt) if pt else 0,
-                    completion_tokens=int(ct) if ct else 0,
-                    fallback_count=route_result.fallback_count if route_result else 0,
-                    user_ip=raw_request.client.host if raw_request.client else None,
-                    error_type="upstream_error" if error_msg else None,
-                    error_msg=(error_msg or "")[:500],
-                    request_body=req_s, response_body=resp_s,
-                ))
-                await _ldb.commit()
-        except Exception:
-            pass
 
     if data.stream:
         async def wrap_stream():
@@ -809,7 +993,7 @@ async def get_auto_ranking(db: AsyncSession = Depends(get_db)):
             "speed_score": s.speed_score,
             "intel_score": s.intel_score,
             "stab_score": s.stab_score,
-            "p50_ms": s.p50_ms,
+            "avg_ms": s.avg_ms,
             "success_rate": s.success_rate,
             "final_score": s.final_score,
             "excluded_reason": s.excluded_reason,
