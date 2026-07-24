@@ -1,0 +1,89 @@
+# AIGate 配置示例
+# 用法：复制本文件为 config.yaml 后启动。
+#
+# 首次启动若 config.yaml 中以下字段为空/缺失，会自动生成：
+#   - security.aigate_api_key   AIGate 访问密钥（业务接口 /v1/* 鉴权用）
+#   - security.encryption_key   加密上游 Key 的 Fernet 密钥
+#   - auth.password_hash        管理面板默认密码 aigate123 的 bcrypt 哈希
+# 因此本示例故意留空这些字段，发布到 GitHub 不会泄露任何密钥。
+# 需要自定义端口、代理池等时，取消对应注释修改即可。
+
+arena:
+  sync_on_startup: true
+  timeout_seconds: 15
+
+auth:
+  enabled: true
+  username: admin
+  session_timeout_hours: 24
+  # password_hash 留空 → 首次启动用默认密码 aigate123 生成
+
+auto_router:
+  cooling_period_seconds: 30
+  free_model_priority: true
+  max_fallbacks: 5
+  session_sticky_minutes: 30
+
+combos:
+  default_strategy: fallback
+  enabled: true
+  max_fallbacks: 5
+
+database:
+  path: ./data/aigate.db
+
+headroom:
+  enabled: false
+  entries: []
+
+health_check:
+  healthy_latency_threshold_ms: 2000.0
+  interval_minutes: 1440
+  max_history_per_model: 100
+  ping_timeout_seconds: 10
+
+log_archive:
+  archive_dir: ./data/archives
+  enabled: true
+
+logging:
+  file: null
+  level: INFO
+  verbose_diag: false
+
+model_refresh:
+  remove_missing_models: true
+  timeout_seconds: 20
+
+# 代理池：留空表示不启用。需要时用如下结构：
+# proxy_pool:
+#   enabled: true
+#   strategy: round_robin
+#   proxies:
+#     - name: my-proxy
+#       url: socks5://127.0.0.1:10888
+#       weight: 1
+
+rate_limit:
+  default_rpm: 60
+  default_tpm: 100000
+
+security:
+  # aigate_api_key / encryption_key 留空 → 首次启动自动生成
+  # aigate_api_key: ""
+  # encryption_key: ""
+
+server:
+  cors_origins:
+  - '*'
+  host: 0.0.0.0
+  port: 8000
+
+token_saver:
+  enabled: false
+  log_savings: false
+  min_chars: 80
+
+token_saver_extra:
+  caveman_enabled: false
+  ponytail_enabled: false

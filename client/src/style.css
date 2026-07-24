@@ -1,0 +1,427 @@
+/* ==========================================================
+   AIGate 全局样式 + 主题（暗色 / 浅色）切换
+   - 切换方式：根元素加 data-theme="dark" | "light"
+   - 老组件 class（.card/.btn/.form-group/...）也会自动跟主题
+   ========================================================== */
+
+:root {
+  --primary: #3b82f6;
+  --primary-dark: #2563eb;
+  --primary-light: #60a5fa;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --border-radius: 8px;
+}
+
+/* 默认/暗色主题（通过 root 上没有或 dark 触发）*/
+[data-theme="dark"] {
+  --bg-base: #0a0a0c;
+  --bg-elevated: #111114;
+  --bg-card: rgba(255,255,255,0.04);
+  --bg-card-hover: rgba(255,255,255,0.07);
+  --bg-input: rgba(255,255,255,0.04);
+  --bg-code: rgba(255,255,255,0.06);
+  --bg-header: rgba(255,255,255,0.02);
+  --bg-hover: rgba(255,255,255,0.06);
+  --surface-1: rgba(255,255,255,0.09);
+  --border-soft: rgba(255,255,255,0.06);
+  --border-medium: rgba(255,255,255,0.12);
+  --border-strong: rgba(255,255,255,0.2);
+  --text-primary: rgba(255,255,255,0.92);
+  --text-secondary: rgba(255,255,255,0.72);
+  --text-muted: rgba(255,255,255,0.55);
+  --text-dim: rgba(255,255,255,0.4);
+  --badge-free-bg: rgba(16,185,129,0.18);
+  --badge-free-fg: #10b981;
+  --badge-paid-bg: rgba(245,158,11,0.18);
+  --badge-paid-fg: #f59e0b;
+  --badge-err-bg: rgba(239,68,68,0.18);
+  --badge-err-fg: #ef4444;
+  --alert-success-bg: rgba(16,185,129,0.12);
+  --alert-success-fg: #10b981;
+  --alert-success-border: rgba(16,185,129,0.3);
+  --alert-error-bg: rgba(239,68,68,0.12);
+  --alert-error-fg: #ef4444;
+  --alert-error-border: rgba(239,68,68,0.3);
+  --alert-info-bg: rgba(59,130,246,0.12);
+  --alert-info-fg: #3b82f6;
+  --alert-info-border: rgba(59,130,246,0.3);
+  --chat-user-bg: rgba(59,130,246,0.14);
+  --chat-asst-bg: rgba(255,255,255,0.04);
+}
+
+/* 浅色（白天）主题 */
+[data-theme="light"] {
+  --primary: #2563eb;
+  --primary-dark: #1e40af;
+  --primary-light: #3b82f6;
+  --bg-base: #f7f8fa;
+  --bg-elevated: #ffffff;
+  --bg-card: #ffffff;
+  --bg-card-hover: #fafbfc;
+  --bg-input: #ffffff;
+  --bg-code: #f3f4f6;
+  --bg-header: #fafbfc;
+  --bg-hover: #f3f4f6;
+  --surface-1: #f3f4f6;
+  --border-soft: #e5e7eb;
+  --border-medium: #d1d5db;
+  --border-strong: #9ca3af;
+  --text-primary: #111827;
+  --text-secondary: #374151;
+  --text-muted: #6b7280;
+  --text-dim: #9ca3af;
+  --badge-free-bg: #dcfce7;
+  --badge-free-fg: #166534;
+  --badge-paid-bg: #fef3c7;
+  --badge-paid-fg: #92400e;
+  --badge-err-bg: #fee2e2;
+  --badge-err-fg: #991b1b;
+  --alert-success-bg: #dcfce7;
+  --alert-success-fg: #166534;
+  --alert-success-border: #bbf7d0;
+  --alert-error-bg: #fee2e2;
+  --alert-error-fg: #991b1b;
+  --alert-error-border: #fecaca;
+  --alert-info-bg: #dbeafe;
+  --alert-info-fg: #1e40af;
+  --alert-info-border: #bfdbfe;
+  --chat-user-bg: #dbeafe;
+  --chat-asst-bg: #ffffff;
+}
+
+/* 老组件遗留的 --gray-* / --green 变量兼容层
+   — 老页面 scoped style 引用了这些 var，统一映射到主题变量让它们自动跟随主题 */
+:root,
+[data-theme="light"] {
+  --gray-50: var(--bg-hover);            /* light: #f3f4f6 */
+  --gray-100: var(--bg-code);            /* light: #f3f4f6 */
+  --gray-200: var(--border-soft);        /* light: #e5e7eb */
+  --gray-300: var(--border-medium);      /* light: #d1d5db */
+  --gray-400: var(--text-dim);           /* light: #9ca3af */
+  --gray-500: var(--text-muted);         /* light: #6b7280 */
+  --gray-700: var(--text-secondary);     /* light: #374151 */
+  --green: var(--badge-free-fg);         /* light: #166534 */
+  --info: var(--primary);                /* light: #2563eb */
+}
+[data-theme="dark"] {
+  --gray-50: var(--bg-hover);
+  --gray-100: var(--bg-code);
+  --gray-200: var(--border-soft);
+  --gray-300: var(--border-medium);
+  --gray-400: var(--text-dim);
+  --gray-500: var(--text-muted);
+  --gray-700: var(--text-secondary);
+  --green: var(--badge-free-fg);
+  --info: var(--primary);
+}
+
+/* 默认 root 兜底：只在 <html> 没设 data-theme 属性时生效（暗色），避免 JS 启动前白底闪烁。
+   关键：用 :not([data-theme]) 限定，保证 [data-theme="dark"] 和 [data-theme="light"] 永远优先 */
+:root:not([data-theme]) {
+  --bg-base: #0a0a0c;
+  --bg-elevated: #111114;
+  --bg-card: rgba(255,255,255,0.04);
+  --bg-card-hover: rgba(255,255,255,0.07);
+  --bg-input: rgba(255,255,255,0.04);
+  --bg-code: rgba(255,255,255,0.06);
+  --bg-header: rgba(255,255,255,0.02);
+  --bg-hover: rgba(255,255,255,0.06);
+  --surface-1: rgba(255,255,255,0.09);
+  --border-soft: rgba(255,255,255,0.06);
+  --border-medium: rgba(255,255,255,0.12);
+  --border-strong: rgba(255,255,255,0.2);
+  --text-primary: rgba(255,255,255,0.92);
+  --text-secondary: rgba(255,255,255,0.72);
+  --text-muted: rgba(255,255,255,0.55);
+  --text-dim: rgba(255,255,255,0.4);
+  --badge-free-bg: rgba(16,185,129,0.18);
+  --badge-free-fg: #10b981;
+  --badge-paid-bg: rgba(245,158,11,0.18);
+  --badge-paid-fg: #f59e0b;
+  --badge-err-bg: rgba(239,68,68,0.18);
+  --badge-err-fg: #ef4444;
+  --alert-success-bg: rgba(16,185,129,0.12);
+  --alert-success-fg: #10b981;
+  --alert-success-border: rgba(16,185,129,0.3);
+  --alert-error-bg: rgba(239,68,68,0.12);
+  --alert-error-fg: #ef4444;
+  --alert-error-border: rgba(239,68,68,0.3);
+  --alert-info-bg: rgba(59,130,246,0.12);
+  --alert-info-fg: #3b82f6;
+  --alert-info-border: rgba(59,130,246,0.3);
+  --chat-user-bg: rgba(59,130,246,0.14);
+  --chat-asst-bg: rgba(255,255,255,0.04);
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  transition: background 0.25s, color 0.25s;
+}
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+/* ─── 老组件兼容层（跟着 data-theme 变色）─ */
+
+.card {
+  background: var(--bg-card);
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-soft);
+  padding: 20px;
+  margin-bottom: 20px;
+}
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.card-header h2, .card h2 {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+  color: var(--text-primary);
+}
+h1, h2, h3, h4 {
+  color: var(--text-primary);
+}
+h1 {
+  font-size: 22px;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 16px;
+  font-size: 14px;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+  gap: 6px;
+}
+.btn-primary { background: var(--primary); color: white; }
+.btn-primary:hover { background: var(--primary-dark); }
+.btn-danger { background: var(--danger); color: white; }
+.btn-danger:hover { background: #dc2626; }
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border-medium);
+  color: var(--text-primary);
+}
+.btn-outline:hover { background: var(--bg-hover); }
+.btn-sm { padding: 4px 12px; font-size: 12px; }
+
+.form-group { margin-bottom: 16px; }
+.form-group label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: 6px;
+  color: var(--text-secondary);
+}
+.form-group input,
+.form-group select,
+.form-group textarea {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 14px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-medium);
+  border-radius: 6px;
+  color: var(--text-primary);
+  transition: border-color 0.2s;
+}
+.form-group input:focus,
+.form-group select:focus,
+.form-group textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+.form-group input::placeholder,
+.form-group textarea::placeholder {
+  color: var(--text-dim);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+table th {
+  text-align: left;
+  padding: 12px;
+  background: var(--bg-header);
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-soft);
+}
+table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-primary);
+}
+table tr:hover {
+  background: var(--bg-hover);
+}
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: 9999px;
+}
+.badge-free, .badge-healthy {
+  background: var(--badge-free-bg);
+  color: var(--badge-free-fg);
+}
+.badge-paid, .badge-degraded {
+  background: var(--badge-paid-bg);
+  color: var(--badge-paid-fg);
+}
+.badge-rate_limited, .badge-unhealthy {
+  background: var(--badge-err-bg);
+  color: var(--badge-err-fg);
+}
+
+.toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.toggle-slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: var(--border-medium);
+  transition: .4s;
+  border-radius: 24px;
+}
+.toggle-slider:before {
+  position: absolute;
+  content: "";
+  height: 16px;
+  width: 16px;
+  left: 4px;
+  bottom: 4px;
+  background-color: white;
+  transition: .4s;
+  border-radius: 50%;
+}
+input:checked + .toggle-slider {
+  background-color: var(--primary);
+}
+input:checked + .toggle-slider:before {
+  transform: translateX(20px);
+}
+
+.alert {
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+.alert-success {
+  background: var(--alert-success-bg);
+  color: var(--alert-success-fg);
+  border: 1px solid var(--alert-success-border);
+}
+.alert-error {
+  background: var(--alert-error-bg);
+  color: var(--alert-error-fg);
+  border: 1px solid var(--alert-error-border);
+}
+.alert-info {
+  background: var(--alert-info-bg);
+  color: var(--alert-info-fg);
+  border: 1px solid var(--alert-info-border);
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.stat-card {
+  background: var(--bg-card);
+  padding: 20px;
+  border-radius: var(--border-radius);
+  border: 1px solid var(--border-soft);
+}
+.stat-number {
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--primary);
+}
+.stat-label {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.chat-message {
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  border-radius: 8px;
+  color: var(--text-primary);
+}
+.chat-message.user {
+  background: var(--chat-user-bg);
+  margin-left: 40px;
+}
+.chat-message.assistant {
+  background: var(--chat-asst-bg);
+  margin-right: 40px;
+  border: 1px solid var(--border-soft);
+}
+.chat-role {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+code {
+  background: var(--bg-code);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, 'SF Mono', monospace;
+  font-size: 0.9em;
+  color: var(--text-primary);
+}
+pre {
+  background: var(--bg-code);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  color: var(--text-primary);
+  border: 1px solid var(--border-soft);
+}
+a {
+  color: var(--primary-light);
+}
+a:hover {
+  color: var(--primary);
+}

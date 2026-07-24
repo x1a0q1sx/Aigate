@@ -1,0 +1,47 @@
+# Data (contains encrypted keys and user data)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/*.sqlite
+.atomcode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# Node
+node_modules/
+client/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (ignore real config with secrets; ship config.example.yaml instead)
+config.local.yaml
+config.yaml
+
+# Log archives
+data/archives/
+
+# Logs
+*.log
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
