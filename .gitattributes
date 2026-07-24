@@ -1,0 +1,17 @@
+# 统一换行符为 LF，保证 Windows / macOS / Linux 协作者一致，避免 CRLF/LF 引起的无意义 diff
+* text=auto eol=lf
+
+# 二进制资源不转换、不自动识别为文本
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.sqlite binary
+*.db binary
+*.db-shm binary
+*.db-wal binary
