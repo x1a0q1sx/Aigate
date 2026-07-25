@@ -115,7 +115,7 @@ export const FREE_TIER_PROVIDERS = [
     "icon": "developer_board",
     "website": "https://developer.nvidia.com/nim",
     "baseUrl": "https://integrate.api.nvidia.com/v1/chat/completions",
-    "authModes": []
+    "authModes": ["api_key"]
   },
   {
     "id": "ollama",
