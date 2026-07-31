@@ -342,6 +342,9 @@
                     <pre style="margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #e2e8f0; max-height: 300px; overflow-y: auto;">{{ collapseBlank(c.content) || '(空)' }}</pre>
                   </div>
                 </div>
+                <div v-else-if="respInfo.content" style="white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #e2e8f0;">
+                  {{ respInfo.content }}
+                </div>
                 <div v-else-if="respInfo.error" style="color: #f87171;">
                   <strong>错误:</strong> {{ respInfo.error }}
                 </div>
@@ -462,7 +465,12 @@ export default {
       if (!raw) {
         // [stream] 或无数据
         const s = this.detailRow?.response_body
-        if (typeof s === 'string' && s !== '[stream]') return { error: s }
+        if (typeof s === 'string' && s !== '[stream]') {
+          // 成功的媒体生成（图片/视频）会把结果摘要以纯文本存入 response_body，
+          // 不应当作 error；只有真正失败的请求才标红为错误。
+          if (this.detailRow?.status === 'error') return { error: s }
+          return { content: s }
+        }
         return null
       }
       // 流式：chunk 数组 → 合并
