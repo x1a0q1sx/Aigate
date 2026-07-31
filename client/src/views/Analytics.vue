@@ -88,7 +88,7 @@
               <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 11px;">{{ r.status === 'success' ? '成功' : '失败' }}</span>
             </td>
             <td style="font-family: monospace;">{{ r.latency_ms ? (r.latency_ms / 1000).toFixed(1) + 's' : '-' }}</td>
-            <td style="font-family: monospace; font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}</td>
+            <td style="font-family: monospace; font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}<span v-if="r.cache_read_tokens" style="color: #2b8aef;" :title="`缓存读 ${r.cache_read_tokens} / 写 ${r.cache_write_tokens || 0}`"> · 缓存{{ r.cache_read_tokens }}</span></td>
             <td>
               <span v-if="r.used_proxy" style="color: #22c55e; font-size: 12px;">🟢 代理</span>
               <span v-else style="color: var(--gray-500); font-size: 12px;">⚪ 直连</span>
@@ -270,6 +270,10 @@
           <tr>
             <td class="k">Prompt Token</td><td class="v">{{ detailRow.prompt_tokens || 0 }}</td>
             <td class="k">Completion Token</td><td class="v">{{ detailRow.completion_tokens || 0 }}</td>
+          </tr>
+          <tr v-if="detailRow.cache_read_tokens || detailRow.cache_write_tokens">
+            <td class="k">缓存读 Token</td><td class="v" style="color: #2b8aef;">{{ detailRow.cache_read_tokens || 0 }}</td>
+            <td class="k">缓存写 Token</td><td class="v" style="color: #2b8aef;">{{ detailRow.cache_write_tokens || 0 }}</td>
           </tr>
           <tr>
             <td class="k">回退次数</td><td class="v">{{ detailRow.fallback_count || 0 }}</td>
