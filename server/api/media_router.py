@@ -159,7 +159,7 @@ async def _write_media_log(
             routed_model=model,
             requested_model=model,
             latency_ms=int(latency_ms) if latency_ms else 0,
-            error_msg=error_msg[:500] if error_msg else None,
+            error_msg=error_msg[:2000] if error_msg else None,
             request_body=_json.dumps({"prompt": prompt[:500]}, ensure_ascii=False),
             response_body=rb,
             fallback_count=0,

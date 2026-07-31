@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import re
 import httpx
 from typing import Optional, List
 from dataclasses import dataclass, field
@@ -157,7 +158,7 @@ class VideoAdapter(BaseAdapter):
             # 同步成功 — 直接返回
             if resp.status_code < 400:
                 data = resp.json()
-                videos = self._extract_videos(data)
+                videos = self._extract_videos(data, base_url)
                 if videos:
                     return VideoGenResult(success=True, videos=videos,
                                            model=req.model, elapsed_ms=elapsed)
@@ -197,12 +198,66 @@ class VideoAdapter(BaseAdapter):
             return VideoGenResult(success=False, error=f"{type(e).__name__}: {str(e)[:300]}",
                                   elapsed_ms=(time.time() - start) * 1000)
 
-    def _extract_videos(self, data: dict) -> list:
+    # ── 视频 URL 递归提取辅助 ──
+    _MEDIA_EXT_RE = re.compile(r'\.(mp4|webm|m3u8|mov|m4v|avi|mkv|flv)(\?|$|#)', re.I)
+    _MEDIA_HOST_RE = re.compile(r'(cdn|oss|cos|s3|storage|media|file)', re.I)
+    _CONTROL_RE = re.compile(r'/v1/(models|videos|images|audio|chat|completions)', re.I)
+    _KEY_SKIP_RE = re.compile(r'(callback|notify|webhook|redirect|avatar|icon|logo)', re.I)
+
+    def _norm_url(self, url: str, base_url: Optional[str]) -> str:
+        """规范化 URL：处理协议相对(//)与相对路径(/xx)，用 base_url 补全 host"""
+        if not url:
+            return url
+        url = url.strip()
+        if url.startswith('//'):
+            scheme = 'https'
+            if base_url and '://' in base_url:
+                scheme = base_url.split('://', 1)[0]
+            return f"{scheme}:{url}"
+        if url.startswith('/'):
+            if base_url:
+                m = re.match(r'^(https?://[^/]+)', base_url)
+                if m:
+                    return m.group(1) + url
+            return url
+        return url
+
+    def _classify_url(self, value: str):
+        """返回 'file'(像媒体文件) / 'cand'(候选但像控制端点) / None(忽略)"""
+        v = value.strip()
+        if not (re.match(r'^https?://', v, re.I) or v.startswith('//') or v.startswith('data:video')):
+            return None
+        if self._MEDIA_EXT_RE.search(v):
+            return 'file'
+        # host 级媒体主机判断（避免把 /v1/videos 路径里的 video 误判为媒体）
+        host = v.split('//', 1)[1].split('/', 1)[0] if '//' in v else ''
+        if re.search(self._MEDIA_HOST_RE, host):
+            return 'file'
+        if self._CONTROL_RE.search(v):
+            return None  # 控制端点（如 /v1/videos/{id}）跳过，避免把任务接口当视频
+        return 'cand'
+
+    def _walk_urls(self, node, file_urls: list, cand_urls: list):
+        """递归遍历任意嵌套结构，收集视频 URL（按置信度分桶）"""
+        if isinstance(node, str):
+            cls = self._classify_url(node)
+            if cls == 'file':
+                file_urls.append(node)
+            elif cls == 'cand':
+                cand_urls.append(node)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                if self._KEY_SKIP_RE.search((k or '').lower()):
+                    continue
+                self._walk_urls(v, file_urls, cand_urls)
+        elif isinstance(node, list):
+            for v in node:
+                self._walk_urls(v, file_urls, cand_urls)
+
+    def _extract_videos(self, data: dict, base_url: Optional[str] = None) -> list:
         """从同步返回或轮询结果中提取视频列表。
-        兼容两种 agnes 返回结构：
-          - 扁平: {"status":"completed","remixed_from_video_id":"https://...mp4"}
-          - 嵌套: {"data": {"status":"completed","remixed_from_video_id":"..."}}
-        以及 Sora 风格 {"data":[{"url":"..."}]}。"""
+        兼容：Sora 风格 data[]、agnes 已知字段(remixed_from_video_id/video_url/url)、
+        以及任意嵌套/任意字段名的扁平返回（递归扫描所有视频 URL，不再依赖字段名）。"""
         videos = []
         # 候选对象：顶层 + data 内（dict 或 list 元素）
         candidates = [data]
@@ -220,16 +275,26 @@ class VideoAdapter(BaseAdapter):
                     url = item.get("url") or item.get("video_url") or item.get("download_url")
                     if url:
                         videos.append({
-                            "url": url,
+                            "url": self._norm_url(url, base_url),
                             "duration": item.get("duration_seconds") or item.get("duration"),
                         })
-            # 2) agnes 风格: remixed_from_video_id / video_url / url
+            # 2) agnes 风格已知字段（跳过控制端点 URL，避免把任务接口当视频）
             url = obj.get("remixed_from_video_id") or obj.get("video_url") or obj.get("url")
-            if url:
+            if url and self._classify_url(url) is not None:
                 videos.append({
-                    "url": url,
+                    "url": self._norm_url(url, base_url),
                     "duration": obj.get("seconds") or obj.get("duration"),
                 })
+        # 3) 兜底：递归扫描整个响应的任意视频 URL（不依赖字段名）
+        file_urls, cand_urls = [], []
+        self._walk_urls(data, file_urls, cand_urls)
+        dur = None
+        if isinstance(data, dict):
+            dur = data.get("seconds") or data.get("duration") or data.get("duration_seconds")
+        for u in (file_urls or cand_urls):
+            nu = self._norm_url(u, base_url)
+            if nu and nu not in [v["url"] for v in videos]:
+                videos.append({"url": nu, "duration": dur})
         # 去重
         seen, out = set(), []
         for v in videos:
@@ -273,7 +338,7 @@ class VideoAdapter(BaseAdapter):
         task_id = data.get(cfg["id_field"]) or data.get("task_id") or data.get("id")
         if not task_id:
             # 可能同步返回了结果
-            videos = self._extract_videos(data)
+            videos = self._extract_videos(data, base_url)
             if videos:
                 return VideoGenResult(success=True, videos=videos,
                                        model=req.model, elapsed_ms=elapsed)
@@ -312,7 +377,7 @@ class VideoAdapter(BaseAdapter):
                 status = raw_status.capitalize() if raw_status else ""
                 # 成功
                 if status == cfg.get("success_value", "Success") or status in ("Succeeded", "Completed", "Done"):
-                    videos = self._extract_videos(data)
+                    videos = self._extract_videos(data, base_url)
                     if videos:
                         elapsed = (time.time() - start) * 1000
                         return VideoGenResult(success=True, videos=videos,
@@ -328,7 +393,7 @@ class VideoAdapter(BaseAdapter):
                             elapsed_ms=(time.time() - start) * 1000,
                         )
                     return VideoGenResult(
-                        success=False, error=f"任务完成但无视频输出. 响应: {str(data)[:300]}",
+                        success=False, error=f"任务完成但无视频输出. 响应: {str(data)[:1500]}",
                         elapsed_ms=(time.time() - start) * 1000,
                     )
                 # 失败
