@@ -20,9 +20,16 @@ import logging
 import socket
 import re
 import threading
+import httpx
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 from contextvars import ContextVar
+
+try:
+    from socksio import exceptions as _socks_exc
+    _SOCKS_PROTOCOL_ERROR = (_socks_exc.ProtocolError,)
+except Exception:
+    _SOCKS_PROTOCOL_ERROR = ()
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +41,21 @@ _COOLDOWN_SECONDS = 30
 # 由 adapter 在创建 httpx 客户端前 set，由请求日志写入处读取；
 # 每个请求在独立 asyncio 任务中处理，ContextVar 天然隔离并发，不会串号。
 CURRENT_PROXY_URL = ContextVar("current_proxy_url", default=None)
+
+# 传输层错误（代理抖动 / 连接中断 / SOCKS 握手失败）→ 可换代理重试
+_TRANSPORT_EXCEPTIONS = (httpx.TransportError, httpx.ProtocolError) + _SOCKS_PROTOCOL_ERROR
+
+
+def _is_transport_err(e: Exception) -> bool:
+    """判断是否为可重试的传输层错误（代理相关），应用层错误不应重试"""
+    if isinstance(e, _TRANSPORT_EXCEPTIONS):
+        return True
+    msg = str(e)
+    if "Malformed reply" in msg or "RemoteProtocolError" in msg:
+        return True
+    if isinstance(e, (ConnectionError, TimeoutError, OSError)):
+        return True
+    return False
 
 
 class ProxyPool:
@@ -93,6 +115,29 @@ class ProxyPool:
             return {}
         return {"proxy": proxy}
 
+    async def request_with_fallback(self, method: str, url: str, *, max_attempts: int = 3,
+                                    timeout: float = 120, **kwargs):
+        """发请求，遇到传输层错误（ConnectError / SOCKS Malformed reply / 连接中断等）
+        自动换代理重试；应用层错误（4xx/5xx/JSON 解析）不重试，直接返回 Response。
+        全部尝试都因传输错误失败时，抛出最后一个异常。"""
+        last_exc = None
+        for attempt in range(max_attempts):
+            proxy_kwargs = self.proxied_kwargs()
+            pu = proxy_kwargs.get("proxy")
+            try:
+                async with httpx.AsyncClient(timeout=timeout, **proxy_kwargs) as client:
+                    return await client.request(method, url, **kwargs)
+            except Exception as e:
+                if not _is_transport_err(e):
+                    raise  # 应用层错误不重试
+                last_exc = e
+                if pu:
+                    self.mark_failure_by_url(pu)
+                logger.warning("[ProxyPool] 代理请求 %s %s 第%d次失败(%s)，换代理重试",
+                               method, url, attempt + 1, type(e).__name__)
+                continue
+        raise last_exc if last_exc else RuntimeError("request_with_fallback: 无可用尝试")
+
     def _is_available(self, idx: int) -> bool:
         cd = self._cooldown_until.get(idx)
         if cd and datetime.utcnow() < cd:
@@ -119,6 +164,16 @@ class ProxyPool:
             self._cooldown_until[proxy_index] = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
             logger.info("[ProxyPool] proxy #%d entering cooldown %ds",
                         proxy_index, _COOLDOWN_SECONDS)
+
+    def mark_failure_by_url(self, url: Optional[str]):
+        """按代理 URL 标记失败（adapter 在请求时拿到的是 URL，不是 index）"""
+        if not url:
+            return
+        with self._lock:
+            for i, p in enumerate(self._proxies):
+                if p.get("url") == url:
+                    self.mark_failure(i)
+                    return
 
     def status_snapshot(self) -> dict:
         return {
@@ -149,9 +204,8 @@ def _mask_url(url: str) -> str:
     return url
 
 
-def _probe_proxy(url: str) -> bool:
-    """TCP 端口存活探测。仅对 localhost 代理有效（远端代理无法可靠探测，返回 True）。
-    返回 False 表示该代理端口不可达，应从轮询中剔除（避免 ConnectError）。"""
+def _probe_tcp(url: str) -> bool:
+    """TCP 端口存活探测。仅对 localhost 代理有效（远端代理返回 True）。"""
     if not url:
         return False
     m = re.match(r"^(?P<scheme>socks5h?|https?)://(?P<host>[^:/?#]+)(?P<port>:\d+)?", url)
@@ -159,7 +213,6 @@ def _probe_proxy(url: str) -> bool:
         return True
     host = m.group("host")
     port = m.group("port")
-    # 非本机代理不探测，避免误杀（信任其可达性）
     if host not in ("127.0.0.1", "localhost", "::1"):
         return True
     if not port:
@@ -170,6 +223,12 @@ def _probe_proxy(url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _probe_relay(url: str) -> bool:
+    """保留但已不使用：曾用 cloudflare 做 SOCKS 中继探测，因会误判（能通 cloudflare 不代表
+    能通用户真实上游）而弃用，改用 _probe_tcp（仅 TCP 端口存活）。保留以免其它地方引用报错。"""
+    return _probe_tcp(url)
 
 
 # ── 后台存活探测（单例线程，跟随 _pool 实例刷新） ──────────────────────────
@@ -185,7 +244,11 @@ def _health_loop():
         if pool and getattr(pool, "_proxies", None):
             for i, p in enumerate(pool._proxies):
                 try:
-                    pool._alive[i] = _probe_proxy(p.get("url", ""))
+                    # 仅做 TCP 端口存活探测：端口不可达 = 真正死代理，应从轮询剔除。
+                    # 注意：不以 cloudflare 等第三方站点做 SOCKS 中继探测 —— 代理能通 cloudflare
+                    # 不代表能通用户真实上游（如 agnes），用第三方站点判定会误杀可用代理。
+                    # 真实上游的连通性由 request_with_fallback 在每次请求时按传输层错误自动换代理重试。
+                    pool._alive[i] = _probe_tcp(p.get("url", ""))
                 except Exception:
                     pass
         if _checker_stop:

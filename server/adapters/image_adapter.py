@@ -128,25 +128,25 @@ class ImageAdapter(BaseAdapter):
         start = time.time()
         try:
             from server.core.proxy_pool import get_proxy_pool
-            proxy_kwargs = get_proxy_pool().proxied_kwargs()
-            async with httpx.AsyncClient(timeout=self.timeout, **proxy_kwargs) as client:
-                resp = await client.post(url, headers=headers, json=payload)
-                elapsed = (time.time() - start) * 1000
-                if resp.status_code >= 400:
-                    body = resp.text[:500]
-                    return ImageGenResult(success=False, error=f"HTTP {resp.status_code}: {body}", elapsed_ms=elapsed)
-                data = resp.json()
-                images = []
-                for item in data.get("data", []):
-                    if "b64_json" in item and item["b64_json"]:
-                        images.append({"data": item["b64_json"], "format": "base64",
-                                       "revised_prompt": item.get("revised_prompt")})
-                    elif "url" in item and item["url"]:
-                        images.append({"url": item["url"], "format": "url",
-                                       "revised_prompt": item.get("revised_prompt")})
-                if not images:
-                    return ImageGenResult(success=False, error="empty result", elapsed_ms=elapsed)
-                return ImageGenResult(success=True, images=images, model=req.model, raw=data, elapsed_ms=elapsed)
+            pool = get_proxy_pool()
+            # 传输层错误（代理抖动 / 连接中断 / SOCKS 握手失败）由代理池自动换代理重试
+            resp = await pool.request_with_fallback("POST", url, timeout=self.timeout, headers=headers, json=payload)
+            elapsed = (time.time() - start) * 1000
+            if resp.status_code >= 400:
+                body = resp.text[:500]
+                return ImageGenResult(success=False, error=f"HTTP {resp.status_code}: {body}", elapsed_ms=elapsed)
+            data = resp.json()
+            images = []
+            for item in data.get("data", []):
+                if "b64_json" in item and item["b64_json"]:
+                    images.append({"data": item["b64_json"], "format": "base64",
+                                   "revised_prompt": item.get("revised_prompt")})
+                elif "url" in item and item["url"]:
+                    images.append({"url": item["url"], "format": "url",
+                                   "revised_prompt": item.get("revised_prompt")})
+            if not images:
+                return ImageGenResult(success=False, error="empty result", elapsed_ms=elapsed)
+            return ImageGenResult(success=True, images=images, model=req.model, raw=data, elapsed_ms=elapsed)
         except httpx.HTTPStatusError as e:
             return ImageGenResult(success=False, error=f"{type(e).__name__}: {str(e)[:200]}",
                                    elapsed_ms=(time.time() - start) * 1000)

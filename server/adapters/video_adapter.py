@@ -18,6 +18,7 @@ import httpx
 from typing import Optional, List
 from dataclasses import dataclass, field
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.proxy_pool import get_proxy_pool
 
 logger = logging.getLogger(__name__)
 
@@ -144,81 +145,98 @@ class VideoAdapter(BaseAdapter):
 
         start = time.time()
         try:
-            from server.core.proxy_pool import get_proxy_pool
-            proxy_kwargs = get_proxy_pool().proxied_kwargs()
+            pool = get_proxy_pool()
+            proxy_kwargs = pool.proxied_kwargs()
 
             # 先尝试 OpenAI 同步式 POST /videos
+            # 传输层错误（代理抖动 / 连接中断 / SOCKS 握手失败）由代理池自动换代理重试
             openai_url = self._build_url(base_url, "/videos")
-            async with httpx.AsyncClient(timeout=self.timeout, **proxy_kwargs) as client:
-                resp = await client.post(openai_url, headers=headers, json=payload)
-                elapsed = (time.time() - start) * 1000
+            resp = await pool.request_with_fallback("POST", openai_url, timeout=self.timeout, headers=headers, json=payload)
+            elapsed = (time.time() - start) * 1000
 
-                # 同步成功 — 直接返回
-                if resp.status_code < 400:
-                    data = resp.json()
-                    videos = self._extract_videos(data)
-                    if videos:
-                        return VideoGenResult(success=True, videos=videos,
-                                               model=req.model, elapsed_ms=elapsed)
+            # 同步成功 — 直接返回
+            if resp.status_code < 400:
+                data = resp.json()
+                videos = self._extract_videos(data)
+                if videos:
+                    return VideoGenResult(success=True, videos=videos,
+                                           model=req.model, elapsed_ms=elapsed)
 
-                # 检查是否是"不支持 /videos" → 退到轮询协议
-                if resp.status_code == 404:
-                    protocol = _detect_protocol(base_url)
-                    if protocol:
-                        return await self._poll_generate(
-                            req, api_key, base_url, headers, proxy_kwargs, start, protocol
-                        )
-                    return VideoGenResult(
-                        success=False,
-                        error=f"上游不支持 /videos 且无法识别轮询协议 (base_url={base_url})",
-                        elapsed_ms=elapsed,
+            # 检查是否是"不支持 /videos" → 退到轮询协议
+            if resp.status_code == 404:
+                protocol = _detect_protocol(base_url)
+                if protocol:
+                    return await self._poll_generate(
+                        req, api_key, base_url, headers, proxy_kwargs, start, protocol
                     )
+                return VideoGenResult(
+                    success=False,
+                    error=f"上游不支持 /videos 且无法识别轮询协议 (base_url={base_url})",
+                    elapsed_ms=elapsed,
+                )
 
-                # 其他错误
-                body = resp.text[:500]
-                # 可能上游返回了 task_id 要求轮询（HTTP 200 但 body 含 task_id）
-                try:
-                    body_json = resp.json()
-                    task_id = body_json.get("task_id") or body_json.get("taskId") or body_json.get("id")
-                    if task_id and resp.status_code < 400:
-                        return await self._poll_result(
-                            task_id, req, api_key, base_url, headers, proxy_kwargs, start,
-                            _detect_protocol(base_url) or "generic",
-                        )
-                except Exception:
-                    pass
+            # 其他错误
+            body = resp.text[:500]
+            # 可能上游返回了 task_id 要求轮询（HTTP 200 但 body 含 task_id）
+            try:
+                body_json = resp.json()
+                task_id = body_json.get("task_id") or body_json.get("taskId") or body_json.get("id")
+                if task_id and resp.status_code < 400:
+                    return await self._poll_result(
+                        task_id, req, api_key, base_url, headers, proxy_kwargs, start,
+                        _detect_protocol(base_url) or "generic",
+                    )
+            except Exception:
+                pass
 
-                return VideoGenResult(success=False,
-                                      error=f"HTTP {resp.status_code}: {body}",
-                                      elapsed_ms=elapsed)
+            return VideoGenResult(success=False,
+                                  error=f"HTTP {resp.status_code}: {body}",
+                                  elapsed_ms=elapsed)
 
         except Exception as e:
             return VideoGenResult(success=False, error=f"{type(e).__name__}: {str(e)[:300]}",
                                   elapsed_ms=(time.time() - start) * 1000)
 
     def _extract_videos(self, data: dict) -> list:
-        """从同步返回或轮询结果中提取视频列表"""
+        """从同步返回或轮询结果中提取视频列表。
+        兼容两种 agnes 返回结构：
+          - 扁平: {"status":"completed","remixed_from_video_id":"https://...mp4"}
+          - 嵌套: {"data": {"status":"completed","remixed_from_video_id":"..."}}
+        以及 Sora 风格 {"data":[{"url":"..."}]}。"""
         videos = []
-        # 1) Sora 风格: {"data": [{"url": "..."}]}
-        for item in (data.get("data") or data.get("videos") or data.get("results") or []):
-            if isinstance(item, dict):
-                url = item.get("url") or item.get("video_url") or item.get("download_url")
-                if url:
-                    videos.append({
-                        "url": url,
-                        "duration": item.get("duration_seconds") or item.get("duration"),
-                    })
-        # 2) agnes 风格: 顶层 {"remixed_from_video_id": "https://..."}
-        if not videos:
-            url = (data.get("remixed_from_video_id")
-                   or data.get("video_url")
-                   or data.get("url"))
+        # 候选对象：顶层 + data 内（dict 或 list 元素）
+        candidates = [data]
+        inner = data.get("data") if isinstance(data, dict) else None
+        if isinstance(inner, dict):
+            candidates.append(inner)
+        elif isinstance(inner, list):
+            candidates.extend(inner)
+        for obj in candidates:
+            if not isinstance(obj, dict):
+                continue
+            # 1) Sora 风格: data[].url
+            for item in (obj.get("data") or obj.get("videos") or obj.get("results") or []):
+                if isinstance(item, dict):
+                    url = item.get("url") or item.get("video_url") or item.get("download_url")
+                    if url:
+                        videos.append({
+                            "url": url,
+                            "duration": item.get("duration_seconds") or item.get("duration"),
+                        })
+            # 2) agnes 风格: remixed_from_video_id / video_url / url
+            url = obj.get("remixed_from_video_id") or obj.get("video_url") or obj.get("url")
             if url:
                 videos.append({
                     "url": url,
-                    "duration": data.get("seconds"),
+                    "duration": obj.get("seconds") or obj.get("duration"),
                 })
-        return videos
+        # 去重
+        seen, out = set(), []
+        for v in videos:
+            if v.get("url") and v["url"] not in seen:
+                seen.add(v["url"])
+                out.append(v)
+        return out
 
     async def _poll_generate(
         self, req, api_key, base_url, headers, proxy_kwargs, start, protocol: str
@@ -243,27 +261,28 @@ class VideoAdapter(BaseAdapter):
         if req.extra_params and isinstance(req.extra_params, dict):
             payload.update(req.extra_params)
 
-        async with httpx.AsyncClient(timeout=self.timeout, **proxy_kwargs) as client:
-            resp = await client.post(submit_url, headers=headers, json=payload)
-            elapsed = (time.time() - start) * 1000
-            if resp.status_code >= 400:
-                return VideoGenResult(success=False,
-                                      error=f"Submit HTTP {resp.status_code}: {resp.text[:300]}",
-                                      elapsed_ms=elapsed)
-            data = resp.json()
-            task_id = data.get(cfg["id_field"]) or data.get("task_id") or data.get("id")
-            if not task_id:
-                # 可能同步返回了结果
-                videos = self._extract_videos(data)
-                if videos:
-                    return VideoGenResult(success=True, videos=videos,
-                                           model=req.model, elapsed_ms=elapsed)
-                return VideoGenResult(success=False,
-                                      error=f"提交后未获得 task_id: {resp.text[:300]}",
-                                      elapsed_ms=elapsed)
-            return await self._poll_result(
-                task_id, req, api_key, base_url, headers, proxy_kwargs, start, protocol
-            )
+        pool = get_proxy_pool()
+        # 传输层错误（代理抖动 / 连接中断 / SOCKS 握手失败）由代理池自动换代理重试
+        resp = await pool.request_with_fallback("POST", submit_url, timeout=self.timeout, headers=headers, json=payload)
+        elapsed = (time.time() - start) * 1000
+        if resp.status_code >= 400:
+            return VideoGenResult(success=False,
+                                  error=f"Submit HTTP {resp.status_code}: {resp.text[:300]}",
+                                  elapsed_ms=elapsed)
+        data = resp.json()
+        task_id = data.get(cfg["id_field"]) or data.get("task_id") or data.get("id")
+        if not task_id:
+            # 可能同步返回了结果
+            videos = self._extract_videos(data)
+            if videos:
+                return VideoGenResult(success=True, videos=videos,
+                                       model=req.model, elapsed_ms=elapsed)
+            return VideoGenResult(success=False,
+                                  error=f"提交后未获得 task_id: {resp.text[:300]}",
+                                  elapsed_ms=elapsed)
+        return await self._poll_result(
+            task_id, req, api_key, base_url, headers, proxy_kwargs, start, protocol
+        )
 
     async def _poll_result(
         self, task_id, req, api_key, base_url, headers, proxy_kwargs, start, protocol: str
@@ -279,57 +298,58 @@ class VideoAdapter(BaseAdapter):
         if req.duration and req.duration > 30:
             max_poll = 120       # 长视频给更多时间
 
-        async with httpx.AsyncClient(timeout=self.timeout, **proxy_kwargs) as client:
-            for attempt in range(max_poll):
-                await asyncio.sleep(poll_interval)
-                try:
+        pool = get_proxy_pool()
+        for attempt in range(max_poll):
+            await asyncio.sleep(poll_interval)
+            try:
+                # 每次轮询都用新的代理（代理池会自动避开死/抖动代理），避免单代理连接中断导致整轮轮询失败
+                async with httpx.AsyncClient(timeout=self.timeout, **pool.proxied_kwargs()) as client:
                     resp = await client.get(result_url, headers=headers)
-                    if resp.status_code >= 400:
-                        continue
-                    data = resp.json()
-                    raw_status = data.get(cfg.get("status_field", "status")) or data.get("status", "")
-                    status = raw_status.capitalize() if raw_status else ""
-                    # 成功
-                    if status == cfg.get("success_value", "Success") or status in ("Succeeded", "Completed", "Done"):
-                        videos = self._extract_videos(data)
-                        if videos:
-                            elapsed = (time.time() - start) * 1000
-                            return VideoGenResult(success=True, videos=videos,
-                                                   model=req.model, elapsed_ms=elapsed)
-                        # 有成功状态但没视频 → 可能字段不同，尝试所有可能字段
-                        url = (data.get("remixed_from_video_id")
-                               or data.get("url") or data.get("video_url")
-                               or data.get("download_url"))
-                        if url:
-                            return VideoGenResult(
-                                success=True, videos=[{"url": url}],
-                                model=req.model,
-                                elapsed_ms=(time.time() - start) * 1000,
-                            )
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                raw_status = data.get(cfg.get("status_field", "status")) or data.get("status", "")
+                status = raw_status.capitalize() if raw_status else ""
+                # 成功
+                if status == cfg.get("success_value", "Success") or status in ("Succeeded", "Completed", "Done"):
+                    videos = self._extract_videos(data)
+                    if videos:
+                        elapsed = (time.time() - start) * 1000
+                        return VideoGenResult(success=True, videos=videos,
+                                               model=req.model, elapsed_ms=elapsed)
+                    # 有成功状态但没视频 → 可能字段不同，尝试所有可能字段
+                    url = (data.get("remixed_from_video_id")
+                           or data.get("url") or data.get("video_url")
+                           or data.get("download_url"))
+                    if url:
                         return VideoGenResult(
-                            success=False, error=f"任务完成但无视频输出. 响应: {str(data)[:300]}",
+                            success=True, videos=[{"url": url}],
+                            model=req.model,
                             elapsed_ms=(time.time() - start) * 1000,
                         )
-                    # 失败
-                    if status in ("Failed", "Error"):
-                        err = data.get("error", {}).get("message", "") if isinstance(data.get("error"), dict) else str(data.get("error", ""))
-                        return VideoGenResult(success=False,
-                                              error=f"任务失败: {err or status}",
-                                              elapsed_ms=(time.time() - start) * 1000)
-                    # 仍在处理（queued / in_progress / processing / pending 等都继续轮询）
-                    # 添加日志记录第 1 次和每 6 次（30 秒）的进度
-                    if attempt == 0 or (attempt + 1) % 6 == 0:
-                        progress = data.get("progress", "?")
-                        logger.info("[video] polling %s status=%s progress=%s attempt=%d/%d",
-                                    task_id, raw_status, progress, attempt + 1, max_poll)
-                except Exception as e:
-                    if attempt == 0 or (attempt + 1) % 6 == 0:
-                        logger.warning("[video] poll error attempt=%d: %s", attempt + 1, e)
-                    continue
+                    return VideoGenResult(
+                        success=False, error=f"任务完成但无视频输出. 响应: {str(data)[:300]}",
+                        elapsed_ms=(time.time() - start) * 1000,
+                    )
+                # 失败
+                if status in ("Failed", "Error"):
+                    err = data.get("error", {}).get("message", "") if isinstance(data.get("error"), dict) else str(data.get("error", ""))
+                    return VideoGenResult(success=False,
+                                          error=f"任务失败: {err or status}",
+                                          elapsed_ms=(time.time() - start) * 1000)
+                # 仍在处理（queued / in_progress / processing / pending 等都继续轮询）
+                if attempt == 0 or (attempt + 1) % 6 == 0:
+                    progress = data.get("progress", "?")
+                    logger.info("[video] polling %s status=%s progress=%s attempt=%d/%d",
+                                task_id, raw_status, progress, attempt + 1, max_poll)
+            except Exception as e:
+                if attempt == 0 or (attempt + 1) % 6 == 0:
+                    logger.warning("[video] poll error attempt=%d: %s", attempt + 1, e)
+                continue
 
-            return VideoGenResult(success=False,
-                                  error=f"轮询超时 ({max_poll * poll_interval}s)",
-                                  elapsed_ms=(time.time() - start) * 1000)
+        return VideoGenResult(success=False,
+                              error=f"轮询超时 ({max_poll * poll_interval}s)",
+                              elapsed_ms=(time.time() - start) * 1000)
 
     # ── BaseAdapter 兼容占位 ──
     async def chat_completion(self, request, api_key, base_url, extra_headers=None):
