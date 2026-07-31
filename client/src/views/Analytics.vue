@@ -330,7 +330,26 @@
               <h4 style="margin: 0; color: var(--success);">📥 返回内容</h4>
               <button class="btn btn-outline btn-sm" @click="copy(prettyResponseBody)">复制</button>
             </div>
-            <div v-if="respInfo || responseToolCalls.length" class="code-block" style="max-height: 500px;">
+            <div v-if="mediaContent" class="code-block" style="max-height: 600px; overflow-y: auto;">
+              <div style="font-size: 13px; color: #94a3b8; margin-bottom: 10px;">
+                共 <strong style="color: #e2e8f0;">{{ mediaContent.count }}</strong> 个{{ mediaContent.type === 'image_generation' ? '图片' : '视频' }}
+                <span style="margin-left: 8px; font-family: monospace; color: #64748b;">{{ mediaContent.model }}</span>
+              </div>
+              <div v-if="mediaContent.type === 'image_generation'" style="display: flex; flex-wrap: wrap; gap: 12px;">
+                <div v-for="(im, i) in mediaContent.images" :key="i" style="flex: 1 1 220px; max-width: 320px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; overflow: hidden;">
+                  <img v-if="im.url" :src="im.url" alt="image" style="width: 100%; max-height: 340px; object-fit: contain; background: #fff; display: block;" loading="lazy" />
+                  <img v-else-if="im.data" :src="'data:' + (im.mime || 'image/png') + ';base64,' + im.data" alt="image" style="width: 100%; max-height: 340px; object-fit: contain; background: #fff; display: block;" loading="lazy" />
+                  <div v-if="im.revised_prompt" style="padding: 6px 8px; font-size: 11px; color: #94a3b8; white-space: pre-wrap; word-break: break-word;">{{ im.revised_prompt }}</div>
+                </div>
+              </div>
+              <div v-else style="display: flex; flex-wrap: wrap; gap: 12px;">
+                <div v-for="(v, i) in mediaContent.videos" :key="i" style="flex: 1 1 280px; max-width: 420px; background: #0f172a; border: 1px solid #334155; border-radius: 8px; overflow: hidden;">
+                  <video :src="v.url" controls style="width: 100%; max-height: 380px; display: block; background: #000;"></video>
+                  <div v-if="v.duration" style="padding: 6px 8px; font-size: 11px; color: #94a3b8;">时长 {{ v.duration }}s</div>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="respInfo || responseToolCalls.length" class="code-block" style="max-height: 500px;">
               <div v-if="respInfo">
                 <div v-if="respInfo.model"><strong>模型:</strong> {{ respInfo.model }}</div>
                 <div><strong>Token:</strong> 输入 {{ detailRow.prompt_tokens || 0 }} / 输出 {{ detailRow.completion_tokens || 0 }}</div>
@@ -473,6 +492,10 @@ export default {
         }
         return null
       }
+      // 媒体生成（图片/视频）：结构化结果，直接交给 mediaContent 渲染，不要当 error
+      if (raw.type === 'image_generation' || raw.type === 'video_generation') {
+        return raw
+      }
       // 流式：chunk 数组 → 合并
       if (Array.isArray(raw)) {
         const merged = { choices: [], usage: null, model: '' }
@@ -516,6 +539,12 @@ export default {
         }
       }
       return { error: typeof raw === 'string' ? raw : JSON.stringify(raw) }
+    },
+    // 媒体生成（图片/视频）结构化结果：从 respInfo 中提取，供图廊/播放器渲染
+    mediaContent() {
+      const r = this.respInfo
+      if (r && (r.type === 'image_generation' || r.type === 'video_generation')) return r
+      return null
     },
     // 解析 response_body 中的 tool_calls，兼容三种存储形态：
     //   A. 顶层干净数组 [{index,id,type:"function",function:{name,arguments}}]

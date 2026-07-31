@@ -17,9 +17,11 @@ from __future__ import annotations
 import random
 import time
 import logging
+import socket
+import re
+import threading
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
-import threading
 from contextvars import ContextVar
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,7 @@ class ProxyPool:
         self._cursor = 0
         self._fail_count: Dict[int, int] = {}        # index → 连续失败次数
         self._cooldown_until: Dict[int, datetime] = {}  # index → 恢复时间
+        self._alive: Dict[int, Optional[bool]] = {}  # index → 端口存活探测结果（None=未探/视为可用）
         self._lock = threading.Lock()               # 保护 cursor
 
     def next_proxy(self) -> Optional[str]:
@@ -97,6 +100,9 @@ class ProxyPool:
         if cd and datetime.utcnow() >= cd:
             self._cooldown_until.pop(idx, None)
             self._fail_count.pop(idx, None)
+        # 端口存活探测：探测到死代理（仅对 localhost 有效）直接排除，避免 ConnectError
+        if self._alive.get(idx) is False:
+            return False
         return True
 
     def mark_success(self, proxy_index: Optional[int] = None):
@@ -143,6 +149,59 @@ def _mask_url(url: str) -> str:
     return url
 
 
+def _probe_proxy(url: str) -> bool:
+    """TCP 端口存活探测。仅对 localhost 代理有效（远端代理无法可靠探测，返回 True）。
+    返回 False 表示该代理端口不可达，应从轮询中剔除（避免 ConnectError）。"""
+    if not url:
+        return False
+    m = re.match(r"^(?P<scheme>socks5h?|https?)://(?P<host>[^:/?#]+)(?P<port>:\d+)?", url)
+    if not m:
+        return True
+    host = m.group("host")
+    port = m.group("port")
+    # 非本机代理不探测，避免误杀（信任其可达性）
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return True
+    if not port:
+        return True
+    try:
+        s = socket.create_connection((host, int(port[1:])), timeout=2)
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+# ── 后台存活探测（单例线程，跟随 _pool 实例刷新） ──────────────────────────
+_PROBE_TTL = 15          # 探测周期（秒）
+_checker_thread: Optional[threading.Thread] = None
+_checker_stop: Optional[threading.Event] = None
+
+
+def _health_loop():
+    global _pool
+    while not (_checker_stop and _checker_stop.is_set()):
+        pool = _pool
+        if pool and getattr(pool, "_proxies", None):
+            for i, p in enumerate(pool._proxies):
+                try:
+                    pool._alive[i] = _probe_proxy(p.get("url", ""))
+                except Exception:
+                    pass
+        if _checker_stop:
+            _checker_stop.wait(_PROBE_TTL)
+
+
+def _ensure_checker():
+    """确保只有一个后台探测线程在运行（进程级，避免热重载产生孤儿线程）"""
+    global _checker_thread, _checker_stop
+    if _checker_thread and _checker_thread.is_alive():
+        return
+    _checker_stop = threading.Event()
+    _checker_thread = threading.Thread(target=_health_loop, daemon=True)
+    _checker_thread.start()
+
+
 # 进程级单例
 _pool: Optional[ProxyPool] = None
 
@@ -155,6 +214,8 @@ def init_proxy_pool(config_dict: dict) -> ProxyPool:
         strategy=config_dict.get("strategy", "round_robin"),
         enabled=bool(config_dict.get("enabled", False)),
     )
+    # 启动（或复用）后台存活探测线程；新池会由探测线程自动接管
+    _ensure_checker()
     return _pool
 
 

@@ -5,6 +5,7 @@
 - POST /admin/api/media/image         图片生成
 """
 from typing import Optional, List
+import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -99,6 +100,43 @@ class ImageGenPayload(BaseModel):
 
 # ── 媒体生成日志写入 ──────────────────────────────────────
 
+def _infer_image_mime(b64: str) -> str:
+    """从 base64 头推断图片 MIME（OpenAI 等接口返回裸 base64，无 mime 字段）"""
+    if b64.startswith("iVBORw0KGgo"):
+        return "image/png"
+    if b64.startswith("/9j/"):
+        return "image/jpeg"
+    if b64.startswith("UklGR"):
+        return "image/webp"
+    if b64.startswith("R0lGOD"):
+        return "image/gif"
+    return "image/png"
+
+
+def _build_image_payload(result) -> str:
+    """把图片结果结构化，便于分析页直接渲染图廊（url 或 base64）"""
+    imgs = []
+    for im in (result.images or []):
+        if im.get("url"):
+            imgs.append({"url": im["url"], "format": "url",
+                         "revised_prompt": im.get("revised_prompt")})
+        elif im.get("data"):
+            data = im["data"]
+            if len(data) > 3_000_000:
+                data = data[:3_000_000]   # 超大图截断，避免单行日志过大
+            imgs.append({"data": data, "format": "base64", "mime": _infer_image_mime(data),
+                         "revised_prompt": im.get("revised_prompt")})
+    return json.dumps({"type": "image_generation", "model": result.model,
+                       "count": len(imgs), "images": imgs}, ensure_ascii=False)
+
+
+def _build_video_payload(result) -> str:
+    """把视频结果结构化，便于分析页直接渲染播放器"""
+    vids = [{"url": v.get("url"), "duration": v.get("duration")} for v in (result.videos or [])]
+    return json.dumps({"type": "video_generation", "model": result.model,
+                       "count": len(vids), "videos": vids}, ensure_ascii=False)
+
+
 async def _write_media_log(
     db, media_type: str, status: str, provider_name: str, model: str,
     prompt: str, latency_ms: float, error_msg: str = "",
@@ -108,6 +146,11 @@ async def _write_media_log(
     import json as _json
     from server.models.request_log import RequestLog
     from server.core.request_logger import write_log  # v3.6 消息级去重写入
+    rb = result_summary if result_summary else None
+    # 媒体结果（图片 base64 / 视频 url）可能较大，放宽上限；极端情况下仅保留摘要
+    if rb and len(rb) > 8_000_000:
+        rb = _json.dumps({"type": media_type + "_generation", "model": model,
+                          "count": 0, "note": "内容过大已省略存储"}, ensure_ascii=False)
     async with AsyncSessionLocal() as log_db:
         await write_log(log_db,
             media_type=media_type,
@@ -118,7 +161,7 @@ async def _write_media_log(
             latency_ms=int(latency_ms) if latency_ms else 0,
             error_msg=error_msg[:500] if error_msg else None,
             request_body=_json.dumps({"prompt": prompt[:500]}, ensure_ascii=False),
-            response_body=result_summary[:2000] if result_summary else None,
+            response_body=rb,
             fallback_count=0,
             prompt_tokens=0,
             completion_tokens=0,
@@ -161,7 +204,7 @@ async def media_generate_image(data: ImageGenPayload, db: AsyncSession = Depends
     # 写日志
     if result.success:
         rotator.mark_success(_key_id)
-        summary = f"{len(result.images)} image(s) generated"
+        summary = _build_image_payload(result)
         await _write_media_log(db, "image", "success", provider.name, result.model,
                               data.prompt, result.elapsed_ms, result_summary=summary)
         return {
@@ -228,7 +271,7 @@ async def media_generate_video(data: VideoGenPayload, db: AsyncSession = Depends
     # 写日志
     if result.success:
         rotator.mark_success(_key_id)
-        summary = f"{len(result.videos)} video(s): " + ", ".join(v.get("url", "")[:100] for v in result.videos)
+        summary = _build_video_payload(result)
         await _write_media_log(db, "video", "success", provider.name, result.model,
                               data.prompt, result.elapsed_ms, result_summary=summary)
         return {
