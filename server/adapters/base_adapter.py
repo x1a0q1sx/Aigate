@@ -12,6 +12,8 @@ class ModelInfo:
     display_name: str = ""
     input_price: float = 0.0
     output_price: float = 0.0
+    cache_read_input_price: float = 0.0   # 每百万 token 美元（缓存读）
+    cache_write_input_price: float = 0.0  # 每百万 token 美元（缓存写/创建）
     is_free: bool = False
     supports_streaming: bool = True
     supports_vision: bool = False

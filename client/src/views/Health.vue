@@ -1,126 +1,181 @@
 <template>
   <div>
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-      <h1>健康监控 💓</h1>
-      <button class="btn btn-primary" @click="pingAll" :disabled="pinging">
-        {{ pinging ? '测速中...' : '🚀 一键测速' }}
-      </button>
-    </div>
+    <PageHeader title="健康监控" icon="activity" subtitle="模型测速、延迟统计与失败冷却总览">
+      <template #actions>
+        <button class="btn btn-primary" @click="pingAll" :disabled="pinging">
+          <AppIcon name="zap" :size="14" />
+          {{ pinging ? '测速中...' : '一键测速' }}
+        </button>
+      </template>
+    </PageHeader>
+
     <!-- 延迟柱状图 -->
-    <div class="card" v-if="chartData.length > 0" style="margin-bottom: 20px;">
-      <h2 style="margin-bottom: 16px;">📊 延迟对比 (ms)</h2>
+    <section v-if="chartData.length > 0" class="card">
+      <div class="card-header">
+        <span class="card-title"><AppIcon name="chart" :size="16" />延迟对比 (ms)</span>
+      </div>
       <div class="bar-chart">
         <div v-for="item in chartData" :key="item.model_id" class="bar-item" @click="pingSingle(item.model_id)" title="点击测速">
-          <div class="bar-label" :title="item.model_full_id">{{ item.short_name }}</div>
+          <div class="bar-label mono" :title="item.model_full_id">{{ item.short_name }}</div>
           <div class="bar-track">
-            <div class="bar-fill"
-                 :style="{width: barWidth(item.latency_ms) + '%', background: barColor(item.latency_ms)}">
-            </div>
-            <span class="bar-value" :style="{color: barColor(item.latency_ms)}">{{ Math.round(item.latency_ms || 0) }}ms</span>
+            <div class="bar-fill" :style="{ width: barWidth(item.latency_ms) + '%', background: barColor(item.latency_ms) }"></div>
+            <span class="bar-value" :style="{ color: barColor(item.latency_ms) }">{{ Math.round(item.latency_ms || 0) }}ms</span>
           </div>
         </div>
       </div>
-    </div>
+    </section>
+
     <!-- 延迟统计 -->
-    <div class="stats-grid" v-if="latencyStats" style="margin-bottom: 20px;">
-      <div class="stat-card">
-        <div class="stat-number" style="color: var(--success);">{{ Math.round((latencyStats.average_latency_ms) || 0) }}ms</div>
-        <div class="stat-label">平均延迟</div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-number">{{ latencyStats.total_models }}</div>
-        <div class="stat-label">已测速模型</div>
-      </div>
+    <div v-if="latencyStats" class="stats-grid">
+      <StatCard label="平均延迟" icon="clock" tone="ok" :value="Math.round(latencyStats.average_latency_ms || 0) + 'ms'" />
+      <StatCard label="已测速模型" icon="cpu" :value="latencyStats.total_models" />
     </div>
+
     <!-- 最快 Top5 -->
-    <div class="card" v-if="latencyStats && latencyStats.fastest && latencyStats.fastest.length > 0" style="margin-bottom: 20px;">
-      <h2 style="margin-bottom: 12px;">⚡ 最快模型 Top5</h2>
+    <section v-if="latencyStats && latencyStats.fastest && latencyStats.fastest.length > 0" class="card">
+      <div class="card-header">
+        <span class="card-title"><AppIcon name="zap" :size="16" />最快模型 Top5</span>
+      </div>
       <table>
         <thead>
-          <tr><th>排名</th><th>模型</th><th>延迟</th><th>状态</th></tr>
+          <tr>
+            <th>排名</th>
+            <th>模型</th>
+            <th>延迟</th>
+            <th>状态</th>
+          </tr>
         </thead>
         <tbody>
           <tr v-for="(item, idx) in latencyStats.fastest" :key="item.model_id">
-            <td>{{ ['🥇','🥈','🥉','4','5'][idx] }}</td>
+            <td>
+              <span class="rank-badge" :class="'rank-' + (idx + 1)">{{ idx + 1 }}</span>
+            </td>
             <td><strong>{{ item.model_full_id }}</strong></td>
-            <td :style="{color: barColor(item.latency_ms), fontWeight: 'bold'}">{{ Math.round(item.latency_ms || 0) }}ms</td>
-            <td><span :class="['badge', statusBadgeClass(item.status)]">{{ statusEmoji(item.status) }} {{ item.status }}</span></td>
+            <td>
+              <span class="tabular" :style="{ color: barColor(item.latency_ms), fontWeight: 600 }">
+                {{ Math.round(item.latency_ms || 0) }}ms
+              </span>
+            </td>
+            <td>
+              <span class="badge" :class="statusBadgeClass(item.status)">{{ statusLabel(item.status) }}</span>
+            </td>
           </tr>
         </tbody>
       </table>
-    </div>
+    </section>
+
     <!-- 失败罚时 / 冷却总览 -->
-    <div class="card" v-if="cooling" style="margin-bottom: 20px;">
-      <h2 style="margin-bottom: 12px; display: flex; align-items: center; gap: 10px;">
-        ❄️ 失败罚时 / 冷却总览
-        <span class="cooling-refresh" @click="loadCooling" title="立即刷新">⟳</span>
-      </h2>
-      <div class="cooling-summary" v-if="cooling.summary">
-        <span class="cs-badge" :class="cooling.summary.model_cooling_count ? 'cs-warn' : 'cs-ok'">模型罚时 {{ cooling.summary.model_cooling_count }}</span>
-        <span class="cs-badge" :class="cooling.summary.key_cooling_count ? 'cs-warn' : 'cs-ok'">密钥冷却 {{ cooling.summary.key_cooling_count }}</span>
-        <span class="cs-badge" :class="cooling.summary.proxy_cooling_count ? 'cs-warn' : 'cs-ok'">代理冷却 {{ cooling.summary.proxy_cooling_count }}</span>
-        <span class="cs-badge cs-neutral" v-if="!cooling.summary.proxy_enabled">代理未启用</span>
+    <section v-if="cooling" class="card">
+      <div class="card-header">
+        <span class="card-title">
+          <AppIcon name="snowflake" :size="16" />失败罚时 / 冷却总览
+        </span>
+        <button class="btn btn-ghost btn-xs" @click="loadCooling" title="立即刷新">
+          <AppIcon name="refresh" :size="13" />
+        </button>
       </div>
 
+      <div v-if="cooling.summary" class="cooling-summary">
+        <span class="badge" :class="cooling.summary.model_cooling_count ? 'badge-warning' : 'badge-success'">
+          模型罚时 {{ cooling.summary.model_cooling_count }}
+        </span>
+        <span class="badge" :class="cooling.summary.key_cooling_count ? 'badge-warning' : 'badge-success'">
+          密钥冷却 {{ cooling.summary.key_cooling_count }}
+        </span>
+        <span class="badge" :class="cooling.summary.proxy_cooling_count ? 'badge-warning' : 'badge-success'">
+          代理冷却 {{ cooling.summary.proxy_cooling_count }}
+        </span>
+        <span v-if="!cooling.summary.proxy_enabled" class="badge badge-neutral">代理未启用</span>
+      </div>
+
+      <!-- 模型冷却 -->
       <div v-if="cooling.model_cooling.length" class="cooling-group">
-        <h3 style="display: flex; align-items: center; gap: 10px;">
-          🤖 模型失败冷却（真实流量驱动，指数退避 30s~1h）
-          <button class="btn btn-outline" style="font-size: 12px; padding: 4px 10px;" @click="clearAllModelCooling" :disabled="clearingCooling">
-            {{ clearingCooling ? '清除中...' : '🧹 一键清除模型冷却' }}
+        <div class="cooling-group-head">
+          <h4><AppIcon name="cpu" :size="14" />模型失败冷却（指数退避 30s~1h）</h4>
+          <button class="btn btn-outline btn-xs" @click="clearAllModelCooling" :disabled="clearingCooling">
+            <AppIcon name="broom" :size="11" />
+            {{ clearingCooling ? '清除中...' : '一键清除' }}
           </button>
-        </h3>
+        </div>
         <table>
-          <thead><tr><th>模型</th><th>连续失败</th><th>剩余冷却</th><th>状态</th><th>操作</th></tr></thead>
+          <thead>
+            <tr><th>模型</th><th>连续失败</th><th>剩余冷却</th><th>状态</th><th>操作</th></tr>
+          </thead>
           <tbody>
             <tr v-for="m in cooling.model_cooling" :key="'m' + m.model_id">
               <td><strong>{{ m.model_full_id }}</strong></td>
-              <td>{{ m.fail_count }}</td>
+              <td class="tabular">{{ m.fail_count }}</td>
               <td class="mono">{{ m.cooling ? fmtRemain(m.remaining_sec) : '已恢复' }}</td>
-              <td><span :class="['badge', m.cooling ? 'badge-warning' : 'badge-success']">{{ m.cooling ? '冷却中' : '正常' }}</span></td>
-              <td><button class="btn btn-outline" style="font-size: 11px; padding: 2px 8px;" @click="clearOneModelCooling(m.model_id)">清除</button></td>
+              <td>
+                <span class="badge" :class="m.cooling ? 'badge-warning' : 'badge-success'">
+                  {{ m.cooling ? '冷却中' : '正常' }}
+                </span>
+              </td>
+              <td>
+                <button class="btn btn-outline btn-xs" @click="clearOneModelCooling(m.model_id)">清除</button>
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
 
+      <!-- 密钥冷却 -->
       <div v-if="cooling.key_cooling.length" class="cooling-group">
-        <h3>🔑 密钥冷却 / 熔断（连续 3 次失败→冷却 60s；401/403 永久禁用）</h3>
+        <h4><AppIcon name="key" :size="14" />密钥冷却 / 熔断（连续 3 次→60s；401/403 永久禁用）</h4>
         <table>
-          <thead><tr><th>服务商</th><th>连续失败</th><th>剩余冷却</th><th>状态</th></tr></thead>
+          <thead>
+            <tr><th>服务商</th><th>连续失败</th><th>剩余冷却</th><th>状态</th></tr>
+          </thead>
           <tbody>
             <tr v-for="k in cooling.key_cooling" :key="'k' + k.api_key_id">
-              <td><strong>{{ k.provider }}</strong> <span class="mono dim">#{{ k.api_key_id }}</span></td>
-              <td>{{ k.fail_count }}</td>
+              <td><strong>{{ k.provider }}</strong> <span class="mono text-xs text-muted">#{{ k.api_key_id }}</span></td>
+              <td class="tabular">{{ k.fail_count }}</td>
               <td class="mono">{{ k.hard_disabled ? '永久禁用' : (k.remaining_sec > 0 ? fmtRemain(k.remaining_sec) : '已恢复') }}</td>
-              <td><span :class="['badge', k.hard_disabled ? 'badge-danger' : (k.remaining_sec > 0 ? 'badge-warning' : 'badge-success')]">{{ k.hard_disabled ? '硬禁用' : (k.remaining_sec > 0 ? '冷却中' : '正常') }}</span></td>
+              <td>
+                <span class="badge" :class="k.hard_disabled ? 'badge-danger' : (k.remaining_sec > 0 ? 'badge-warning' : 'badge-success')">
+                  {{ k.hard_disabled ? '硬禁用' : (k.remaining_sec > 0 ? '冷却中' : '正常') }}
+                </span>
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
 
+      <!-- 代理冷却 -->
       <div v-if="cooling.proxy_cooling.length" class="cooling-group">
-        <h3>🌐 代理冷却（连续 3 次失败→冷却 30s）</h3>
+        <h4><AppIcon name="globe" :size="14" />代理冷却（连续 3 次失败→冷却 30s）</h4>
         <table>
-          <thead><tr><th>代理</th><th>连续失败</th><th>剩余冷却</th><th>状态</th></tr></thead>
+          <thead>
+            <tr><th>代理</th><th>连续失败</th><th>剩余冷却</th><th>状态</th></tr>
+          </thead>
           <tbody>
             <tr v-for="p in cooling.proxy_cooling" :key="'p' + p.name">
-              <td><strong>{{ p.name }}</strong> <span class="dim">{{ p.url }}</span></td>
-              <td>{{ p.fail_count }}</td>
+              <td><strong>{{ p.name }}</strong> <span class="text-xs text-muted">{{ p.url }}</span></td>
+              <td class="tabular">{{ p.fail_count }}</td>
               <td class="mono">{{ p.remaining_sec > 0 ? fmtRemain(p.remaining_sec) : '已恢复' }}</td>
-              <td><span :class="['badge', p.remaining_sec > 0 ? 'badge-warning' : 'badge-success']">{{ p.remaining_sec > 0 ? '冷却中' : '正常' }}</span></td>
+              <td>
+                <span class="badge" :class="p.remaining_sec > 0 ? 'badge-warning' : 'badge-success'">
+                  {{ p.remaining_sec > 0 ? '冷却中' : '正常' }}
+                </span>
+              </td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <p v-if="!cooling.model_cooling.length && !cooling.key_cooling.length && !cooling.proxy_cooling.length"
-         style="text-align: center; color: var(--text-muted); padding: 16px;">
-        ✅ 当前没有模型、密钥或代理处于冷却 / 罚时状态
-      </p>
-    </div>
+      <EmptyState
+        v-if="!cooling.model_cooling.length && !cooling.key_cooling.length && !cooling.proxy_cooling.length"
+        icon="checkCircle"
+        title="当前没有模型、密钥或代理处于冷却 / 罚时状态"
+        small
+      />
+    </section>
+
     <!-- 健康记录表 -->
-    <div class="card" v-if="healthData.length > 0">
-      <h2 style="margin-bottom: 12px;">📋 最近探测记录</h2>
+    <section v-if="healthData.length > 0" class="card">
+      <div class="card-header">
+        <span class="card-title"><AppIcon name="archive" :size="16" />最近探测记录</span>
+      </div>
       <table>
         <thead>
           <tr>
@@ -135,48 +190,52 @@
           <tr v-for="h in healthData" :key="h.model_id + '-' + h.last_checked">
             <td><strong>{{ h.model_full_id }}</strong></td>
             <td>
-              <span :class="['badge', statusBadgeClass(h.status)]">
-                {{ statusEmoji(h.status) }} {{ statusLabel(h.status) }}
+              <span class="badge" :class="statusBadgeClass(h.status)">{{ statusLabel(h.status) }}</span>
+            </td>
+            <td>
+              <span v-if="h.latency_ms" class="tabular" :style="{ color: barColor(h.latency_ms), fontWeight: 600 }">
+                {{ Math.round(h.latency_ms || 0) }}ms
               </span>
+              <span v-else class="text-muted">-</span>
             </td>
-            <td :style="{color: h.latency_ms ? barColor(h.latency_ms) : 'var(--text-muted)', fontWeight: 'bold'}">
-              {{ h.latency_ms ? Math.round(h.latency_ms || 0) + 'ms' : '-' }}
-            </td>
-            <td>{{ formatDate(h.last_checked) }}</td>
-            <td style="font-size: 12px; color: var(--danger); max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
-              {{ h.error_message || '-' }}
-            </td>
+            <td class="text-sm">{{ formatDate(h.last_checked) }}</td>
+            <td class="error-cell text-xs">{{ h.error_message || '-' }}</td>
           </tr>
         </tbody>
       </table>
-    </div>
-    <div class="card" v-else>
-      <p style="text-align: center; color: var(--text-muted); padding: 40px;">
-        暂无健康数据，系统将在后台自动探测已配置的模型 ⏳
-      </p>
-    </div>
+    </section>
+
+    <section v-else class="card">
+      <EmptyState icon="activity" title="暂无健康数据" hint="系统将在后台自动探测已配置的模型" />
+    </section>
   </div>
 </template>
+
 <script>
 import api from '../api.js'
+import toast from '../toast.js'
+import AppIcon from '../components/AppIcon.vue'
+import PageHeader from '../components/PageHeader.vue'
+import StatCard from '../components/StatCard.vue'
+import EmptyState from '../components/EmptyState.vue'
+
 export default {
   name: 'HealthView',
+  components: { AppIcon, PageHeader, StatCard, EmptyState },
   data() {
     return {
       healthData: [],
       latencyStats: null,
       pinging: false,
       cooling: null,
-      _coolingTimer: null,           // 服务端拉取定时器（慢，发请求）
-      _countdownTimer: null,         // 本地倒计时定时器（1s，仅更新显示，不发请求）
-      coolingRefreshMs: 10000,       // 服务端冷却总览拉取间隔（毫秒）
+      _coolingTimer: null,
+      _countdownTimer: null,
+      coolingRefreshMs: 10000,
       clearingCooling: false,
-      _coolingTick: 0
     }
   },
   computed: {
     chartData() {
-      // 从 healthData 中提取每个模型的最新延迟
       const map = {}
       for (const h of this.healthData) {
         if (!map[h.model_full_id] || new Date(h.last_checked) > new Date(map[h.model_full_id].last_checked)) {
@@ -184,13 +243,13 @@ export default {
         }
       }
       return Object.values(map)
-        .filter(h => h.latency_ms && h.latency_ms > 0)
+        .filter((h) => h.latency_ms && h.latency_ms > 0)
         .sort((a, b) => a.latency_ms - b.latency_ms)
-        .map(h => ({
+        .map((h) => ({
           ...h,
-          short_name: h.model_full_id.length > 25 ? h.model_full_id.substring(0, 22) + '...' : h.model_full_id
+          short_name: h.model_full_id.length > 25 ? h.model_full_id.substring(0, 22) + '...' : h.model_full_id,
         }))
-    }
+    },
   },
   async mounted() {
     await this.loadAll()
@@ -198,21 +257,18 @@ export default {
     this.startCoolingTimer()
     document.addEventListener('visibilitychange', this.onVisibility)
   },
-  beforeDestroy() {
+  beforeUnmount() {
     this.stopCoolingTimer()
     document.removeEventListener('visibilitychange', this.onVisibility)
   },
   methods: {
     async loadAll() {
       try {
-        const [healthRes, statsRes] = await Promise.all([
-          api.getHealth(),
-          api.getLatencyStats()
-        ])
+        const [healthRes, statsRes] = await Promise.all([api.getHealth(), api.getLatencyStats()])
         this.healthData = healthRes.items || []
         this.latencyStats = statsRes
       } catch (e) {
-        console.error('加载健康数据失败:', e)
+        toast.error('加载健康数据失败: ' + e.message)
       }
     },
     async loadCooling() {
@@ -224,7 +280,6 @@ export default {
     },
     startCoolingTimer() {
       this.stopCoolingTimer()
-      // 本地倒计时：每秒仅更新显示，不发起任何网络请求
       this._countdownTimer = setInterval(() => {
         if (!this.cooling) return
         const dec = (arr) => {
@@ -237,7 +292,6 @@ export default {
         dec(this.cooling.key_cooling)
         dec(this.cooling.proxy_cooling)
       }, 1000)
-      // 服务端校正：每 coolingRefreshMs 拉一次（捕获新冷却 / 漂移）
       this._coolingTimer = setInterval(() => {
         this.loadCooling()
       }, this.coolingRefreshMs)
@@ -253,7 +307,6 @@ export default {
       }
     },
     onVisibility() {
-      // setInterval 不会因标签页不可见而自动暂停；切到其他标签页时停轮询，切回时恢复
       if (document.hidden) {
         this.stopCoolingTimer()
       } else {
@@ -275,9 +328,9 @@ export default {
       try {
         const res = await api.clearModelCooling(null)
         await this.loadCooling()
-        alert(`已清除 ${res.cleared || 0} 个模型的冷却惩罚`)
+        toast.success(`已清除 ${res.cleared || 0} 个模型的冷却惩罚`)
       } catch (e) {
-        alert('清除失败: ' + e.message)
+        toast.error('清除失败: ' + e.message)
       } finally {
         this.clearingCooling = false
       }
@@ -286,13 +339,14 @@ export default {
       try {
         await api.clearModelCooling(modelId)
         await this.loadCooling()
+        toast.success('已清除')
       } catch (e) {
-        alert('清除失败: ' + e.message)
+        toast.error('清除失败: ' + e.message)
       }
     },
     barWidth(ms) {
       if (!ms || ms <= 0) return 1
-      const max = Math.max(...this.chartData.map(h => h.latency_ms || 1), 1)
+      const max = Math.max(...this.chartData.map((h) => h.latency_ms || 1), 1)
       return Math.max(2, Math.round((ms / max) * 100))
     },
     barColor(ms) {
@@ -301,16 +355,10 @@ export default {
       return 'var(--danger)'
     },
     statusBadgeClass(s) {
-      const map = { healthy: 'badge-success', degraded: 'badge-warning', rate_limited: 'badge-info', unhealthy: 'badge-danger' }
-      return map[s] || 'badge-neutral'
-    },
-    statusEmoji(s) {
-      const map = { healthy: '✅', degraded: '⚠️', rate_limited: '⏸️', unhealthy: '❌' }
-      return map[s] || '❓'
+      return { healthy: 'badge-success', degraded: 'badge-warning', rate_limited: 'badge-info', unhealthy: 'badge-danger' }[s] || 'badge-neutral'
     },
     statusLabel(s) {
-      const map = { healthy: '健康', degraded: '延迟', rate_limited: '限流', unhealthy: '故障' }
-      return map[s] || s
+      return { healthy: '健康', degraded: '延迟', rate_limited: '限流', unhealthy: '故障' }[s] || s
     },
     formatDate(d) {
       if (!d) return '-'
@@ -324,7 +372,7 @@ export default {
         await api.pingModel(modelId)
         await this.loadAll()
       } catch (e) {
-        console.error('测速失败:', e)
+        toast.error('测速失败: ' + e.message)
       }
     },
     async pingAll() {
@@ -332,37 +380,39 @@ export default {
       try {
         await api.pingAllModels()
         await this.loadAll()
+        toast.success('批量测速完成')
       } catch (e) {
-        alert('批量测速失败: ' + e.message)
+        toast.error('批量测速失败: ' + e.message)
       } finally {
         this.pinging = false
       }
-    }
-  }
+    },
+  },
 }
 </script>
+
 <style scoped>
+/* 柱状图 */
 .bar-chart {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-3);
 }
 .bar-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   cursor: pointer;
-  padding: 4px 8px;
-  border-radius: 6px;
-  transition: background 0.2s;
+  padding: 4px var(--space-2);
+  border-radius: var(--radius-sm);
+  transition: background 0.15s;
 }
 .bar-item:hover {
-  background: var(--gray-50);
+  background: var(--surface-2);
 }
 .bar-label {
   width: 180px;
-  font-size: 12px;
-  font-family: monospace;
+  font-size: var(--text-xs);
   text-align: right;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -371,14 +421,14 @@ export default {
 .bar-track {
   flex: 1;
   height: 24px;
-  background: var(--gray-100);
-  border-radius: 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius-lg);
   position: relative;
   overflow: visible;
 }
 .bar-fill {
   height: 100%;
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   transition: width 0.5s ease;
   min-width: 4px;
   opacity: 0.7;
@@ -388,48 +438,78 @@ export default {
   right: 8px;
   top: 50%;
   transform: translateY(-50%);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-weight: 600;
 }
-/* ── 失败罚时 / 冷却总览 ── */
-.cooling-refresh {
-  cursor: pointer;
-  font-size: 16px;
-  color: var(--gray-400);
-  transition: transform 0.3s, color 0.2s;
-  user-select: none;
+
+/* 排名徽章 */
+.rank-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  font-weight: 700;
+  font-size: var(--text-xs);
+  background: var(--surface-3);
+  color: var(--text-secondary);
 }
-.cooling-refresh:hover {
-  color: var(--primary, #3b82f6);
-  transform: rotate(180deg);
+.rank-1 {
+  background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%);
+  color: #1a1006;
 }
+.rank-2 {
+  background: linear-gradient(135deg, #94a3b8 0%, #64748b 100%);
+  color: #fff;
+}
+.rank-3 {
+  background: linear-gradient(135deg, #d97706 0%, #b45309 100%);
+  color: #fff;
+}
+
+/* 冷却 */
 .cooling-summary {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 14px;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
 }
-.cs-badge {
-  font-size: 12px;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-}
-.cs-ok { background: rgba(34,197,94,0.12); color: #15803d; border-color: rgba(34,197,94,0.3); }
-.cs-warn { background: rgba(234,179,8,0.14); color: #a16207; border-color: rgba(234,179,8,0.35); }
-.cs-neutral { background: var(--gray-100); color: var(--gray-500); }
 .cooling-group {
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid var(--gray-100);
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-base);
 }
-.cooling-group h3 {
-  font-size: 14px;
-  color: var(--gray-600);
-  margin-bottom: 10px;
+.cooling-group h4 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin-bottom: var(--space-3);
   font-weight: 600;
 }
-.mono { font-family: monospace; }
-.dim { color: var(--text-muted); font-size: 12px; }
+.cooling-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-3);
+}
+.cooling-group-head h4 {
+  margin-bottom: 0;
+}
+
+/* 错误列 */
+.error-cell {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--danger);
+}
+
+@media (max-width: 900px) {
+  .bar-label {
+    width: 100px;
+  }
+}
 </style>

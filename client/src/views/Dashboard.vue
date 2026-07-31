@@ -1,224 +1,287 @@
 <template>
   <div>
-    <div class="dash-header">
-      <h1>仪表盘</h1>
-      <span class="dash-sub">请求量、延迟、Token 用量和失败统计</span>
+    <PageHeader title="仪表盘" icon="dashboard" subtitle="网关总览：服务商、模型、健康分布与接入方式">
+      <template #actions>
+        <button class="btn btn-outline" :disabled="loading" @click="load">
+          <AppIcon name="refresh" :size="14" />
+          {{ loading ? '刷新中…' : '刷新' }}
+        </button>
+      </template>
+    </PageHeader>
+
+    <!-- 概览指标 -->
+    <div class="stats-grid">
+      <StatCard label="服务商" icon="server" :value="stat('total_providers')" />
+      <StatCard label="已配置密钥" icon="key" :value="stat('total_keys')" />
+      <StatCard label="启用模型" icon="cpu" :value="stat('total_models')" />
+      <StatCard label="Auto 候选" icon="scale" :value="stat('auto_candidates')" />
     </div>
 
-    <n-grid cols="2 s:2 m:4" responsive="screen" gap="16" v-if="summary" style="margin-bottom: 20px;">
-      <n-gi>
-        <n-card hoverable>
-          <n-statistic label="服务商总数" :value="summary.total_providers" />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card hoverable>
-          <n-statistic label="已配置密钥" :value="summary.total_keys" />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card hoverable>
-          <n-statistic label="启用模型" :value="summary.total_models" />
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card hoverable>
-          <n-statistic label="Auto 候选" :value="summary.auto_candidates" />
-        </n-card>
-      </n-gi>
-    </n-grid>
-
-    <n-card title="AIGate 连接密钥" hoverable style="margin-bottom: 20px;" size="small">
-      <template #header-extra>
-        <n-space align="center" size="small">
-          <n-text code>{{ showAIGateKey ? aigateKey : maskedKey }}</n-text>
-          <n-button size="small" tertiary @click="toggleAIGateKey">
-            {{ showAIGateKey ? '隐藏' : '显示' }}
-          </n-button>
-          <n-button size="small" tertiary type="primary" @click="copyAIGateKey" :disabled="!aigateKey">
-            复制
-          </n-button>
-        </n-space>
-      </template>
-      <n-text depth="3" style="font-size: 13px;">
-        使用此密钥连接 AIGate 网关，所有请求需在 <n-text code>Authorization: Bearer &lt;key&gt;</n-text> 中携带此密钥。
-      </n-text>
-    </n-card>
-
-    <n-card v-if="currentModel && currentModel.provider" title="Auto 排名第一" hoverable style="margin-bottom: 20px;" size="small">
-      <n-space align="center" size="small">
-        <n-text strong type="primary" style="font-size: 18px;">
-          {{ currentModel.provider }}/{{ currentModel.model }}
-        </n-text>
-        <n-text depth="3" v-if="currentModel.display_name">({{ currentModel.display_name }})</n-text>
-        <n-tag v-if="currentModel.final_score != null" type="success" size="small" round>
-          {{ Number(currentModel.final_score).toFixed(1) }} 分
-        </n-tag>
-        <n-tag v-if="currentModel.excluded_reason" type="warning" size="small" round>
-          {{ currentModel.excluded_reason }}
-        </n-tag>
-      </n-space>
-    </n-card>
-
-    <n-card title="健康状态分布" hoverable style="margin-bottom: 20px;" size="small">
-      <div class="status-row">
-        <span>健康</span>
-        <div class="bar-container">
-          <div class="bar healthy" :style="{width: percent(summary.healthy_models, total) + '%'}"></div>
+    <div class="dash-grid">
+      <!-- 健康分布 -->
+      <section class="card">
+        <div class="card-header">
+          <span class="card-title"><AppIcon name="activity" :size="16" />健康状态分布</span>
+          <span class="text-sm text-muted">Auto 候选 {{ healthTotal }} 个</span>
         </div>
-        <span class="count">{{ summary.healthy_models }}</span>
-      </div>
-      <div class="status-row">
-        <span>延迟</span>
-        <div class="bar-container">
-          <div class="bar degraded" :style="{width: percent(summary.degraded_models, total) + '%'}"></div>
-        </div>
-        <span class="count">{{ summary.degraded_models }}</span>
-      </div>
-      <div class="status-row">
-        <span>限流</span>
-        <div class="bar-container">
-          <div class="bar rate_limited" :style="{width: percent(summary.rate_limited_models, total) + '%'}"></div>
-        </div>
-        <span class="count">{{ summary.rate_limited_models }}</span>
-      </div>
-      <div class="status-row">
-        <span>故障</span>
-        <div class="bar-container">
-          <div class="bar unhealthy" :style="{width: percent(summary.unhealthy_models, total) + '%'}"></div>
-        </div>
-        <span class="count">{{ summary.unhealthy_models }}</span>
-      </div>
-    </n-card>
 
-    <n-card title="快速开始" hoverable size="small">
-      <n-alert type="info" :show-icon="false" style="margin-bottom: 12px;">
-        <ol style="margin: 0; padding-left: 16px;">
-          <li>先在 <router-link to="/providers">服务商</router-link> 添加服务商并配置 API 密钥</li>
-          <li>在 <router-link to="/models">模型</router-link> 刷新模型列表，确认 auto 开关正确</li>
-          <li>在 <router-link to="/playground">Playground</router-link> 测试对话</li>
-        </ol>
-      </n-alert>
-      <n-text strong>使用方式：</n-text>
-      <n-code :code="usageCode" language="python" style="margin-top: 8px;" />
-    </n-card>
+        <div v-if="healthTotal > 0" class="health-rows">
+          <div v-for="h in healthRows" :key="h.key" class="health-row">
+            <span class="health-name">
+              <span class="dot" :style="{ color: h.color }"></span>{{ h.label }}
+            </span>
+            <div class="progress">
+              <div class="progress-bar" :style="{ width: h.pct + '%', background: h.color }"></div>
+            </div>
+            <span class="health-count tabular">{{ h.value }}</span>
+            <span class="health-pct text-sm text-muted tabular">{{ h.pct }}%</span>
+          </div>
+        </div>
+        <EmptyState v-else icon="activity" title="暂无健康数据" hint="健康数据来自真实调用日志，先在 Playground 发几个请求" small />
+      </section>
+
+      <!-- Auto 当前最优 -->
+      <section class="card">
+        <div class="card-header">
+          <span class="card-title"><AppIcon name="star" :size="16" />Auto 当前最优</span>
+          <router-link to="/auto" class="text-sm">查看排名</router-link>
+        </div>
+
+        <div v-if="currentModel && currentModel.provider" class="best-model">
+          <div class="best-id mono">{{ currentModel.provider }}/{{ currentModel.model }}</div>
+          <div v-if="currentModel.display_name" class="text-sm text-muted">{{ currentModel.display_name }}</div>
+          <div class="best-tags">
+            <span v-if="currentModel.final_score != null" class="badge badge-success">
+              {{ Number(currentModel.final_score).toFixed(1) }} 分
+            </span>
+            <span v-if="currentModel.excluded_reason" class="badge badge-warning">
+              {{ currentModel.excluded_reason }}
+            </span>
+          </div>
+        </div>
+        <EmptyState v-else icon="scale" title="还没有 Auto 候选" hint="到「模型」页把要参与选举的模型打开 Auto 开关" small />
+      </section>
+    </div>
+
+    <!-- 连接密钥 -->
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title"><AppIcon name="key" :size="16" />AIGate 连接密钥</span>
+        <div class="row">
+          <code class="key-display">{{ showKey ? aigateKey || '未配置' : maskedKey }}</code>
+          <button class="btn btn-outline btn-sm" :disabled="!aigateKey" @click="showKey = !showKey">
+            <AppIcon :name="showKey ? 'eyeOff' : 'eye'" :size="13" />
+            {{ showKey ? '隐藏' : '显示' }}
+          </button>
+          <button class="btn btn-outline btn-sm" :disabled="!aigateKey" @click="copyKey">
+            <AppIcon name="copy" :size="13" />复制
+          </button>
+        </div>
+      </div>
+      <p class="text-sm text-muted">
+        所有请求需在 <code>Authorization: Bearer &lt;key&gt;</code> 头中携带此密钥。
+        密钥在 <code>config.yaml</code> 的 <code>security.aigate_api_key</code> 配置。
+      </p>
+    </section>
+
+    <!-- 快速开始 -->
+    <section class="card">
+      <div class="card-header">
+        <span class="card-title"><AppIcon name="play" :size="16" />快速开始</span>
+      </div>
+      <ol class="quick-steps">
+        <li><router-link to="/providers">服务商</router-link>页添加服务商并配置 API 密钥</li>
+        <li><router-link to="/models">模型</router-link>页刷新模型列表，确认 Auto 开关</li>
+        <li><router-link to="/playground">Playground</router-link>发一条消息验证链路</li>
+      </ol>
+      <div class="code-head">
+        <span class="text-sm text-muted">OpenAI SDK 接入</span>
+        <button class="btn btn-ghost btn-xs" @click="copy(usageCode)">
+          <AppIcon name="copy" :size="12" />复制
+        </button>
+      </div>
+      <pre class="code-block">{{ usageCode }}</pre>
+    </section>
   </div>
 </template>
+
 <script>
 import api from '../api.js'
+import toast from '../toast.js'
+import AppIcon from '../components/AppIcon.vue'
+import PageHeader from '../components/PageHeader.vue'
+import StatCard from '../components/StatCard.vue'
+import EmptyState from '../components/EmptyState.vue'
+
 export default {
   name: 'Dashboard',
+  components: { AppIcon, PageHeader, StatCard, EmptyState },
   data() {
     return {
       summary: null,
       currentModel: null,
       loading: false,
       aigateKey: '',
-      showAIGateKey: false,
+      showKey: false,
       usageCode: `from openai import OpenAI
+
 client = OpenAI(
     base_url="http://localhost:8000/v1",
-    api_key="aigate-local"
+    api_key="<你的 AIGate 密钥>",
 )
-response = client.chat.completions.create(
-    model="auto",  # 自动选最优模型
-    messages=[{"role": "user", "content": "你好！"}]
+
+resp = client.chat.completions.create(
+    model="auto",          # 交给 AIGate 选最优模型
+    messages=[{"role": "user", "content": "你好！"}],
 )
-print(response.choices[0].message.content)`
+print(resp.choices[0].message.content)`,
     }
   },
   computed: {
-    total() {
-      if (!this.summary) return 1
-      return this.summary.total_models || 1
+    /** Auto 候选总数：健康分布的分母应是四种状态之和，而不是"启用模型总数" */
+    healthTotal() {
+      const s = this.summary
+      if (!s) return 0
+      return (
+        (s.healthy_models || 0) +
+        (s.degraded_models || 0) +
+        (s.rate_limited_models || 0) +
+        (s.unhealthy_models || 0)
+      )
+    },
+    healthRows() {
+      const s = this.summary || {}
+      const rows = [
+        { key: 'healthy', label: '健康', value: s.healthy_models || 0, color: 'var(--success)' },
+        { key: 'degraded', label: '延迟', value: s.degraded_models || 0, color: 'var(--warning)' },
+        { key: 'rate_limited', label: '限流', value: s.rate_limited_models || 0, color: 'var(--info)' },
+        { key: 'unhealthy', label: '故障', value: s.unhealthy_models || 0, color: 'var(--danger)' },
+      ]
+      const total = this.healthTotal || 1
+      return rows.map((r) => ({ ...r, pct: Math.round((r.value / total) * 100) }))
     },
     maskedKey() {
-      if (!this.aigateKey) return '***'
-      if (this.aigateKey.length <= 8) return '*'.repeat(this.aigateKey.length)
-      return this.aigateKey.slice(0, 4) + '*'.repeat(Math.min(this.aigateKey.length - 8, 12)) + this.aigateKey.slice(-4)
-    }
+      const k = this.aigateKey
+      if (!k) return '未配置'
+      if (k.length <= 8) return '•'.repeat(k.length)
+      return k.slice(0, 4) + '•'.repeat(Math.min(k.length - 8, 12)) + k.slice(-4)
+    },
   },
   methods: {
-    percent(value, total) {
-      return Math.round((value / total) * 100)
+    /** summary 在首次渲染时还是 null，模板里一律走这里取值，避免读 null 属性直接把整页渲染打崩 */
+    stat(key) {
+      return this.summary ? this.summary[key] ?? 0 : '—'
     },
     async load() {
       this.loading = true
-      try {
-        this.summary = await api.getDashboard()
-      } catch (e) { console.error('dashboard load', e) }
-      try {
-        this.currentModel = await api.getCurrentModel()
-      } catch (e) { console.error('current model load', e) }
-      try {
-        const keyData = await api.getAIGateKey(true)
-        this.aigateKey = keyData.key || keyData || ''
-      } catch (e) { console.error('aigate key load', e) }
+      const [summary, current, key] = await Promise.all([
+        api.getDashboard().catch((e) => {
+          toast.error('仪表盘数据加载失败：' + e.message)
+          return null
+        }),
+        api.getCurrentModel().catch(() => null),
+        api.getAIGateKey(true).catch(() => null),
+      ])
+      if (summary) this.summary = summary
+      this.currentModel = current
+      this.aigateKey = (key && key.key) || ''
       this.loading = false
     },
-    toggleAIGateKey() {
-      this.showAIGateKey = !this.showAIGateKey
-    },
-    async copyAIGateKey() {
+    async copy(text) {
+      if (!text) return
       try {
-        await navigator.clipboard.writeText(this.aigateKey)
+        await navigator.clipboard.writeText(text)
+        toast.success('已复制到剪贴板')
       } catch {
         const ta = document.createElement('textarea')
-        ta.value = this.aigateKey
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
         document.body.appendChild(ta)
         ta.select()
-        document.execCommand('copy')
+        try {
+          document.execCommand('copy')
+          toast.success('已复制到剪贴板')
+        } catch {
+          toast.error('复制失败，请手动选中复制')
+        }
         document.body.removeChild(ta)
       }
-    }
+    },
+    copyKey() {
+      this.copy(this.aigateKey)
+    },
   },
   mounted() {
     this.load()
-  }
+  },
 }
 </script>
+
 <style scoped>
-.dash-header {
-  margin-bottom: 20px;
+.dash-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
 }
-.dash-header h1 {
-  margin: 0 0 4px 0;
-  font-size: 22px;
+.dash-grid .card { margin-bottom: 0; }
+
+/* 健康分布 */
+.health-rows { display: flex; flex-direction: column; gap: var(--space-3); }
+.health-row {
+  display: grid;
+  grid-template-columns: 62px 1fr 34px 38px;
+  align-items: center;
+  gap: var(--space-3);
+}
+.health-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-base);
+  color: var(--text-secondary);
+}
+.health-count { font-weight: 600; text-align: right; }
+.health-pct { text-align: right; }
+
+/* Auto 最优 */
+.best-model { display: flex; flex-direction: column; gap: var(--space-2); }
+.best-id {
+  font-size: var(--text-lg);
   font-weight: 600;
+  color: var(--primary);
+  word-break: break-all;
 }
-.dash-sub {
-  font-size: 13px;
-  color: var(--text-muted);
+.best-tags { display: flex; gap: var(--space-2); flex-wrap: wrap; }
+
+/* 密钥 */
+.key-display {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  padding: 4px var(--space-2);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.status-row {
+
+/* 快速开始 */
+.quick-steps {
+  margin: 0 0 var(--space-4);
+  padding-left: var(--space-5);
+  color: var(--text-secondary);
+  font-size: var(--text-base);
+  line-height: 2;
+}
+.code-head {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  justify-content: space-between;
+  margin-bottom: var(--space-2);
 }
-.status-row span {
-  width: 60px;
-  font-size: 14px;
-}
-.bar-container {
-  flex: 1;
-  height: 24px;
-  background: var(--surface-1);
-  border-radius: 12px;
-  overflow: hidden;
-}
-.bar {
-  height: 100%;
-  border-radius: 12px;
-  transition: width 0.3s;
-}
-.bar.healthy { background: #10b981; }
-.bar.degraded { background: #f59e0b; }
-.bar.rate_limited { background: #3b82f6; }
-.bar.unhealthy { background: #ef4444; }
-.count {
-  font-weight: 600;
-  min-width: 30px;
-  text-align: right;
+
+@media (max-width: 1000px) {
+  .dash-grid { grid-template-columns: 1fr; }
 }
 </style>

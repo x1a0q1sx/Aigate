@@ -171,13 +171,32 @@ python start.py
 
 打开浏览器访问 `http://localhost:8000/admin` 进入管理面板（首次需用 `admin` / `aigate123` 登录）。
 
-### 发布前清理（clean.py）
+### 升级到新版本
 
-`python clean.py` 用于发布前擦除本机数据，但**不会删除这 3 个内置渠道**：它会裁剪数据库，仅保留 MiMo / OpenCode / AtomCode 及其模型，清空其余服务商、模型、密钥、日志、Combo 等用户数据；同时把 `config.yaml` 中的密钥与代理置空（首次启动自动重新生成）。其余服务商需用户自行添加。
+**不要重新下载整个项目，也不需要导出导入数据。** 在项目目录直接执行：
+
+```bash
+python scripts/update.py          # Windows 也可双击 update.cmd
+```
+
+脚本会自动：备份数据库 → `git pull` 增量拉取（只下载变化的文件）→ 依赖变了才装依赖、前端变了才重建 → 重启 PM2。
+
+`data/aigate.db`（服务商 / 模型 / 密钥 / 日志）、`config.yaml`（加密密钥 / 代理 / 密码）、`data/archives/`（日志归档）全程不受影响——它们都在 `.gitignore` 里，git 既不会上传也不会覆盖。
+
+常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--check` | 只预览有哪些更新，不实际执行 |
+| `--stash` | 有本地未提交改动时自动暂存 |
+| `--no-restart` | 更新后不自动重启服务 |
+| `--rebuild` | 强制重建前端 |
+
+数据库备份保存在 `data/backups/`，自动保留最近 5 份。
 
 ### 构建前端（可选）
 
-已含预构建的 `client/dist/`，无需构建即可使用。如需修改前端：
+Releases 压缩包已内置构建好的 `client/dist/`，开箱即用。从源码 clone 的用户需要构建一次：
 
 ```bash
 cd client
@@ -327,11 +346,16 @@ rate_limit:
 
 ```
 aigate/
-├── config.yaml              # 主配置文件（含 security / auth / auto_router / health_check / log_archive / rate_limit）
+├── config.example.yaml      # 配置模板（首次使用复制为 config.yaml）
+├── config.yaml              # 主配置文件，含密钥，已在 .gitignore 中，不会上传
 ├── start.py                 # 一键启动
+├── update.cmd               # Windows 双击即可增量更新
 ├── requirements.txt         # Python 依赖
-├── clean.py                 # 发布前清理脚本
 ├── mobile_agent.py          # （实验性）手机屏幕 Agent 演示，与网关核心无关
+│
+├── .github/workflows/       # CI：推送校验 + 打 tag 自动发版
+├── .githooks/pre-commit     # 提交防护：拦截数据库 / 密钥误提交
+├── scripts/update.py        # 一键增量更新
 │
 ├── server/                  # Python 后端
 │   ├── main.py              # FastAPI 入口 + 内置服务商模板 + 生命周期

@@ -333,6 +333,8 @@ class AnthropicAdapter(BaseAdapter):
                 "prompt_tokens": int(usage.get("input_tokens") or 0),
                 "completion_tokens": int(usage.get("output_tokens") or 0),
                 "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
+                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
             },
         }
     async def chat_completion(self, request: ChatCompletionRequest, api_key: str, base_url: str, extra_headers: dict = None) -> dict:
@@ -484,6 +486,8 @@ class AnthropicAdapter(BaseAdapter):
                                     "prompt_tokens": int(usage.get("input_tokens") or 0),
                                     "completion_tokens": int(usage.get("output_tokens") or 0),
                                     "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
+                                    "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
+                                    "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
                                 },
                             }
                         continue
@@ -504,12 +508,56 @@ class AnthropicAdapter(BaseAdapter):
             # （典型：代理出口被 WAF/验证码拦截）。判为错误，让网关记为 error，
             # 避免客户端把"空成功"当成完成而无限重试。
             yield {"error": "upstream returned empty stream (no SSE events; possible proxy/WAF block)"}
-    async def list_models(self, api_key: str, base_url: str, extra_headers: dict = None) -> List[ModelInfo]:
+    def _builtin_models(self) -> List[ModelInfo]:
         return [
             ModelInfo(model_id=mid, display_name=name, input_price=15.0 if "opus" in mid else 3.0,
                       output_price=75.0 if "opus" in mid else 15.0, is_free=False, supports_streaming=True)
             for mid, name in CLAUDE_BUILTIN_MODELS
         ]
+
+    async def list_models(self, api_key: str, base_url: str, extra_headers: dict = None) -> List[ModelInfo]:
+        """真实请求上游 /v1/models（带 Claude CLI 指纹头，第三方中转如 agentrouter 会校验客户端指纹）。
+        失败/空结果时回退内置 Claude 列表，保证官方 API 或不支持 /v1/models 的站仍可用。"""
+        base = (base_url or "").rstrip("/")
+        if not base:
+            return self._builtin_models()
+        # 归一化出站点 origin：剥掉 /v1/messages、/messages、/v1 尾巴
+        for suffix in ("/v1/messages", "/messages", "/v1"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        oauth = bool(extra_headers and extra_headers.get("__oauth"))
+        eh = {k: v for k, v in (extra_headers or {}).items() if k != "__oauth"}
+        eh["__baseUrl"] = base_url or ""
+        headers = self._get_headers(api_key, eh, oauth=oauth, full_fingerprint=True)
+        headers.pop("Content-Type", None)
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, **self._proxy()) as client:
+                resp = await client.get(f"{base}/v1/models", headers=headers)
+                if resp.status_code != 200:
+                    print(f"[anthropic] list_models {base} -> HTTP {resp.status_code}，回退内置列表")
+                    return self._builtin_models()
+                data = resp.json()
+                items = data.get("data", data if isinstance(data, list) else [])
+                models = []
+                for it in items:
+                    mid = (it.get("id") or "").strip() if isinstance(it, dict) else ""
+                    if not mid:
+                        continue
+                    models.append(ModelInfo(
+                        model_id=mid,
+                        display_name=(it.get("display_name") or mid) if isinstance(it, dict) else mid,
+                        input_price=15.0 if "opus" in mid else 3.0,
+                        output_price=75.0 if "opus" in mid else 15.0,
+                        is_free=False,
+                        supports_streaming=True,
+                    ))
+                if not models:
+                    return self._builtin_models()
+                return models
+        except Exception as exc:
+            print(f"[anthropic] list_models {base} 失败：{type(exc).__name__}: {exc}，回退内置列表")
+            return self._builtin_models()
 
     async def health_check(self, model: str, api_key: str, base_url: str, extra_headers: dict = None, timeout: int = 10) -> HealthResult:
         url = self._build_url(base_url)

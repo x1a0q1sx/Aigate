@@ -2,7 +2,7 @@
 /admin/api/* 管理 API
 v2.0: 新增手动测速 API
 """
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime, timezone
 import logging
 logger = logging.getLogger(__name__)
@@ -142,6 +142,714 @@ async def list_providers(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Provider).order_by(Provider.id))
     providers = list(result.scalars().all())
     return [ProviderResponse.model_validate(p) for p in providers]
+
+
+# ==========================================================================
+# 一键备份 / 恢复（全系统配置 + 数据）
+# ==========================================================================
+from server.models.combo import Combo
+from server.models.routing_config import RoutingWeights
+from server.models.oauth_token import OAuthToken
+
+BACKUP_KIND = "aigate.backup"
+BACKUP_VERSION = 1
+
+# 备份时跳过的 config 节（含敏感或运行时专属配置）
+_CONFIG_SKIP_SECTIONS = {"server", "database"}
+
+
+@router.get("/backup")
+async def full_backup(db: AsyncSession = Depends(get_db)):
+    """一键导出全系统配置：服务商+模型+密钥+OAuth+组合+路由权重+config.yaml 设置。
+
+    密钥和 OAuth token 以明文导出（用于换机迁移）。
+    """
+    from server.core.crypto_service import get_crypto_service
+    crypto = get_crypto_service()
+
+    # ── 1) 服务商 + 模型 + 密钥 ──
+    providers_out = []
+    all_providers = list((await db.execute(
+        select(Provider).order_by(Provider.id)
+    )).scalars().all())
+
+    for p in all_providers:
+        models = list((await db.execute(
+            select(Model).where(Model.provider_id == p.id).order_by(Model.model_id)
+        )).scalars().all())
+
+        keys = list((await db.execute(
+            select(ApiKey).where(ApiKey.provider_id == p.id).order_by(ApiKey.id)
+        )).scalars().all())
+
+        exported_keys = []
+        for k in keys:
+            try:
+                plaintext = crypto.decrypt(k.key_encrypted)
+            except Exception as e:
+                logger.warning("[备份] 服务商 %s 的密钥 #%s 解密失败：%s", p.name, k.id, e)
+                continue
+            exported_keys.append({
+                "label": k.label or "",
+                "key": plaintext,
+                "is_active": bool(k.is_active),
+            })
+
+        providers_out.append({
+            "name": p.name,
+            "base_url": p.base_url,
+            "api_type": p.api_type,
+            "credential_type": p.credential_type or "api_key",
+            "oauth_code": p.oauth_code,
+            "headers": p.headers or {},
+            "description": p.description or "",
+            "models": [_serialize_model_for_export(m) for m in models],
+            "keys": exported_keys,
+        })
+
+    # ── 2) OAuth tokens ──
+    oauth_tokens = list((await db.execute(
+        select(OAuthToken).order_by(OAuthToken.id)
+    )).scalars().all())
+    oauth_out = []
+    for t in oauth_tokens:
+        entry = {
+            "provider_code": t.provider_code,
+            "owner": t.owner or "__default",
+            "token_type": t.token_type or "Bearer",
+            "scope": t.scope or "",
+            "is_active": bool(t.is_active),
+        }
+        try:
+            entry["access_token"] = crypto.decrypt(t.access_token_enc)
+        except Exception:
+            entry["access_token"] = ""
+        try:
+            entry["refresh_token"] = crypto.decrypt(t.refresh_token_enc) if t.refresh_token_enc else ""
+        except Exception:
+            entry["refresh_token"] = ""
+        if t.expires_at:
+            entry["expires_at"] = utc_iso(t.expires_at)
+        oauth_out.append(entry)
+
+    # ── 3) 组合路由 ──
+    combos = list((await db.execute(select(Combo).order_by(Combo.id))).scalars().all())
+    combos_out = [{
+        "name": c.name,
+        "description": c.description or "",
+        "strategy": c.strategy,
+        "model_ids": c.model_ids or [],
+        "priority": c.priority,
+        "enabled": bool(c.enabled),
+    } for c in combos]
+
+    # ── 4) 路由权重 ──
+    rw = (await db.execute(select(RoutingWeights).where(RoutingWeights.id == 1))).scalar_one_or_none()
+    weights_out = None
+    if rw:
+        weights_out = {
+            "w_speed": float(rw.w_speed),
+            "w_intel": float(rw.w_intel),
+            "w_stab": float(rw.w_stab),
+        }
+
+    # ── 5) config.yaml 设置（排除 server/database 等运行时节）──
+    config_dump = config.model_dump()
+    config_out = {k: v for k, v in config_dump.items() if k not in _CONFIG_SKIP_SECTIONS}
+    # 脱敏 security 中的 encryption_key（各机器不同），保留 aigate_api_key
+    if "security" in config_out:
+        config_out["security"].pop("encryption_key", None)
+
+    return {
+        "kind": BACKUP_KIND,
+        "version": BACKUP_VERSION,
+        "exported_at": utc_iso(datetime.utcnow()),
+        "summary": {
+            "providers": len(providers_out),
+            "models": sum(len(p["models"]) for p in providers_out),
+            "keys": sum(len(p["keys"]) for p in providers_out),
+            "oauth_tokens": len(oauth_out),
+            "combos": len(combos_out),
+        },
+        "providers": providers_out,
+        "oauth_tokens": oauth_out,
+        "combos": combos_out,
+        "routing_weights": weights_out,
+        "config": config_out,
+    }
+
+
+class BackupRestoreRequest(BaseModel):
+    """恢复请求体"""
+    data: Any
+    restore_keys: bool = True
+    restore_models: bool = True
+    restore_combos: bool = True
+    restore_oauth: bool = True
+    restore_weights: bool = True
+    restore_config: bool = True
+    conflict: str = "merge"   # skip / merge / replace
+
+
+@router.post("/restore")
+async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends(get_db)):
+    """一键恢复全系统配置。接受 /backup 导出的 JSON bundle。"""
+    import json as _json
+    from server.core.crypto_service import get_crypto_service
+    from server.core.oauth_client import get_oauth_client
+    crypto = get_crypto_service()
+
+    raw = payload.data
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON 解析失败: {e}")
+
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="数据格式错误")
+
+    kind = raw.get("kind", "")
+    if kind and kind != BACKUP_KIND and kind != EXPORT_KIND:
+        raise HTTPException(status_code=400, detail=f"不认识的备份类型: {kind}")
+
+    conflict = (payload.conflict or "merge").lower()
+    if conflict not in ("skip", "merge", "replace"):
+        raise HTTPException(status_code=400, detail="conflict 必须是 skip / merge / replace 之一")
+
+    stats = {
+        "providers_created": 0, "providers_updated": 0, "providers_skipped": 0,
+        "models_added": 0, "models_updated": 0,
+        "keys_added": 0,
+        "oauth_restored": 0,
+        "combos_created": 0, "combos_updated": 0, "combos_skipped": 0,
+        "weights_restored": False,
+        "config_restored": False,
+    }
+    errors = []
+
+    # ── 1) 服务商 + 模型 + 密钥 ──
+    entries = raw.get("providers", [])
+    if not isinstance(entries, list):
+        entries = []
+
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        base_url = str(entry.get("base_url") or "").strip()
+        if not name or not base_url:
+            continue
+
+        try:
+            existing = (await db.execute(
+                select(Provider).where(Provider.name == name)
+            )).scalar_one_or_none()
+
+            if existing and conflict == "skip":
+                stats["providers_skipped"] += 1
+                continue
+
+            if existing:
+                provider = existing
+                provider.base_url = base_url
+                provider.api_type = entry.get("api_type") or provider.api_type
+                provider.credential_type = entry.get("credential_type") or provider.credential_type
+                if "oauth_code" in entry:
+                    provider.oauth_code = entry.get("oauth_code")
+                if entry.get("headers") is not None:
+                    provider.headers = entry.get("headers") or {}
+                if entry.get("description") is not None:
+                    provider.description = entry.get("description") or ""
+                stats["providers_updated"] += 1
+
+                if conflict == "replace":
+                    await db.execute(delete(ApiKey).where(ApiKey.provider_id == provider.id))
+                    await db.execute(delete(Model).where(Model.provider_id == provider.id))
+            else:
+                provider = Provider(
+                    name=name, base_url=base_url,
+                    api_type=entry.get("api_type") or "openai_compat",
+                    credential_type=entry.get("credential_type") or "api_key",
+                    oauth_code=entry.get("oauth_code"),
+                    headers=entry.get("headers") or {},
+                    description=entry.get("description") or "",
+                )
+                db.add(provider)
+                stats["providers_created"] += 1
+
+            await db.flush()
+
+            # 模型
+            if payload.restore_models:
+                for raw_model in (entry.get("models") or []):
+                    if not isinstance(raw_model, dict):
+                        continue
+                    mid = str(raw_model.get("model_id") or "").strip()
+                    if not mid:
+                        continue
+                    fields = {f: raw_model[f] for f in _MODEL_FIELDS if f in raw_model and f != "model_id"}
+                    found = (await db.execute(
+                        select(Model).where(Model.provider_id == provider.id, Model.model_id == mid)
+                    )).scalar_one_or_none()
+                    if found:
+                        for f, v in fields.items():
+                            setattr(found, f, v)
+                        stats["models_updated"] += 1
+                    else:
+                        db.add(Model(
+                            provider_id=provider.id, model_id=mid,
+                            display_name=fields.pop("display_name", None) or mid,
+                            created_at=datetime.utcnow(), **fields,
+                        ))
+                        stats["models_added"] += 1
+
+            # 密钥
+            if payload.restore_keys and entry.get("keys"):
+                existing_plain = set()
+                for k in (await db.execute(
+                    select(ApiKey).where(ApiKey.provider_id == provider.id)
+                )).scalars().all():
+                    try:
+                        existing_plain.add(crypto.decrypt(k.key_encrypted))
+                    except Exception:
+                        pass
+                for raw_key in entry["keys"]:
+                    if isinstance(raw_key, str):
+                        raw_key = {"key": raw_key}
+                    if not isinstance(raw_key, dict):
+                        continue
+                    plaintext = str(raw_key.get("key") or "").strip()
+                    if not plaintext or plaintext in existing_plain:
+                        continue
+                    existing_plain.add(plaintext)
+                    db.add(ApiKey(
+                        provider_id=provider.id,
+                        key_encrypted=crypto.encrypt(plaintext),
+                        key_prefix=plaintext[:3] if len(plaintext) >= 3 else plaintext,
+                        label=str(raw_key.get("label") or ""),
+                        is_active=bool(raw_key.get("is_active", True)),
+                    ))
+                    stats["keys_added"] += 1
+
+        except Exception as e:
+            logger.warning("[恢复] 服务商 %s 恢复失败：%s", name, e)
+            errors.append(f"服务商「{name}」: {str(e)[:200]}")
+
+    # ── 2) OAuth tokens ──
+    if payload.restore_oauth:
+        for raw_tok in (raw.get("oauth_tokens") or []):
+            if not isinstance(raw_tok, dict):
+                continue
+            pc = str(raw_tok.get("provider_code") or "").strip()
+            at = str(raw_tok.get("access_token") or "").strip()
+            if not pc or not at:
+                continue
+            owner = raw_tok.get("owner") or "__default"
+            try:
+                existing_tok = (await db.execute(
+                    select(OAuthToken).where(OAuthToken.provider_code == pc, OAuthToken.owner == owner)
+                )).scalar_one_or_none()
+                if existing_tok and conflict == "skip":
+                    continue
+                if existing_tok:
+                    existing_tok.access_token_enc = crypto.encrypt(at)
+                    rt = str(raw_tok.get("refresh_token") or "").strip()
+                    if rt:
+                        existing_tok.refresh_token_enc = crypto.encrypt(rt)
+                    existing_tok.is_active = bool(raw_tok.get("is_active", True))
+                else:
+                    rt = str(raw_tok.get("refresh_token") or "").strip()
+                    db.add(OAuthToken(
+                        provider_code=pc, owner=owner,
+                        access_token_enc=crypto.encrypt(at),
+                        refresh_token_enc=crypto.encrypt(rt) if rt else None,
+                        token_type=raw_tok.get("token_type") or "Bearer",
+                        scope=raw_tok.get("scope") or "",
+                        is_active=bool(raw_tok.get("is_active", True)),
+                    ))
+                stats["oauth_restored"] += 1
+            except Exception as e:
+                errors.append(f"OAuth {pc}/{owner}: {str(e)[:200]}")
+
+    # ── 3) 组合路由 ──
+    if payload.restore_combos:
+        for raw_combo in (raw.get("combos") or []):
+            if not isinstance(raw_combo, dict):
+                continue
+            cname = str(raw_combo.get("name") or "").strip()
+            if not cname:
+                continue
+            try:
+                existing_combo = (await db.execute(
+                    select(Combo).where(Combo.name == cname)
+                )).scalar_one_or_none()
+                if existing_combo and conflict == "skip":
+                    stats["combos_skipped"] += 1
+                    continue
+                if existing_combo:
+                    existing_combo.description = raw_combo.get("description") or ""
+                    existing_combo.strategy = raw_combo.get("strategy") or "fallback"
+                    existing_combo.model_ids = raw_combo.get("model_ids") or []
+                    existing_combo.priority = raw_combo.get("priority", 0)
+                    existing_combo.enabled = bool(raw_combo.get("enabled", True))
+                    stats["combos_updated"] += 1
+                else:
+                    db.add(Combo(
+                        name=cname,
+                        description=raw_combo.get("description") or "",
+                        strategy=raw_combo.get("strategy") or "fallback",
+                        model_ids=raw_combo.get("model_ids") or [],
+                        priority=raw_combo.get("priority", 0),
+                        enabled=bool(raw_combo.get("enabled", True)),
+                    ))
+                    stats["combos_created"] += 1
+            except Exception as e:
+                errors.append(f"组合 {cname}: {str(e)[:200]}")
+
+    # ── 4) 路由权重 ──
+    if payload.restore_weights and raw.get("routing_weights"):
+        rw_data = raw["routing_weights"]
+        try:
+            rw = (await db.execute(select(RoutingWeights).where(RoutingWeights.id == 1))).scalar_one_or_none()
+            if rw:
+                rw.w_speed = rw_data.get("w_speed", 0.3)
+                rw.w_intel = rw_data.get("w_intel", 0.5)
+                rw.w_stab = rw_data.get("w_stab", 0.2)
+            else:
+                db.add(RoutingWeights(
+                    id=1,
+                    w_speed=rw_data.get("w_speed", 0.3),
+                    w_intel=rw_data.get("w_intel", 0.5),
+                    w_stab=rw_data.get("w_stab", 0.2),
+                ))
+            stats["weights_restored"] = True
+        except Exception as e:
+            errors.append(f"路由权重: {str(e)[:200]}")
+
+    # ── 5) config.yaml 设置 ──
+    if payload.restore_config and raw.get("config"):
+        try:
+            cfg_data = raw["config"]
+            for section_key, section_val in cfg_data.items():
+                if section_key in _CONFIG_SKIP_SECTIONS:
+                    continue
+                if not isinstance(section_val, dict):
+                    continue
+                target = getattr(config, section_key, None)
+                if target is None:
+                    continue
+                for k, v in section_val.items():
+                    if hasattr(target, k):
+                        setattr(target, k, v)
+            save_config()
+            stats["config_restored"] = True
+        except Exception as e:
+            errors.append(f"config.yaml: {str(e)[:200]}")
+
+    await db.commit()
+
+    return {
+        "ok": len(errors) == 0,
+        "stats": stats,
+        "errors": errors,
+    }
+
+
+# ==========================================================================
+# 服务商配置导入 / 导出
+# 注意：这两个路由必须注册在 /providers/{provider_id} 之前，否则 "export"
+# 会被当成 provider_id 去匹配参数化路由。
+# ==========================================================================
+EXPORT_KIND = "aigate.providers"
+EXPORT_VERSION = 1
+
+# 导出/导入时携带的模型字段（其余如 success_rate / avg_latency 属运行期统计，不搬运）
+_MODEL_FIELDS = (
+    "model_id", "display_name", "input_price", "output_price", "is_free",
+    "enabled", "auto_enabled", "auto_excluded", "supports_streaming",
+    "supports_vision", "context_length", "priority_boost", "is_manual",
+    "request_overrides", "pricing_source",
+)
+
+
+class ProviderImportRequest(BaseModel):
+    """导入请求体。data 允许直接传对象，也允许传原始 JSON 字符串（方便前端粘贴）。"""
+    data: Any
+    # skip 跳过同名 / merge 合并补齐（默认）/ replace 覆盖（清空原有模型与密钥）
+    conflict: str = "merge"
+    import_keys: bool = True
+    import_models: bool = True
+
+
+def _serialize_model_for_export(m: Model) -> dict:
+    out = {}
+    for f in _MODEL_FIELDS:
+        v = getattr(m, f, None)
+        if f == "request_overrides" and not v:
+            continue
+        if f == "pricing_source" and not v:
+            continue
+        out[f] = v
+    return out
+
+
+@router.get("/providers/export")
+async def export_providers(
+    include_keys: bool = False,
+    provider_ids: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """导出服务商配置为可移植 JSON。
+
+    - include_keys=true 时明文导出 API Key（用于换机迁移），默认不导出。
+    - provider_ids 为逗号分隔 id 列表，缺省导出全部。
+    """
+    query = select(Provider).order_by(Provider.id)
+    wanted: Optional[set] = None
+    if provider_ids:
+        try:
+            wanted = {int(x) for x in provider_ids.split(",") if x.strip()}
+        except ValueError:
+            raise HTTPException(status_code=400, detail="provider_ids 必须是逗号分隔的整数")
+        if not wanted:
+            raise HTTPException(status_code=400, detail="provider_ids 不能为空")
+        query = query.where(Provider.id.in_(wanted))
+
+    providers = list((await db.execute(query)).scalars().all())
+    if wanted and not providers:
+        raise HTTPException(status_code=404, detail="指定的服务商都不存在")
+
+    bundle_providers = []
+    key_count = 0
+    model_count = 0
+    for p in providers:
+        models = list((await db.execute(
+            select(Model).where(Model.provider_id == p.id).order_by(Model.model_id)
+        )).scalars().all())
+        model_count += len(models)
+
+        entry = {
+            "name": p.name,
+            "base_url": p.base_url,
+            "api_type": p.api_type,
+            "credential_type": p.credential_type or "api_key",
+            "oauth_code": p.oauth_code,
+            "headers": p.headers or {},
+            "description": p.description or "",
+            "models": [_serialize_model_for_export(m) for m in models],
+        }
+
+        keys = list((await db.execute(
+            select(ApiKey).where(ApiKey.provider_id == p.id).order_by(ApiKey.id)
+        )).scalars().all())
+        if include_keys:
+            exported_keys = []
+            for k in keys:
+                try:
+                    plaintext = _key_manager._crypto.decrypt(k.key_encrypted)
+                except Exception as e:
+                    # 单个密钥解密失败（换过 secret_key）不该让整包导出失败
+                    logger.warning("[导出] 服务商 %s 的密钥 #%s 解密失败：%s", p.name, k.id, e)
+                    continue
+                exported_keys.append({
+                    "label": k.label or "",
+                    "key": plaintext,
+                    "is_active": bool(k.is_active),
+                })
+            entry["keys"] = exported_keys
+            key_count += len(exported_keys)
+        else:
+            # 不导出明文时仍记录数量，导入方可据此知道需要自行补密钥
+            entry["key_count"] = len(keys)
+
+        bundle_providers.append(entry)
+
+    return {
+        "kind": EXPORT_KIND,
+        "version": EXPORT_VERSION,
+        "exported_at": utc_iso(datetime.utcnow()),
+        "includes_keys": include_keys,
+        "summary": {
+            "providers": len(bundle_providers),
+            "models": model_count,
+            "keys": key_count,
+        },
+        "providers": bundle_providers,
+    }
+
+
+@router.post("/providers/import")
+async def import_providers(payload: ProviderImportRequest, db: AsyncSession = Depends(get_db)):
+    """导入服务商配置。返回逐个服务商的处理结果，便于前端展示明细。"""
+    import json as _json
+
+    conflict = (payload.conflict or "merge").lower()
+    if conflict not in ("skip", "merge", "replace"):
+        raise HTTPException(status_code=400, detail="conflict 必须是 skip / merge / replace 之一")
+
+    raw = payload.data
+    if isinstance(raw, str):
+        try:
+            raw = _json.loads(raw)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"JSON 解析失败: {e}")
+
+    # 允许三种输入：完整 bundle / 直接给 providers 数组 / 单个 provider 对象
+    if isinstance(raw, dict) and "providers" in raw:
+        if raw.get("kind") and raw.get("kind") != EXPORT_KIND:
+            raise HTTPException(status_code=400, detail=f"不认识的导出类型: {raw.get('kind')}")
+        entries = raw.get("providers")
+    elif isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict) and raw.get("name"):
+        entries = [raw]
+    else:
+        raise HTTPException(status_code=400, detail="缺少 providers 数组")
+
+    if not isinstance(entries, list) or not entries:
+        raise HTTPException(status_code=400, detail="providers 为空")
+
+    results = []
+    stats = {"created": 0, "updated": 0, "skipped": 0, "failed": 0,
+             "models_added": 0, "models_updated": 0, "keys_added": 0}
+
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            results.append({"index": idx, "name": None, "action": "failed", "error": "条目不是对象"})
+            stats["failed"] += 1
+            continue
+
+        name = str(entry.get("name") or "").strip()
+        base_url = str(entry.get("base_url") or "").strip()
+        if not name or not base_url:
+            results.append({"index": idx, "name": name or None, "action": "failed",
+                            "error": "缺少 name 或 base_url"})
+            stats["failed"] += 1
+            continue
+
+        try:
+            existing = (await db.execute(
+                select(Provider).where(Provider.name == name)
+            )).scalar_one_or_none()
+
+            if existing and conflict == "skip":
+                results.append({"index": idx, "name": name, "action": "skipped",
+                                "reason": "同名服务商已存在"})
+                stats["skipped"] += 1
+                continue
+
+            if existing:
+                provider = existing
+                provider.base_url = base_url
+                provider.api_type = entry.get("api_type") or provider.api_type
+                provider.credential_type = entry.get("credential_type") or provider.credential_type
+                if "oauth_code" in entry:
+                    provider.oauth_code = entry.get("oauth_code")
+                if entry.get("headers") is not None:
+                    provider.headers = entry.get("headers") or {}
+                if entry.get("description") is not None:
+                    provider.description = entry.get("description") or ""
+                action = "updated"
+                stats["updated"] += 1
+
+                if conflict == "replace":
+                    # 覆盖模式：先清掉原有模型与密钥，再按包内容重建
+                    await db.execute(delete(ApiKey).where(ApiKey.provider_id == provider.id))
+                    await db.execute(delete(Model).where(Model.provider_id == provider.id))
+            else:
+                provider = Provider(
+                    name=name,
+                    base_url=base_url,
+                    api_type=entry.get("api_type") or "openai_compat",
+                    credential_type=entry.get("credential_type") or "api_key",
+                    oauth_code=entry.get("oauth_code"),
+                    headers=entry.get("headers") or {},
+                    description=entry.get("description") or "",
+                )
+                db.add(provider)
+                action = "created"
+                stats["created"] += 1
+
+            await db.flush()   # 拿到新建 provider 的自增 id
+
+            m_added = m_updated = k_added = 0
+
+            # ── 模型 ──
+            if payload.import_models:
+                for raw_model in (entry.get("models") or []):
+                    if not isinstance(raw_model, dict):
+                        continue
+                    mid = str(raw_model.get("model_id") or "").strip()
+                    if not mid:
+                        continue
+                    fields = {f: raw_model[f] for f in _MODEL_FIELDS
+                              if f in raw_model and f != "model_id"}
+                    found = (await db.execute(
+                        select(Model).where(Model.provider_id == provider.id, Model.model_id == mid)
+                    )).scalar_one_or_none()
+                    if found:
+                        for f, v in fields.items():
+                            setattr(found, f, v)
+                        m_updated += 1
+                    else:
+                        db.add(Model(
+                            provider_id=provider.id,
+                            model_id=mid,
+                            display_name=fields.pop("display_name", None) or mid,
+                            created_at=datetime.utcnow(),
+                            **fields,
+                        ))
+                        m_added += 1
+
+            # ── 密钥 ──
+            if payload.import_keys and entry.get("keys"):
+                existing_plain = set()
+                for k in (await db.execute(
+                    select(ApiKey).where(ApiKey.provider_id == provider.id)
+                )).scalars().all():
+                    try:
+                        existing_plain.add(_key_manager._crypto.decrypt(k.key_encrypted))
+                    except Exception:
+                        pass
+                for raw_key in entry["keys"]:
+                    if isinstance(raw_key, str):
+                        raw_key = {"key": raw_key}
+                    if not isinstance(raw_key, dict):
+                        continue
+                    plaintext = str(raw_key.get("key") or "").strip()
+                    if not plaintext or plaintext in existing_plain:
+                        continue   # 同一把密钥不重复导入
+                    existing_plain.add(plaintext)
+                    db.add(ApiKey(
+                        provider_id=provider.id,
+                        key_encrypted=_key_manager._crypto.encrypt(plaintext),
+                        key_prefix=plaintext[:3] if len(plaintext) >= 3 else plaintext,
+                        label=str(raw_key.get("label") or ""),
+                        is_active=bool(raw_key.get("is_active", True)),
+                    ))
+                    k_added += 1
+
+            stats["models_added"] += m_added
+            stats["models_updated"] += m_updated
+            stats["keys_added"] += k_added
+            results.append({
+                "index": idx, "name": name, "action": action,
+                "models_added": m_added, "models_updated": m_updated, "keys_added": k_added,
+            })
+        except Exception as e:
+            await db.rollback()
+            logger.warning("[导入] 服务商 %s 导入失败：%s", name, e)
+            results.append({"index": idx, "name": name, "action": "failed", "error": str(e)[:300]})
+            stats["failed"] += 1
+            # 回滚会丢掉本轮之前累计的未提交改动，如实反馈而不是假装成功
+            stats["created"] = stats["updated"] = 0
+            stats["models_added"] = stats["models_updated"] = stats["keys_added"] = 0
+            return {"ok": False, "conflict": conflict, "stats": stats, "results": results,
+                    "detail": f"在导入「{name}」时出错，本次导入已整体回滚"}
+
+    await db.commit()
+    return {"ok": True, "conflict": conflict, "stats": stats, "results": results}
 @router.post("/providers")
 async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_db)):
     provider = Provider(
@@ -288,10 +996,13 @@ async def list_models(
 async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depends(get_db)):
     model = await _model_catalog.update_model(
         db, model_id,
+        display_name=data.display_name,
         auto_enabled=data.auto_enabled,
         enabled=data.enabled,
         input_price=data.input_price,
         output_price=data.output_price,
+        cache_read_input_price=data.cache_read_input_price,
+        cache_write_input_price=data.cache_write_input_price,
         success_rate=data.success_rate,
         is_free=data.is_free,
         priority_boost=data.priority_boost,
@@ -412,6 +1123,8 @@ class ManualModelAdd(BaseModel):
     display_name: str = ""
     input_price: float = 0.0
     output_price: float = 0.0
+    cache_read_input_price: float = 0.0
+    cache_write_input_price: float = 0.0
 
 @router.post("/providers/{provider_id}/models")
 async def add_model_to_provider(provider_id: int, data: ManualModelAdd, db: AsyncSession = Depends(get_db)):
@@ -431,6 +1144,8 @@ async def add_model_to_provider(provider_id: int, data: ManualModelAdd, db: Asyn
         display_name=data.display_name or data.model_id,
         input_price=data.input_price,
         output_price=data.output_price,
+        cache_read_input_price=data.cache_read_input_price or 0.0,
+        cache_write_input_price=data.cache_write_input_price or 0.0,
         is_free=(data.input_price == 0.0 and data.output_price == 0.0),
         enabled=True,
         auto_enabled=True,
@@ -484,7 +1199,20 @@ async def import_provider_pricing(provider_id: int, data: PricingImport, db: Asy
             out = round(mr * cr * group_ratio, 6)
         else:
             continue
-        
+
+        # 缓存价：优先取绝对价，否则按 ratio（相对 input 价）折算
+        def _cf(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        cr_abs = _cf(item.get("cache_read_input_price"))
+        cw_abs = _cf(item.get("cache_write_input_price"))
+        cr_ratio = _cf(item.get("cache_read_ratio", item.get("cache_ratio", 0))) or 0.0
+        cw_ratio = _cf(item.get("cache_write_ratio", item.get("cache_creation_ratio", 0))) or 0.0
+        cache_read = cr_abs if cr_abs is not None else (round(inp * cr_ratio, 6) if cr_ratio else 0.0)
+        cache_write = cw_abs if cw_abs is not None else (round(inp * cw_ratio, 6) if cw_ratio else 0.0)
+
         # 更新匹配的模型
         result = await db.execute(
             select(Model).where(Model.provider_id == provider_id, Model.model_id == name)
@@ -493,35 +1221,33 @@ async def import_provider_pricing(provider_id: int, data: PricingImport, db: Asy
         if model:
             model.input_price = inp
             model.output_price = out
+            model.cache_read_input_price = cache_read
+            model.cache_write_input_price = cache_write
             model.is_free = (inp == 0 and out == 0)
-            if hasattr(model, 'pricing_source'):
-                model.pricing_source = provider.base_url
+            model.pricing_source = provider.base_url
+            model.pricing_updated_at = now
             updated += 1
         else:
             # 创建不存在的模型
-            model = Model(
+            db.add(Model(
                 provider_id=provider_id,
                 model_id=name,
                 display_name=name,
                 input_price=inp,
                 output_price=out,
+                cache_read_input_price=cache_read,
+                cache_write_input_price=cache_write,
                 is_free=(inp == 0 and out == 0),
                 enabled=True,
                 auto_enabled=False,
                 supports_streaming=True,
                 context_length=4096,
                 created_at=now,
-            )
-            db.add(model)
+                pricing_source=provider.base_url,
+                pricing_updated_at=now,
+            ))
             created += 1
-        if model:
-            model.input_price = inp
-            model.output_price = out
-            model.is_free = (inp == 0 and out == 0)
-            if hasattr(model, 'pricing_source'):
-                model.pricing_source = provider.base_url
-            updated += 1
-    
+
     await db.commit()
     return {"updated": updated, "created": created, "total_models": len(items), "group_ratio": group_ratio}
 

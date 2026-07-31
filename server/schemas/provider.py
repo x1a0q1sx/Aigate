@@ -51,6 +51,8 @@ class ModelInfoResponse(BaseModel):
     display_name: Optional[str]
     input_price: float
     output_price: float
+    cache_read_input_price: float = 0.0
+    cache_write_input_price: float = 0.0
     success_rate: Optional[float] = None
     avg_latency_ms: Optional[float] = None
     avg_ttft_ms: Optional[float] = None
@@ -87,6 +89,8 @@ class ModelInfoResponse(BaseModel):
             display_name=model.display_name,
             input_price=model.input_price,
             output_price=model.output_price,
+            cache_read_input_price=getattr(model, 'cache_read_input_price', 0) or 0,
+            cache_write_input_price=getattr(model, 'cache_write_input_price', 0) or 0,
             success_rate=getattr(model, 'success_rate', None),
             avg_latency_ms=getattr(model, 'avg_latency_ms', None),
             avg_ttft_ms=getattr(model, 'avg_ttft_ms', None),
@@ -106,10 +110,13 @@ class ModelInfoResponse(BaseModel):
             request_overrides=getattr(model, 'request_overrides', None),
         )
 class ModelUpdate(BaseModel):
+    display_name: Optional[str] = None
     auto_enabled: Optional[bool] = None
     enabled: Optional[bool] = None
     input_price: Optional[float] = None
     output_price: Optional[float] = None
+    cache_read_input_price: Optional[float] = None
+    cache_write_input_price: Optional[float] = None
     success_rate: Optional[float] = None
     is_free: Optional[bool] = None
     # v2.0 新增

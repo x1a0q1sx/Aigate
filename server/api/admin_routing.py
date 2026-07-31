@@ -305,6 +305,8 @@ async def get_log(log_id: int, db: AsyncSession = Depends(get_db)):
         "status": row.status, "media_type": getattr(row, "media_type", None), "http_status": row.http_status,
         "latency_ms": row.latency_ms,
         "prompt_tokens": row.prompt_tokens, "completion_tokens": row.completion_tokens,
+        "cache_read_tokens": getattr(row, "cache_read_tokens", None),
+        "cache_write_tokens": getattr(row, "cache_write_tokens", None),
         "error_type": row.error_type, "error_msg": row.error_msg,
         "fallback_count": row.fallback_count,
         "user_ip": row.user_ip, "api_key_id": row.api_key_id,
@@ -446,6 +448,8 @@ async def list_request_logs(
             "latency_ms": r.latency_ms,
             "prompt_tokens": r.prompt_tokens,
             "completion_tokens": r.completion_tokens,
+            "cache_read_tokens": getattr(r, "cache_read_tokens", None),
+            "cache_write_tokens": getattr(r, "cache_write_tokens", None),
             "error_type": r.error_type,
             "error_msg": r.error_msg,
             "fallback_count": r.fallback_count,
@@ -719,6 +723,8 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
                 "latency_ms": r.latency_ms,
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
+                "cache_read_tokens": getattr(r, "cache_read_tokens", None),
+                "cache_write_tokens": getattr(r, "cache_write_tokens", None),
                 "error_type": r.error_type,
                 "error_msg": r.error_msg,
                 "fallback_count": r.fallback_count,
@@ -801,15 +807,19 @@ async def restore_archive(filename: str, db: AsyncSession = Depends(get_db)):
             # JSON 中的 created_at 是 ISO 字符串，DB 需要 datetime
             if rec.get("created_at") and isinstance(rec["created_at"], str):
                 rec["created_at"] = datetime.fromisoformat(rec["created_at"].replace("Z", "+00:00"))
+            rec.setdefault("cache_read_tokens", None)
+            rec.setdefault("cache_write_tokens", None)
             await db.execute(sa_text("""
                 INSERT INTO request_logs
                     (id, conversation_id, requested_model, routed_provider, routed_model,
                      status, http_status, latency_ms, prompt_tokens, completion_tokens,
+                     cache_read_tokens, cache_write_tokens,
                      error_type, error_msg, fallback_count, user_ip, api_key_id,
                      request_body, response_body, created_at)
                 VALUES
                     (:id, :conversation_id, :requested_model, :routed_provider, :routed_model,
                      :status, :http_status, :latency_ms, :prompt_tokens, :completion_tokens,
+                     :cache_read_tokens, :cache_write_tokens,
                      :error_type, :error_msg, :fallback_count, :user_ip, :api_key_id,
                      :request_body, :response_body, :created_at)
             """), rec)

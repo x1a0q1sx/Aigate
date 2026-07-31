@@ -61,6 +61,92 @@ def _openai_completion_is_empty(result) -> bool:
     return True
 
 
+def _estimate_prompt_tokens_from_request(request) -> int:
+    """按请求内容粗估 prompt token 数（兜底用，不追求精确）。"""
+    if not request or not getattr(request, "messages", None):
+        return 0
+    chars = 0
+    for m in request.messages:
+        content = getattr(m, "content", None) or ""
+        if isinstance(content, str):
+            chars += len(content)
+        elif isinstance(content, list):  # multimodal content parts
+            for p in content:
+                if isinstance(p, dict):
+                    if isinstance(p.get("text"), str):
+                        chars += len(p["text"])
+                    elif isinstance(p.get("content"), str):
+                        chars += len(p["content"])
+    # 中文/混合文本粗略按 4 字符≈1 token 估算，最少 1
+    return max(1, chars // 4 + 1)
+
+
+def _sanitize_token_counts(request, pt: int, ct: int):
+    """
+    修正上游明显瞎报的 token 数，避免污染用量/成本统计。
+    典型场景：agentrouter 等聚合站把 input_tokens 恒报为 1（与实际 prompt 完全不符）。
+    若上游 prompt_tokens 明显低于按请求内容粗估的值，则用粗估值覆盖；
+    若上游完全没给（0），也用粗估兜底。completion_tokens 仅在确实为 0 时粗估。
+    """
+    pt = int(pt or 0)
+    ct = int(ct or 0)
+    est = _estimate_prompt_tokens_from_request(request)
+    # 上游明显瞎报（如 agentrouter 恒报 1）：当且仅当上游报的 prompt 极少（≤2）
+    # 而按请求内容粗估明显更多（>2）时，用粗估覆盖。真实极短 prompt（如 "hi"）粗估也≈1，不会误改。
+    if est > 2 and pt <= 2:
+        pt = est
+    elif pt == 0 and est > 0:
+        pt = est
+    return pt, ct
+
+
+def _extract_cache_tokens(usage: dict):
+    """从 usage 提取缓存读/写 token 数，兼容多种上游格式。返回 (cache_read, cache_write)。"""
+    if not usage:
+        return 0, 0
+    # OpenAI 格式：usage.prompt_tokens_details.{cached_tokens, cache_creation_tokens}
+    ptd = usage.get("prompt_tokens_details") or {}
+    if isinstance(ptd, dict):
+        crt = int(ptd.get("cached_tokens") or 0)
+        cwt = int(ptd.get("cache_creation_tokens") or 0)
+        if crt or cwt:
+            return crt, cwt
+    # Anthropic 格式：usage.cache_read_input_tokens / cache_creation_input_tokens
+    crt = int(usage.get("cache_read_input_tokens") or 0)
+    cwt = int(usage.get("cache_creation_input_tokens") or 0)
+    if crt or cwt:
+        return crt, cwt
+    # Responses API 格式：usage.input_tokens_details.{cached_tokens, cache_write_tokens, cache_creation_tokens}
+    # / usage.cache_creation_details.total_tokens（部分上游把缓存写放在 input_tokens_details.cache_write_tokens）
+    itd = usage.get("input_tokens_details") or {}
+    if isinstance(itd, dict):
+        if not crt:
+            crt = int(itd.get("cached_tokens") or 0)
+        if not cwt:
+            cwt = int(itd.get("cache_write_tokens") or itd.get("cache_creation_tokens") or 0)
+    ccd = usage.get("cache_creation_details") or {}
+    if isinstance(ccd, dict) and not cwt:
+        cwt = int(ccd.get("total_tokens") or 0)
+    return crt, cwt
+
+
+def _segmented_cost(prices: dict, pt: int, ct: int, crt: int, cwt: int) -> float:
+    """分段计算成本（美元/请求）。
+
+    普通输入 token 按 input_price；缓存读 token 按 cache_read_input_price（缺价时回退 input_price，
+    保守不低估）；缓存写 token 按 cache_write_input_price（缺价时回退 input_price）；输出按 output_price。
+    缓存价缺省为 0 视为「未配置」，回退到 input 价，等价于改造前行为。
+    """
+    ip = float(prices.get("input_price") or 0)
+    op = float(prices.get("output_price") or 0)
+    crp = float(prices.get("cache_read_input_price") or 0) or ip
+    cwp = float(prices.get("cache_write_input_price") or 0) or ip
+    pt = int(pt or 0); ct = int(ct or 0); crt = int(crt or 0); cwt = int(cwt or 0)
+    # 普通输入 = 总输入 - 缓存读 - 缓存写（防止上游口径不一致导致负数）
+    safe = max(0, pt - crt - cwt)
+    return round((safe * ip + crt * crp + cwt * cwp + ct * op) / 1_000_000.0, 6)
+
+
 def _stream_content_is_empty(buf) -> bool:
     """
     判断一段流式 chunk 列表是否『零内容』：所有 delta.content 拼起来为空，且没有 tool_calls。
@@ -658,7 +744,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
 async def _write_stream_log(conversation_id, request, raw_request, status,
                            routed_provider, routed_model, error_msg, fallback_count, attempt_errors,
                            stream_body=None, prompt_tokens=0, completion_tokens=0, latency_ms=None,
-                           diag_start_ts=None):
+                           cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None):
     """在流式生成器内异步写请求日志。
 
     方案A：request_logs 作为唯一用量数据源，直接在此写入
@@ -687,10 +773,14 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
             if _prov_id and routed_model:
                 md_row = (await _ldb.execute(_sa_sel(_QM).where(_QM.provider_id == _prov_id, _QM.model_id == routed_model).limit(1))).scalar_one_or_none()
                 _model_id = md_row.id if md_row else None
-                if md_row is not None and (pt or ct):
-                    _ip = float(getattr(md_row, "input_price", 0) or 0)
-                    _op = float(getattr(md_row, "output_price", 0) or 0)
-                    _cost = round((pt * _ip + ct * _op) / 1_000_000.0, 6)
+                if md_row is not None and (pt or ct or cache_read_tokens or cache_write_tokens):
+                    _md_prices = {
+                        "input_price": float(getattr(md_row, "input_price", 0) or 0),
+                        "output_price": float(getattr(md_row, "output_price", 0) or 0),
+                        "cache_read_input_price": getattr(md_row, "cache_read_input_price", 0) or 0,
+                        "cache_write_input_price": getattr(md_row, "cache_write_input_price", 0) or 0,
+                    }
+                    _cost = _segmented_cost(_md_prices, pt, ct, cache_read_tokens, cache_write_tokens)
             await write_log(_ldb,
                 conversation_id=conversation_id,
                 requested_model=request.model if request else "unknown",
@@ -700,6 +790,8 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                 status=status,
                 prompt_tokens=pt,
                 completion_tokens=ct,
+                cache_read_tokens=cache_read_tokens or None,
+                cache_write_tokens=cache_write_tokens or None,
                 estimated_cost_usd=_cost,
                 error_type="upstream_error" if error_msg else None,
                 error_msg=(error_msg or ""),
@@ -884,9 +976,12 @@ async def chat_completions(
                                 _combo_body = _cj.dumps(_cbuf, ensure_ascii=False) if _cbuf else None
                                 _pt = int(_cu.get("prompt_tokens") or _cu.get("input_tokens") or 0)
                                 _ct = int(_cu.get("completion_tokens") or _cu.get("output_tokens") or 0)
+                                _crd, _cwt = _extract_cache_tokens(_cu)
+                                _pt, _ct = _sanitize_token_counts(request, _pt, _ct)
                                 await _write_stream_log(conversation_id, request, raw_request, "success",
                                     _prov.name, _mdl.model_id, None, st_attempt, None,
                                     stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
+                                    cache_read_tokens=_crd, cache_write_tokens=_cwt,
                                     latency_ms=_combo_latency, diag_start_ts=_diag_start)
                                 if ar.health_checker:
                                     ar.health_checker.mark_success(_mdl.id)
@@ -986,12 +1081,17 @@ async def chat_completions(
                     try:
                         import json as _j
                         _usage = result.get("usage", {}) if isinstance(result, dict) else {}
+                        _pt = int(_usage.get("prompt_tokens") or _usage.get("input_tokens") or 0)
+                        _ct = int(_usage.get("completion_tokens") or _usage.get("output_tokens") or 0)
+                        _crd, _cwt = _extract_cache_tokens(_usage)
+                        _pt, _ct = _sanitize_token_counts(request, _pt, _ct)
                         await _write_stream_log(
                             conversation_id, request, raw_request, "success",
                             provider.name, model.model_id, None, 0, None,
                             stream_body=_j.dumps(result, ensure_ascii=False),
-                            prompt_tokens=_usage.get("prompt_tokens") or _usage.get("input_tokens") or 0,
-                            completion_tokens=_usage.get("completion_tokens") or _usage.get("output_tokens") or 0,
+                            prompt_tokens=_pt,
+                            completion_tokens=_ct,
+                            cache_read_tokens=_crd, cache_write_tokens=_cwt,
                             latency_ms=int((time.time() - _combo_send_time) * 1000),
                             diag_start_ts=_diag_start,
                         )
@@ -1270,9 +1370,12 @@ async def chat_completions(
                                 ct = sum(len(str(c.get("choices", [{}])[0].get("delta", {}).get("content", "") or "")) for c in stream_buf if isinstance(c, dict))
                             if not pt and request:
                                 pt = sum(len(str(m.get("content", ""))) for m in (request.messages or [])) // 4 + 1
+                        _crd, _cwt = _extract_cache_tokens(last_usage)
+                        _pt, _ct = _sanitize_token_counts(request, pt, ct)
                         await _write_stream_log(conversation_id, request, raw_request, "success",
                             cand_provider_name, cand_model_id, None, st_attempt, None,
-                            stream_body=resp_snapshot, prompt_tokens=pt, completion_tokens=ct,
+                            stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
+                            cache_read_tokens=_crd, cache_write_tokens=_cwt,
                             latency_ms=int((time.time() - _send_time) * 1000), diag_start_ts=_diag_start)
                         if ar.health_checker:
                             ar.health_checker.mark_success(cand_model_pk)
@@ -1431,6 +1534,8 @@ async def chat_completions(
                         resp_snapshot = _j.dumps(_stream_chunks_log, ensure_ascii=False)
                     pt = int(_stream_usage.get("prompt_tokens") or _stream_usage.get("input_tokens") or 0)
                     ct = int(_stream_usage.get("completion_tokens") or _stream_usage.get("output_tokens") or 0)
+                    pt, ct = _sanitize_token_counts(request, pt, ct)
+                    _crd, _cwt = _extract_cache_tokens(_stream_usage)
                     # 兜底：部分免费上游不返回 usage，用 chunk content 粗估 completion tokens
                     if not pt or not ct:
                         if not ct and _stream_chunks_log:
@@ -1460,6 +1565,17 @@ async def chat_completions(
                                 status="error" if _stream_err else "success",
                                 prompt_tokens=pt,
                                 completion_tokens=ct,
+                cache_read_tokens=_crd or None,
+                cache_write_tokens=_cwt or None,
+                estimated_cost_usd=(
+                    _segmented_cost({
+                        "input_price": float(route_result.model.input_price or 0),
+                        "output_price": float(route_result.model.output_price or 0),
+                        "cache_read_input_price": float(getattr(route_result.model, "cache_read_input_price", 0) or 0),
+                        "cache_write_input_price": float(getattr(route_result.model, "cache_write_input_price", 0) or 0),
+                    }, pt, ct, _crd, _cwt)
+                    if (not _stream_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
+                ),
                 fallback_count=route_result.fallback_count if route_result else 0,
                 latency_ms=int((time.time() - _send_time) * 1000),
                 error_type="upstream_error" if _stream_err else None,
@@ -1542,6 +1658,8 @@ async def chat_completions(
             usage = resp_dict.get("usage", {}) if resp_dict else {}
             pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
             ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            pt, ct = _sanitize_token_counts(request, pt, ct)
+            _crd, _cwt = _extract_cache_tokens(usage)
             _latency = int((time.time() - _send_time) * 1000) if _send_time else None
             try:
                 _log_req = upstream_request
@@ -1564,10 +1682,16 @@ async def chat_completions(
                     latency_ms=_latency,
                     prompt_tokens=int(pt) if pt else 0,
                     completion_tokens=int(ct) if ct else 0,
+                    cache_read_tokens=_crd or None,
+                    cache_write_tokens=_cwt or None,
                     estimated_cost_usd=(
-                        round((int(pt) * float(route_result.model.input_price or 0)
-                               + int(ct) * float(route_result.model.output_price or 0)) / 1_000_000.0, 6)
-                        if (not is_err and route_result and route_result.success and (pt or ct)) else 0.0
+                        _segmented_cost({
+                            "input_price": float(route_result.model.input_price or 0),
+                            "output_price": float(route_result.model.output_price or 0),
+                            "cache_read_input_price": float(getattr(route_result.model, "cache_read_input_price", 0) or 0),
+                            "cache_write_input_price": float(getattr(route_result.model, "cache_write_input_price", 0) or 0),
+                        }, pt, ct, _crd, _cwt)
+                        if (not is_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
                     ),
                     fallback_count=route_result.fallback_count if route_result else 0,
                     user_ip=raw_request.client.host if raw_request.client else None,
@@ -1614,6 +1738,8 @@ async def list_models(
             "pricing": {
                 "input": model.input_price,
                 "output": model.output_price,
+                "cache_read_input": getattr(model, "cache_read_input_price", 0) or 0,
+                "cache_write_input": getattr(model, "cache_write_input_price", 0) or 0,
                 "unit": "per_1M_tokens",
                 "currency": "USD"
             },

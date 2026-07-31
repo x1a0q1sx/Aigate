@@ -1,0 +1,54 @@
+#!/bin/sh
+# AIGate 提交防护：拦截数据库、配置密钥等绝不该进入仓库的文件。
+# 启用方式（clone 后执行一次）：git config core.hooksPath .githooks
+
+RED=$(printf '\033[31m'); YEL=$(printf '\033[33m'); RST=$(printf '\033[0m')
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$STAGED" ] && exit 0
+
+FAIL=0
+
+# ── 1. 文件路径黑名单 ────────────────────────────────────────────────────────
+BLOCKED=$(printf '%s\n' "$STAGED" | grep -E \
+  '\.(db|db-wal|db-shm|sqlite)$|^config\.yaml$|^config\.local\.yaml$|^data/|\.env$|\.jsonl\.gz$|\.bak-|\.old-' )
+
+if [ -n "$BLOCKED" ]; then
+  echo "${RED}✗ 提交被拦截：以下文件包含本机数据或密钥，不能推送到 GitHub${RST}"
+  printf '%s\n' "$BLOCKED" | sed 's/^/    /'
+  echo ""
+  echo "  处理方式：git restore --staged <文件>"
+  echo "  若确属误报，检查 .gitignore 是否漏配。"
+  FAIL=1
+fi
+
+# ── 2. 暂存内容里的明文密钥 ──────────────────────────────────────────────────
+LEAK=$(git diff --cached -U0 | grep -E '^\+' | grep -Ei \
+  'encryption_key:[[:space:]]*[A-Za-z0-9+/=_-]{16,}|password_hash:[[:space:]]*\$|aigate_api_key:[[:space:]]*ak-|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}' )
+
+if [ -n "$LEAK" ]; then
+  echo "${RED}✗ 提交被拦截：改动内容里疑似包含明文密钥${RST}"
+  printf '%s\n' "$LEAK" | cut -c1-100 | sed 's/^/    /'
+  echo ""
+  echo "  确认无误后可用 git commit --no-verify 跳过本检查。"
+  FAIL=1
+fi
+
+# ── 3. 后端语法编译（只在有 .py 改动时跑） ───────────────────────────────────
+if printf '%s\n' "$STAGED" | grep -q '\.py$'; then
+  PY=$(command -v python || command -v python3)
+  if [ -n "$PY" ]; then
+    ERR=$("$PY" -m compileall -q server start.py scripts 2>&1)
+    if [ $? -ne 0 ]; then
+      echo "${RED}✗ 提交被拦截：后端代码语法错误${RST}"
+      echo "$ERR" | sed 's/^/    /'
+      FAIL=1
+    fi
+  else
+    echo "${YEL}! 未找到 python，跳过语法检查${RST}"
+  fi
+fi
+
+[ "$FAIL" != "0" ] && exit 1
+
+echo "✓ 提交检查通过（无数据 / 无密钥 / 语法正常）"
+exit 0

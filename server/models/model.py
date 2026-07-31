@@ -15,6 +15,8 @@ class Model(Base):
     display_name = Column(String(200), nullable=True, default="")
     input_price = Column(Float, nullable=False, default=0.0)  # 每百万 token 美元
     output_price = Column(Float, nullable=False, default=0.0)
+    cache_read_input_price = Column(Float, nullable=False, default=0.0)   # 每百万 token 美元（缓存命中读，通常远低于 input_price）
+    cache_write_input_price = Column(Float, nullable=False, default=0.0)  # 每百万 token 美元（缓存创建写）
     success_rate = Column(Float, nullable=True)
     avg_latency_ms = Column(Float, nullable=True)
     avg_ttft_ms = Column(Float, nullable=True)

@@ -49,7 +49,10 @@
               <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']">{{ r.status === 'success' ? '成功' : '失败' }}</span>
             </td>
             <td>{{ r.latency_ms ? Math.round(r.latency_ms) + 'ms' : '-' }}</td>
-            <td style="font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}</td>
+            <td style="font-size: 12px;">
+              {{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}
+              <span v-if="r.cache_read_tokens" style="color: var(--accent, #2b8aef);" :title="`缓存读 ${r.cache_read_tokens} / 写 ${r.cache_write_tokens || 0}`"> · 缓存{{ r.cache_read_tokens }}</span>
+            </td>
             <td>{{ r.fallback_count > 0 ? r.fallback_count : '-' }}</td>
           </tr>
         </tbody>
@@ -83,6 +86,7 @@
           <div><span class="meta-k">HTTP</span><span class="meta-v mono">{{ detail.http_status ?? '-' }}</span></div>
           <div><span class="meta-k">延迟</span><span class="meta-v mono">{{ detail.latency_ms ? Math.round(detail.latency_ms) + 'ms' : '-' }}</span></div>
           <div><span class="meta-k">Token</span><span class="meta-v mono">{{ detail.prompt_tokens || 0 }}/{{ detail.completion_tokens || 0 }}</span></div>
+          <div v-if="detail.cache_read_tokens || detail.cache_write_tokens"><span class="meta-k">缓存</span><span class="meta-v mono" style="color: var(--accent, #2b8aef);">读 {{ detail.cache_read_tokens || 0 }} / 写 {{ detail.cache_write_tokens || 0 }}</span></div>
           <div><span class="meta-k">回退</span><span class="meta-v mono">{{ detail.fallback_count || 0 }}</span></div>
           <div><span class="meta-k">用户IP</span><span class="meta-v mono">{{ detail.user_ip || '-' }}</span></div>
           <div v-if="detail.error_type" style="grid-column: 1 / -1;"><span class="meta-k">错误类型</span><span class="meta-v mono">{{ detail.error_type }}</span></div>
@@ -111,6 +115,7 @@
 
 <script>
 import api from '../api.js'
+import toast from '../toast.js'
 
 export default {
   name: 'LogsView',
@@ -139,7 +144,7 @@ export default {
         this.total = data.total || 0
         this.totalPages = data.total_pages || 1
       } catch (e) {
-        alert('加载日志失败: ' + e.message)
+        toast.error('加载日志失败: ' + e.message)
       }
     },
     fmtTime(ts) {
@@ -153,7 +158,7 @@ export default {
       try {
         this.detail = await api.getLogDetail(id)
       } catch (e) {
-        alert('加载日志详情失败: ' + e.message)
+        toast.error('加载日志详情失败: ' + e.message)
       } finally {
         this.loadingDetail = false
       }

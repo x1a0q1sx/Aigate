@@ -1,0 +1,106 @@
+name: 发布版本
+
+# 打标签即发版：git tag v6.1.0 && git push origin v6.1.0
+# 也可在 Actions 页面手动触发（workflow_dispatch）
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "版本号，例如 v6.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析版本号
+        run: |
+          VERSION="${{ github.event.inputs.tag }}"
+          if [ -z "$VERSION" ]; then VERSION="${GITHUB_REF_NAME}"; fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PKG=aigate-$VERSION" >> "$GITHUB_ENV"
+          echo "本次发布版本：$VERSION"
+
+      - name: 准备 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: 安装前端依赖
+        working-directory: client
+        run: npm ci
+
+      - name: 构建前端
+        working-directory: client
+        run: npm run build
+
+      - name: 组装发布包
+        run: |
+          set -e
+          mkdir -p "release/$PKG"
+          # 只导出 git 跟踪的文件——数据库、config.yaml、归档天然不在其中
+          git archive HEAD | tar -x -C "release/$PKG"
+          # 放入 CI 刚编译好的前端，用户无需安装 Node
+          mkdir -p "release/$PKG/client/dist"
+          cp -r client/dist/. "release/$PKG/client/dist/"
+          # 发布包不需要开发期脚本与 CI 配置
+          rm -rf "release/$PKG/.github" "release/$PKG/.githooks" \
+                 "release/$PKG/.build_providers_vue.py" "release/$PKG/tests"
+          # 空数据目录：首次启动自动建库并创建 3 个内置服务商
+          mkdir -p "release/$PKG/data"
+          touch "release/$PKG/data/.gitkeep"
+
+      - name: 安全校验（确保发布包不含任何数据或密钥）
+        run: |
+          set -e
+          cd "release/$PKG"
+          FOUND=0
+          for pat in "*.db" "*.db-wal" "*.db-shm" "*.sqlite" "config.yaml" "*.jsonl.gz" ".env"; do
+            HITS=$(find . -name "$pat" -not -path "./client/dist/*" || true)
+            if [ -n "$HITS" ]; then
+              echo "::error::发布包中发现敏感文件（$pat）：$HITS"
+              FOUND=1
+            fi
+          done
+          if [ ! -f config.example.yaml ]; then
+            echo "::error::缺少 config.example.yaml，用户将无从配置"
+            FOUND=1
+          fi
+          if [ ! -f client/dist/index.html ]; then
+            echo "::error::前端构建产物缺失，发布包不可用"
+            FOUND=1
+          fi
+          if [ "$FOUND" != "0" ]; then exit 1; fi
+          echo "✓ 安全校验通过：无数据库 / 无 config.yaml / 无归档 / 前端产物完整"
+
+      - name: 打包
+        run: |
+          cd release
+          zip -qr "$PKG.zip" "$PKG"
+          echo "--- 发布包大小 ---"
+          du -h "$PKG.zip"
+          echo "--- 顶层内容 ---"
+          unzip -l "$PKG.zip" | head -30
+
+      - name: 发布到 Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$VERSION" "release/$PKG.zip" \
+            --title "AIGate $VERSION" \
+            --notes-file .github/release-notes.md \
+            --generate-notes

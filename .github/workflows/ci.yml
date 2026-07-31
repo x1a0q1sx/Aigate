@@ -1,0 +1,52 @@
+name: 代码校验
+
+# 每次推送到 main 时自动检查：后端能否编译、前端能否构建、有没有误传敏感文件
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 敏感文件扫描
+        run: |
+          set -e
+          BAD=$(git ls-files | grep -E '\.(db|db-wal|db-shm|sqlite)$|^config\.yaml$|^data/|\.env$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::仓库中混入了不该提交的文件："
+            echo "$BAD"
+            exit 1
+          fi
+          echo "✓ 未发现数据库 / config.yaml / data 目录"
+
+      - name: 准备 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: 后端语法编译校验
+        run: |
+          python -m compileall -q server start.py scripts
+          echo "✓ 后端全部文件编译通过"
+
+      - name: 准备 Node 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: 前端构建校验
+        working-directory: client
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+          echo "✓ 前端构建通过"

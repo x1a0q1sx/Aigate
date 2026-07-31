@@ -207,6 +207,10 @@ class CodexResponsesAdapter(BaseAdapter):
             "User-Agent": "codex_cli_rs/0.136.0",
             "originator": "codex_cli_rs",
             "session_id": self._session_id(request),
+            # 模拟 Codex 官方客户端：部分上游（如 zzzcoding 公益站）按此头放行，
+            # 缺失则返回 403 "This account only allows Codex official clients"
+            "X-Codex-Client": "official",
+            "OpenAI-Beta": "responses=v1",
         }
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"
@@ -449,6 +453,9 @@ class CodexResponsesAdapter(BaseAdapter):
             "total_tokens": int(usage.get("total_tokens") or input_tokens + output_tokens),
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            # 透传缓存明细，供 v1_router 计费时提取缓存 token
+            "input_tokens_details": usage.get("input_tokens_details") or {},
+            "cache_creation_details": usage.get("cache_creation_details") or {},
         }
 
     async def chat_completion(
@@ -725,6 +732,9 @@ class CodexResponsesAdapter(BaseAdapter):
             "Accept": "application/json",
             "User-Agent": "codex_cli_rs/0.136.0",
             "originator": "codex_cli_rs",
+            # 模拟 Codex 官方客户端，部分上游按此头放行
+            "X-Codex-Client": "official",
+            "OpenAI-Beta": "responses=v1",
         }
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"

@@ -1,255 +1,315 @@
 <template>
-  <aside class="aigate-sidebar" :class="{ collapsed }" :data-theme="currentTheme">
+  <aside class="sidebar" :class="{ collapsed }">
     <div class="sidebar-brand">
-      <span class="brand-dot"></span>
-      <strong v-if="!collapsed">AIGate</strong>
-      <span v-if="!collapsed" class="brand-tag">网关</span>
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span v-if="!collapsed" class="brand-text">
+        <strong>AIGate</strong>
+        <span class="brand-tag">LLM 网关</span>
+      </span>
     </div>
 
-    <nav class="sidebar-nav">
+    <nav class="sidebar-nav" aria-label="主导航">
       <router-link
         v-for="r in routes"
         :key="r.path"
         :to="r.path"
-        class="sidebar-item"
-        :class="{ active: currentPath === r.path }"
-        :title="r.name"
+        class="nav-item"
+        :class="{ active: isActive(r.path) }"
+        :title="collapsed ? r.name : null"
       >
-        <span class="sidebar-icon" v-html="r.icon"></span>
-        <span v-if="!collapsed" class="sidebar-label">{{ r.name }}</span>
+        <AppIcon :name="r.icon" :size="17" />
+        <span v-if="!collapsed" class="nav-label">{{ r.name }}</span>
       </router-link>
     </nav>
 
-    <div class="sidebar-footer">
-      <span v-if="!collapsed" class="login-user">{{ username }}</span>
-      <button class="theme-toggle-btn" @click="handleLogout" title="退出登录">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/>
-          <polyline points="16 17 21 12 16 7"/>
-          <line x1="21" y1="12" x2="9" y2="12"/>
-        </svg>
-      </button>
-      <button class="theme-toggle-btn" @click="toggleTheme" :title="currentTheme === 'dark' ? '切换到白天模式' : '切换到夜晚模式'">
-        <svg v-if="currentTheme === 'dark'" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="5"/>
-          <line x1="12" y1="1" x2="12" y2="3"/>
-          <line x1="12" y1="21" x2="12" y2="23"/>
-          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>
-          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-          <line x1="1" y1="12" x2="3" y2="12"/>
-          <line x1="21" y1="12" x2="23" y2="12"/>
-          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>
-          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-        </svg>
-        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-        </svg>
-      </button>
-      <span v-if="!collapsed" class="version-tag">v1.0.0</span>
-      <button class="collapse-btn" @click="collapsed = !collapsed" :title="collapsed ? '展开' : '收起'">
-        <svg v-if="collapsed" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
-        <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="15 18 9 12 9 6" />
-        </svg>
-      </button>
+    <div class="sidebar-foot">
+      <div v-if="!collapsed" class="foot-user">
+        <span class="user-avatar" aria-hidden="true">{{ (username || 'A').charAt(0).toUpperCase() }}</span>
+        <span class="user-name">{{ username }}</span>
+        <span class="version-tag">v{{ version }}</span>
+      </div>
+      <div class="foot-actions">
+        <button
+          class="icon-btn"
+          type="button"
+          :title="currentTheme === 'dark' ? '切换到白天模式' : '切换到夜晚模式'"
+          :aria-label="currentTheme === 'dark' ? '切换到白天模式' : '切换到夜晚模式'"
+          @click="toggleTheme"
+        >
+          <AppIcon :name="currentTheme === 'dark' ? 'sun' : 'moon'" :size="15" />
+        </button>
+        <button class="icon-btn" type="button" title="退出登录" aria-label="退出登录" @click="handleLogout">
+          <AppIcon name="logout" :size="15" />
+        </button>
+        <button
+          class="icon-btn"
+          type="button"
+          :title="collapsed ? '展开侧边栏' : '收起侧边栏'"
+          :aria-label="collapsed ? '展开侧边栏' : '收起侧边栏'"
+          @click="toggleCollapse"
+        >
+          <AppIcon :name="collapsed ? 'chevronRight' : 'chevronLeft'" :size="15" />
+        </button>
+      </div>
     </div>
   </aside>
 </template>
 
 <script>
 import api from '../api.js'
+import AppIcon from './AppIcon.vue'
+
+const COLLAPSE_KEY = 'aigate:navCollapsed'
 
 export default {
   name: 'NavBar',
+  components: { AppIcon },
   emits: ['theme-changed'],
   data() {
     return {
-      collapsed: false,
+      collapsed: localStorage.getItem(COLLAPSE_KEY) === '1',
       currentTheme: localStorage.getItem('aigate-theme') || 'dark',
       username: localStorage.getItem('aigate_username') || 'admin',
+      version: '1.0.0',
       routes: [
-        { path: '/dashboard', name: '仪表盘', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>' },
-        { path: '/providers', name: '服务商', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="6" rx="2"/><rect x="2" y="15" width="20" height="6" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>' },
-        { path: '/models', name: '模型', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><line x1="6.5" y1="6.5" x2="10" y2="10"/><line x1="17.5" y1="6.5" x2="14" y2="10"/><line x1="6.5" y1="17.5" x2="10" y2="14"/><line x1="17.5" y1="17.5" x2="14" y2="14"/></svg>' },
-        { path: '/health', name: '健康', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>' },
-        { path: '/auto', name: 'Auto', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>' },
-        { path: '/token-saver', name: '省 Token', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h8l-1 8 11-14h-8l0-6z"/></svg>' },
-        { path: '/combos', name: '组合', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8h14M5 12h14M5 16h14"/><rect x="3" y="4" width="18" height="16" rx="2"/></svg>' },
-        { path: '/proxies', name: '代理池', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z"/></svg>' },
-        { path: '/media', name: '媒体', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>' },
-        { path: '/analytics', name: '分析', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>' },
-        { path: '/playground', name: 'Playground', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>' },
-      ]
-    }
-  },
-  computed: {
-    currentPath() {
-      return this.$route.path
+        { path: '/dashboard', name: '仪表盘', icon: 'dashboard' },
+        { path: '/providers', name: '服务商', icon: 'server' },
+        { path: '/models', name: '模型', icon: 'cpu' },
+        { path: '/health', name: '健康', icon: 'activity' },
+        { path: '/auto', name: 'Auto 选举', icon: 'scale' },
+        { path: '/token-saver', name: '省 Token', icon: 'zap' },
+        { path: '/combos', name: '组合路由', icon: 'layers' },
+        { path: '/proxies', name: '代理池', icon: 'globe' },
+        { path: '/media', name: '媒体', icon: 'image' },
+        { path: '/analytics', name: '分析', icon: 'chart' },
+        { path: '/playground', name: 'Playground', icon: 'message' },
+      ],
     }
   },
   methods: {
+    isActive(path) {
+      return this.$route.path === path || this.$route.path.startsWith(path + '/')
+    },
+    toggleCollapse() {
+      this.collapsed = !this.collapsed
+      localStorage.setItem(COLLAPSE_KEY, this.collapsed ? '1' : '0')
+    },
     toggleTheme() {
       this.currentTheme = this.currentTheme === 'dark' ? 'light' : 'dark'
       this.$emit('theme-changed', this.currentTheme)
     },
     async handleLogout() {
-      try { await api.logout() } catch (e) { /* ignore */ }
+      try {
+        await api.logout()
+      } catch (e) {
+        /* 服务端 session 可能已过期，本地照常清理 */
+      }
       localStorage.removeItem('aigate_session')
       localStorage.removeItem('aigate_username')
       window.location.href = '/login'
-    }
-  }
+    },
+  },
 }
 </script>
 
 <style scoped>
-.aigate-sidebar {
-  width: 220px;
-  background: var(--bg-elevated);
-  border-right: 1px solid var(--border-soft);
+.sidebar {
+  width: 216px;
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   position: sticky;
   top: 0;
   height: 100vh;
-  transition: width 0.25s ease, background 0.25s;
-  flex-shrink: 0;
+  background: var(--bg-surface);
+  border-right: 1px solid var(--border-soft);
+  transition: width var(--dur-slow) var(--ease-out);
 }
-.aigate-sidebar.collapsed {
-  width: 64px;
+.sidebar.collapsed {
+  width: 60px;
 }
+
+/* ── 品牌 ── */
 .sidebar-brand {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 20px 18px;
-  font-size: 17px;
-  border-bottom: 1px solid var(--border-soft);
+  gap: var(--space-3);
+  height: 56px;
+  padding: 0 var(--space-4);
   flex-shrink: 0;
+  border-bottom: 1px solid var(--border-soft);
   overflow: hidden;
 }
-.sidebar-brand .brand-dot {
+.brand-mark {
   width: 10px;
   height: 10px;
-  border-radius: 9999px;
-  background: linear-gradient(135deg, #3b82f6, #10b981);
   flex-shrink: 0;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(135deg, var(--primary), var(--success));
+  box-shadow: 0 0 0 3px var(--primary-soft);
 }
-.sidebar-brand strong {
-  color: var(--text-primary);
-  font-weight: 600;
+.brand-text {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  white-space: nowrap;
 }
-.sidebar-brand .brand-tag {
-  font-size: 12px;
+.brand-text strong {
+  font-size: var(--text-lg);
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+.brand-tag {
+  font-size: var(--text-xs);
   color: var(--text-dim);
-  font-weight: 400;
-  margin-left: 2px;
 }
+
+/* ── 导航 ── */
 .sidebar-nav {
   flex: 1;
-  padding: 8px;
+  padding: var(--space-2);
   overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-.sidebar-item {
+.nav-item {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 9px 12px;
-  margin-bottom: 2px;
-  text-decoration: none;
+  gap: var(--space-3);
+  height: 34px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
-  font-size: 14px;
+  font-size: var(--text-base);
   font-weight: 500;
-  border-radius: 8px;
-  transition: all 0.15s ease;
-  cursor: pointer;
+  text-decoration: none;
   white-space: nowrap;
   overflow: hidden;
+  position: relative;
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
 }
-.sidebar-item:hover {
+.sidebar.collapsed .nav-item {
+  justify-content: center;
+  padding: 0;
+}
+.nav-item:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+  text-decoration: none;
 }
-.sidebar-item.active {
-  background: rgba(59, 130, 246, 0.14);
-  color: #3b82f6;
+.nav-item.active {
+  background: var(--primary-soft);
+  color: var(--primary);
 }
-.sidebar-item.active .sidebar-icon :deep(svg) {
-  stroke: #3b82f6;
+.nav-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 2px;
+  height: 16px;
+  border-radius: 0 2px 2px 0;
+  background: var(--primary);
 }
-.sidebar-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.sidebar-icon :deep(svg) {
-  stroke: currentColor;
-}
-.sidebar-label {
+.nav-label {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.sidebar-footer {
+
+/* ── 底部 ── */
+.sidebar-foot {
+  flex-shrink: 0;
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.foot-user {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 14px;
-  border-top: 1px solid var(--border-soft);
+  gap: var(--space-2);
+  min-width: 0;
+}
+.user-avatar {
+  width: 22px;
+  height: 22px;
   flex-shrink: 0;
-  gap: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.user-name {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .version-tag {
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
   color: var(--text-dim);
-  font-family: ui-monospace, monospace;
 }
-.login-user {
-  font-size: 12px;
-  color: var(--text-dim);
-  max-width: 80px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.foot-actions {
+  display: flex;
+  gap: var(--space-1);
 }
-.theme-toggle-btn {
-  background: transparent;
-  border: 1px solid var(--border-medium);
-  color: var(--text-secondary);
-  border-radius: 6px;
-  padding: 4px;
-  cursor: pointer;
+.sidebar.collapsed .foot-actions {
+  flex-direction: column;
+  align-items: center;
+}
+.icon-btn {
+  flex: 1;
+  height: 28px;
+  min-width: 28px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: all 0.2s;
-}
-.theme-toggle-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-.collapse-btn {
   background: transparent;
-  border: 1px solid var(--border-medium);
-  color: var(--text-secondary);
-  border-radius: 6px;
-  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
   cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  transition: all 0.2s;
+  transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
 }
-.collapse-btn:hover {
+.icon-btn:hover {
   background: var(--bg-hover);
+  border-color: var(--border-medium);
   color: var(--text-primary);
 }
-@media (max-width: 768px) {
-  .aigate-sidebar {
-    position: fixed;
-    z-index: 1000;
+.sidebar.collapsed .icon-btn {
+  flex: none;
+  width: 30px;
+}
+
+@media (max-width: 900px) {
+  .sidebar {
+    width: 60px;
+  }
+  .sidebar .brand-text,
+  .sidebar .nav-label,
+  .sidebar .foot-user {
+    display: none;
+  }
+  .sidebar .nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+  .sidebar .foot-actions {
+    flex-direction: column;
+    align-items: center;
   }
 }
 </style>

@@ -106,7 +106,11 @@
                   <div class="transfer-group-body" v-show="!isGroupCollapsed(g)">
                     <div class="transfer-model" v-for="m in g.models" :key="m.id"
                          :class="{ 'is-sel': isSel(g.name, m.model_id) }"
-                         @click="toggle(g.name, m.model_id)">
+                         draggable="true"
+                         @click="toggle(g.name, m.model_id)"
+                         @dragstart="onPoolDragStart(g, m, $event)"
+                         @dragend="onDragEnd">
+                      <span class="drag-grip" title="拖到右侧已选栏">⠿</span>
                       <span class="transfer-model-name">{{ m.display_name || m.model_id }}</span>
                       <span class="transfer-model-meta" v-if="m.is_free || m.input_price || m.avg_latency_ms">
                         {{ m.is_free ? '免费' : '¥' + fmtPrice(m.input_price) }}<template v-if="m.avg_latency_ms"> · {{ Math.round(m.avg_latency_ms) }}ms</template>
@@ -120,23 +124,29 @@
             </div>
 
             <!-- 右：已选候选 -->
-            <div class="transfer-pane">
+            <div class="transfer-pane" :class="{ 'drag-target': dragFrom === 'pool' }">
               <div class="transfer-head">
                 <span class="transfer-sel-count">已选 · {{ form.model_ids.length }}</span>
                 <div class="transfer-actions">
-                  <button class="btn btn-outline btn-xs" @click="sortBy('name')" :disabled="form.model_ids.length < 2">按名称</button>
-                  <button class="btn btn-outline btn-xs" @click="sortBy('price')" :disabled="form.model_ids.length < 2">按价格</button>
-                  <button class="btn btn-outline btn-xs" @click="sortBy('latency')" :disabled="form.model_ids.length < 2">按延迟</button>
-                  <button class="btn btn-outline btn-xs" @click="clearSel" :disabled="!form.model_ids.length">清空</button>
+                  <select class="sort-select" v-model="sortPick" @change="onSortPick" :disabled="form.model_ids.length < 2">
+                    <option value="">排序…</option>
+                    <option value="model">按模型名</option>
+                    <option value="name">按名称</option>
+                    <option value="price">按价格</option>
+                    <option value="latency">按延迟</option>
+                  </select>
+                  <button class="btn btn-outline btn-xs clear-btn" @click="clearSel" :disabled="!form.model_ids.length">清空</button>
                 </div>
               </div>
-              <div class="transfer-list transfer-selected">
+              <div class="transfer-list transfer-selected"
+                   @dragover.prevent="onRightDragOver($event)"
+                   @drop="onRightContainerDrop($event)">
                 <div class="sel-item" v-for="(m, i) in form.model_ids" :key="i"
                      draggable="true"
                      @dragstart="onDragStart(i, $event)"
                      @dragenter.prevent="onDragOver(i, $event)"
                      @dragover.prevent="onDragOver(i, $event)"
-                     @drop="onDrop(i, $event)"
+                     @drop.stop="onSelItemDrop(i, $event)"
                      @dragend="onDragEnd"
                      :class="{ 'dragging': dragIndex === i, 'drag-over': dragOverIndex === i }">
                   <span class="sel-idx">{{ i + 1 }}</span>
@@ -166,6 +176,7 @@
 
 <script>
 import api from '../api.js'
+import toast from '../toast.js'
 export default {
   name: 'CombosView',
   data() {
@@ -181,8 +192,11 @@ export default {
       collapsedGroups: {},   // provider_id → true 表示收起（默认全部收起）
       dragIndex: null,
       dragOverIndex: null,
+      dragFrom: null,        // 'pool' 从左侧模型池拖出 / 'sel' 右侧已选栏内重排
+      dragModel: null,       // 从左侧拖出的模型 { provider, model_id }
       myTemplates: [],
       templatePick: '',
+      sortPick: '',
       form: {
         name: '',
         description: '',
@@ -245,7 +259,7 @@ export default {
         this.providers = providers || []
         this.models = models || []
       } catch (e) {
-        alert('加载失败: ' + e.message)
+        toast.error('加载失败: ' + e.message)
       }
     },
     loadMyTemplates() {
@@ -311,12 +325,12 @@ export default {
         }).map(toEntry)
       }
       list = list.filter(Boolean)
-      if (!list.length) { alert('没有匹配到可用模型'); return }
+      if (!list.length) { toast.warning('没有匹配到可用模型'); return }
       this.form.model_ids = list
     },
     saveTemplate() {
       const cleaned = this.form.model_ids.filter(m => m.provider && m.model_id)
-      if (!cleaned.length) { alert('请先选择至少一个模型再存为模板'); return }
+      if (!cleaned.length) { toast.warning('请先选择至少一个模型再存为模板'); return }
       const name = window.prompt('模板名称：')
       if (!name) return
       const trimmed = name.trim()
@@ -326,9 +340,9 @@ export default {
       try {
         localStorage.setItem('aigate_combo_templates', JSON.stringify(arr))
         this.myTemplates = arr
-        alert('已保存模板：' + trimmed)
+        toast.success('已保存模板：' + trimmed)
       } catch (e) {
-        alert('保存失败（浏览器存储不可用）：' + e.message)
+        toast.error('保存失败：' + e.message)
       }
     },
     onTemplatePick() {
@@ -362,7 +376,7 @@ export default {
     },
     // 分组是否收起：默认收起；搜索时自动全部展开，便于看到过滤结果
     isGroupCollapsed(g) {
-      if (this.searchQuery) return false
+      // 默认收起；尊重手动折叠状态。搜索时不再强制全部展开。
       return this.collapsedGroups[g.id] !== false
     },
     toggleCollapse(g) {
@@ -409,9 +423,18 @@ export default {
       const n = Number(p || 0)
       return n === 0 ? '0' : n.toFixed(2)
     },
+    onSortPick() {
+      if (!this.sortPick) return
+      this.sortBy(this.sortPick)
+      this.sortPick = ''   // 复位，允许重复选择同一排序
+    },
     sortBy(field) {
       const arr = this.form.model_ids.slice()
       arr.sort((a, b) => {
+        if (field === 'model') {
+          // 按模型名（忽略服务商前缀）
+          return a.model_id.toLowerCase().localeCompare(b.model_id.toLowerCase(), 'zh')
+        }
         if (field === 'name') {
           const ka = `${a.provider}::${a.model_id}`.toLowerCase()
           const kb = `${b.provider}::${b.model_id}`.toLowerCase()
@@ -419,9 +442,14 @@ export default {
         }
         const ma = this.selLookup[`${a.provider}::${a.model_id}`]
         const mb = this.selLookup[`${b.provider}::${b.model_id}`]
-        const va = ma && ma[field] != null ? ma[field] : Infinity
-        const vb = mb && mb[field] != null ? mb[field] : Infinity
-        return va - vb
+        // 字段映射：模型对象实际字段为 input_price / avg_latency_ms
+        const fkey = field === 'price' ? 'input_price' : field === 'latency' ? 'avg_latency_ms' : field
+        const pick = (mo) => {
+          if (!mo) return Infinity
+          if (fkey === 'input_price' && mo.is_free) return 0
+          return mo[fkey] != null ? Number(mo[fkey]) : Infinity
+        }
+        return pick(ma) - pick(mb)
       })
       this.form.model_ids = arr
     },
@@ -441,8 +469,19 @@ export default {
       if (i >= arr.length - 1) return
       const t = arr[i + 1]; arr[i + 1] = arr[i]; arr[i] = t
     },
-    // ── 拖拽排序 ──
+    // ── 拖拽 ──
+    // 从左侧模型池拖出：记录要加入的模型（copy 语义）
+    onPoolDragStart(g, m, e) {
+      this.dragFrom = 'pool'
+      this.dragModel = { provider: g.name, model_id: m.model_id }
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'copy'
+        try { e.dataTransfer.setData('text/plain', `${g.name}::${m.model_id}`) } catch (_) {}
+      }
+    },
+    // 右侧已选栏内：拖拽重排（move 语义）
     onDragStart(i, e) {
+      this.dragFrom = 'sel'
       this.dragIndex = i
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = 'move'
@@ -450,17 +489,44 @@ export default {
       }
     },
     onDragOver(i, e) {
-      if (this.dragIndex === null || this.dragIndex === i) return
+      if (this.dragFrom !== 'sel' || this.dragIndex === null || this.dragIndex === i) return
       this.dragOverIndex = i
     },
-    onDrop(i, e) {
+    onRightDragOver(e) {
+      if (!e.dataTransfer) return
+      e.dataTransfer.dropEffect = this.dragFrom === 'pool' ? 'copy' : 'move'
+    },
+    // 拖到具体已选项上：插入到该位置（pool 来源则新增，sel 来源则重排）
+    onSelItemDrop(i, e) {
+      e.stopPropagation()
+      if (this.dragFrom === 'pool' && this.dragModel) {
+        const key = `${this.dragModel.provider}::${this.dragModel.model_id}`
+        if (!this.selectedSet.has(key)) {
+          this.form.model_ids.splice(i, 0, { provider: this.dragModel.provider, model_id: this.dragModel.model_id })
+        }
+      } else if (this.dragFrom === 'sel' && this.dragIndex !== null) {
+        const from = this.dragIndex
+        if (from !== i) {
+          const arr = this.form.model_ids
+          const moved = arr.splice(from, 1)[0]
+          arr.splice(i, 0, moved)
+        }
+      }
+      this.resetDrag()
+    },
+    // 拖到右侧空白区域（容器）：pool 来源追加到末尾，sel 来源移到末尾
+    onRightContainerDrop(e) {
       if (e && e.preventDefault) e.preventDefault()
-      const from = this.dragIndex
-      const to = i
-      if (from === null || to === null || from === to) { this.resetDrag(); return }
-      const arr = this.form.model_ids
-      const moved = arr.splice(from, 1)[0]
-      arr.splice(to, 0, moved)
+      if (this.dragFrom === 'pool' && this.dragModel) {
+        const key = `${this.dragModel.provider}::${this.dragModel.model_id}`
+        if (!this.selectedSet.has(key)) {
+          this.form.model_ids.push({ provider: this.dragModel.provider, model_id: this.dragModel.model_id })
+        }
+      } else if (this.dragFrom === 'sel' && this.dragIndex !== null) {
+        const arr = this.form.model_ids
+        const moved = arr.splice(this.dragIndex, 1)[0]
+        arr.push(moved)
+      }
       this.resetDrag()
     },
     onDragEnd() {
@@ -469,6 +535,8 @@ export default {
     resetDrag() {
       this.dragIndex = null
       this.dragOverIndex = null
+      this.dragFrom = null
+      this.dragModel = null
     },
     openAddModal() {
       this.isEditing = false
@@ -493,9 +561,9 @@ export default {
       this.showModal = true
     },
     async saveCombo() {
-      if (!this.form.name.trim()) { alert('请填组合名'); return }
+      if (!this.form.name.trim()) { toast.error('请填组合名'); return }
       const cleaned = this.form.model_ids.filter(m => m.provider && m.model_id)
-      if (cleaned.length === 0) { alert('至少添加一个候选模型'); return }
+      if (cleaned.length === 0) { toast.error('至少添加一个候选模型'); return }
       this.saving = true
       try {
         const payload = {
@@ -514,7 +582,7 @@ export default {
         this.showModal = false
         await this.loadAll()
       } catch (e) {
-        alert('保存失败: ' + e.message)
+        toast.error('保存失败: ' + e.message)
       } finally {
         this.saving = false
       }
@@ -525,7 +593,7 @@ export default {
         await api.deleteCombo(c.id)
         await this.loadAll()
       } catch (e) {
-        alert('删除失败: ' + e.message)
+        toast.error('删除失败: ' + e.message)
       }
     }
   }
@@ -612,6 +680,11 @@ export default {
   background: var(--bg-input);
   display: flex; flex-direction: column;
   min-height: 380px;
+  max-height: 460px;   /* 单列独立滚动，互不撑开整体 */
+}
+.transfer-pane.drag-target {
+  outline: 2px dashed var(--accent, #4f8cff);
+  outline-offset: -2px;
 }
 .transfer-search {
   margin: 8px; padding: 7px 10px;
@@ -655,10 +728,15 @@ export default {
 .transfer-group-body { margin: 2px 0 4px; }
 .transfer-model {
   display: flex; align-items: center; gap: 6px;
-  padding: 5px 8px; border-radius: 6px; cursor: pointer;
+  padding: 5px 8px; border-radius: 6px; cursor: grab;
   font-size: 13px; color: var(--text-secondary);
 }
 .transfer-model:hover { background: var(--bg-code); color: var(--text-primary); }
+.transfer-model:active { cursor: grabbing; }
+.drag-grip {
+  color: var(--text-muted); font-size: 12px; flex-shrink: 0;
+  cursor: grab; line-height: 1; user-select: none;
+}
 .transfer-model.is-sel { background: var(--accent-soft, rgba(79,140,255,0.12)); color: var(--text-primary); }
 .transfer-model-name { flex: 1; font-family: ui-monospace, monospace; }
 .transfer-model-meta { font-size: 11px; color: var(--text-muted); }
@@ -666,11 +744,19 @@ export default {
 .transfer-empty { text-align: center; color: var(--text-muted); font-size: 13px; padding: 24px 0; }
 
 .transfer-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; gap: 8px;
   padding: 8px; border-bottom: 1px solid var(--border-soft);
 }
 .transfer-sel-count { font-size: 13px; font-weight: 500; color: var(--text-primary); }
-.transfer-actions { display: flex; gap: 6px; }
+.transfer-actions { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.clear-btn { padding: 2px 9px; font-size: 12px; }
+.sort-select {
+  padding: 2px 4px; font-size: 12px;
+  border: 1px solid var(--border-medium); border-radius: 6px;
+  background: var(--bg-input); color: var(--text-primary);
+  cursor: pointer; flex-shrink: 0; max-width: 104px;
+}
+.sort-select:disabled { opacity: 0.5; cursor: not-allowed; }
 .template-bar {
   display: flex; flex-wrap: nowrap; align-items: center; gap: 4px;
   margin-bottom: 10px; overflow-x: auto;

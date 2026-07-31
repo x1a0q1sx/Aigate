@@ -4,6 +4,7 @@
 v2.0: 支持 priority_boost + auto_excluded
 """
 import logging
+import asyncio
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -163,10 +164,13 @@ class ModelCatalog:
         self,
         session: AsyncSession,
         model_id: int,
+        display_name: Optional[str] = None,
         auto_enabled: Optional[bool] = None,
         enabled: Optional[bool] = None,
         input_price: Optional[float] = None,
         output_price: Optional[float] = None,
+        cache_read_input_price: Optional[float] = None,
+        cache_write_input_price: Optional[float] = None,
         success_rate: Optional[float] = None,
         is_free: Optional[bool] = None,
         priority_boost: Optional[int] = None,
@@ -177,6 +181,8 @@ class ModelCatalog:
         model = await self.get_by_id(session, model_id)
         if not model:
             return None
+        if display_name is not None:
+            model.display_name = display_name
         if auto_enabled is not None:
             model.auto_enabled = auto_enabled
         if enabled is not None:
@@ -185,6 +191,10 @@ class ModelCatalog:
             model.input_price = input_price
         if output_price is not None:
             model.output_price = output_price
+        if cache_read_input_price is not None:
+            model.cache_read_input_price = cache_read_input_price
+        if cache_write_input_price is not None:
+            model.cache_write_input_price = cache_write_input_price
         if success_rate is not None:
             model.success_rate = success_rate
         if is_free is not None:
@@ -294,16 +304,19 @@ class ModelCatalog:
             )).scalars().all()
             if not keys:
                 return {"error": "No active API key for this provider"}
-            for k in keys:
+            # 多 key 并发 list_models（缩短单服务商刷新耗时；纯网络 IO，无 DB 写）
+            async def _fetch_one(k):
                 ak = key_manager._crypto.decrypt(k.key_encrypted)
                 try:
-                    _m = await adapter.list_models(ak, provider.base_url, extra_headers)
+                    return k.id, await adapter.list_models(ak, provider.base_url, extra_headers)
                 except Exception as e:
                     logger.warning(f"list_models failed for key {k.id} of {provider.name}: {e}")
-                    _m = []
+                    return k.id, []
+            results = await asyncio.gather(*[_fetch_one(k) for k in keys]) if keys else []
+            for kid, _m in results:
                 if _m:
                     any_success = True
-                    key_models[k.id] = {mi.model_id for mi in _m}
+                    key_models[kid] = {mi.model_id for mi in _m}
                     for mi in _m:
                         all_model_infos.setdefault(mi.model_id, mi)
 
@@ -339,6 +352,8 @@ class ModelCatalog:
             if pricing:
                 model_info.input_price = pricing["input"]
                 model_info.output_price = pricing["output"]
+                model_info.cache_read_input_price = float(pricing.get("cache_read") or 0)
+                model_info.cache_write_input_price = float(pricing.get("cache_write") or 0)
                 model_info.is_free = pricing["is_free"]
                 pricing_updated += 1
             # 移除了 "auto-mark as free" 逻辑：当上游不返回定价时，不再自动标记免费
@@ -356,6 +371,8 @@ class ModelCatalog:
                 existing_model.display_name = model_info.display_name or existing_model.display_name
                 existing_model.input_price = model_info.input_price
                 existing_model.output_price = model_info.output_price
+                existing_model.cache_read_input_price = model_info.cache_read_input_price
+                existing_model.cache_write_input_price = model_info.cache_write_input_price
                 existing_model.is_free = model_info.is_free
                 existing_model.supports_streaming = model_info.supports_streaming
                 existing_model.supports_vision = model_info.supports_vision
@@ -373,6 +390,10 @@ class ModelCatalog:
                     existing_model.input_price = model_info.input_price
                 if existing_model.output_price == 0 and model_info.output_price > 0:
                     existing_model.output_price = model_info.output_price
+                if existing_model.cache_read_input_price == 0 and model_info.cache_read_input_price > 0:
+                    existing_model.cache_read_input_price = model_info.cache_read_input_price
+                if existing_model.cache_write_input_price == 0 and model_info.cache_write_input_price > 0:
+                    existing_model.cache_write_input_price = model_info.cache_write_input_price
                 if not existing_model.is_free and model_info.is_free:
                     existing_model.is_free = True
                     # 不再自动开启 auto；免费模型需用户手动参与选举
@@ -384,6 +405,8 @@ class ModelCatalog:
                     display_name=model_info.display_name or model_info.model_id,
                     input_price=model_info.input_price,
                     output_price=model_info.output_price,
+                    cache_read_input_price=model_info.cache_read_input_price,
+                    cache_write_input_price=model_info.cache_write_input_price,
                     success_rate=remote_metadata.get("success_rate") if remote_metadata else None,
                     avg_latency_ms=remote_metadata.get("avg_latency_ms") if remote_metadata else None,
                     avg_ttft_ms=remote_metadata.get("avg_ttft_ms") if remote_metadata else None,

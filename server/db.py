@@ -48,8 +48,8 @@ engine = create_async_engine(
         "check_same_thread": False,
         "timeout": 15,  # 等待锁的超时（秒），默认 5 秒对并发场景偏短
     },
-    pool_size=10,       # 连接池大小，适应多请求并发
-    max_overflow=5,     # 超出 pool_size 时可额外创建的数量
+    pool_size=20,      # 连接池大小，适应并发刷新+多请求并发
+    max_overflow=10,    # 超出 pool_size 时可额外创建的数量（并发刷新不饿死其它请求）
     pool_pre_ping=True, # 连接复用前检测有效性
 )
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -160,6 +160,11 @@ async def init_db():
             "DROP TABLE IF EXISTS quota_usage",
             # v8.1: 清理 rate_limits 历史重复行（并发创建导致 (model_id,key_id) 重复，会引发 MultipleResultsFound）
             "DELETE FROM rate_limits WHERE id NOT IN (SELECT MIN(id) FROM rate_limits GROUP BY model_id, key_id)",
+            # v10: 精细化计费 —— 模型缓存价 + 请求日志缓存 token
+            "ALTER TABLE models ADD COLUMN cache_read_input_price REAL DEFAULT 0.0",
+            "ALTER TABLE models ADD COLUMN cache_write_input_price REAL DEFAULT 0.0",
+            "ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER",
+            "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER",
         ]:
             try:
                 await conn.execute(text(sql))

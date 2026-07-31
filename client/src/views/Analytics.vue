@@ -38,9 +38,9 @@
         <div class="stat-number">{{ (summary.avg_latency_ms / 1000).toFixed(1) }}s</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">总请求数</div>
+        <div class="stat-label">成功请求</div>
         <div class="stat-number">{{ formatNum(summary.success_count) }}</div>
-        <div class="stat-sub">成功请求</div>
+        <div class="stat-sub">占总请求比</div>
       </div>
     </div>
 
@@ -373,6 +373,7 @@
 
 <script>
 import api from '../api.js'
+import toast from '../toast.js'
 
 function safeParseJSON(str) {
   if (!str) return null
@@ -591,10 +592,10 @@ export default {
     async toggleDiag() {
       try {
         await api.setDiag(this.diagVerbose)
-        this.$emit('toast', this.diagVerbose ? '请求诊断日志：已开启（全量输出）' : '请求诊断日志：已关闭（仅关键里程碑）')
+        toast.info(this.diagVerbose ? '请求诊断日志：已开启（全量输出）' : '请求诊断日志：已关闭（仅关键里程碑）')
       } catch (e) {
         this.diagVerbose = !this.diagVerbose  // 失败回滚
-        this.$emit('toast', '切换失败：' + e.message)
+        toast.error('切换失败：' + e.message)
       }
     },
     async loadSummary() {
@@ -662,7 +663,7 @@ export default {
         this.items = data.items || []
         this.total = data.total || 0
         this.totalPages = data.total_pages || 1
-      } catch (e) { alert('加载日志失败: ' + e.message) }
+      } catch (e) { toast.error('加载日志失败: ' + e.message) }
     },
     showDetail(r) {
       this.detailLoading = true
@@ -686,11 +687,11 @@ export default {
       this.archiveBusy = true
       try {
         const r = await api.triggerArchive()
-        alert(r.archived_count > 0 ? `成功归档 ${r.archived_count} 条记录 → ${r.filename}` : r.message || '暂无需要归档的日志')
+        toast.success(r.archived_count > 0 ? `成功归档 ${r.archived_count} 条记录 → ${r.filename}` : r.message || '暂无需要归档的日志')
         await this.loadArchives()
         await this.loadSummary()
         await this.loadPage(this.page)
-      } catch (e) { alert('归档失败: ' + e.message) }
+      } catch (e) { toast.error('归档失败: ' + e.message) }
       finally { this.archiveBusy = false }
     },
     async doRestore(a) {
@@ -698,11 +699,11 @@ export default {
       this.archiveBusy = true
       try {
         const r = await api.restoreArchive(a.filename)
-        alert(r.message || '恢复完成')
+        toast.success(r.message || '恢复完成')
         await this.loadArchives()
         await this.loadSummary()
         await this.loadPage(this.page)
-      } catch (e) { alert('恢复失败: ' + e.message) }
+      } catch (e) { toast.error('恢复失败: ' + e.message) }
       finally { this.archiveBusy = false }
     },
     async doDeleteArchive(a) {
@@ -711,8 +712,8 @@ export default {
       try {
         await api.deleteArchive(a.filename)
         await this.loadArchives()
-        alert('归档文件已删除')
-      } catch (e) { alert('删除失败: ' + e.message) }
+        toast.success('归档文件已删除')
+      } catch (e) { toast.error('删除失败: ' + e.message) }
       finally { this.archiveBusy = false }
     },
     async doClearLogs() {
@@ -721,10 +722,10 @@ export default {
       this.archiveBusy = true
       try {
         const r = await api.clearLogs()
-        alert(r.message || '日志已清空')
+        toast.success(r.message || '日志已清空')
         await this.loadSummary()
         await this.loadPage(1)
-      } catch (e) { alert('清空失败: ' + e.message) }
+      } catch (e) { toast.error('清空失败: ' + e.message) }
       finally { this.archiveBusy = false }
     },
 

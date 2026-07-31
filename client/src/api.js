@@ -85,6 +85,19 @@ export default {
   createProvider: (data) => apiPost('/admin/api/providers', data),
   updateProvider: (id, data) => apiPut(`/admin/api/providers/${id}`, data),
   deleteProvider: (id) => apiDelete(`/admin/api/providers/${id}`),
+  // 一键备份 / 恢复（全系统）
+  fullBackup: () => apiGet('/admin/api/backup'),
+  fullRestore: (data) => apiPost('/admin/api/restore', data),
+  // 服务商配置导入 / 导出
+  exportProviders: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.include_keys) qs.append('include_keys', 'true')
+    if (params.provider_ids) qs.append('provider_ids', params.provider_ids)
+    return apiGet(`/admin/api/providers/export?${qs.toString()}`)
+  },
+  importProviders: (data) => apiPost('/admin/api/providers/import', data),
+  // 服务商定价导入（newapi / one-api 的 /api/pricing JSON）
+  importProviderPricing: (id, jsonData) => apiPost(`/admin/api/providers/${id}/import-pricing`, { json_data: jsonData }),
   // AtomCode 直连反代：从默认路径 ~/.atomcode/auth.toml 解析鉴权 JSON
   loadAtomAuth: () => apiPost('/admin/api/atomcode/load-auth', {}),
   // AtomCode 本地 daemon 可执行文件：状态查询与 UI 配置

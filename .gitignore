@@ -1,9 +1,18 @@
-# Data (contains encrypted keys and user data)
-data/*.db
-data/*.db-shm
-data/*.db-wal
-data/*.sqlite
+# Data —— 整个目录屏蔽（数据库 / WAL / 归档 / 备份 / 子目录一律不上传）
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
 .atomcode/
+
+# 各类备份与临时产物
+*.bak
+*.bak-*
+*.old-*
+_v1_v2_diff.txt
+*.orig
+*.rej
 
 # Python
 __pycache__/
@@ -34,9 +43,6 @@ Thumbs.db
 # Config (ignore real config with secrets; ship config.example.yaml instead)
 config.local.yaml
 config.yaml
-
-# Log archives
-data/archives/
 
 # Logs
 *.log

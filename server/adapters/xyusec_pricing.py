@@ -66,6 +66,39 @@ def _first(record: dict, *keys: str) -> Any:
     return None
 
 
+# 缓存价常见字段名（New API / one-api 各 fork 命名不一，尽量兼容）
+_CACHE_READ_KEYS = (
+    "cache_read_input_price", "cacheReadInputPrice", "cache_read_input_token_price",
+    "inputCachedPrice", "cache_read_price", "cacheReadPrice", "cache_read_input_cost",
+)
+_CACHE_WRITE_KEYS = (
+    "cache_write_input_price", "cacheWriteInputPrice", "cache_write_input_token_price",
+    "cache_write_price", "cacheWritePrice", "cache_creation_input_price",
+    "cacheCreationInputPrice", "cache_write_input_cost",
+)
+_CACHE_READ_RATIO_KEYS = ("cache_read_ratio", "cacheReadRatio", "cache_read_input_ratio", "cache_ratio")
+_CACHE_WRITE_RATIO_KEYS = ("cache_write_ratio", "cacheWriteRatio", "cache_creation_ratio", "cacheCreationRatio", "create_cache_ratio")
+
+
+def _extract_cache_prices(record: dict, in_price: Optional[float]) -> tuple:
+    """从定价记录抽取缓存读/写价（每百万 token 美元）。
+
+    优先取绝对价格字段；缺失时退化为 ratio（相对 input 价的乘数，New API 语义）
+    乘 input 价。返回 (cache_read, cache_write)，任一为 None 表示未提供。
+    """
+    read = _to_float(_first(record, *_CACHE_READ_KEYS))
+    write = _to_float(_first(record, *_CACHE_WRITE_KEYS))
+    if read is None:
+        r = _to_float(_first(record, *_CACHE_READ_RATIO_KEYS))
+        if r is not None and in_price:
+            read = round(in_price * r, 6)
+    if write is None:
+        w = _to_float(_first(record, *_CACHE_WRITE_RATIO_KEYS))
+        if w is not None and in_price:
+            write = round(in_price * w, 6)
+    return read, write
+
+
 def _merge_record(target: Dict[str, dict], model_key: str, values: dict) -> None:
     current = target.setdefault(model_key, {})
     for key, value in values.items():
@@ -100,9 +133,12 @@ def _extract_pricing_from_json(data: Any) -> Dict[str, dict]:
             out_price = in_price * completion_multiplier
         if not model_key or in_price is None or out_price is None:
             continue
+        cache_read, cache_write = _extract_cache_prices(record, in_price)
         _merge_record(pricing, model_key, {
             "input": in_price,
             "output": out_price,
+            "cache_read": cache_read,
+            "cache_write": cache_write,
             "is_free": in_price == 0 and out_price == 0,
         })
     return pricing

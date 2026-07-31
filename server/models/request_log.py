@@ -37,6 +37,8 @@ class RequestLog(Base):
     latency_ms = Column(Integer, nullable=True)
     prompt_tokens = Column(Integer, nullable=True)
     completion_tokens = Column(Integer, nullable=True)
+    cache_read_tokens = Column(Integer, nullable=True)   # 缓存命中（读）token 数
+    cache_write_tokens = Column(Integer, nullable=True)  # 缓存创建（写）token 数
     error_type = Column(String(50), nullable=True)
     error_msg = Column(Text, nullable=True)
     fallback_count = Column(Integer, nullable=False, default=0)
