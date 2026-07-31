@@ -955,9 +955,11 @@ async def list_models(
     is_free: Optional[bool] = None,
     auto_enabled: Optional[bool] = None,
     q: Optional[str] = None,
+    limit: int = 0,
+    offset: int = 0,
     db: AsyncSession = Depends(get_db)
 ):
-    """列出模型，附带最新延迟信息"""
+    """列出模型，附带最新延迟信息；limit>0 时分页返回（offset 起 limit 条）"""
     from server.main import get_health_checker
     hc = get_health_checker()
     from server.models.provider import Provider as ProvModel
@@ -991,6 +993,8 @@ async def list_models(
             if cd and datetime.now(timezone.utc).replace(tzinfo=None) < cd:
                 item.cooldown_until = cd.isoformat() + "Z"
         result.append(item)
+    if limit and limit > 0:
+        result = result[offset:offset + limit]
     return result
 @router.put("/models/{model_id}")
 async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depends(get_db)):

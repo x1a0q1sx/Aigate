@@ -116,6 +116,8 @@ export default {
     if (params && params.is_free !== null && params.is_free !== undefined) qs.append('is_free', params.is_free)
     if (params && params.auto_enabled !== null && params.auto_enabled !== undefined) qs.append('auto_enabled', params.auto_enabled)
     if (params && params.q) qs.append('q', params.q)
+    if (params && params.limit) qs.append('limit', params.limit)
+    if (params && params.offset) qs.append('offset', params.offset)
     return apiGet(`/admin/api/models?${qs.toString()}`)
   },
   updateModel: (id, data) => apiPut(`/admin/api/models/${id}`, data),

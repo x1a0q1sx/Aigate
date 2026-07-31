@@ -56,7 +56,7 @@
 
     <!-- 模型表格 -->
     <div class="card">
-      <div class="table-wrap">
+      <div class="table-wrap" ref="scrollWrap" @scroll="onScroll">
         <table>
           <thead>
             <tr>
@@ -164,6 +164,13 @@
             </tr>
           </tbody>
         </table>
+      </div>
+      <div class="models-footer">
+        <span class="text-sm text-muted">已加载 <b class="tabular">{{ models.length }}</b> 条</span>
+        <button v-if="hasMore" class="btn btn-outline btn-sm" @click="loadMore" :disabled="loadingMore">
+          <AppIcon name="chevronDown" :size="12" />{{ loadingMore ? '加载中...' : '加载更多' }}
+        </button>
+        <span v-else class="text-sm text-muted">已加载全部</span>
       </div>
     </div>
 
@@ -316,6 +323,11 @@ export default {
       addModelForm: { provider_id: null, model_id: '', display_name: '', input_price: 0, output_price: 0, cache_read_input_price: 0, cache_write_input_price: 0 },
       showRefreshModal: false,
       refreshResult: null,
+      // 分页 / 无限滚动
+      limit: 100,
+      offset: 0,
+      hasMore: true,
+      loadingMore: false,
     }
   },
   computed: {
@@ -374,17 +386,57 @@ export default {
     async load() {
       try {
         this.providers = await api.getProviders()
-        const params = {}
-        if (this.filterProvider) params.provider_id = this.filterProvider
-        if (this.filterAuto) params.auto_enabled = true
-        if (this.searchQuery) params.q = this.searchQuery
+        const params = this._buildParams(0)
         const loadedModels = await api.getModels(params)
-        this.models = this.filterFree ? (loadedModels || []).filter((m) => m.is_free) : loadedModels || []
-        this.models.forEach((m) => {
+        const arr = loadedModels || []
+        arr.forEach((m) => {
           if (m._pinging === undefined) m._pinging = false
+        })
+        this.models = arr
+        this.offset = 0
+        this.hasMore = arr.length >= this.limit
+        this.$nextTick(() => {
+          const el = this.$refs.scrollWrap
+          if (el) el.scrollTop = 0
         })
       } catch (e) {
         toast.error('加载失败: ' + e.message)
+      }
+    },
+    _buildParams(offset) {
+      const params = { limit: this.limit, offset }
+      if (this.filterProvider) params.provider_id = this.filterProvider
+      if (this.filterFree) params.is_free = true
+      if (this.filterAuto) params.auto_enabled = true
+      if (this.searchQuery) params.q = this.searchQuery
+      return params
+    },
+    async loadMore() {
+      if (this.loadingMore || !this.hasMore) return
+      this.loadingMore = true
+      try {
+        const nextOffset = this.offset + this.limit
+        const arr = (await api.getModels(this._buildParams(nextOffset))) || []
+        arr.forEach((m) => {
+          if (m._pinging === undefined) m._pinging = false
+        })
+        if (arr.length === 0) {
+          this.hasMore = false
+          return
+        }
+        this.models = this.models.concat(arr)
+        this.offset = nextOffset
+        if (arr.length < this.limit) this.hasMore = false
+      } catch (e) {
+        toast.error('加载更多失败: ' + e.message)
+      } finally {
+        this.loadingMore = false
+      }
+    },
+    onScroll(e) {
+      const el = e.target
+      if (el.scrollTop + el.clientHeight >= el.scrollHeight - 140) {
+        this.loadMore()
       }
     },
     clearSearch() {
@@ -651,10 +703,25 @@ export default {
 
 /* 表格 */
 .table-wrap {
-  overflow-x: auto;
+  overflow: auto;
+  max-height: calc(100vh - 300px);
+}
+.table-wrap thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface-2);
 }
 .row-disabled {
   opacity: 0.45;
+}
+.models-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-base);
 }
 .sortable {
   cursor: pointer;
