@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from server.db import AsyncSessionLocal
 from server.config import get_config, save_config
-from server.core.proxy_pool import get_proxy_pool
+from server.core.proxy_pool import get_proxy_pool, CURRENT_PROXY_URL
 from server.models.provider import Provider
 from server.models.api_key import ApiKey
 from server.models.model import Model
@@ -151,6 +151,11 @@ async def _write_media_log(
     if rb and len(rb) > 8_000_000:
         rb = _json.dumps({"type": media_type + "_generation", "model": model,
                           "count": 0, "note": "内容过大已省略存储"}, ensure_ascii=False)
+    # 如实记录本次线请求是否走了代理：媒体适配器统一经代理池 request_with_fallback，
+    # 代理池在发请求前把实际使用的代理 URL 写入 ContextVar，这里读取即可，
+    # 避免日志里所有媒体请求都误显示「直连」（之前的 bug）
+    _pu = CURRENT_PROXY_URL.get()
+    _used_proxy = bool(_pu)
     async with AsyncSessionLocal() as log_db:
         await write_log(log_db,
             media_type=media_type,
@@ -162,6 +167,8 @@ async def _write_media_log(
             error_msg=error_msg[:2000] if error_msg else None,
             request_body=_json.dumps({"prompt": prompt[:500]}, ensure_ascii=False),
             response_body=rb,
+            used_proxy=_used_proxy,
+            proxy_url=_pu if _used_proxy else None,
             fallback_count=0,
             prompt_tokens=0,
             completion_tokens=0,

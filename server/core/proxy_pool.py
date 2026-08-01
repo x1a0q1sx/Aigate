@@ -124,6 +124,9 @@ class ProxyPool:
         for attempt in range(max_attempts):
             proxy_kwargs = self.proxied_kwargs()
             pu = proxy_kwargs.get("proxy")
+            # 记录本次线请求实际使用的代理（供日志落库 used_proxy 判定，
+            # 即便随后因传输层错误换代理重试，最后一次成功的值也会留在这里）
+            CURRENT_PROXY_URL.set(pu)
             try:
                 async with httpx.AsyncClient(timeout=timeout, **proxy_kwargs) as client:
                     return await client.request(method, url, **kwargs)

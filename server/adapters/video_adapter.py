@@ -19,7 +19,7 @@ import httpx
 from typing import Optional, List
 from dataclasses import dataclass, field
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
-from server.core.proxy_pool import get_proxy_pool
+from server.core.proxy_pool import get_proxy_pool, CURRENT_PROXY_URL
 
 logger = logging.getLogger(__name__)
 
@@ -368,7 +368,9 @@ class VideoAdapter(BaseAdapter):
             await asyncio.sleep(poll_interval)
             try:
                 # 每次轮询都用新的代理（代理池会自动避开死/抖动代理），避免单代理连接中断导致整轮轮询失败
-                async with httpx.AsyncClient(timeout=self.timeout, **pool.proxied_kwargs()) as client:
+                _pk = pool.proxied_kwargs()
+                CURRENT_PROXY_URL.set(_pk.get("proxy"))
+                async with httpx.AsyncClient(timeout=self.timeout, **_pk) as client:
                     resp = await client.get(result_url, headers=headers)
                 if resp.status_code >= 400:
                     continue
@@ -431,7 +433,7 @@ class VideoAdapter(BaseAdapter):
         try:
             url = self._build_url(base_url, "/videos")
             headers = self._get_headers(api_key, extra_headers)
-            from server.core.proxy_pool import get_proxy_pool
+            from server.core.proxy_pool import get_proxy_pool, CURRENT_PROXY_URL
             async with httpx.AsyncClient(timeout=timeout, **get_proxy_pool().proxied_kwargs()) as client:
                 resp = await client.get(url.replace("/videos", "/models"), headers=headers)
                 if resp.status_code < 400:
