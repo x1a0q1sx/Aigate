@@ -59,7 +59,7 @@ jobs:
           cp -r client/dist/. "release/$PKG/client/dist/"
           # 发布包不需要开发期脚本与 CI 配置
           rm -rf "release/$PKG/.github" "release/$PKG/.githooks" \
-                 "release/$PKG/.build_providers_vue.py" "release/$PKG/tests"
+                 "release/$PKG/tests"
           # 空数据目录：首次启动自动建库并创建 3 个内置服务商
           mkdir -p "release/$PKG/data"
           touch "release/$PKG/data/.gitkeep"

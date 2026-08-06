@@ -42,10 +42,42 @@ Thumbs.db
 
 # Config (ignore real config with secrets; ship config.example.yaml instead)
 config.local.yaml
+config.local.*
 config.yaml
+
+# 环境变量文件（可能包含密钥，一律不提交）
+.env
+.env.*
+!.env.example
+
+# 密钥 / 证书 / 凭据文件
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+service_account*.json
+credentials*.json
+
+# 运行时本地配置（atomcode daemon 可执行文件路径等，含本机绝对路径）
+data/atomcode_config.json
 
 # Logs
 *.log
+*.jsonl
+*.jsonl.gz
+
+# 临时 / 一次性产物
+*.tmp
+*.temp
+*.part
+*.~
+*.swp
+*.swo
+*~
+aigate-*.zip
 
 # Test
 .pytest_cache/

@@ -15,3 +15,20 @@
 *.db binary
 *.db-shm binary
 *.db-wal binary
+
+# ── 归档保护（git archive / git bundle / 发布打包时排除敏感与运行时文件）──
+# 即使被意外加入 git 跟踪，以下文件也不会进入 Release 压缩包（release.yml 用 git archive）
+config.yaml export-ignore
+config.local.yaml export-ignore
+config.local.* export-ignore
+.env export-ignore
+.env.* export-ignore
+data/ export-ignore
+*.db export-ignore
+*.db-shm export-ignore
+*.db-wal export-ignore
+*.sqlite export-ignore
+*.log export-ignore
+*.jsonl.gz export-ignore
+*.pem export-ignore
+*.key export-ignore

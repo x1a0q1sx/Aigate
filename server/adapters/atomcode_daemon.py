@@ -122,8 +122,6 @@ def _candidate_exes() -> List[str]:
     la = os.environ.get("LOCALAPPDATA")
     if la:
         cands.append(os.path.join(la, "AtomCode", "atomcode.exe"))
-    # 本机已知的开发/逆向目录（用户在此放了 v4.26.0 可执行文件）
-    cands.append(r"D:\300_Study\340_AI\atomcode\atomcode-v4.26.0-windows-x64.exe")
     # 去重并仅保留真实存在的
     seen = set()
     out: List[str] = []

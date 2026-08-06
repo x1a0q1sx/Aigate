@@ -18,13 +18,23 @@ jobs:
       - name: 敏感文件扫描
         run: |
           set -e
-          BAD=$(git ls-files | grep -E '\.(db|db-wal|db-shm|sqlite)$|^config\.yaml$|^data/|\.env$' || true)
+          BAD=$(git ls-files | grep -E '\.(db|db-wal|db-shm|sqlite)$|^config\.yaml$|^config\.local\.yaml$|^data/|\.env(\.|$)|\.jsonl(\.gz)?$|\.pem$|\.key$|\.p12$|\.pfx$|\.jks$' || true)
           if [ -n "$BAD" ]; then
             echo "::error::仓库中混入了不该提交的文件："
             echo "$BAD"
             exit 1
           fi
-          echo "✓ 未发现数据库 / config.yaml / data 目录"
+          echo "✓ 未发现数据库 / config.yaml / .env / data 目录"
+      - name: 敏感内容扫描（密钥 / OAuth client_id / 本机路径）
+        run: |
+          set -e
+          LEAK=$(git grep -n -I -E 'app_[A-Za-z0-9]{20,}|Iv1\.[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|encryption_key:[[:space:]]*[A-Za-z0-9+/=_-]{16,}|[A-Za-z]:\\|/Users/[A-Za-z]|/home/[A-Za-z]' -- ':!*.md' ':!docs/**' || true)
+          if [ -n "$LEAK" ]; then
+            echo "::error::仓库内容中疑似包含密钥 / OAuth client_id / 本机绝对路径："
+            echo "$LEAK" | head -30
+            exit 1
+          fi
+          echo "✓ 未发现明文密钥 / OAuth client_id / 本机绝对路径"
 
       - name: 准备 Python 环境
         uses: actions/setup-python@v5

@@ -1,9 +1,13 @@
 """
 OAuth 供应商注册表
-复用 9Router 的 OAuth App 注册：每个 provider 的 client_id / token_endpoint / refresh 提前置都 hardcode
-（即 AIGate 充当 9Router 同一个 OAuth App 的 client；refresh_token 续约走标准 OAuth2 grant_type=refresh_token）
+每个 provider 的 client_id / token_endpoint / refresh 提前置都在这里注册
+（refresh_token 续约走标准 OAuth2 grant_type=refresh_token）。
 
-提前置时长取自 9Router 各 executor 的实际行为：
+安全说明：本文件不再硬编码任何真实 OAuth client_id —— 真实 client_id
+通过环境变量注入（格式：AIGATE_OAUTH_<CODE>_CLIENT_ID，CODE 为 provider
+code 的大写），未配置时使用占位符。这样仓库可以在公开环境下安全分发。
+
+提前置时长参考各 executor 的实际行为：
   - Codex        → 5 天前置刷新
   - Antigravity  → 5 分钟前置刷新
   - Claude Code  → 接近到期才刷
@@ -12,7 +16,7 @@ OAuth 供应商注册表
 
 AIGate 端字段说明：
   code         = provider_name（用作会话标识）
-  client_id    = OAuth App Client ID
+  client_id    = OAuth App Client ID（环境变量注入，见 _env_client_id）
   client_secret= OAuth App Secret（可空，PKCE 时不用）
   authorize_url= 跳浏览器授权的 URL（用户在该 URL 上登录后回调）
   token_url    = AIGate 拿 code 换 token 的 URL
@@ -22,6 +26,7 @@ AIGate 端字段说明：
   refresh_lead_seconds = access_token 到期前多久自动刷新（提前置）
 """
 from __future__ import annotations
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -48,12 +53,22 @@ class OAuthProviderConfig:
 _DEFAULT_REDIRECT = "http://localhost:8000/admin/oauth/callback"
 
 
+def _env_client_id(code: str, placeholder: str = "CHANGE_ME") -> str:
+    """从环境变量读取该 provider 的 OAuth client_id，避免真实凭据硬编码入库。
+
+    环境变量格式：AIGATE_OAUTH_<CODE>_CLIENT_ID（CODE 为 provider code 大写，
+    如 AIGATE_OAUTH_CODEX_CLIENT_ID）。未配置时返回占位符，运行时需自行注入
+    真实值，否则 OAuth 授权流程将无法通过。
+    """
+    return os.environ.get(f"AIGATE_OAUTH_{code.upper()}_CLIENT_ID", "") or placeholder
+
+
 _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     # ── Claude Code (Pro/Max 订阅) ──
     "claude_code": OAuthProviderConfig(
         code="claude_code",
         name="Claude Code (Pro/Max)",
-        client_id="9d1f8e2c-4a7b-4d3e-9f5a-1b2c3d4e5f6a",
+        client_id=_env_client_id("claude_code"),
         client_secret="",
         authorize_url="https://claude.ai/oauth/authorize",
         token_url="https://console.anthropic.com/v1/oauth/token",
@@ -69,7 +84,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "codex": OAuthProviderConfig(
         code="codex",
         name="OpenAI Codex (Plus/Pro)",
-        client_id="app_EMoamEEZ3f4c8Qr9f3fZ34f5a6789012",
+        client_id=_env_client_id("codex"),
         client_secret="",
         authorize_url="https://auth.openai.com/oauth/authorize",
         token_url="https://auth.openai.com/oauth/token",
@@ -85,8 +100,8 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "github_copilot": OAuthProviderConfig(
         code="github_copilot",
         name="GitHub Copilot",
-        # GitHub OAuth App — 公开 client_id（sourcecopilot），无 secret（PKCE 模式）
-        client_id="Iv1.b507a08cefb6f0c8",
+        # GitHub OAuth App — 无 secret（PKCE 模式），client_id 经环境变量注入
+        client_id=_env_client_id("github_copilot"),
         client_secret="",
         authorize_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
@@ -102,7 +117,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "antigravity": OAuthProviderConfig(
         code="antigravity",
         name="Antigravity (Google)",
-        client_id="antigravity-client-7a8b9c0d",
+        client_id=_env_client_id("antigravity"),
         client_secret="",
         authorize_url="https://antigravity.google.com/oauth/authorize",
         token_url="https://antigravity.google.com/oauth/token",
@@ -118,7 +133,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "cursor": OAuthProviderConfig(
         code="cursor",
         name="Cursor IDE",
-        client_id="cursor-ide-client-1234567890",
+        client_id=_env_client_id("cursor"),
         client_secret="",
         authorize_url="https://www.cursor.com/oauth/authorize",
         token_url="https://www.cursor.com/oauth/token",
@@ -134,7 +149,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "qoder": OAuthProviderConfig(
         code="qoder",
         name="Qoder (device_code)",
-        client_id="qoder-device-client",
+        client_id=_env_client_id("qoder"),
         client_secret="",
         authorize_url="",                    # Qoder 走 device_code flow，无浏览器授权 URL
         token_url="https://api.qoder.com/oauth/device_token",
@@ -175,7 +190,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     "kimchi": OAuthProviderConfig(
         code="kimchi",
         name="Kimchi (browser-token)",
-        client_id="kimchi-browser-client",
+        client_id=_env_client_id("kimchi"),
         client_secret="",
         authorize_url="https://kimchi.ai/oauth/authorize",
         token_url="https://kimchi.ai/oauth/token",

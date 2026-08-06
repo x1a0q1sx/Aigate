@@ -145,10 +145,11 @@ def ensure_encryption_key(config: Config, config_path: str) -> Config:
         import secrets
         config.security.aigate_api_key = "ak-" + secrets.token_urlsafe(32)
         changed = True
-    # 首次启动自动生成管理面板默认密码
+    # 首次启动自动生成管理面板默认密码。
+    # 可用环境变量 AIGATE_DEFAULT_PASSWORD 指定初始密码；未设置时才回退到内置默认值。
     if config.auth.enabled and not config.auth.password_hash:
         import bcrypt
-        default_password = "aigate123"
+        default_password = os.environ.get("AIGATE_DEFAULT_PASSWORD", "aigate123")
         config.auth.password_hash = bcrypt.hashpw(
             default_password.encode(), bcrypt.gensalt()
         ).decode()
@@ -161,8 +162,7 @@ def ensure_encryption_key(config: Config, config_path: str) -> Config:
         with open(path, "w", encoding="utf-8") as f:
             yaml.dump(config.model_dump(), f, default_flow_style=False, allow_unicode=True)
         print(f"\n⚠️  首次启动：已生成新的安全配置，请备份 {config_path} 到安全位置！")
-        print(f"   加密密钥: {config.security.encryption_key}")
-        print(f"   AIGate 访问密钥: {config.security.aigate_api_key}\n")
+        print(f"   加密密钥与 AIGate 访问密钥已写入 {config_path}，请勿外泄。\n")
     return config
 # 全局配置实例
 _config: Optional[Config] = None
