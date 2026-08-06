@@ -13,7 +13,7 @@ jobs:
 
     steps:
       - name: 检出源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 敏感文件扫描
         run: |

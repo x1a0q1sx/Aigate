@@ -451,12 +451,12 @@
       </p>
       <ol class="text-sm text-secondary" style="margin: var(--space-3) 0 var(--space-3) var(--space-5); line-height: 1.8">
         <li>从 <a href="https://atomgit.com" target="_blank" rel="noopener">AtomGit 官网</a> 下载并安装「AtomCode / AtomGit 桌面客户端」。</li>
-        <li>记下它的安装目录（例如 <code>C:\Users\你\AppData\Local\AtomCode</code> 或你自定义的路径）。</li>
+        <li>记下它的安装目录（例如 <code>AppData\Local\AtomCode</code> 或你自定义的路径）。</li>
         <li>把该目录（或目录里的 <code>atomcode.exe</code>）粘贴到下方，点击保存。AIGate 会自动拉起守护进程并验证。</li>
       </ol>
       <div class="form-group">
         <label class="form-label">安装目录 或 exe 路径 *</label>
-        <input v-model="atomExePath" placeholder="例如 C:\Users\你\AppData\Local\AtomCode 或 D:\atomcode\atomcode.exe" />
+        <input v-model="atomExePath" placeholder="例如 AppData\Local\AtomCode 或 atomcode\atomcode.exe" />
       </div>
       <p v-if="atomExeStatus.configured_path && atomExeStatus.configured_path !== atomExePath" class="text-xs text-muted">
         当前已保存路径：<code>{{ atomExeStatus.configured_path }}</code>
