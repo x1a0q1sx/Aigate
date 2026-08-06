@@ -80,6 +80,10 @@ export default {
   logout: () => apiPost('/admin/api/auth/logout', {}),
   checkAuth: () => apiGet('/admin/api/auth/check'),
   changePassword: (oldPass, newPass) => apiPut('/admin/api/auth/password', { old_password: oldPass, new_password: newPass }),
+  // 一键更新
+  checkUpdate: () => apiGet('/admin/api/update/check'),
+  applyUpdate: () => apiPost('/admin/api/update/apply', {}),
+  updateStatus: () => apiGet('/admin/api/update/status'),
   // 服务商
   getProviders: () => apiGet('/admin/api/providers'),
   createProvider: (data) => apiPost('/admin/api/providers', data),

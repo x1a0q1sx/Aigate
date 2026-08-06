@@ -73,7 +73,7 @@
 
       <EmptyState v-if="filteredProviders.length === 0" icon="inbox" title="暂无匹配服务商" />
       <div v-else class="providers-grid">
-        <article v-for="p in filteredProviders" :key="p.id" :class="['provider-card', { highlight: highlightProviderId === p.id }]">
+        <article v-for="p in filteredProviders" :key="p.id" :class="['provider-card', { highlight: highlightProviderId === p.id, disabled: isProviderDisabled(p) }]">
           <div class="provider-top">
             <div class="provider-header">
               <button class="pin-btn" :class="{ pinned: isPinned(p.id) }" @click="togglePin(p.id)" :aria-label="isPinned(p.id) ? '取消固定' : '固定常用'">
@@ -84,7 +84,13 @@
                 <span class="badge" :class="credBadgeClass(p.credential_type)">{{ credLabel(p.credential_type) }}</span>
               </div>
             </div>
-            <StatusBadge :status="providerStatus(p).level" :label="providerStatus(p).text" />
+            <div class="provider-top-right">
+              <label class="toggle-switch" :title="isProviderDisabled(p) ? '启用该服务商' : '禁用该服务商（请求时自动跳过，配置与组合顺序保留）'">
+                <input type="checkbox" :checked="!isProviderDisabled(p)" @change="toggleProviderEnabled(p, $event.target.checked)" />
+                <span class="toggle-slider"></span>
+              </label>
+              <StatusBadge :status="providerStatus(p).level" :label="providerStatus(p).text" />
+            </div>
           </div>
 
           <div class="provider-url mono text-sm text-muted" :title="p.base_url">{{ p.base_url }}</div>
@@ -706,7 +712,7 @@ export default {
         restore_config: true,
       },
 
-      busy: { refreshModels: false, cleanOrphans: false, enableCode: '' },
+      busy: { refreshModels: false, cleanOrphans: false, enableCode: '', togglingProvider: false },
       showRefreshModal: false,
       refreshResult: null,
     }
@@ -825,10 +831,28 @@ export default {
       return labels
     },
     providerStatus(p) {
+      // v4.0: 服务商被禁用
+      if (this.isProviderDisabled(p)) return { text: '已禁用', level: 'muted' }
       const labels = this.statusLabels(p)
       if (labels.some((x) => ['缺密钥', '无模型', 'OAuth 未连接', 'URL 异常', '需配置 AtomCode'].includes(x))) return { text: labels[0], level: 'error' }
       if (labels.length) return { text: '需关注', level: 'warn' }
       return { text: '可用', level: 'ok' }
+    },
+    isProviderDisabled(p) {
+      return p && p.enabled === false
+    },
+    async toggleProviderEnabled(p, enabled) {
+      if (this.busy.togglingProvider) return
+      this.busy.togglingProvider = true
+      try {
+        await api.updateProvider(p.id, { enabled })
+        p.enabled = enabled
+        toast.success(enabled ? `服务商「${p.name}」已启用` : `服务商「${p.name}」已禁用，请求将自动跳过`)
+      } catch (e) {
+        toast.error(e.response?.data?.detail || '切换失败')
+      } finally {
+        this.busy.togglingProvider = false
+      }
     },
     credLabel(t) {
       return { api_key: 'API Key', free_tier: 'Free', oauth: 'OAuth' }[t || 'api_key'] || 'API Key'
@@ -1464,10 +1488,16 @@ export default {
   border-color: var(--primary);
   box-shadow: 0 0 0 3px rgba(91, 141, 255, 0.15);
 }
+.provider-card.disabled {
+  opacity: 0.55;
+  filter: grayscale(0.6);
+  border-style: dashed;
+}
 .provider-top {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
+  gap: var(--space-2);
   margin-bottom: var(--space-3);
 }
 .provider-header {
@@ -1488,6 +1518,56 @@ export default {
 }
 .pin-btn.pinned {
   color: var(--warning);
+}
+.provider-top-right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+/* 启用/禁用开关 */
+.toggle-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 36px;
+  height: 20px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+  position: absolute;
+}
+.toggle-switch .toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border-strong, #6b7280);
+  border-radius: 20px;
+  transition: background 0.2s;
+}
+.toggle-switch .toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 3px;
+  top: 3px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.toggle-switch input:checked + .toggle-slider {
+  background: var(--primary, #5b8dff);
+}
+.toggle-switch input:checked + .toggle-slider::before {
+  transform: translateX(16px);
+}
+.toggle-switch input:disabled + .toggle-slider {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .provider-title {
   display: flex;

@@ -83,6 +83,7 @@ export default {
         { path: '/media', name: '媒体', icon: 'image' },
         { path: '/analytics', name: '分析', icon: 'chart' },
         { path: '/playground', name: 'Playground', icon: 'message' },
+        { path: '/settings', name: '设置', icon: 'sliders' },
       ],
     }
   },

@@ -355,6 +355,8 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                 provider.base_url = base_url
                 provider.api_type = entry.get("api_type") or provider.api_type
                 provider.credential_type = entry.get("credential_type") or provider.credential_type
+                if "enabled" in entry:
+                    provider.enabled = bool(entry.get("enabled", True))
                 if "oauth_code" in entry:
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
@@ -372,6 +374,7 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                     api_type=entry.get("api_type") or "openai_compat",
                     credential_type=entry.get("credential_type") or "api_key",
                     oauth_code=entry.get("oauth_code"),
+                    enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
                     description=entry.get("description") or "",
                 )
@@ -635,6 +638,7 @@ async def export_providers(
             "api_type": p.api_type,
             "credential_type": p.credential_type or "api_key",
             "oauth_code": p.oauth_code,
+            "enabled": p.enabled if p.enabled is not None else True,
             "headers": p.headers or {},
             "description": p.description or "",
             "models": [_serialize_model_for_export(m) for m in models],
@@ -744,6 +748,8 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                 provider.base_url = base_url
                 provider.api_type = entry.get("api_type") or provider.api_type
                 provider.credential_type = entry.get("credential_type") or provider.credential_type
+                if "enabled" in entry:
+                    provider.enabled = bool(entry.get("enabled", True))
                 if "oauth_code" in entry:
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
@@ -764,6 +770,7 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                     api_type=entry.get("api_type") or "openai_compat",
                     credential_type=entry.get("credential_type") or "api_key",
                     oauth_code=entry.get("oauth_code"),
+                    enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
                     description=entry.get("description") or "",
                 )
@@ -858,6 +865,7 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         api_type=data.api_type,
         credential_type=data.credential_type,
         oauth_code=data.oauth_code,
+        enabled=data.enabled,
         headers=data.headers or {},
         description=data.description or ""
     )
@@ -880,6 +888,8 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.credential_type = data.credential_type
     if data.oauth_code is not None:
         provider.oauth_code = data.oauth_code
+    if data.enabled is not None:
+        provider.enabled = data.enabled
     if data.headers is not None:
         provider.headers = data.headers
     if data.description is not None:
@@ -1566,6 +1576,9 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
         provider = await db.get(Provider, model.provider_id)
+        # v4.0: 服务商被禁用 → playground 直连同样不可用
+        if provider is None or not getattr(provider, "enabled", True):
+            raise HTTPException(status_code=404, detail=f"Provider for model {request.model} is disabled")
 
         # ─── v3.2 free_tier / OAuth 路径：playground 也走专用分支 ───
         cred_type = getattr(provider, "credential_type", "api_key") or "api_key"

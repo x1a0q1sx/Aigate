@@ -90,6 +90,9 @@ async def resolve_combo_targets(
                 # provider 已不存在 → 失效
                 stale_idx.append(idx)
                 continue
+            # v4.0: 服务商被禁用 → 请求时跳过该候选，但保留组合顺序不删除
+            if not getattr(provider, "enabled", True):
+                continue
             m_result = await db.execute(
                 select(Model).where(
                     Model.provider_id == provider.id,
@@ -171,6 +174,10 @@ async def prune_stale_combo_targets(db: AsyncSession) -> int:
                 )).scalar_one_or_none()
                 if not p:
                     removed.append(item)
+                    continue
+                # v4.0: 服务商被禁用 → 保留候选不删除（仅请求时跳过），保持组合顺序
+                if not getattr(p, "enabled", True):
+                    cleaned.append(item)
                     continue
                 m = (await db.execute(
                     select(Model).where(

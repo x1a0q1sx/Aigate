@@ -614,6 +614,10 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             from server.models.model import Model as _M
             p_r = await db.execute(select(_P).where(_P.name == prov_name).limit(1))
             _prov = p_r.scalar_one_or_none()
+            # v4.0: 服务商被禁用 → 跳过该候选（不删除组合配置）
+            if _prov is not None and not getattr(_prov, "enabled", True):
+                attempt_errors.append({"target": full_id, "error": "provider disabled"})
+                continue
             m_r = await db.execute(select(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
             _mdl = m_r.scalar_one_or_none() if m_r is not None else None
             if not _prov or not _mdl:
@@ -914,6 +918,10 @@ async def chat_completions(
                             from sqlalchemy import select as _sel
                             p_r = await cdb.execute(_sel(_P).where(_P.name == prov_name).limit(1))
                             _prov = p_r.scalar_one_or_none()
+                            # v4.0: 服务商被禁用 → 跳过该候选（不删除组合配置）
+                            if _prov is not None and not getattr(_prov, "enabled", True):
+                                stream_errs.append({"attempt": st_attempt, "error": f"provider disabled: {full_id}"})
+                                continue
                             m_r = await cdb.execute(_sel(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
                             _mdl = m_r.scalar_one_or_none() if m_r is not None else None
                             if not _prov or not _mdl:
@@ -1139,6 +1147,9 @@ async def chat_completions(
                 return JSONResponse(status_code=404, content={"error": f"Model {request.model} not found"})
             _diag(conversation_id, "direct_model_done", _diag_start, routed_model=model.model_id)
             provider = await db.get(Provider, model.provider_id)
+            # v4.0: 服务商被禁用 → 直连同样不可用
+            if provider is None or not getattr(provider, "enabled", True):
+                return JSONResponse(status_code=404, content={"error": f"Provider for model {request.model} is disabled"})
             # Free Tier / OAuth providers — key 可空（无需密钥直发 / OAuth token 走 OAuth client）
             api_key = None
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":

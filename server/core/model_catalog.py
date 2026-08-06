@@ -102,6 +102,10 @@ class ModelCatalog:
         if auto_enabled is not None:
             conditions.append(Model.auto_enabled == auto_enabled)
         query = select(Model)
+        if enabled_only:
+            # v4.0: 服务商被禁用时其模型同样不参与任何请求（但仍保留在 DB 中）
+            query = query.join(Provider, Model.provider_id == Provider.id)
+            conditions.append(Provider.enabled == True)
         if conditions:
             query = query.where(and_(*conditions))
         query = query.order_by(Model.provider_id, Model.model_id)
@@ -113,14 +117,16 @@ class ModelCatalog:
     ) -> List[Model]:
         """获取可以参与 auto 选举的候选模型。
         注意：free_tier / oauth 类供应商不需要 ApiKey 表里的密钥，
-        只要 enabled + auto_enabled + 未手动排除即可成为候选（否则免费模型永远进不了 auto）。"""
+        只要 enabled + auto_enabled + 未手动排除即可成为候选（否则免费模型永远进不了 auto）。
+        v4.0: 服务商被禁用时其模型不参与 auto 选举。"""
         query = (
             select(Model, Provider)
             .join(Provider, Model.provider_id == Provider.id)
             .where(
                 Model.enabled == True,
                 Model.auto_enabled == True,
-                Model.auto_excluded == False  # v2.0: 排除用户手动排除的
+                Model.auto_excluded == False,  # v2.0: 排除用户手动排除的
+                Provider.enabled == True,      # v4.0: 跳过已禁用的服务商
             )
             .order_by(Model.priority_boost.desc(), Model.is_free.desc(), Model.input_price.asc())
         )
@@ -152,11 +158,15 @@ class ModelCatalog:
         provider_name: str,
         model_id: str
     ) -> Optional[Model]:
-        """根据 provider/model 获取模型"""
+        """根据 provider/model 获取模型。v4.0: 服务商被禁用时返回 None（视为不可用）。"""
         query = (
             select(Model)
             .join(Provider, Model.provider_id == Provider.id)
-            .where(Provider.name == provider_name, Model.model_id == model_id)
+            .where(
+                Provider.name == provider_name,
+                Model.model_id == model_id,
+                Provider.enabled == True,  # v4.0: 跳过已禁用的服务商
+            )
         )
         result = await session.execute(query)
         return result.scalar_one_or_none()

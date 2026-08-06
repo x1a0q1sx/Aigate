@@ -176,49 +176,51 @@ class AutoRouter:
                         if not cached or cached.status not in ["unhealthy", "rate_limited"]:
                             # 可用
                             provider = await session.get(Provider, sticky_model.provider_id)
-                            # Free Tier / OAuth — key 可空
-                            api_key = None
-                            if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
-                                if provider.credential_type == "oauth":
+                            # v4.0: 服务商被禁用 → sticky 失效，走正常候选选举
+                            if provider is not None and getattr(provider, "enabled", True):
+                                # Free Tier / OAuth — key 可空
+                                api_key = None
+                                if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
+                                    if provider.credential_type == "oauth":
+                                        try:
+                                            from server.core.oauth_client import get_oauth_client
+                                            _oc = getattr(provider, "oauth_code", None) or provider.name
+                                            api_key = await get_oauth_client().pick_access_token(_oc, session)
+                                        except Exception:
+                                            api_key = None
+                                        if not api_key:
+                                            return None   # OAuth 未连接，放走
+                                    else:
+                                        api_key = ""
+                                else:
+                                    # 获取 key（v3.5：按模型归属 key 集合选）
                                     try:
-                                        from server.core.oauth_client import get_oauth_client
-                                        _oc = getattr(provider, "oauth_code", None) or provider.name
-                                        api_key = await get_oauth_client().pick_access_token(_oc, session)
+                                        from server.core.key_rotator import get_key_rotator
+                                        _picked = await get_key_rotator().pick_key_for_model(session, sticky_model)
                                     except Exception:
-                                        api_key = None
-                                    if not api_key:
-                                        return None   # OAuth 未连接，放走
-                                else:
-                                    api_key = ""
-                            else:
-                                # 获取 key（v3.5：按模型归属 key 集合选）
-                                try:
-                                    from server.core.key_rotator import get_key_rotator
-                                    _picked = await get_key_rotator().pick_key_for_model(session, sticky_model)
-                                except Exception:
-                                    _picked = None
-                                if _picked and _picked[0] is not None:
-                                    api_key = _picked[1]
-                                else:
+                                        _picked = None
+                                    if _picked and _picked[0] is not None:
+                                        api_key = _picked[1]
+                                    else:
+                                        return None
+                                if not api_key and api_key != "":
                                     return None
-                            if not api_key and api_key != "":
-                                return None
-                            # 防 MissingGreenlet：provider 属性可能已过期
-                            try:
-                                await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
-                            except Exception:
-                                pass
-                            adapter = create_adapter_for_provider(provider.api_type)
-                            _extra = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
-                            return RouteResult(
-                                success=True,
-                                model=sticky_model,
-                                provider=provider,
-                                api_key=api_key,
-                                adapter=adapter,
-                                fallback_count=0,
-                                extra_headers=_extra,
-                            )
+                                # 防 MissingGreenlet：provider 属性可能已过期
+                                try:
+                                    await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
+                                except Exception:
+                                    pass
+                                adapter = create_adapter_for_provider(provider.api_type)
+                                _extra = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+                                return RouteResult(
+                                    success=True,
+                                    model=sticky_model,
+                                    provider=provider,
+                                    api_key=api_key,
+                                    adapter=adapter,
+                                    fallback_count=0,
+                                    extra_headers=_extra,
+                                )
         # 获取所有候选
         candidates = await self.model_catalog.get_auto_candidates(session)
         if not candidates:

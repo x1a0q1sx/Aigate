@@ -11,6 +11,7 @@ class ProviderCreate(BaseModel):
     api_type: str = "openai_compat"
     credential_type: str = "api_key"  # api_key / free_tier / oauth
     oauth_code: Optional[str] = None   # 当 credential_type=oauth 时填 OAuthRegistry code（如 "claude_code"）
+    enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     description: Optional[str] = None
 class ProviderUpdate(BaseModel):
@@ -19,6 +20,7 @@ class ProviderUpdate(BaseModel):
     api_type: Optional[str] = None
     credential_type: Optional[str] = None
     oauth_code: Optional[str] = None
+    enabled: Optional[bool] = None     # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     description: Optional[str] = None
 class ProviderResponse(BaseModel):
@@ -28,6 +30,7 @@ class ProviderResponse(BaseModel):
     api_type: str
     credential_type: str = "api_key"
     oauth_code: Optional[str] = None
+    enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]]
     description: Optional[str]
     class Config:

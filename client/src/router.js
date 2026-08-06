@@ -10,6 +10,7 @@ import Combos from './views/Combos.vue'
 import ProxyPool from './views/ProxyPool.vue'
 import Media from './views/Media.vue'
 import TokenSaver from './views/TokenSaver.vue'
+import Settings from './views/Settings.vue'
 import Login from './views/Login.vue'
 
 const routes = [
@@ -26,6 +27,7 @@ const routes = [
   { path: '/proxies', component: ProxyPool, meta: { title: '代理池' } },
   { path: '/media', component: Media, meta: { title: '媒体中心' } },
   { path: '/token-saver', component: TokenSaver, meta: { title: '省 Token' } },
+  { path: '/settings', component: Settings, meta: { title: '设置' } },
   { path: '/oauth', redirect: '/providers' },
   // 兜底：未知路径回仪表盘，避免白屏
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },

@@ -23,6 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .api.media_router import router as media_router  # 配额/代理池/媒体生成
 from .api.oauth_router import router as oauth_router  # OAuth 接入（复用 9Router client_id）
 from .api.auth_router import router as auth_router  # 管理面板登录认证
+from .api.update_router import router as update_router  # 一键更新（检查/执行/状态）
 from .core.auth import AuthMiddleware
 config = get_config()
 # 全局单例
@@ -181,6 +182,7 @@ app.include_router(anthropic_router)  # Anthropic Messages API 兼容入口
 app.include_router(combos_router)   # Combos 组合 CRUD（/admin/api/combos）
 app.include_router(media_router)   # 配额追踪 + 代理池 + 媒体生成
 app.include_router(oauth_router)   # OAuth 接入：/admin/oauth/*
+app.include_router(update_router)  # 一键更新：检查/执行/状态
 # ============================================================
 # 挂载前端静态文件 & SPA 路由回退
 # ============================================================
@@ -198,7 +200,7 @@ if _client_dist.exists():
         return FileResponse(str(_client_dist / "vite.svg"))
     # SPA 路由回退：为每个前端路由注册处理器
     # 前端 Vue Router 路由: /dashboard, /providers, /models, /health, /auto, /analytics, /playground
-    SPA_PATHS = ["/dashboard", "/providers", "/models", "/health", "/auto", "/combos", "/oauth", "/proxies", "/media", "/analytics", "/playground", "/token-saver", "/admin", "/login"]
+    SPA_PATHS = ["/dashboard", "/providers", "/models", "/health", "/auto", "/combos", "/oauth", "/proxies", "/media", "/analytics", "/playground", "/token-saver", "/settings", "/admin", "/login"]
     for spa_path in SPA_PATHS:
         # 精确匹配
         def _make_handler():

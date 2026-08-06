@@ -85,6 +85,8 @@ async def init_db():
             "ALTER TABLE providers ADD COLUMN credential_type VARCHAR(20) DEFAULT 'api_key'",
             # v3.1: oauth_code — 当 credential_type=oauth 时明确指向 oauth_registry code
             "ALTER TABLE providers ADD COLUMN oauth_code VARCHAR(50) DEFAULT NULL",
+            # v4.0: 服务商启用/禁用开关（默认启用）
+            "ALTER TABLE providers ADD COLUMN enabled BOOLEAN DEFAULT 1",
         ]:
             try:
                 await conn.execute(text(sql))
