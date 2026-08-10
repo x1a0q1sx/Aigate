@@ -55,8 +55,6 @@ class AutoRouter:
         self.config = config.auto_router
         self.ranking_service = RankingService()
 
-        # 并发分散：进程级原子递增计数器，让并发 auto 请求轮转起点
-        self._rr_counter = itertools.count()
 
         # session sticky 缓存: conversation_id -> (model_id, timestamp)
         self._sticky_cache: Dict[str, tuple[int, datetime]] = {}
@@ -240,10 +238,9 @@ class AutoRouter:
             return RouteResult(success=False, error="All candidates are unhealthy/rate-limited/excluded. Wait for refresh or add more models.")
         # v0.2: 用 RankingService 综合打分排序
         candidates = await self._rank_candidates(candidates, session)
-        # 并发分散：轮转起点，避免并发请求全打 ranking #1
-        if len(candidates) > 1:
-            idx = next(self._rr_counter) % len(candidates)
-            candidates = candidates[idx:] + candidates[:idx]
+        # FIX: 移除并发轮转(_rr_counter)。轮转会把人工 priority_boost 权重高的候选
+        # 整体旋转到后面，导致 fallback 先尝试低权重/已冷却模型而错过可用渠道。
+        # priority_boost 是人工干预权重，应严格按排序降序尝试。
         # 遍历找第一个可用的
         for candidate in candidates:
             # 防 MissingGreenlet：rate_limiter.check_limit 撞库锁时会走 session.rollback()，

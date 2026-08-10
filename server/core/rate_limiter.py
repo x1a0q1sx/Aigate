@@ -6,12 +6,13 @@ from typing import Dict, Optional
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
+from sqlalchemy import inspect as sa_inspect
 from server.models.rate_limit import RateLimitState
 class RateLimiter:
     def __init__(self, default_rpm: int = 60, default_tpm: int = 100000):
         self.default_rpm = default_rpm
         self.default_tpm = default_tpm
-        self._cache: Dict[int, RateLimitState] = {}
+        self._cache: Dict[str, RateLimitState] = {}
     def _get_window_start(self) -> datetime:
         """获取当前分钟窗口开始"""
         now = datetime.utcnow()
@@ -20,6 +21,24 @@ class RateLimiter:
         """获取今日窗口开始"""
         now = datetime.utcnow()
         return now.replace(hour=0, minute=0, second=0, microsecond=0)
+    async def _rebase_cached_state(
+        self,
+        session: AsyncSession,
+        cache_key: str,
+    ):
+        """缓存对象若已 detached(来自已关闭的 session)，merge 回当前 session。
+        返回 (state, ok)；merge 失败时返回 (None, False) 并移除缓存。"""
+        state = self._cache.get(cache_key)
+        if state is None:
+            return None, False
+        try:
+            if sa_inspect(state).detached:
+                state = await session.merge(state)
+                self._cache[cache_key] = state
+            return state, True
+        except Exception:
+            self._cache.pop(cache_key, None)
+            return None, False
     async def get_or_create_state(
         self,
         session: AsyncSession,
@@ -27,10 +46,10 @@ class RateLimiter:
         key_id: Optional[int]
     ) -> RateLimitState:
         """获取或创建当前窗口的状态"""
-        cache_key = f"{model_id}:{key_id}" if key_id else model_id
-        # 先查内存缓存
-        if cache_key in self._cache:
-            state = self._cache[cache_key]
+        cache_key = f"{model_id}:{key_id}" if key_id else str(model_id)
+        # 先查内存缓存（自动处理 detached 重绑定）
+        state, ok = await self._rebase_cached_state(session, cache_key)
+        if ok and state is not None:
             # 检查窗口是否过期
             now = datetime.utcnow()
             if state.window_start < self._get_window_start():

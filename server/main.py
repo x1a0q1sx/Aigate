@@ -18,6 +18,7 @@ from .api.v1_router import router as v1_router
 from .api.admin_router import router as admin_router
 from .api.admin_routing import router as admin_routing_router  # v0.2
 from .api.anthropic_router import router as anthropic_router  # Anthropic Messages API
+from .api.responses_router import router as responses_router  # Responses API (Codex CLI)
 from .api.combos_router import router as combos_router  # Combos 组合 CRUD
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from .api.media_router import router as media_router  # 配额/代理池/媒体生成
@@ -179,6 +180,7 @@ app.include_router(v1_router)
 app.include_router(admin_router)
 app.include_router(admin_routing_router)  # v0.2: 排行/日志/干预/审计
 app.include_router(anthropic_router)  # Anthropic Messages API 兼容入口
+app.include_router(responses_router)  # Responses API 兼容入口（Codex CLI）
 app.include_router(combos_router)   # Combos 组合 CRUD（/admin/api/combos）
 app.include_router(media_router)   # 配额追踪 + 代理池 + 媒体生成
 app.include_router(oauth_router)   # OAuth 接入：/admin/oauth/*
