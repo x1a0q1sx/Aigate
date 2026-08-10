@@ -11,6 +11,9 @@
           请求诊断日志
         </label>
         <button class="btn btn-outline" @click="loadAll">刷新</button>
+        <button class="btn btn-outline" style="color: var(--warning);" @click="resetSummary">
+          <span title="清零归档后保留的累计统计（实时日志统计保留）">重置统计数据</span>
+        </button>
       </div>
     </div>
 
@@ -67,7 +70,7 @@
             <th>请求模型</th>
             <th>路由到</th>
             <th>状态</th>
-            <th>延迟</th>
+            <th title="首字延迟 / 总延迟">延迟（首字/总）</th>
             <th>Token</th>
             <th>代理</th>
             <th>操作</th>
@@ -87,7 +90,7 @@
             <td>
               <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 11px;">{{ r.status === 'success' ? '成功' : '失败' }}</span>
             </td>
-            <td style="font-family: monospace;">{{ r.latency_ms ? (r.latency_ms / 1000).toFixed(1) + 's' : '-' }}</td>
+            <td style="font-family: monospace;">{{ fmtLatency(r.ttft_ms, r.latency_ms) }}</td>
             <td style="font-family: monospace; font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}<span v-if="r.cache_read_tokens" style="color: #2b8aef;" :title="`缓存读 ${r.cache_read_tokens} / 写 ${r.cache_write_tokens || 0}`"> · 缓存{{ r.cache_read_tokens }}</span></td>
             <td>
               <span v-if="r.used_proxy" style="color: #22c55e; font-size: 12px;">🟢 代理</span>
@@ -265,7 +268,7 @@
           </tr>
           <tr>
             <td class="k">路由服务商</td><td class="v">{{ detailRow.routed_provider || '-' }}</td>
-            <td class="k">延迟</td><td class="v">{{ detailRow.latency_ms ? (detailRow.latency_ms / 1000).toFixed(1) + 's' : '-' }}</td>
+            <td class="k">延迟</td><td class="v">{{ fmtLatency(detailRow.ttft_ms, detailRow.latency_ms) }}</td>
           </tr>
           <tr>
             <td class="k">Prompt Token</td><td class="v">{{ detailRow.prompt_tokens || 0 }}</td>
@@ -644,6 +647,15 @@ export default {
         this.summary = await api.getAnalyticsSummary()
       } catch (e) { console.error('summary load failed', e) }
     },
+    async resetSummary() {
+      if (!confirm('确定重置统计数据吗？\n\n将清零归档后保留的累计统计（总请求数、成功率、Token、平均延迟等）。\n当前实时日志的统计不受影响。')) return
+      if (!confirm('再次确认：重置统计数据？')) return
+      try {
+        await api.resetAnalyticsSummary()
+        toast.success('统计数据已重置')
+        await this.loadSummary()
+      } catch (e) { toast.error('重置失败: ' + e.message) }
+    },
     async loadToday() {
       try { this.todayData = await api.getAnalyticsToday() }
       catch (e) { console.error('today load failed', e) }
@@ -835,6 +847,13 @@ export default {
       try { return JSON.stringify(JSON.parse(s), null, 2) } catch (e) { return s }
     },
     formatNum(n) { return (n || 0).toLocaleString() },
+    // 延迟双值展示：首字延迟 / 总延迟（如 0.8s/3.2s）
+    fmtLatency(ttft, latency) {
+      const fmt = (v) => (v ? (v / 1000).toFixed(1) + 's' : '-')
+      const lat = fmt(latency)
+      if (ttft == null) return lat
+      return `${fmt(ttft)}/${lat}`
+    },
     formatTokens(n) {
       if (!n || n < 1000) return String(n || 0)
       if (n < 1e6) return (n / 1000).toFixed(1) + 'K'

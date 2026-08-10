@@ -748,7 +748,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
 async def _write_stream_log(conversation_id, request, raw_request, status,
                            routed_provider, routed_model, error_msg, fallback_count, attempt_errors,
                            stream_body=None, prompt_tokens=0, completion_tokens=0, latency_ms=None,
-                           cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None):
+                           ttft_ms=None, cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None):
     """在流式生成器内异步写请求日志。
 
     方案A：request_logs 作为唯一用量数据源，直接在此写入
@@ -801,6 +801,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                 error_msg=(error_msg or ""),
                 fallback_count=fallback_count or 0,
                 latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
                 user_ip=raw_request.client.host if raw_request.client else None,
                 **_proxy_log_fields(),
                 request_body=req_s,
@@ -947,11 +948,15 @@ async def chat_completions(
                                 _csc = 0
                                 _cbuf = []
                                 _cu = {}
+                                _cb_ttft_ms = None
                                 _fb_eh = _merge_oauth_headers(_prov, _prov.headers)
                                 _fbmov = getattr(_mdl, "request_overrides", None) or {}
                                 if isinstance(_fbmov, dict) and _fbmov.get("headers"):
                                     _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
                                 async for ck in _adapter.stream_chat_completion(up_req, _ak, _prov.base_url, _fb_eh):
+                                    # 首字延迟：首个 chunk 距请求开始的时间
+                                    if _cb_ttft_ms is None:
+                                        _cb_ttft_ms = int((time.time() - _send_time) * 1000)
                                     if isinstance(ck, dict) and "error" in ck:
                                         raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
                                     _csc += 1
@@ -990,7 +995,7 @@ async def chat_completions(
                                     _prov.name, _mdl.model_id, None, st_attempt, None,
                                     stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
                                     cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                                    latency_ms=_combo_latency, diag_start_ts=_diag_start)
+                                    latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms, diag_start_ts=_diag_start)
                                 if ar.health_checker:
                                     ar.health_checker.mark_success(_mdl.id)
                                 yield b"data: [DONE]\n\n"
@@ -1209,8 +1214,12 @@ async def chat_completions(
                     free_req = request.model_copy(update={"model": model.model_id})
                     if request.stream:
                         async def _free_stream():
+                            _free_stream_start = time.time()
+                            _free_ttft_ms = None
                             try:
                                 async for ck in free_exec.execute_stream(free_req):
+                                    if _free_ttft_ms is None:
+                                        _free_ttft_ms = int((time.time() - _free_stream_start) * 1000)
                                     yield _format_sse_chunk(ck, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             except Exception as e:
@@ -1222,7 +1231,9 @@ async def chat_completions(
                                     from server.db import AsyncSessionLocal as _AS
                                     async with _AS() as sdb:
                                         await _write_stream_log(conversation_id, request, raw_request,
-                                            "success", provider.name, model.model_id, None, 0, None)
+                                            "success", provider.name, model.model_id, None, 0, None,
+                                            latency_ms=int((time.time() - _free_stream_start) * 1000),
+                                            ttft_ms=_free_ttft_ms)
                                 except Exception:
                                     pass
                         return StreamingResponse(_free_stream(), media_type="text/event-stream")
@@ -1340,7 +1351,11 @@ async def chat_completions(
                         last_usage = {}
                         stream_has_error = False
                         stream_err_detail = ""
+                        _cascade_ttft_ms = None
                         async for ck in gen:
+                            # 首字延迟：首个 chunk 距请求开始的时间
+                            if _cascade_ttft_ms is None:
+                                _cascade_ttft_ms = int((time.time() - _send_time) * 1000)
                             sc += 1
                             if isinstance(ck, dict) and "error" in ck:
                                 stream_has_error = True
@@ -1387,7 +1402,8 @@ async def chat_completions(
                             cand_provider_name, cand_model_id, None, st_attempt, None,
                             stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
                             cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                            latency_ms=int((time.time() - _send_time) * 1000), diag_start_ts=_diag_start)
+                            latency_ms=int((time.time() - _send_time) * 1000),
+                            ttft_ms=_cascade_ttft_ms, diag_start_ts=_diag_start)
                         if ar.health_checker:
                             ar.health_checker.mark_success(cand_model_pk)
                         yield b"data: [DONE]\n\n"
@@ -1502,15 +1518,19 @@ async def chat_completions(
             )
             _stream_usage = {}
             _stream_err = None
+            _stream_ttft_ms = None
             _stream_chunks_log = []  # 收集所有 chunk 用于日志
             async def wrap_stream():
-                nonlocal _stream_usage, _stream_err
+                nonlocal _stream_usage, _stream_err, _stream_ttft_ms
                 _diag(conversation_id, "direct_stream_generator_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
                 stream_has_error = False
                 stream_err_detail = ""
                 try:
                     _diag(conversation_id, "upstream_stream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
                     async for chunk in generator:
+                        # 首字延迟：首个到达 chunk 距请求开始的时间
+                        if _stream_ttft_ms is None:
+                            _stream_ttft_ms = int((time.time() - _send_time) * 1000)
                         if isinstance(chunk, dict):
                             # 检测上游在 SSE 流中返回的错误
                             if "error" in chunk and "choices" not in chunk:
@@ -1589,6 +1609,7 @@ async def chat_completions(
                 ),
                 fallback_count=route_result.fallback_count if route_result else 0,
                 latency_ms=int((time.time() - _send_time) * 1000),
+                ttft_ms=_stream_ttft_ms,
                 error_type="upstream_error" if _stream_err else None,
                 error_msg=(_stream_err or ""),
                 request_body=_j.dumps(upstream_request.model_dump(), ensure_ascii=False) if upstream_request else None,

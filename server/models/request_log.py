@@ -35,6 +35,7 @@ class RequestLog(Base):
     proxy_url = Column(String(255), nullable=True)  # 实际使用的代理 URL（脱敏由前端处理）
     is_health_check = Column(Boolean, nullable=False, default=False, server_default="0")  # 1=网关自身健康检查探测，列表/聚合查询排除
     latency_ms = Column(Integer, nullable=True)
+    ttft_ms = Column(Integer, nullable=True)  # 首字延迟（time-to-first-token），流式请求记录，非流式/失败为 NULL
     prompt_tokens = Column(Integer, nullable=True)
     completion_tokens = Column(Integer, nullable=True)
     cache_read_tokens = Column(Integer, nullable=True)   # 缓存命中（读）token 数
@@ -53,6 +54,24 @@ class RequestLog(Base):
     request_msg_hashes = Column(Text, nullable=True)      # JSON 数组：逐条消息的 blob hash（含顺序）
     response_body_hash = Column(String(64), nullable=True) # 响应整包的 blob hash
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+class AnalyticsCumulative(Base):
+    """累计统计数据（单行 id=1）。
+
+    归档时把被归档记录的各项统计累加进来，这样归档（删除 DB 记录）后
+    分析页的总请求数/成功率/Token/平均延迟等指标仍然保留；
+    只有「重置统计数据」按钮会清零本表（日志本身不受影响）。
+    """
+    __tablename__ = "analytics_cumulative"
+    id = Column(Integer, primary_key=True, default=1)
+    total_requests = Column(Integer, nullable=False, default=0)
+    success_count = Column(Integer, nullable=False, default=0)
+    auto_requests = Column(Integer, nullable=False, default=0)
+    total_input_tokens = Column(Integer, nullable=False, default=0)
+    total_output_tokens = Column(Integer, nullable=False, default=0)
+    sum_latency_ms = Column(Integer, nullable=False, default=0)   # 有延迟样本的累计和（算平均延迟用）
+    latency_count = Column(Integer, nullable=False, default=0)     # 有延迟的样本数
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
 Index("idx_request_logs_model_time", RequestLog.routed_model, RequestLog.created_at)
 Index("idx_request_logs_status_time", RequestLog.status, RequestLog.created_at)
 Index("idx_request_logs_conv_time", RequestLog.conversation_id, RequestLog.created_at)

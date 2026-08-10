@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text, desc, func
 from sqlalchemy.orm import defer
 from server.db import AsyncSessionLocal
-from server.models.request_log import RequestLog
+from server.models.request_log import RequestLog, AnalyticsCumulative
 from server.core.request_logger import reassemble_request, reassemble_response  # v3.6 消息级去重还原
 from server.models.intelligence import IntelligenceStatic
 from server.models.routing_config import RoutingWeights, RoutingPin, AdminAuditLog
@@ -304,6 +304,7 @@ async def get_log(log_id: int, db: AsyncSession = Depends(get_db)):
         "routed_provider": row.routed_provider, "routed_model": row.routed_model,
         "status": row.status, "media_type": getattr(row, "media_type", None), "http_status": row.http_status,
         "latency_ms": row.latency_ms,
+        "ttft_ms": getattr(row, "ttft_ms", None),
         "prompt_tokens": row.prompt_tokens, "completion_tokens": row.completion_tokens,
         "cache_read_tokens": getattr(row, "cache_read_tokens", None),
         "cache_write_tokens": getattr(row, "cache_write_tokens", None),
@@ -446,6 +447,7 @@ async def list_request_logs(
             "status": r.status,
             "media_type": getattr(r, "media_type", None),
             "latency_ms": r.latency_ms,
+            "ttft_ms": getattr(r, "ttft_ms", None),
             "prompt_tokens": r.prompt_tokens,
             "completion_tokens": r.completion_tokens,
             "cache_read_tokens": getattr(r, "cache_read_tokens", None),
@@ -479,31 +481,63 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
     if _analytics_cache["data"] and (now - _analytics_cache["ts"]) < _ANALYTICS_TTL:
         return _analytics_cache["data"]
 
-    # 一条 SQL 搞定：COUNT、SUM、AVG 全部聚合
+    # 一条 SQL 搞定：COUNT、SUM 全部聚合（延迟取 sum+count 以便与累计表合并算均值）
     row = (await db.execute(
         select(
             func.count(RequestLog.id),
             func.count(RequestLog.id).filter(RequestLog.status == "success"),
             func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
             func.coalesce(func.sum(RequestLog.completion_tokens), 0),
-            func.coalesce(func.avg(RequestLog.latency_ms).filter(RequestLog.latency_ms.isnot(None)), 0),
+            func.coalesce(func.sum(RequestLog.latency_ms).filter(RequestLog.latency_ms.isnot(None)), 0),
+            func.count(RequestLog.id).filter(RequestLog.latency_ms.isnot(None)),
             func.count(RequestLog.id).filter(RequestLog.requested_model == "auto"),
         ).where(RequestLog.is_health_check == 0)
     )).one()
-    total, success_count, total_input, total_output, avg_lat, auto_count = row
+    total, success_count, total_input, total_output, lat_sum, lat_cnt, auto_count = row
+
+    # 累计统计（归档后保留的部分）
+    cum = (await db.execute(
+        select(AnalyticsCumulative).where(AnalyticsCumulative.id == 1)
+    )).scalar_one_or_none()
+    if cum is not None:
+        total = (total or 0) + cum.total_requests
+        success_count = (success_count or 0) + cum.success_count
+        total_input = (total_input or 0) + cum.total_input_tokens
+        total_output = (total_output or 0) + cum.total_output_tokens
+        lat_sum = (lat_sum or 0) + cum.sum_latency_ms
+        lat_cnt = (lat_cnt or 0) + cum.latency_count
+        auto_count = (auto_count or 0) + cum.auto_requests
+
+    total = total or 0
+    success_count = success_count or 0
+    avg_lat = (lat_sum or 0) / (lat_cnt or 1) if lat_cnt else 0.0
 
     data = {
-        "total_requests": total or 0,
-        "success_count": success_count or 0,
-        "success_rate": round((success_count or 0) / (total or 1) * 100, 1),
+        "total_requests": total,
+        "success_count": success_count,
+        "success_rate": round(success_count / (total or 1) * 100, 1),
         "total_input_tokens": int(total_input or 0),
         "total_output_tokens": int(total_output or 0),
-        "avg_latency_ms": round(avg_lat or 0, 1),
+        "avg_latency_ms": round(avg_lat, 1),
         "auto_requests": auto_count or 0,
-        "direct_requests": (total or 0) - (auto_count or 0),
+        "direct_requests": total - (auto_count or 0),
     }
     _analytics_cache = {"data": data, "ts": now}
     return data
+
+
+@router.post("/analytics/summary/reset")
+async def reset_analytics_summary(db: AsyncSession = Depends(get_db)):
+    """手动重置统计数据：清零累计统计表（当前 request_logs 实时日志不受影响）。
+
+    归档后统计数据会保留在累计表中；如需重新统计，可点击「重置统计数据」清零。
+    """
+    await db.execute(text("UPDATE analytics_cumulative SET total_requests=0, success_count=0, "
+                          "auto_requests=0, total_input_tokens=0, total_output_tokens=0, "
+                          "sum_latency_ms=0, latency_count=0 WHERE id=1"))
+    await db.commit()
+    _invalidate_analytics_cache()
+    return {"ok": True, "message": "统计数据已重置，当前实时日志统计保留"}
 
 
 # ===================== 用量分析（配额追踪并入） =====================
@@ -721,6 +755,7 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
                 "status": r.status,
                 "http_status": r.http_status,
                 "latency_ms": r.latency_ms,
+                "ttft_ms": getattr(r, "ttft_ms", None),
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
                 "cache_read_tokens": getattr(r, "cache_read_tokens", None),
@@ -736,6 +771,23 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             count += 1
+
+    # 归档前把被归档记录的统计累加到累计表（删除后统计仍保留）
+    arch_total = len(rows)
+    arch_success = sum(1 for r in rows if r.status == "success")
+    arch_auto = sum(1 for r in rows if r.requested_model == "auto")
+    arch_input = sum(r.prompt_tokens or 0 for r in rows)
+    arch_output = sum(r.completion_tokens or 0 for r in rows)
+    arch_lat_sum = sum(r.latency_ms or 0 for r in rows if r.latency_ms is not None)
+    arch_lat_cnt = sum(1 for r in rows if r.latency_ms is not None)
+    await db.execute(text(
+        "UPDATE analytics_cumulative SET "
+        "total_requests=total_requests+:t, success_count=success_count+:s, "
+        "auto_requests=auto_requests+:a, total_input_tokens=total_input_tokens+:i, "
+        "total_output_tokens=total_output_tokens+:o, sum_latency_ms=sum_latency_ms+:ls, "
+        "latency_count=latency_count+:lc WHERE id=1"
+    ), {"t": arch_total, "s": arch_success, "a": arch_auto, "i": arch_input,
+        "o": arch_output, "ls": arch_lat_sum, "lc": arch_lat_cnt})
 
     # 从 DB 删除已归档记录
     ids_to_delete = [r.id for r in rows]
@@ -809,16 +861,17 @@ async def restore_archive(filename: str, db: AsyncSession = Depends(get_db)):
                 rec["created_at"] = datetime.fromisoformat(rec["created_at"].replace("Z", "+00:00"))
             rec.setdefault("cache_read_tokens", None)
             rec.setdefault("cache_write_tokens", None)
+            rec.setdefault("ttft_ms", None)
             await db.execute(sa_text("""
                 INSERT INTO request_logs
                     (id, conversation_id, requested_model, routed_provider, routed_model,
-                     status, http_status, latency_ms, prompt_tokens, completion_tokens,
+                     status, http_status, latency_ms, ttft_ms, prompt_tokens, completion_tokens,
                      cache_read_tokens, cache_write_tokens,
                      error_type, error_msg, fallback_count, user_ip, api_key_id,
                      request_body, response_body, created_at)
                 VALUES
                     (:id, :conversation_id, :requested_model, :routed_provider, :routed_model,
-                     :status, :http_status, :latency_ms, :prompt_tokens, :completion_tokens,
+                     :status, :http_status, :latency_ms, :ttft_ms, :prompt_tokens, :completion_tokens,
                      :cache_read_tokens, :cache_write_tokens,
                      :error_type, :error_msg, :fallback_count, :user_ip, :api_key_id,
                      :request_body, :response_body, :created_at)
@@ -862,6 +915,25 @@ async def clear_logs(db: AsyncSession = Depends(get_db)):
 
     if count == 0:
         return {"ok": True, "deleted": 0, "message": "没有可删除的日志"}
+
+    # 清空前把统计累加到累计表（与归档一致，统计不清零；需要清零点「重置统计数据」）
+    row = (await db.execute(text(
+        "SELECT COUNT(*), "
+        "COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0), "
+        "COALESCE(SUM(CASE WHEN requested_model='auto' THEN 1 ELSE 0 END),0), "
+        "COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
+        "COALESCE(SUM(latency_ms),0), "
+        "COALESCE(SUM(CASE WHEN latency_ms IS NOT NULL THEN 1 ELSE 0 END),0) "
+        "FROM request_logs WHERE conversation_id NOT LIKE 'hc-%'"
+    ))).one()
+    t, s, a, i, o, ls, lc = row
+    await db.execute(text(
+        "UPDATE analytics_cumulative SET "
+        "total_requests=total_requests+:t, success_count=success_count+:s, "
+        "auto_requests=auto_requests+:a, total_input_tokens=total_input_tokens+:i, "
+        "total_output_tokens=total_output_tokens+:o, sum_latency_ms=sum_latency_ms+:ls, "
+        "latency_count=latency_count+:lc WHERE id=1"
+    ), {"t": t, "s": s, "a": a, "i": i, "o": o, "ls": ls, "lc": lc})
 
     await db.execute(
         text("DELETE FROM request_logs WHERE conversation_id NOT LIKE 'hc-%'")

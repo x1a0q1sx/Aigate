@@ -157,6 +157,7 @@ export default {
   getLogDetail: (id) => apiGet(`/admin/api/logs/${id}`),
   getLogProviders: () => apiGet('/admin/api/logs/providers'),
   getAnalyticsSummary: () => apiGet('/admin/api/analytics/summary'),
+  resetAnalyticsSummary: () => apiPost('/admin/api/analytics/summary/reset', {}),
   // 日志归档
   listArchives: () => apiGet('/admin/api/logs/archives'),
   triggerArchive: () => apiPost('/admin/api/logs/archive', {}),

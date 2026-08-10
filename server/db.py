@@ -31,7 +31,7 @@ from .models.model import Model
 from .models.model_api_key import ModelApiKey  # v3.5 模型级密钥归属关联表（create_all 自动建表）
 from .models.health_check import HealthCheck
 from .models.rate_limit import RateLimitState
-from .models.request_log import RequestLog, LogMsgBlob  # v3.6 消息级去重 blob 仓库
+from .models.request_log import RequestLog, LogMsgBlob, AnalyticsCumulative  # v3.6 消息级去重 blob 仓库
 from .models.intelligence import IntelligenceStatic
 from .models.routing_config import RoutingWeights, RoutingPin, AdminAuditLog
 from .models.combo import Combo
@@ -167,6 +167,8 @@ async def init_db():
             "ALTER TABLE models ADD COLUMN cache_write_input_price REAL DEFAULT 0.0",
             "ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER",
             "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER",
+            # v11: 请求日志首字延迟（time-to-first-token），流式请求记录
+            "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT NULL",
         ]:
             try:
                 await conn.execute(text(sql))
@@ -178,6 +180,8 @@ async def init_db():
             "VALUES (1, 0.30, 0.50, 0.20)"
         ))
         await conn.execute(text("INSERT OR IGNORE INTO routing_pin (id) VALUES (1)"))
+        # v11: 累计统计数据单行（归档后统计仍保留，重置按钮清零）
+        await conn.execute(text("INSERT OR IGNORE INTO analytics_cumulative (id) VALUES (1)"))
         # v0.2 智力种子（避免重复灌）
         # 标记为 source='manual'：原始手工校准基线，Arena 同步绝不覆盖
         for pattern, score, tier, notes in INTEL_SEEDS:
