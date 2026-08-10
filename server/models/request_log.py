@@ -63,13 +63,13 @@ class AnalyticsCumulative(Base):
     """
     __tablename__ = "analytics_cumulative"
     id = Column(Integer, primary_key=True, default=1)
-    total_requests = Column(Integer, nullable=False, default=0)
-    success_count = Column(Integer, nullable=False, default=0)
-    auto_requests = Column(Integer, nullable=False, default=0)
-    total_input_tokens = Column(Integer, nullable=False, default=0)
-    total_output_tokens = Column(Integer, nullable=False, default=0)
-    sum_latency_ms = Column(Integer, nullable=False, default=0)   # 有延迟样本的累计和（算平均延迟用）
-    latency_count = Column(Integer, nullable=False, default=0)     # 有延迟的样本数
+    total_requests = Column(Integer, nullable=False, default=0, server_default="0")
+    success_count = Column(Integer, nullable=False, default=0, server_default="0")
+    auto_requests = Column(Integer, nullable=False, default=0, server_default="0")
+    total_input_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    total_output_tokens = Column(Integer, nullable=False, default=0, server_default="0")
+    sum_latency_ms = Column(Integer, nullable=False, default=0, server_default="0")  # 有延迟样本的累计和（算平均延迟用）
+    latency_count = Column(Integer, nullable=False, default=0, server_default="0")    # 有延迟的样本数
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 Index("idx_request_logs_model_time", RequestLog.routed_model, RequestLog.created_at)

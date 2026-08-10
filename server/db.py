@@ -181,7 +181,13 @@ async def init_db():
         ))
         await conn.execute(text("INSERT OR IGNORE INTO routing_pin (id) VALUES (1)"))
         # v11: 累计统计数据单行（归档后统计仍保留，重置按钮清零）
-        await conn.execute(text("INSERT OR IGNORE INTO analytics_cumulative (id) VALUES (1)"))
+        # 显式带全字段 + updated_at，兼容旧表结构（列无 SQL DEFAULT 时裸 INSERT 会 NOT NULL 失败被吞）
+        await conn.execute(text(
+            "INSERT OR IGNORE INTO analytics_cumulative "
+            "(id, total_requests, success_count, auto_requests, total_input_tokens, "
+            "total_output_tokens, sum_latency_ms, latency_count, updated_at) "
+            "VALUES (1, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)"
+        ))
         # v0.2 智力种子（避免重复灌）
         # 标记为 source='manual'：原始手工校准基线，Arena 同步绝不覆盖
         for pattern, score, tier, notes in INTEL_SEEDS:
