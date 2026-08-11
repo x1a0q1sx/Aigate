@@ -10,6 +10,7 @@ class ChatMessage(BaseModel):
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
     refusal: Optional[str] = None
+    reasoning_content: Optional[str] = None
 class ChatCompletionRequest(BaseModel):
     """OpenAI 兼容的聊天补全请求"""
     model: str
