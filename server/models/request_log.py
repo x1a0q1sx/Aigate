@@ -70,6 +70,8 @@ class AnalyticsCumulative(Base):
     total_output_tokens = Column(Integer, nullable=False, default=0, server_default="0")
     sum_latency_ms = Column(Integer, nullable=False, default=0, server_default="0")  # 有延迟样本的累计和（算平均延迟用）
     latency_count = Column(Integer, nullable=False, default=0, server_default="0")    # 有延迟的样本数
+    sum_ttft_ms = Column(Integer, nullable=False, default=0, server_default="0")      # 首字延迟样本累计和（算平均首字延迟用）
+    ttft_count = Column(Integer, nullable=False, default=0, server_default="0")       # 有首字延迟的样本数
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 Index("idx_request_logs_model_time", RequestLog.routed_model, RequestLog.created_at)

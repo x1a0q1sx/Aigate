@@ -1444,6 +1444,16 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
     total_providers = total_providers_result.scalar_one() or 0
     total_keys_result = await db.execute(select(func.count(ApiKey.id)))
     total_keys = total_keys_result.scalar_one() or 0
+    # 密钥口径拆分：启用中的密钥数 / 已关联到模型的密钥数（与「已配置密钥」总数对照，消除统计口径疑问）
+    active_keys_result = await db.execute(
+        select(func.count(ApiKey.id)).where(ApiKey.is_active == True)
+    )
+    active_keys = active_keys_result.scalar_one() or 0
+    from server.models.model_api_key import ModelApiKey
+    associated_keys_result = await db.execute(
+        select(func.count(func.distinct(ModelApiKey.api_key_id)))
+    )
+    associated_keys = associated_keys_result.scalar_one() or 0
     total_models_result = await db.execute(
         select(func.count(Model.id)).where(Model.enabled == True)
     )
@@ -1455,6 +1465,8 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
     return DashboardSummary(
         total_providers=total_providers,
         total_keys=total_keys,
+        active_keys=active_keys,
+        associated_keys=associated_keys,
         total_models=total_models,
         auto_candidates=auto_candidates,
         healthy_models=counts.get("healthy", 0),

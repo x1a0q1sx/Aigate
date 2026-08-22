@@ -41,6 +41,11 @@
         <div class="stat-number">{{ (summary.avg_latency_ms / 1000).toFixed(1) }}s</div>
       </div>
       <div class="stat-card">
+        <div class="stat-label">平均首字延迟</div>
+        <div class="stat-number">{{ summary.avg_ttft_ms != null ? (summary.avg_ttft_ms / 1000).toFixed(1) + 's' : '--' }}</div>
+        <div class="stat-sub">流式采样 {{ formatNum(summary.ttft_samples || 0) }} 条</div>
+      </div>
+      <div class="stat-card">
         <div class="stat-label">成功请求</div>
         <div class="stat-number">{{ formatNum(summary.success_count) }}</div>
         <div class="stat-sub">占总请求比</div>

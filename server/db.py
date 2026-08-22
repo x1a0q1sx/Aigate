@@ -169,6 +169,9 @@ async def init_db():
             "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER",
             # v11: 请求日志首字延迟（time-to-first-token），流式请求记录
             "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT NULL",
+            # v12: 累计统计表增加首字延迟累计列（平均首字延迟跨归档保留）
+            "ALTER TABLE analytics_cumulative ADD COLUMN sum_ttft_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE analytics_cumulative ADD COLUMN ttft_count INTEGER NOT NULL DEFAULT 0",
         ]:
             try:
                 await conn.execute(text(sql))
@@ -185,8 +188,8 @@ async def init_db():
         await conn.execute(text(
             "INSERT OR IGNORE INTO analytics_cumulative "
             "(id, total_requests, success_count, auto_requests, total_input_tokens, "
-            "total_output_tokens, sum_latency_ms, latency_count, updated_at) "
-            "VALUES (1, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)"
+            "total_output_tokens, sum_latency_ms, latency_count, sum_ttft_ms, ttft_count, updated_at) "
+            "VALUES (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)"
         ))
         # v0.2 智力种子（避免重复灌）
         # 标记为 source='manual'：原始手工校准基线，Arena 同步绝不覆盖

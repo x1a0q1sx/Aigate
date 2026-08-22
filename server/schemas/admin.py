@@ -7,6 +7,8 @@ from .provider import ProviderResponse, ApiKeyResponse, ModelInfoResponse
 class DashboardSummary(BaseModel):
     total_providers: int
     total_keys: int
+    active_keys: Optional[int] = None      # 启用中的密钥数（口径拆分，旧前端可忽略）
+    associated_keys: Optional[int] = None  # 已关联到模型的密钥数（模型级密钥归属）
     total_models: int
     auto_candidates: int
     healthy_models: int

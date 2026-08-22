@@ -481,7 +481,7 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
     if _analytics_cache["data"] and (now - _analytics_cache["ts"]) < _ANALYTICS_TTL:
         return _analytics_cache["data"]
 
-    # 一条 SQL 搞定：COUNT、SUM 全部聚合（延迟取 sum+count 以便与累计表合并算均值）
+    # 一条 SQL 搞定：COUNT、SUM 全部聚合（延迟/首字取 sum+count 以便与累计表合并算均值）
     row = (await db.execute(
         select(
             func.count(RequestLog.id),
@@ -491,9 +491,11 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
             func.coalesce(func.sum(RequestLog.latency_ms).filter(RequestLog.latency_ms.isnot(None)), 0),
             func.count(RequestLog.id).filter(RequestLog.latency_ms.isnot(None)),
             func.count(RequestLog.id).filter(RequestLog.requested_model == "auto"),
+            func.coalesce(func.sum(RequestLog.ttft_ms).filter(RequestLog.ttft_ms.isnot(None)), 0),
+            func.count(RequestLog.id).filter(RequestLog.ttft_ms.isnot(None)),
         ).where(RequestLog.is_health_check == 0)
     )).one()
-    total, success_count, total_input, total_output, lat_sum, lat_cnt, auto_count = row
+    total, success_count, total_input, total_output, lat_sum, lat_cnt, auto_count, ttft_sum, ttft_cnt = row
 
     # 累计统计（归档后保留的部分）
     cum = (await db.execute(
@@ -507,10 +509,13 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
         lat_sum = (lat_sum or 0) + cum.sum_latency_ms
         lat_cnt = (lat_cnt or 0) + cum.latency_count
         auto_count = (auto_count or 0) + cum.auto_requests
+        ttft_sum = (ttft_sum or 0) + (getattr(cum, "sum_ttft_ms", 0) or 0)
+        ttft_cnt = (ttft_cnt or 0) + (getattr(cum, "ttft_count", 0) or 0)
 
     total = total or 0
     success_count = success_count or 0
     avg_lat = (lat_sum or 0) / (lat_cnt or 1) if lat_cnt else 0.0
+    avg_ttft = (ttft_sum or 0) / ttft_cnt if ttft_cnt else None
 
     data = {
         "total_requests": total,
@@ -519,6 +524,8 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
         "total_input_tokens": int(total_input or 0),
         "total_output_tokens": int(total_output or 0),
         "avg_latency_ms": round(avg_lat, 1),
+        "avg_ttft_ms": round(avg_ttft, 1) if avg_ttft is not None else None,
+        "ttft_samples": int(ttft_cnt or 0),
         "auto_requests": auto_count or 0,
         "direct_requests": total - (auto_count or 0),
     }
@@ -534,7 +541,8 @@ async def reset_analytics_summary(db: AsyncSession = Depends(get_db)):
     """
     await db.execute(text("UPDATE analytics_cumulative SET total_requests=0, success_count=0, "
                           "auto_requests=0, total_input_tokens=0, total_output_tokens=0, "
-                          "sum_latency_ms=0, latency_count=0 WHERE id=1"))
+                          "sum_latency_ms=0, latency_count=0, "
+                          "sum_ttft_ms=0, ttft_count=0 WHERE id=1"))
     await db.commit()
     _invalidate_analytics_cache()
     return {"ok": True, "message": "统计数据已重置，当前实时日志统计保留"}
@@ -780,14 +788,18 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
     arch_output = sum(r.completion_tokens or 0 for r in rows)
     arch_lat_sum = sum(r.latency_ms or 0 for r in rows if r.latency_ms is not None)
     arch_lat_cnt = sum(1 for r in rows if r.latency_ms is not None)
+    arch_ttft_sum = sum((getattr(r, "ttft_ms", None) or 0) for r in rows if getattr(r, "ttft_ms", None) is not None)
+    arch_ttft_cnt = sum(1 for r in rows if getattr(r, "ttft_ms", None) is not None)
     await db.execute(text(
         "UPDATE analytics_cumulative SET "
         "total_requests=total_requests+:t, success_count=success_count+:s, "
         "auto_requests=auto_requests+:a, total_input_tokens=total_input_tokens+:i, "
         "total_output_tokens=total_output_tokens+:o, sum_latency_ms=sum_latency_ms+:ls, "
-        "latency_count=latency_count+:lc WHERE id=1"
+        "latency_count=latency_count+:lc, "
+        "sum_ttft_ms=sum_ttft_ms+:ts, ttft_count=ttft_count+:tc WHERE id=1"
     ), {"t": arch_total, "s": arch_success, "a": arch_auto, "i": arch_input,
-        "o": arch_output, "ls": arch_lat_sum, "lc": arch_lat_cnt})
+        "o": arch_output, "ls": arch_lat_sum, "lc": arch_lat_cnt,
+        "ts": arch_ttft_sum, "tc": arch_ttft_cnt})
 
     # 从 DB 删除已归档记录
     ids_to_delete = [r.id for r in rows]
@@ -923,17 +935,20 @@ async def clear_logs(db: AsyncSession = Depends(get_db)):
         "COALESCE(SUM(CASE WHEN requested_model='auto' THEN 1 ELSE 0 END),0), "
         "COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), "
         "COALESCE(SUM(latency_ms),0), "
-        "COALESCE(SUM(CASE WHEN latency_ms IS NOT NULL THEN 1 ELSE 0 END),0) "
+        "COALESCE(SUM(CASE WHEN latency_ms IS NOT NULL THEN 1 ELSE 0 END),0), "
+        "COALESCE(SUM(ttft_ms),0), "
+        "COALESCE(SUM(CASE WHEN ttft_ms IS NOT NULL THEN 1 ELSE 0 END),0) "
         "FROM request_logs WHERE conversation_id NOT LIKE 'hc-%'"
     ))).one()
-    t, s, a, i, o, ls, lc = row
+    t, s, a, i, o, ls, lc, ts, tc = row
     await db.execute(text(
         "UPDATE analytics_cumulative SET "
         "total_requests=total_requests+:t, success_count=success_count+:s, "
         "auto_requests=auto_requests+:a, total_input_tokens=total_input_tokens+:i, "
         "total_output_tokens=total_output_tokens+:o, sum_latency_ms=sum_latency_ms+:ls, "
-        "latency_count=latency_count+:lc WHERE id=1"
-    ), {"t": t, "s": s, "a": a, "i": i, "o": o, "ls": ls, "lc": lc})
+        "latency_count=latency_count+:lc, "
+        "sum_ttft_ms=sum_ttft_ms+:ts, ttft_count=ttft_count+:tc WHERE id=1"
+    ), {"t": t, "s": s, "a": a, "i": i, "o": o, "ls": ls, "lc": lc, "ts": ts, "tc": tc})
 
     await db.execute(
         text("DELETE FROM request_logs WHERE conversation_id NOT LIKE 'hc-%'")

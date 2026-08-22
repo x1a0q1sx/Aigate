@@ -12,7 +12,8 @@
     <!-- 概览指标 -->
     <div class="stats-grid">
       <StatCard label="服务商" icon="server" :value="stat('total_providers')" />
-      <StatCard label="已配置密钥" icon="key" :value="stat('total_keys')" />
+      <StatCard label="已配置密钥" icon="key" :value="stat('total_keys')"
+        :sub="keySub" />
       <StatCard label="启用模型" icon="cpu" :value="stat('total_models')" />
       <StatCard label="Auto 候选" icon="scale" :value="stat('auto_candidates')" />
     </div>
@@ -138,6 +139,12 @@ print(resp.choices[0].message.content)`,
     }
   },
   computed: {
+    /** 密钥口径拆分说明：总数 vs 启用数 vs 已关联模型数 */
+    keySub() {
+      const s = this.summary
+      if (!s || s.active_keys == null) return ''
+      return `启用 ${s.active_keys} · 关联模型 ${s.associated_keys ?? 0}`
+    },
     /** Auto 候选总数：健康分布的分母应是四种状态之和，而不是"启用模型总数" */
     healthTotal() {
       const s = this.summary
