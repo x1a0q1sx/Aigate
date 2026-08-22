@@ -238,10 +238,14 @@ def verify_aigate_api_key(raw_request: Request):
     expected = getattr(config.security, "aigate_api_key", "") or ""
     if not expected:
         return
+    # Bearer（OpenAI/Codex 客户端）与 x-api-key（Anthropic 客户端）都接受
     auth = raw_request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+    else:
+        token = raw_request.headers.get("x-api-key", "").strip()
+    if not token:
         raise HTTPException(status_code=401, detail="Missing AIGate API key")
-    token = auth.split(" ", 1)[1].strip()
     if token != expected:
         raise HTTPException(status_code=401, detail="Invalid AIGate API key")
 
