@@ -363,33 +363,6 @@ def test_estimate_request_tokens_messages_and_tools():
     assert estimate_request_tokens(img_req) >= 800
 
 
-def test_litellm_pricing_extraction_and_match():
-    from server.core.litellm_pricing import _extract_entry, _normalize_name, match_litellm, _to_per_million
-
-    assert _to_per_million("0.0000015") == 1.5
-    assert _to_per_million(None) is None
-    assert _normalize_name("openai/gpt-5.2-2026-01-01") == "gpt-5.2"
-    assert _normalize_name("Claude-Sonnet-4:thinking") == "claude-sonnet-4"
-
-    entry = _extract_entry({
-        "input_cost_per_token": 0.00000125,
-        "output_cost_per_token": 0.00001,
-        "cache_read_input_token_cost": 0.0000001,
-        "max_input_tokens": 272000,
-        "max_output_tokens": 128000,
-        "litellm_provider": "openai",
-    })
-    assert entry["input"] == 1.25
-    assert entry["output"] == 10.0
-    assert entry["cache_read"] == 0.1
-    assert entry["context_length"] == 272000
-
-    db = {"gpt-5.2": entry, "gpt-5": {"input": 1.25, "output": 10.0}}
-    m1 = match_litellm("openai/gpt-5.2-2026-03-01", db)
-    assert m1 and m1["input"] == 1.25          # 前缀+日期剥除后精确命中
-    m2 = match_litellm("gpt-5.2-codex", db)
-    assert m2 and m2.get("context_length") == 272000  # 子串最长匹配
-    assert match_litellm("totally-unknown", db) is None
 
 
 def test_anthropic_request_thinking_and_images():

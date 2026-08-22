@@ -1026,45 +1026,6 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     return ModelInfoResponse.from_orm(model)
-@router.post("/models/pricing/litellm-backfill")
-async def litellm_pricing_backfill(db: AsyncSession = Depends(get_db)):
-    """用 litellm 社区价格库回填：0 价模型补价格、默认 4096 窗口补真实上下文长度。
-
-    手动维护的价格（pricing_source=manual）不动；已有非零价不动（只补空）。
-    """
-    from server.core.litellm_pricing import fetch_litellm_db, match_litellm
-    lite = await fetch_litellm_db(force=True)
-    if not lite:
-        raise HTTPException(status_code=502, detail="litellm pricing DB unavailable (network)")
-    models = (await db.execute(select(Model))).scalars().all()
-    price_filled = ctx_filled = 0
-    for m in models:
-        meta = match_litellm(m.model_id or "", lite)
-        if not meta:
-            continue
-        manual = (m.pricing_source or "").startswith("manual")
-        changed = False
-        if not manual:
-            if m.input_price == 0 and meta.get("input"):
-                m.input_price = meta["input"]; price_filled += 1; changed = True
-            if m.output_price == 0 and meta.get("output"):
-                m.output_price = meta["output"]; changed = True
-            if m.cache_read_input_price == 0 and meta.get("cache_read"):
-                m.cache_read_input_price = meta["cache_read"]; changed = True
-            if m.cache_write_input_price == 0 and meta.get("cache_write"):
-                m.cache_write_input_price = meta["cache_write"]; changed = True
-            if changed and (m.pricing_source or "") != "manual":
-                m.pricing_source = "litellm-community"
-        if m.context_length == 4096 and meta.get("context_length"):
-            m.context_length = int(meta["context_length"]); ctx_filled += 1
-    await db.commit()
-    return {
-        "ok": True,
-        "db_models": len(lite),
-        "local_models": len(models),
-        "price_filled": price_filled,
-        "context_filled": ctx_filled,
-    }
 @router.delete("/models/orphans")
 async def delete_orphan_models(db: AsyncSession = Depends(get_db)):
     """Delete model rows whose provider no longer exists."""
