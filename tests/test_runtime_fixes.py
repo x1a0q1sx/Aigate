@@ -11,7 +11,7 @@ from server.adapters.xyusec_pricing import (
     _extract_pricing_from_json,
     match_model_metadata,
 )
-from server.api.v1_router import _format_sse_chunk
+from server.api.v1_router import _format_sse_chunk, _stream_usage_dict
 from server.core.auto_router import AutoRouter, RouteResult
 from server.core.health_checker import HealthChecker
 from server.core.model_catalog import create_adapter_for_provider
@@ -22,6 +22,13 @@ def test_openai_adapter_timeout_uses_seconds():
     adapter = OpenAICompatAdapter(timeout=60)
 
     assert adapter.timeout == 60
+
+
+def test_stream_usage_ignores_malformed_upstream_usage():
+    assert _stream_usage_dict({"usage": {"prompt_tokens": 3}}) == {"prompt_tokens": 3}
+    assert _stream_usage_dict({"usage": "unknown"}) == {}
+    assert _stream_usage_dict({"usage": [1, 2]}) == {}
+    assert _stream_usage_dict(None) == {}
 
 
 def test_codex_responses_adapter_builds_responses_payload():

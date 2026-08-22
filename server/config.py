@@ -27,6 +27,9 @@ class AutoRouterConfig(BaseModel):
     cooling_period_seconds: int = 30
     session_sticky_minutes: int = 30
     free_model_priority: bool = True
+    # Interactive streamed auto routing must yield a useful response promptly.
+    stream_first_chunk_timeout_seconds: int = 20
+    stream_first_response_budget_seconds: int = 75
 class RateLimitConfig(BaseModel):
     default_rpm: int = 60
     default_tpm: int = 100000

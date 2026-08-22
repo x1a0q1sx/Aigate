@@ -1,6 +1,7 @@
 """
 /v1/* OpenAI 兼容端点
 """
+import asyncio
 import json
 import time
 from typing import Optional
@@ -169,6 +170,29 @@ def _stream_content_is_empty(buf) -> bool:
         if delta.get("tool_calls"):
             return False
     return total == 0
+
+
+def _stream_usage_dict(chunk) -> dict:
+    """Return usage only when an upstream chunk provides the OpenAI object shape."""
+    if not isinstance(chunk, dict):
+        return {}
+    usage = chunk.get("usage")
+    return usage if isinstance(usage, dict) else {}
+
+
+async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
+    """Yield an upstream stream, failing quickly when it never produces a chunk."""
+    try:
+        first = await asyncio.wait_for(anext(source), timeout=max(1, timeout_seconds))
+    except StopAsyncIteration:
+        return
+    except asyncio.TimeoutError as error:
+        raise TimeoutError(
+            f"upstream did not produce a first stream chunk within {timeout_seconds:.0f}s"
+        ) from error
+    yield first
+    async for chunk in source:
+        yield chunk
 
 
 def _merge_oauth_headers(provider, base_headers=None):
@@ -1265,6 +1289,9 @@ async def chat_completions(
             from server.db import AsyncSessionLocal as _CS
             cascade_db = _CS()
             max_r = max(1, ar.config.max_fallbacks)
+            first_chunk_timeout = max(5, int(getattr(ar.config, "stream_first_chunk_timeout_seconds", 20)))
+            first_response_budget = max(first_chunk_timeout, int(getattr(ar.config, "stream_first_response_budget_seconds", 75)))
+            first_response_deadline = time.monotonic() + first_response_budget
             tried_sids = set()
             stream_errs = []
             # v3.0: combo 路由会用自定义候选池替代 ar.get_best_candidate
@@ -1274,6 +1301,13 @@ async def chat_completions(
             yield b": keepalive\n\n"
             try:
                 for st_attempt in range(max_r + 1):
+                    remaining_first_response = first_response_deadline - time.monotonic()
+                    if remaining_first_response <= 0:
+                        stream_errs.append({
+                            "attempt": st_attempt,
+                            "error": f"first response budget exceeded ({first_response_budget}s)"
+                        })
+                        break
                     _diag(conversation_id, "auto_stream_candidate_start", _diag_start, attempt=st_attempt)
                     if combo_pool:
                         # combo 路径：按池子顺序取下一个未试目标
@@ -1352,7 +1386,8 @@ async def chat_completions(
                         stream_has_error = False
                         stream_err_detail = ""
                         _cascade_ttft_ms = None
-                        async for ck in gen:
+                        candidate_first_chunk_timeout = min(first_chunk_timeout, remaining_first_response)
+                        async for ck in _stream_with_first_chunk_timeout(gen, candidate_first_chunk_timeout):
                             # 首字延迟：首个 chunk 距请求开始的时间
                             if _cascade_ttft_ms is None:
                                 _cascade_ttft_ms = int((time.time() - _send_time) * 1000)
@@ -1363,7 +1398,7 @@ async def chat_completions(
                                 break
                             yield _format_sse_chunk(ck, mid_full)
                             stream_buf.append(ck)
-                            u = ck.get("usage", {}) if isinstance(ck, dict) else {}
+                            u = _stream_usage_dict(ck)
                             if u:
                                 last_usage = u
                         if stream_has_error:
@@ -1537,7 +1572,7 @@ async def chat_completions(
                                 stream_has_error = True
                                 stream_err_detail = str(chunk.get("error", "unknown"))[:200]
                                 break  # 跳出循环再抛，避免 aclose() 竞态
-                            u = chunk.get("usage", {})
+                            u = _stream_usage_dict(chunk)
                             if u:
                                 _stream_usage = u
                             _stream_chunks_log.append(chunk)
