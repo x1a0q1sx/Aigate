@@ -48,6 +48,14 @@ def _to_per_million(value: Any) -> Optional[float]:
     return round(v * 1_000_000, 6)
 
 
+def _safe_int(value: Any) -> int:
+    """litellm 库里个别条目把字段写成文档说明字符串，非数字一律按 0 处理。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _extract_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     """从 litellm 条目提取 aigate 需要的字段（缺失的键不出现）。"""
     out: Dict[str, Any] = {}
@@ -64,12 +72,12 @@ def _extract_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
     if cw:
         out["cache_write"] = cw
     # 上下文窗口：优先 max_input_tokens，退回 max_tokens（旧字段，输入+输出共享上限）
-    max_in = entry.get("max_input_tokens") or 0
-    max_total = entry.get("max_tokens") or 0
-    window = int(max_in or max_total or 0)
+    max_in = _safe_int(entry.get("max_input_tokens"))
+    max_total = _safe_int(entry.get("max_tokens"))
+    window = max_in or max_total
     if window > 0:
         out["context_length"] = window
-    mo = int(entry.get("max_output_tokens") or 0)
+    mo = _safe_int(entry.get("max_output_tokens"))
     if mo > 0:
         out["max_output_tokens"] = mo
     if "input" in out or "output" in out:
