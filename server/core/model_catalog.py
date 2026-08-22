@@ -205,6 +205,10 @@ class ModelCatalog:
             model.cache_read_input_price = cache_read_input_price
         if cache_write_input_price is not None:
             model.cache_write_input_price = cache_write_input_price
+        if any(v is not None for v in (input_price, output_price, cache_read_input_price, cache_write_input_price)):
+            # 手动改价 → 标记 manual，后续刷新模型不覆盖（想恢复自动价可手动清掉来源）
+            model.pricing_source = "manual"
+            model.pricing_updated_at = datetime.utcnow()
         if success_rate is not None:
             model.success_rate = success_rate
         if is_free is not None:
@@ -353,10 +357,24 @@ class ModelCatalog:
         metric_updated = 0
         added_models = []
         removed_models = []
+        # litellm 社区价格库兜底（磁盘缓存，站点没给价/没给窗口时填充）
+        try:
+            from server.core.litellm_pricing import fetch_litellm_db, match_litellm
+            litellm_db = await fetch_litellm_db()
+        except Exception:
+            litellm_db = {}
         for model_info in models:
             remote_metadata = match_model_metadata(model_info.model_id, provider_metadata) if provider_metadata else None
-            if remote_metadata and "input" in remote_metadata and "output" in remote_metadata:
+            site_priced = bool(remote_metadata and "input" in remote_metadata and "output" in remote_metadata)
+            litellm_meta = match_litellm(model_info.model_id, litellm_db) if litellm_db else None
+            if site_priced:
                 pricing = remote_metadata
+            elif litellm_meta and ("input" in litellm_meta or "output" in litellm_meta):
+                # 站点没给价 → litellm 兜底（is_free 由价格推导）
+                pricing = dict(litellm_meta)
+                pricing.setdefault("input", 0.0)
+                pricing.setdefault("output", 0.0)
+                pricing["is_free"] = bool(pricing.get("input", 0) == 0 and pricing.get("output", 0) == 0)
             else:
                 pricing = get_builtin_pricing(model_info.model_id)
             if pricing:
@@ -366,6 +384,9 @@ class ModelCatalog:
                 model_info.cache_write_input_price = float(pricing.get("cache_write") or 0)
                 model_info.is_free = pricing["is_free"]
                 pricing_updated += 1
+            # 上下文窗口：站点探测不返回 → litellm 补齐（adapter 默认 4096 不可信）
+            if litellm_meta and litellm_meta.get("context_length"):
+                model_info.context_length = int(litellm_meta["context_length"])
             # 移除了 "auto-mark as free" 逻辑：当上游不返回定价时，不再自动标记免费
             # 用户可在管理面板手动设置价格
             # 免费模型不再自动开启 auto（用户反馈不好使），默认 auto_enabled=False，需手动开启
@@ -379,14 +400,19 @@ class ModelCatalog:
             existing_model = existing.scalar_one_or_none()
             if existing_model:
                 existing_model.display_name = model_info.display_name or existing_model.display_name
-                existing_model.input_price = model_info.input_price
-                existing_model.output_price = model_info.output_price
-                existing_model.cache_read_input_price = model_info.cache_read_input_price
-                existing_model.cache_write_input_price = model_info.cache_write_input_price
-                existing_model.is_free = model_info.is_free
+                # 手动维护的价格（pricing_source == "manual"）不被刷新覆盖
+                manual_priced = (existing_model.pricing_source or "").startswith("manual")
+                if not manual_priced:
+                    existing_model.input_price = model_info.input_price
+                    existing_model.output_price = model_info.output_price
+                    existing_model.cache_read_input_price = model_info.cache_read_input_price
+                    existing_model.cache_write_input_price = model_info.cache_write_input_price
+                    existing_model.is_free = model_info.is_free
                 existing_model.supports_streaming = model_info.supports_streaming
                 existing_model.supports_vision = model_info.supports_vision
-                existing_model.context_length = model_info.context_length
+                # 窗口只在仍是默认 4096 时补齐，用户手动改过的窗口不动
+                if existing_model.context_length == 4096 and model_info.context_length != 4096:
+                    existing_model.context_length = model_info.context_length
                 if remote_metadata:
                     existing_model.success_rate = remote_metadata.get("success_rate")
                     existing_model.avg_latency_ms = remote_metadata.get("avg_latency_ms")
@@ -396,17 +422,21 @@ class ModelCatalog:
                     existing_model.pricing_updated_at = datetime.utcnow()
                     if remote_metadata.get("success_rate") is not None:
                         metric_updated += 1
-                if existing_model.input_price == 0 and model_info.input_price > 0:
-                    existing_model.input_price = model_info.input_price
-                if existing_model.output_price == 0 and model_info.output_price > 0:
-                    existing_model.output_price = model_info.output_price
-                if existing_model.cache_read_input_price == 0 and model_info.cache_read_input_price > 0:
-                    existing_model.cache_read_input_price = model_info.cache_read_input_price
-                if existing_model.cache_write_input_price == 0 and model_info.cache_write_input_price > 0:
-                    existing_model.cache_write_input_price = model_info.cache_write_input_price
-                if not existing_model.is_free and model_info.is_free:
-                    existing_model.is_free = True
-                    # 不再自动开启 auto；免费模型需用户手动参与选举
+                elif not manual_priced and not site_priced and litellm_meta:
+                    existing_model.pricing_source = "litellm-community"
+                    existing_model.pricing_updated_at = datetime.utcnow()
+                if not manual_priced:
+                    if existing_model.input_price == 0 and model_info.input_price > 0:
+                        existing_model.input_price = model_info.input_price
+                    if existing_model.output_price == 0 and model_info.output_price > 0:
+                        existing_model.output_price = model_info.output_price
+                    if existing_model.cache_read_input_price == 0 and model_info.cache_read_input_price > 0:
+                        existing_model.cache_read_input_price = model_info.cache_read_input_price
+                    if existing_model.cache_write_input_price == 0 and model_info.cache_write_input_price > 0:
+                        existing_model.cache_write_input_price = model_info.cache_write_input_price
+                    if not existing_model.is_free and model_info.is_free:
+                        existing_model.is_free = True
+                        # 不再自动开启 auto；免费模型需用户手动参与选举
                 updated += 1
             else:
                 new_model = Model(

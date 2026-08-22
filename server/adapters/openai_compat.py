@@ -154,6 +154,9 @@ class OpenAICompatAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
+        # reasoning dict 是网关内部思考控制提示（anthropic 出站方言）；OpenAI 兼容上游
+        # 只认 reasoning_effort，透传非标字段有被严格上游 400 的风险
+        payload.pop("reasoning", None)
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url)) as client:
             resp = await client.post(url, headers=headers, json=payload)
@@ -182,6 +185,7 @@ class OpenAICompatAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
+        payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
         timeout_error = None
         try:

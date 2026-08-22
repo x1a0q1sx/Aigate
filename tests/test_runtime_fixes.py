@@ -313,3 +313,172 @@ async def test_model_name_resolves_queries():
     assert await _model_name_resolves(Sess([None]), "prov/m") is False
     # 裸 model_id 命中
     assert await _model_name_resolves(Sess([(1,)]), "gpt-5.2") is True
+
+
+# ===================== 上下文守护 / litellm 价格库 / 客户端兼容增强 =====================
+
+def test_context_guard_estimator_and_classifier():
+    from server.core.context_guard import (
+        estimate_request_tokens, estimate_text_tokens, is_context_error, context_overflows,
+    )
+
+    # CJK ~1 token/字，英文 ~4字符/token
+    assert estimate_text_tokens("你好世界") == 4
+    assert 3 <= estimate_text_tokens("abcdefgh") <= 2 or estimate_text_tokens("abcdefgh") == 2
+    # 上下文错误识别（各家上游的常见报错）
+    assert is_context_error("This model's maximum context length is 4096 tokens")
+    assert is_context_error("Prompt is too long: 200000 tokens > 128000 maximum")
+    assert is_context_error("input length and `max_tokens` exceed context limit")
+    assert is_context_error("Requested tokens exceed the model's context window")
+    assert not is_context_error("connection timeout")
+    assert not is_context_error("401 unauthorized")
+    assert not is_context_error(None)
+    # 窗口判断
+    class M: context_length = 8192
+    assert context_overflows(M(), 8000) is True       # 8000+1024 > 8192
+    assert context_overflows(M(), 6000) is False
+    M.context_length = 0
+    assert context_overflows(M(), 999999) is False    # 未知窗口不拦截
+
+
+def test_estimate_request_tokens_messages_and_tools():
+    from server.core.context_guard import estimate_request_tokens
+
+    req = ChatCompletionRequest(
+        model="m", messages=[{"role": "user", "content": "你好世界"}],
+        tools=[{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}],
+    )
+    est = estimate_request_tokens(req)
+    assert est >= 4  # 至少覆盖正文
+    img_req = ChatCompletionRequest(
+        model="m", messages=[{"role": "user", "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+        ]}],
+    )
+    assert estimate_request_tokens(img_req) >= 800
+
+
+def test_litellm_pricing_extraction_and_match():
+    from server.core.litellm_pricing import _extract_entry, _normalize_name, match_litellm, _to_per_million
+
+    assert _to_per_million("0.0000015") == 1.5
+    assert _to_per_million(None) is None
+    assert _normalize_name("openai/gpt-5.2-2026-01-01") == "gpt-5.2"
+    assert _normalize_name("Claude-Sonnet-4:thinking") == "claude-sonnet-4"
+
+    entry = _extract_entry({
+        "input_cost_per_token": 0.00000125,
+        "output_cost_per_token": 0.00001,
+        "cache_read_input_token_cost": 0.0000001,
+        "max_input_tokens": 272000,
+        "max_output_tokens": 128000,
+        "litellm_provider": "openai",
+    })
+    assert entry["input"] == 1.25
+    assert entry["output"] == 10.0
+    assert entry["cache_read"] == 0.1
+    assert entry["context_length"] == 272000
+
+    db = {"gpt-5.2": entry, "gpt-5": {"input": 1.25, "output": 10.0}}
+    m1 = match_litellm("openai/gpt-5.2-2026-03-01", db)
+    assert m1 and m1["input"] == 1.25          # 前缀+日期剥除后精确命中
+    m2 = match_litellm("gpt-5.2-codex", db)
+    assert m2 and m2.get("context_length") == 272000  # 子串最长匹配
+    assert match_litellm("totally-unknown", db) is None
+
+
+def test_anthropic_request_thinking_and_images():
+    from server.core.anthropic_converter import anthropic_to_openai_request
+
+    req = anthropic_to_openai_request({
+        "model": "claude-sonnet-4",
+        "system": "be brief",
+        "max_tokens": 1024,
+        "thinking": {"type": "enabled", "budget_tokens": 10000},
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "let me think"},
+                {"type": "text", "text": "answer"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}},
+                {"type": "text", "text": "这是什么"},
+            ]},
+        ],
+    })
+    assert req["reasoning"] == {"type": "enabled", "budget_tokens": 10000}
+    assert req["reasoning_effort"] == "high"  # 10000 落在 8192~16384 → high 档
+    # 历史 thinking → reasoning_content
+    asst = [m for m in req["messages"] if m["role"] == "assistant"][0]
+    assert asst.get("reasoning_content") == "let me think"
+    # 图片 → image_url data URL
+    user_img = req["messages"][-1]
+    assert isinstance(user_img["content"], list)
+    img_part = [p for p in user_img["content"] if p["type"] == "image_url"][0]
+    assert img_part["image_url"]["url"] == "data:image/png;base64,QUJD"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_thinking_and_tool_events():
+    from server.core.anthropic_converter import openai_stream_to_anthropic_events, openai_stream_end_events
+
+    state = {"msg_id": "msg_1", "model": "claude-x"}
+    ev1 = await openai_stream_to_anthropic_events(
+        {"choices": [{"delta": {"reasoning_content": "思考中"}}]}, state)
+    types1 = [e["type"] for e in ev1]
+    assert "message_start" in types1
+    assert "content_block_start" in types1
+    think_start = [e for e in ev1 if e["type"] == "content_block_start"][0]
+    assert think_start["content_block"]["type"] == "thinking"
+    think_delta = [e for e in ev1 if e["type"] == "content_block_delta"][0]
+    assert think_delta["delta"] == {"type": "thinking_delta", "thinking": "思考中"}
+
+    ev2 = await openai_stream_to_anthropic_events(
+        {"choices": [{"delta": {"content": "答案"}}]}, state)
+    # 思考块关闭后开文本块
+    assert any(e["type"] == "content_block_stop" for e in ev2)
+    text_start = [e for e in ev2 if e["type"] == "content_block_start"]
+    assert text_start and text_start[0]["content_block"]["type"] == "text"
+
+    ev3 = await openai_stream_to_anthropic_events(
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": "call_1", "function": {"name": "get_weather", "arguments": "{\"city\":"}}
+        ]}}]}, state)
+    tool_start = [e for e in ev3 if e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use"]
+    assert tool_start and tool_start[0]["content_block"]["name"] == "get_weather"
+    json_delta = [e for e in ev3 if e["type"] == "content_block_delta" and e["delta"]["type"] == "input_json_delta"]
+    assert json_delta and json_delta[0]["delta"]["partial_json"] == "{\"city\":"
+
+    ev4 = await openai_stream_to_anthropic_events(
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 10, "completion_tokens": 5}}, state)
+    end_events = openai_stream_end_events(state)
+    assert state["usage_in"] == 10
+    stop_reason = [e for e in end_events if e["type"] == "message_delta"][0]["delta"]["stop_reason"]
+    assert stop_reason == "tool_use"
+    assert end_events[-1]["type"] == "message_stop"
+
+
+def test_responses_input_parts_normalization():
+    from server.api.responses_router import _input_to_messages
+
+    msgs = _input_to_messages([
+        {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "看这张图"},
+            {"type": "input_image", "image_url": "https://x/1.png"},
+        ]},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "先前推理"}]},
+        {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "42"},
+    ], instructions="sys")
+    assert msgs[0] == {"role": "system", "content": "sys"}
+    user = msgs[1]
+    assert isinstance(user["content"], list)
+    assert {"type": "image_url", "image_url": {"url": "https://x/1.png"}} in user["content"]
+    # reasoning 摘要 + function_call 合并进同一条 assistant 消息
+    asst = [m for m in msgs if m["role"] == "assistant"]
+    assert len(asst) == 1
+    assert asst[0].get("reasoning_content") == "先前推理"
+    assert asst[0]["tool_calls"][0]["id"] == "c1"
+    assert msgs[-1]["role"] == "tool" and msgs[-1]["tool_call_id"] == "c1"

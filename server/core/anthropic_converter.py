@@ -22,9 +22,9 @@ def anthropic_to_openai_request(req: dict) -> dict:
     """Anthropic Messages 请求 → OpenAI Chat Completions 请求
 
     Anthropic 格式:
-      model, system, messages[{role, content}], max_tokens, temperature, ...
+      model, system, messages[{role, content}], max_tokens, temperature, thinking, ...
     OpenAI 格式:
-      model, messages[{role, content}], max_tokens, temperature, ...
+      model, messages[{role, content}], max_tokens, temperature, reasoning, reasoning_effort, ...
     """
     messages: List[dict] = []
 
@@ -52,11 +52,26 @@ def anthropic_to_openai_request(req: dict) -> dict:
         # content 可以是 string 或 list of blocks
         if isinstance(content, list):
             blocks = []
+            images = []
             tool_calls = []
+            reasoning_text = ""
             for block in (content or []):
                 btype = block.get("type", "")
                 if btype == "text":
                     blocks.append(block.get("text", ""))
+                elif btype == "thinking":
+                    # 历史思考块 → reasoning_content（Claude Code 多轮会回传）
+                    t = block.get("thinking", "")
+                    if isinstance(t, str) and t:
+                        reasoning_text = t
+                elif btype == "image":
+                    # 图片块 → OpenAI image_url 部件（base64 data URL 直传）
+                    src = block.get("source") or {}
+                    if isinstance(src, dict) and src.get("data"):
+                        media = src.get("media_type") or "image/png"
+                        images.append(f"data:{media};base64,{src['data']}")
+                    elif isinstance(src, dict) and src.get("url"):
+                        images.append(src["url"])
                 elif btype == "tool_use":
                     # assistant tool_use → OpenAI tool_calls
                     tool_calls.append({
@@ -70,15 +85,24 @@ def anthropic_to_openai_request(req: dict) -> dict:
                 elif btype == "tool_result":
                     # user tool_result → OpenAI tool message
                     tc_content = block.get("content", "")
+                    img_urls = []
                     if isinstance(tc_content, list):
-                        # 拼接 text blocks
+                        # 拼接 text blocks；图片转 data URL 文本标记
                         parts = []
                         for tb in tc_content:
                             if isinstance(tb, dict) and tb.get("type") == "text":
                                 parts.append(tb.get("text", ""))
+                            elif isinstance(tb, dict) and tb.get("type") == "image":
+                                src = tb.get("source") or {}
+                                if isinstance(src, dict) and src.get("data"):
+                                    media = src.get("media_type") or "image/png"
+                                    img_urls.append(f"data:{media};base64,{src['data']}")
                             elif isinstance(tb, str):
                                 parts.append(tb)
                         tc_content = "\n".join(parts)
+                        if img_urls:
+                            tc_content = (str(tc_content) + "\n" if tc_content else "") + "\n".join(
+                                f"[image attached: {u[:64]}...]" for u in img_urls)
                     messages.append({
                         "role": role,
                         "content": str(tc_content),
@@ -86,10 +110,26 @@ def anthropic_to_openai_request(req: dict) -> dict:
                     })
                     continue
             if tool_calls:
-                messages.append({"role": role, "content": "\n".join(blocks) or None, "tool_calls": tool_calls})
+                m: dict = {"role": role, "content": "\n".join(blocks) or None, "tool_calls": tool_calls}
+                if reasoning_text:
+                    m["reasoning_content"] = reasoning_text
+                messages.append(m)
+            elif images:
+                # 混合文本+图片 → OpenAI 多模态 content 数组
+                parts = [{"type": "text", "text": "\n".join(blocks)}] if blocks else []
+                parts += [{"type": "image_url", "image_url": {"url": u}} for u in images]
+                m = {"role": role, "content": parts}
+                if reasoning_text:
+                    m["reasoning_content"] = reasoning_text
+                messages.append(m)
             elif blocks:
-                messages.append({"role": role, "content": "\n".join(blocks)})
-            elif not blocks and not tool_calls:
+                m = {"role": role, "content": "\n".join(blocks)}
+                if reasoning_text:
+                    m["reasoning_content"] = reasoning_text
+                messages.append(m)
+            elif reasoning_text:
+                messages.append({"role": role, "content": "", "reasoning_content": reasoning_text})
+            else:
                 messages.append({"role": role, "content": ""})
         else:
             messages.append({"role": role, "content": content})
@@ -112,7 +152,29 @@ def anthropic_to_openai_request(req: dict) -> dict:
         openai_req["tools"] = _anthropic_tools_to_openai(req["tools"])
     if req.get("tool_choice"):
         openai_req["tool_choice"] = _anthropic_tool_choice_to_openai(req["tool_choice"])
+    # thinking 参数：Anthropic thinking → OpenAI reasoning（anthropic 出站适配器原生识别）
+    # 同时反推 effort 档位，让 openai_compat / codex_responses 上游也能控制思考深度
+    thinking = req.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        openai_req["reasoning"] = {
+            "type": "enabled",
+            "budget_tokens": int(thinking.get("budget_tokens") or 0),
+        }
+        openai_req["reasoning_effort"] = _budget_to_effort(int(thinking.get("budget_tokens") or 0))
     return openai_req
+
+
+def _budget_to_effort(budget_tokens: int) -> str:
+    """Anthropic 思考预算 → OpenAI effort 档位（近似反推）。"""
+    if budget_tokens <= 0:
+        return "low"
+    if budget_tokens <= 2048:
+        return "low"
+    if budget_tokens <= 8192:
+        return "medium"
+    if budget_tokens <= 16384:
+        return "high"
+    return "xhigh"
 
 
 def _anthropic_tools_to_openai(tools: list) -> list:
@@ -154,7 +216,12 @@ def openai_response_to_anthropic(openai_resp: dict, model_name: str) -> dict:
     choice = choices[0] if choices else {}
     openai_msg = choice.get("message", {})
     text = openai_msg.get("content") or ""
+    reasoning = openai_msg.get("reasoning_content")
+    if not isinstance(reasoning, str):
+        reasoning = None
     content_blocks = []
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     # 检查 tool_calls
     tool_calls = openai_msg.get("tool_calls") or []
     for tc in tool_calls:
@@ -237,7 +304,7 @@ async def openai_stream_to_anthropic_events(openai_chunk: dict, state: dict) -> 
       - msg_id: Anthropic message id
       - model: 目标模型名
       - started: 是否已发 message_start
-      - block_started: 是否已发 content_block_start
+      - blocks: [{type: text|thinking|tool_use, ...}] 已开启的内容块
       - text_so_far: 累计文本
       - finish_reason: finish_reason
       - usage_in/usage_out: token 统计
@@ -262,14 +329,28 @@ async def openai_stream_to_anthropic_events(openai_chunk: dict, state: dict) -> 
                 }
             }
         })
-        # 发 content_block_start（第一个 text block）
-        events.append({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {"type": "text", "text": ""}
-        })
         state["started"] = True
-        state["block_started"] = True
+        state.setdefault("blocks", [])
+        state.setdefault("next_index", 0)
+
+    blocks_state: list = state.setdefault("blocks", [])
+    state.setdefault("next_index", 0)
+
+    def _open_block(btype: str, extra: dict) -> int:
+        idx = state["next_index"]
+        state["next_index"] = idx + 1
+        block = {"type": btype}
+        block.update(extra)
+        blocks_state.append({"type": btype, "index": idx})
+        events.append({"type": "content_block_start", "index": idx, "content_block": block})
+        return idx
+
+    def _close_block(btype: str):
+        for b in blocks_state:
+            if b["type"] == btype and not b.get("closed"):
+                b["closed"] = True
+                events.append({"type": "content_block_stop", "index": b["index"]})
+                return
 
     # 解析 OpenAI chunk
     choices = openai_chunk.get("choices", [])
@@ -277,13 +358,69 @@ async def openai_stream_to_anthropic_events(openai_chunk: dict, state: dict) -> 
         choice = choices[0]
         delta = choice.get("delta", {})
         text = delta.get("content")
-        if text:
-            # 发 content_block_delta
+        reasoning = delta.get("reasoning_content")
+        if not isinstance(reasoning, str):
+            r2 = delta.get("reasoning")
+            reasoning = r2 if isinstance(r2, str) else None
+        if reasoning:
+            # 思考增量 → thinking 块（与文本块分离，Claude Code 前端可折叠展示）
+            idx = None
+            for b in blocks_state:
+                if b["type"] == "thinking" and not b.get("closed"):
+                    idx = b["index"]
+                    break
+            if idx is None:
+                if any(b["type"] == "text" for b in blocks_state):
+                    _close_block("text")
+                idx = _open_block("thinking", {"thinking": "", "signature": ""})
             events.append({
                 "type": "content_block_delta",
-                "index": 0,
-                "delta": {"type": "text_delta", "text": text}
+                "index": idx,
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
             })
+        if text:
+            # 思考结束才能开始正文（thinking 块必须在 text 之前关闭）
+            _close_block("thinking")
+            idx = None
+            for b in blocks_state:
+                if b["type"] == "text" and not b.get("closed"):
+                    idx = b["index"]
+                    break
+            if idx is None:
+                idx = _open_block("text", {"text": ""})
+            events.append({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "text_delta", "text": text},
+            })
+        # 工具调用增量 → tool_use 块（流式 input_json_delta）
+        for tc in (delta.get("tool_calls") or []):
+            tc_idx = tc.get("index", 0)
+            fn = tc.get("function") or {}
+            target = None
+            for b in blocks_state:
+                if b["type"] == "tool_use" and b.get("tc_index") == tc_idx and not b.get("closed"):
+                    target = b
+                    break
+            if target is None:
+                # 新工具调用：先关掉前面的文本/思考块
+                _close_block("thinking")
+                _close_block("text")
+                idx = _open_block("tool_use", {
+                    "id": str(tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"),
+                    "name": fn.get("name") or "",
+                    "input": {},
+                })
+                target = {"type": "tool_use", "index": idx, "tc_index": tc_idx}
+                blocks_state.append(target)
+                state["has_tool_use"] = True
+            args_delta = fn.get("arguments")
+            if args_delta:
+                events.append({
+                    "type": "content_block_delta",
+                    "index": target["index"],
+                    "delta": {"type": "input_json_delta", "partial_json": args_delta},
+                })
         finish = choice.get("finish_reason")
         if finish:
             state["finish_reason"] = finish
@@ -300,9 +437,16 @@ async def openai_stream_to_anthropic_events(openai_chunk: dict, state: dict) -> 
 def openai_stream_end_events(state: dict) -> List[dict]:
     """OpenAI 流结束 [DONE] → 发送 Anthropic message_stop 等收尾事件"""
     events: List[dict] = []
-    if state.get("block_started"):
+    for b in state.get("blocks", []):
+        if not b.get("closed"):
+            events.append({"type": "content_block_stop", "index": b["index"]})
+    # 兼容旧 state（无 blocks 字段）
+    if not state.get("blocks") and state.get("block_started"):
         events.append({"type": "content_block_stop", "index": 0})
-    stop_reason = _openai_finish_to_anthropic_stop(state.get("finish_reason", "stop"))
+    finish = state.get("finish_reason", "stop")
+    stop_reason = _openai_finish_to_anthropic_stop(finish)
+    if state.get("has_tool_use") and finish not in ("stop", None):
+        stop_reason = "tool_use"
     events.append({
         "type": "message_delta",
         "delta": {

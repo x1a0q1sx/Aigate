@@ -271,6 +271,8 @@ class AnthropicAdapter(BaseAdapter):
                         "name": fn.get("name") or "_unknown",
                         "input": self._safe_json(fn.get("arguments") or "{}"),
                     })
+            # 历史思考（reasoning_content）不回传：Anthropic 要求 thinking 块携带原始签名，
+            # 合成块会被拒；丢掉只损失少量思维链连续性，不影响正确性
             if blocks:
                 messages.append({"role": role_claude, "content": blocks})
 

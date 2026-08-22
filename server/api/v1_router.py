@@ -20,6 +20,11 @@ from server.core.auto_router import AutoRouter
 from server.core.request_logger import write_log, dedup_log_row  # v3.6 消息级去重写入
 from server.core.model_catalog import ModelCatalog
 from server.core.auto_router import RouteResult
+from server.core.context_guard import (
+    estimate_request_tokens,
+    is_context_error,
+    context_overflows,
+)
 from server.config import get_config, save_config
 
 
@@ -583,7 +588,8 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
                 "error": err_short,
             })
-            if ar.health_checker:
+            if ar.health_checker and not is_context_error(err_short):
+                # 上下文超限不是模型故障，不进冷却（请求体大小问题）
                 ar.health_checker.mark_cooling(
                     candidate.model.id,
                     ar.config.cooling_period_seconds,
@@ -627,7 +633,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
     tried_ids = set()
     last_result = None
     diag_start_ts = diag_start_ts or time.time()
-    _diag(conversation_id, "auto_cascade_start", diag_start_ts, max_retries=max_retries, combo=bool(combo_targets))
+    est_tokens = estimate_request_tokens(request)
+    _diag(conversation_id, "auto_cascade_start", diag_start_ts, max_retries=max_retries, combo=bool(combo_targets), est_tokens=est_tokens)
     
     # 预先解析 combo 候选（如果有），避免在循环内重复查 DB
     combo_candidates = []
@@ -679,6 +686,14 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             break
         if candidate.model:
             tried_ids.add(candidate.model.id)
+        # 上下文预检：估算输入装不进窗口的候选直接跳过（不打上游、不进冷却）
+        if candidate.model and context_overflows(candidate.model, est_tokens):
+            attempt_errors.append({
+                "attempt": attempt,
+                "model": f"{candidate.provider.name}/{candidate.model.model_id}",
+                "error": f"skip: est ~{est_tokens} tokens > context window {candidate.model.context_length}",
+            })
+            continue
         # 发起完整业务请求（非探测）
         upstream_request = request.model_copy(update={"model": candidate.model.model_id})
         extra_headers = candidate.provider.headers
@@ -726,7 +741,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
                 "error": err_short,
             })
-            if ar.health_checker:
+            if ar.health_checker and not is_context_error(err_short):
+                # 上下文超限不进冷却（漏网的预检由上游 400 兜底识别）
                 ar.health_checker.mark_failure(candidate.model.id)
                 ar.health_checker.mark_cooling(
                     candidate.model.id,
@@ -949,6 +965,8 @@ async def chat_completions(
             request = request.model_copy(update=_upd)
             _diag(conversation_id, "effort_suffix_applied", _diag_start,
                   base=_base_name, effort=_upd.get("reasoning_effort"))
+    # 上下文窗口预检的请求体量估算（跳过装不下的候选，避免 400 + 误冷却）
+    est_req_tokens = estimate_request_tokens(request)
     http_status_code = 200
     _send_time = time.time()  # 提前设，级联路径也需要
     route_result: Optional[RouteResult] = None
@@ -1009,6 +1027,10 @@ async def chat_completions(
                             _mdl = m_r.scalar_one_or_none() if m_r is not None else None
                             if not _prov or not _mdl:
                                 stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
+                                continue
+                            # 上下文预检：装不下的候选直接跳过
+                            if context_overflows(_mdl, est_req_tokens):
+                                stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{est_req_tokens} tokens): {full_id}"})
                                 continue
                             from server.core.key_rotator import get_key_rotator as _gkr
                             _picked = await _gkr().pick_key_for_model(cdb, _mdl)
@@ -1086,7 +1108,8 @@ async def chat_completions(
                                 err_s = f"{type(se).__name__}: {str(se)[:200]}"
                                 stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
                                 # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                                if ar.health_checker:
+                                if ar.health_checker and not is_context_error(err_s):
+                                    # 上下文超限不进冷却
                                     ar.health_checker.mark_failure(_mdl.id)
                                     ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
                                 raw_err = _extract_error_body(se) or err_s
@@ -1120,6 +1143,10 @@ async def chat_completions(
                 )).scalar_one_or_none() if provider else None
                 if not provider or not model:
                     combo_attempts.append({"target": full_id, "error": "provider or model not found"})
+                    continue
+                # 上下文预检：装不下的候选直接跳过
+                if context_overflows(model, est_req_tokens):
+                    combo_attempts.append({"target": full_id, "error": f"skip: est ~{est_req_tokens} tokens > context window {model.context_length}"})
                     continue
                 # 跳过处于冷却（被惩罚）中的 target，让后续健康候选顶上
                 if ar.health_checker and ar.health_checker.is_cooling(model.id):
@@ -1199,7 +1226,8 @@ async def chat_completions(
                     combo_attempts.append({"target": full_id, "error": err_str})
                     last_error = err_str
                     # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                    if ar.health_checker and model:
+                    if ar.health_checker and model and not is_context_error(err_str):
+                        # 上下文超限不进冷却
                         ar.health_checker.mark_failure(model.id)
                         ar.health_checker.mark_cooling(model.id, ar.config.cooling_period_seconds)
                     print(f"[组合路由] 目标 {full_id} 失败：{err_str}，正在尝试下一个候选", flush=True)
@@ -1418,7 +1446,7 @@ async def chat_completions(
                     # ORM 对象属性可能过期。这里先显式刷新并把后续要用的字段拷贝成普通 Python 值。
                     try:
                         await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code"])
-                        await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides"])
+                        await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides", "context_length"])
                     except Exception:
                         pass
                     cand_model_pk = cand.model.id
@@ -1427,6 +1455,11 @@ async def chat_completions(
                     cand_provider_base_url = cand.provider.base_url
                     cand_provider_headers = cand.provider.headers
                     mid_full = f"{cand_provider_name}/{cand_model_id}"
+                    # 上下文预检：装不下的候选直接跳过（不打上游、不进冷却）
+                    _cand_ctx_len = int(getattr(cand.model, "context_length", 0) or 0)
+                    if _cand_ctx_len > 0 and est_req_tokens + 1024 > _cand_ctx_len:
+                        stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{est_req_tokens} tokens)"})
+                        continue
                     up_req = request.model_copy(update={"model": cand_model_id})
                     gen = None
                     sc = 0
@@ -1505,7 +1538,8 @@ async def chat_completions(
                         _diag(conversation_id, "upstream_stream_error", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id, error=type(se).__name__)
                         err_s = f"{type(se).__name__}: {str(se)[:200]}"
                         stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
-                        if ar.health_checker:
+                        if ar.health_checker and not is_context_error(err_s):
+                            # 上下文超限不进冷却（请求体过大不是候选的错）
                             ar.health_checker.mark_failure(cand_model_pk)
                             ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
                         cd_seconds = ar.config.cooling_period_seconds

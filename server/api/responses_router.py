@@ -55,6 +55,57 @@ def _verify_aigate_api_key(raw_request: Request):
 # 请求翻译：Responses API -> Chat Completions
 # ---------------------------------------------------------------------------
 
+def _normalize_content_parts(parts: Any) -> Any:
+    """Responses 内容部件 → OpenAI 部件（input_text/output_text → text；input_image → image_url）。
+
+    无可识别部件时原样返回；全为纯文本时合并成字符串（兼容更多上游）。
+    """
+    if not isinstance(parts, list):
+        return parts
+    out = []
+    for p in parts:
+        if isinstance(p, str):
+            out.append({"type": "text", "text": p})
+            continue
+        if not isinstance(p, dict):
+            continue
+        ptype = p.get("type", "")
+        if ptype in ("input_text", "output_text", "text", "summary_text"):
+            out.append({"type": "text", "text": p.get("text", "")})
+        elif ptype == "input_image":
+            url = p.get("image_url") or ""
+            if not url and p.get("data"):
+                url = f"data:{p.get('mime_type') or 'image/png'};base64,{p['data']}"
+            if url:
+                out.append({"type": "image_url", "image_url": {"url": url}})
+    if not out:
+        return parts
+    if all(p["type"] == "text" for p in out):
+        return "\n".join(p["text"] for p in out)
+    return out
+
+
+def _append_message(messages: List[dict], role: str, content, **extra) -> None:
+    """追加消息；连续 assistant 消息合并（message + function_call 是同轮输出，拆开会被部分上游拒）。"""
+    if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+        prev = messages[-1]
+        prev_text = prev.get("content")
+        cur_text = content if isinstance(content, str) else content
+        if cur_text:
+            if prev_text:
+                prev["content"] = f"{prev_text}\n{cur_text}" if isinstance(prev_text, str) else prev_text
+            else:
+                prev["content"] = cur_text
+        for k, v in extra.items():
+            if k == "tool_calls":
+                prev.setdefault("tool_calls", [])
+                prev["tool_calls"].extend(v)
+    else:
+        m = {"role": role, "content": content}
+        m.update(extra)
+        messages.append(m)
+
+
 def _input_to_messages(input_: Any, instructions: Optional[str]) -> List[dict]:
     """把 Responses 的 input（字符串 / 数组）翻译成 messages。"""
     messages: List[dict] = []
@@ -74,18 +125,14 @@ def _input_to_messages(input_: Any, instructions: Optional[str]) -> List[dict]:
             continue
         role = item.get("role") or item.get("type")
         if role in ("user", "system", "assistant", "developer"):
-            content = item.get("content")
-            messages.append({"role": role, "content": content if content is not None else ""})
+            content = _normalize_content_parts(item.get("content"))
+            _append_message(messages, role, content if content is not None else "")
         elif role == "message":
             inner = item.get("content")
             if isinstance(inner, list):
-                text_parts = []
-                for p in inner:
-                    if isinstance(p, dict) and p.get("type") == "input_text":
-                        text_parts.append(p.get("text", ""))
-                messages.append({"role": item.get("role", "user"), "content": "".join(text_parts)})
+                _append_message(messages, item.get("role", "user"), _normalize_content_parts(inner))
             else:
-                messages.append({"role": item.get("role", "user"), "content": str(inner or "")})
+                _append_message(messages, item.get("role", "user"), str(inner or ""))
         elif role == "function_call":
             # 历史 function_call item -> assistant message with tool_calls
             call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}"
@@ -93,11 +140,10 @@ def _input_to_messages(input_: Any, instructions: Optional[str]) -> List[dict]:
             args = item.get("arguments", "{}")
             if isinstance(args, dict):
                 args = json.dumps(args, ensure_ascii=False)
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{"id": call_id, "type": "function", "function": {"name": name, "arguments": str(args)}}],
-            })
+            _append_message(
+                messages, "assistant", None,
+                tool_calls=[{"id": call_id, "type": "function", "function": {"name": name, "arguments": str(args)}}],
+            )
         elif role == "function_call_output":
             call_id = item.get("call_id") or item.get("id") or ""
             output = item.get("output", "")
@@ -105,7 +151,16 @@ def _input_to_messages(input_: Any, instructions: Optional[str]) -> List[dict]:
                 output = json.dumps(output, ensure_ascii=False)
             messages.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
         elif role == "reasoning":
-            continue  # 推理摘要不参与 chat
+            # 推理摘要/加密块不参与 chat（跨上游无法解密复用）；有摘要文本时
+            # 附到紧邻的 assistant 消息 reasoning_content，保住可见思维链
+            summary = item.get("summary")
+            text = ""
+            if isinstance(summary, str):
+                text = summary
+            elif isinstance(summary, list):
+                text = "\n".join(s.get("text", "") for s in summary if isinstance(s, dict))
+            if text:
+                _append_message(messages, "assistant", None, reasoning_content=text)
     return messages
 
 
