@@ -148,6 +148,10 @@ def _responses_to_chat_request(body: dict) -> ChatCompletionRequest:
         "temperature": body.get("temperature"),
         "top_p": body.get("top_p"),
     }
+    # 思考强度：Codex 的 reasoning.effort → reasoning_effort（透传给各 adapter 按方言翻译）
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        req_dict["reasoning_effort"] = reasoning["effort"]
     if tools:
         req_dict["tools"] = tools
     # codex 默认会让模型自行决定是否调用工具

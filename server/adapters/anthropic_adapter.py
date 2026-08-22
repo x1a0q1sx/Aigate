@@ -62,6 +62,14 @@ CLAUDE_CLI_FINGERPRINT = {
 
 ANTHROPIC_MINIMAL_BETA = "claude-code-20250219,interleaved-thinking-2025-05-14"
 
+# OpenAI reasoning effort → Anthropic 思考 token 预算（档位近似映射；none/minimal 不开启思考）
+_EFFORT_BUDGET_TOKENS = {
+    "low": 2048,
+    "medium": 8192,
+    "high": 16384,
+    "xhigh": 32768,
+}
+
 
 def _stainless_arch() -> str:
     a = platform.machine().lower()
@@ -290,6 +298,22 @@ class AnthropicAdapter(BaseAdapter):
         thinking_spec = getattr(request, "reasoning", None)
         if isinstance(thinking_spec, dict) and thinking_spec.get("type"):
             payload["thinking"] = thinking_spec
+        else:
+            # OpenAI 风格思考强度（reasoning_effort）→ Anthropic thinking 预算映射
+            effort = str(getattr(request, "reasoning_effort", None) or "").lower()
+            budget = _EFFORT_BUDGET_TOKENS.get(effort)
+            if budget:
+                client_max = int(getattr(request, "max_tokens", 0) or 0)
+                if not client_max:
+                    # 客户端没限输出：放大 max_tokens 容纳思考预算
+                    payload["max_tokens"] = budget + 8192
+                elif client_max - budget <= 1024:
+                    # Anthropic 要求 max_tokens > budget_tokens：预算随客户端上限收缩
+                    budget = client_max - 1024
+                if budget >= 1024:
+                    payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                    # thinking 模式下 Anthropic 要求 temperature=1（缺省值），显式传入会 400
+                    payload.pop("temperature", None)
         return payload
 
     def _safe_json(self, s: Any) -> dict:

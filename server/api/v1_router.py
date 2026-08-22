@@ -851,6 +851,52 @@ def get_auto_router() -> AutoRouter:
             key_manager=KeyManager(get_crypto_service()),
         )
     return _auto_router
+
+
+# 思考强度后缀档位（与 codex_responses adapter 的 _EFFORT_LEVELS 约定保持一致，另加 minimal）
+_EFFORT_SUFFIX_LEVELS = ("xhigh", "none", "minimal", "high", "medium", "low")
+
+
+def _split_effort_suffix(model_name: str):
+    """模型名尾部思考强度后缀（如 combo:xxx-high）→ (剥后缀基名, 强度档位)。
+
+    无后缀或名字本身就只是后缀时返回 (原名, None)。
+    """
+    if not model_name:
+        return model_name, None
+    for level in _EFFORT_SUFFIX_LEVELS:
+        suffix = f"-{level}"
+        if model_name.endswith(suffix) and len(model_name) > len(suffix):
+            return model_name[: -len(suffix)], level
+    return model_name, None
+
+
+async def _model_name_resolves(db: AsyncSession, name: str) -> bool:
+    """名称能否解析为启用中的组合或启用模型（provider/model_id 或裸 model_id）。
+
+    用于后缀剥离的安全预检：原名能解析就不剥，避免误伤恰好以 -high 结尾的真实模型名。
+    """
+    try:
+        from server.core.combo_router import is_combo_request, find_combo_by_name
+        is_combo, combo_name = is_combo_request(name)
+        if is_combo:
+            return await find_combo_by_name(db, combo_name) is not None
+        if "/" in name:
+            prov_name, m_id = name.split("/", 1)
+            row = (await db.execute(
+                select(Model.id).join(Provider, Model.provider_id == Provider.id)
+                .where(Provider.name == prov_name, Model.model_id == m_id, Model.enabled == True)
+                .limit(1)
+            )).first()
+            return row is not None
+        row = (await db.execute(
+            select(Model.id).where(Model.model_id == name, Model.enabled == True).limit(1)
+        )).first()
+        return row is not None
+    except Exception:
+        return False
+
+
 @router.post("/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -891,6 +937,18 @@ async def chat_completions(
     _diag(conversation_id, "router_get_done", _diag_start)
     request = _preprocess_request(request)
     _diag(conversation_id, "preprocess_done", _diag_start)
+    # ─── 思考强度后缀：combo:xxx-high / 模型-high ───
+    # 仅当原名解析不到、剥后缀后能解析时才剥离（避免误伤以 -high 结尾的真实模型名）；
+    # 显式传入的 reasoning_effort 优先于后缀档位
+    _base_name, _suffix_effort = _split_effort_suffix(request.model)
+    if _suffix_effort and not await _model_name_resolves(db, request.model):
+        if await _model_name_resolves(db, _base_name):
+            _upd = {"model": _base_name}
+            if not request.reasoning_effort:
+                _upd["reasoning_effort"] = _suffix_effort
+            request = request.model_copy(update=_upd)
+            _diag(conversation_id, "effort_suffix_applied", _diag_start,
+                  base=_base_name, effort=_upd.get("reasoning_effort"))
     http_status_code = 200
     _send_time = time.time()  # 提前设，级联路径也需要
     route_result: Optional[RouteResult] = None
