@@ -13,14 +13,14 @@ import json
 import re
 from typing import Any
 
-# 上游各家 context 超限报错的特征串（小写匹配）
+# 上游各家 context 超限报错的特征串（小写匹配；含国内公益站常见中文报错）
 _CONTEXT_ERROR_PATTERNS = [
+    # 英文（OpenAI / Anthropic / Gemini / 各兼容站）
     "context length",
     "context window",
     "maximum context",
     "max context",
     "too many tokens",
-    "too long",
     "prompt is too long",
     "input is too long",
     "request too large",
@@ -30,11 +30,30 @@ _CONTEXT_ERROR_PATTERNS = [
     "maximum_number_of_tokens",
     "max_tokens is too large",
     "input length and `max_tokens`",
-    "input tokens exceeds",
+    "input tokens exceed",
     "longer than the model's context",
     "requested tokens exceed",
     "context_length_exceeded",
     "content filter: too long",
+    # 中文（new-api / 国内公益站常见报错）
+    "内容超长",
+    "内容过长",
+    "输入超长",
+    "输入过长",
+    "请求过长",
+    "提示词过长",
+    "超出上下文",
+    "超过上下文",
+    "上下文长度",
+    "长度超限",
+    "长度限制",
+    "超出长度",
+    "超出最大",
+    "超过最大长度",
+    "token 超限",
+    "token超限",
+    "过长，请",
+    "超长，请",
 ]
 
 _CJK_RANGES = (

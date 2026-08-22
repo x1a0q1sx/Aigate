@@ -330,8 +330,12 @@ def test_context_guard_estimator_and_classifier():
     assert is_context_error("Prompt is too long: 200000 tokens > 128000 maximum")
     assert is_context_error("input length and `max_tokens` exceed context limit")
     assert is_context_error("Requested tokens exceed the model's context window")
+    # 国内公益站中文报错
+    assert is_context_error("内容超长，请删减后再试")
+    assert is_context_error("输入过长，超过模型上下文限制")
     assert not is_context_error("connection timeout")
     assert not is_context_error("401 unauthorized")
+    assert not is_context_error("钱包余额不足")
     assert not is_context_error(None)
     # 窗口判断
     class M: context_length = 8192
