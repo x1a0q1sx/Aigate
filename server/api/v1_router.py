@@ -87,12 +87,13 @@ def _estimate_prompt_tokens_from_request(request) -> int:
     return max(1, chars // 4 + 1)
 
 
-def _sanitize_token_counts(request, pt: int, ct: int):
+def _sanitize_token_counts(request, pt: int, ct: int, output_text: str = ""):
     """
-    修正上游明显瞎报的 token 数，避免污染用量/成本统计。
-    典型场景：agentrouter 等聚合站把 input_tokens 恒报为 1（与实际 prompt 完全不符）。
-    若上游 prompt_tokens 明显低于按请求内容粗估的值，则用粗估值覆盖；
-    若上游完全没给（0），也用粗估兜底。completion_tokens 仅在确实为 0 时粗估。
+    修正上游明显瞎报/漏报的 token 数，避免污染用量/成本统计。
+    典型场景：agentrouter 等聚合站把 input_tokens 恒报为 1；ModelScope 等流式上游
+    根本不返回 usage（completion 恒为 0）。
+    - prompt_tokens：上游漏报/明显偏低时按请求内容粗估覆盖
+    - completion_tokens：上游漏报（=0）时按实际输出文本粗估（传给 output_text）
     """
     pt = int(pt or 0)
     ct = int(ct or 0)
@@ -103,7 +104,51 @@ def _sanitize_token_counts(request, pt: int, ct: int):
         pt = est
     elif pt == 0 and est > 0:
         pt = est
+    if ct <= 0 and output_text:
+        ct = max(1, len(output_text) // 4 + 1)
     return pt, ct
+
+
+def _output_text_from_chunks(chunks) -> str:
+    """从 OpenAI 流式 chunk 列表提取实际输出文本（正文 + 思考 + 工具调用参数），用于估算 completion tokens。"""
+    parts = []
+    for c in (chunks or []):
+        if not isinstance(c, dict):
+            continue
+        for ch in (c.get("choices") or []):
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get("delta") or {}
+            if isinstance(d.get("content"), str):
+                parts.append(d["content"])
+            rc = d.get("reasoning_content")
+            if isinstance(rc, str):
+                parts.append(rc)
+            for tc in (d.get("tool_calls") or []):
+                a = ((tc or {}).get("function") or {}).get("arguments")
+                if isinstance(a, str):
+                    parts.append(a)
+    return "".join(parts)
+
+
+def _output_text_from_result(result: dict) -> str:
+    """从 OpenAI 非流式响应提取实际输出文本，用于估算 completion tokens。"""
+    parts = []
+    for ch in ((result or {}).get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        m = ch.get("message") or {}
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        rc = m.get("reasoning_content")
+        if isinstance(rc, str):
+            parts.append(rc)
+        for tc in (m.get("tool_calls") or []):
+            a = ((tc or {}).get("function") or {}).get("arguments") or ""
+            if a:
+                parts.append(a)
+    return "".join(parts)
 
 
 def _extract_cache_tokens(usage: dict):
@@ -1098,7 +1143,7 @@ async def chat_completions(
                                 _pt = int(_cu.get("prompt_tokens") or _cu.get("input_tokens") or 0)
                                 _ct = int(_cu.get("completion_tokens") or _cu.get("output_tokens") or 0)
                                 _crd, _cwt = _extract_cache_tokens(_cu)
-                                _pt, _ct = _sanitize_token_counts(request, _pt, _ct)
+                                _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_chunks(_cbuf))
                                 await _write_stream_log(conversation_id, request, raw_request, "success",
                                     _prov.name, _mdl.model_id, None, st_attempt, None,
                                     stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
@@ -1210,7 +1255,7 @@ async def chat_completions(
                         _pt = int(_usage.get("prompt_tokens") or _usage.get("input_tokens") or 0)
                         _ct = int(_usage.get("completion_tokens") or _usage.get("output_tokens") or 0)
                         _crd, _cwt = _extract_cache_tokens(_usage)
-                        _pt, _ct = _sanitize_token_counts(request, _pt, _ct)
+                        _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_result(result))
                         await _write_stream_log(
                             conversation_id, request, raw_request, "success",
                             provider.name, model.model_id, None, 0, None,
@@ -1520,14 +1565,9 @@ async def chat_completions(
                             resp_snapshot = _json_mod.dumps(stream_buf, ensure_ascii=False)
                         pt = int(last_usage.get("prompt_tokens") or last_usage.get("input_tokens") or 0)
                         ct = int(last_usage.get("completion_tokens") or last_usage.get("output_tokens") or 0)
-                        # 兜底：部分免费上游（如 z-ai/glm）不返回 usage，用 chunk content 粗估 completion tokens
-                        if not pt or not ct:
-                            if not ct and stream_buf:
-                                ct = sum(len(str(c.get("choices", [{}])[0].get("delta", {}).get("content", "") or "")) for c in stream_buf if isinstance(c, dict))
-                            if not pt and request:
-                                pt = sum(len(str(m.get("content", ""))) for m in (request.messages or [])) // 4 + 1
                         _crd, _cwt = _extract_cache_tokens(last_usage)
-                        _pt, _ct = _sanitize_token_counts(request, pt, ct)
+                        # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
+                        _pt, _ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(stream_buf))
                         await _write_stream_log(conversation_id, request, raw_request, "success",
                             cand_provider_name, cand_model_id, None, st_attempt, None,
                             stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
@@ -1696,24 +1736,9 @@ async def chat_completions(
                         resp_snapshot = _j.dumps(_stream_chunks_log, ensure_ascii=False)
                     pt = int(_stream_usage.get("prompt_tokens") or _stream_usage.get("input_tokens") or 0)
                     ct = int(_stream_usage.get("completion_tokens") or _stream_usage.get("output_tokens") or 0)
-                    pt, ct = _sanitize_token_counts(request, pt, ct)
                     _crd, _cwt = _extract_cache_tokens(_stream_usage)
-                    # 兜底：部分免费上游不返回 usage，用 chunk content 粗估 completion tokens
-                    if not pt or not ct:
-                        if not ct and _stream_chunks_log:
-                            est_ct = sum(len(str(c.get("choices", [{}])[0].get("delta", {}).get("content", "") or "")) for c in _stream_chunks_log if isinstance(c, dict))
-                            ct = est_ct
-                        if not pt and request and getattr(request, "messages", None):
-                            def _msg_text(mm):
-                                c = getattr(mm, "content", "") or ""
-                                if isinstance(c, list):
-                                    txt = ""
-                                    for p in c:
-                                        if isinstance(p, dict) and p.get("type") == "text":
-                                            txt += p.get("text", "") or ""
-                                    return txt
-                                return c if isinstance(c, str) else str(c)
-                            pt = sum(len(str(_msg_text(m))) for m in request.messages) // 4 + 1
+                    # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
+                    pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(_stream_chunks_log))
                     try:
                         _diag(conversation_id, "stream_log_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
                         from server.db import AsyncSessionLocal as _LS
@@ -1821,7 +1846,7 @@ async def chat_completions(
             usage = resp_dict.get("usage", {}) if resp_dict else {}
             pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
             ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
-            pt, ct = _sanitize_token_counts(request, pt, ct)
+            pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_result(resp_dict) if resp_dict else "")
             _crd, _cwt = _extract_cache_tokens(usage)
             _latency = int((time.time() - _send_time) * 1000) if _send_time else None
             try:

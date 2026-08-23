@@ -459,3 +459,38 @@ def test_responses_input_parts_normalization():
     assert asst[0].get("reasoning_content") == "先前推理"
     assert asst[0]["tool_calls"][0]["id"] == "c1"
     assert msgs[-1]["role"] == "tool" and msgs[-1]["tool_call_id"] == "c1"
+
+
+# ===================== 请求日志 token 兜底：completion 漏报 =====================
+
+def test_output_text_extractors():
+    from server.api.v1_router import _output_text_from_chunks, _output_text_from_result
+
+    chunks = [
+        {"choices": [{"delta": {"content": "hi"}}]},
+        {"choices": [{"delta": {"reasoning_content": "think"}}]},
+        {"choices": [{"delta": {"tool_calls": [{"function": {"name": "f", "arguments": "{}"}}]}}]},
+        "not-a-dict",
+    ]
+    assert _output_text_from_chunks(chunks) == "hithink{}"
+
+    result = {"choices": [{"message": {"content": "answer", "reasoning_content": "why", "tool_calls": [
+        {"function": {"arguments": "{\"a\":1}"}}
+    ]}}]}
+    assert _output_text_from_result(result) == "answerwhy{\"a\":1}"
+    assert _output_text_from_result({"choices": []}) == ""
+
+
+def test_sanitize_estimates_completion_when_missing():
+    from server.api.v1_router import _sanitize_token_counts
+
+    req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
+    # 上游漏报 completion → 按输出文本粗估（>0）
+    pt, ct = _sanitize_token_counts(req, 0, 0, "a" * 80)
+    assert ct == 21  # 80 // 4 + 1
+    # 上游给了 completion → 不被覆盖
+    pt, ct = _sanitize_token_counts(req, 0, 99, "a" * 80)
+    assert ct == 99
+    # 无输出文本时 completion 保持 0
+    pt, ct = _sanitize_token_counts(req, 0, 0, "")
+    assert ct == 0
