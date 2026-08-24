@@ -173,12 +173,16 @@ def get_config() -> Config:
     """获取全局配置"""
     global _config
     if _config is None:
-        _config = load_config()
-        _config = ensure_encryption_key(_config, "config.yaml")
+        config_path = os.environ.get("AIGATE_CONFIG_PATH", "config.yaml")
+        _config = load_config(config_path)
+        _config = ensure_encryption_key(_config, config_path)
+        database_path = os.environ.get("AIGATE_DATABASE_PATH")
+        if database_path:
+            _config.database.path = database_path
     return _config
 def save_config():
     """持久化当前配置到 config.yaml"""
     import yaml
-    path = Path("config.yaml")
+    path = Path(os.environ.get("AIGATE_CONFIG_PATH", "config.yaml"))
     with open(path, "w", encoding="utf-8") as f:
         yaml.dump(get_config().model_dump(), f, default_flow_style=False, allow_unicode=True)

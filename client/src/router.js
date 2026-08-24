@@ -4,6 +4,7 @@ import Providers from './views/Providers.vue'
 import Models from './views/Models.vue'
 import Health from './views/Health.vue'
 import Auto from './views/Auto.vue'
+import RouteDecisions from './views/RouteDecisions.vue'
 import Analytics from './views/Analytics.vue'
 import Playground from './views/Playground.vue'
 import Combos from './views/Combos.vue'
@@ -21,6 +22,7 @@ const routes = [
   { path: '/models', component: Models, meta: { title: '模型' } },
   { path: '/health', component: Health, meta: { title: '健康监控' } },
   { path: '/auto', component: Auto, meta: { title: 'Auto 选举' } },
+  { path: '/route-decisions', component: RouteDecisions, meta: { title: '路由决策' } },
   { path: '/analytics', component: Analytics, meta: { title: '分析' } },
   { path: '/playground', component: Playground, meta: { title: 'Playground' } },
   { path: '/combos', component: Combos, meta: { title: '组合路由' } },

@@ -19,6 +19,7 @@ import sys
 import socket
 import json
 import subprocess
+import asyncio
 from pathlib import Path
 from typing import Optional
 from fastapi import APIRouter
@@ -109,6 +110,17 @@ def _write_status(data: dict):
         pass
 
 
+def _pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
+        return False
+
+
 def _current_commit() -> dict:
     """读取本地 git 当前提交信息（无仓库时返回空）"""
     try:
@@ -181,7 +193,9 @@ async def check_update():
 async def apply_update():
     """后台执行更新（scripts/update.py --stash）。执行期间请勿重复触发。"""
     global _running
-    if _running is not None and _running.poll() is None:
+    current_status = _read_status()
+    status_active = current_status.get("state") in {"running", "rolling_back"}
+    if (_running is not None and _running.poll() is None) or (status_active and _pid_alive(current_status.get("pid"))):
         return {"ok": False, "message": "已有更新任务正在执行，请稍后再试"}
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     _write_status({"state": "running", "started_at": __import__("datetime").datetime.now().isoformat()})
@@ -195,12 +209,22 @@ async def apply_update():
             env["HTTP_PROXY"] = proxy
             env["HTTPS_PROXY"] = proxy
         with open(LOG_FILE, "w", encoding="utf-8") as f:
+            process_options = {"start_new_session": True} if os.name != "nt" else {
+                "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
+            }
             _running = subprocess.Popen(
                 [sys.executable, str(ROOT / "scripts" / "update.py"), "--stash"],
                 cwd=str(ROOT), stdout=f, stderr=subprocess.STDOUT,
                 env=env,
+                **process_options,
             )
-        return {"ok": True, "message": "更新已在后台开始，可轮询 /status 查看进度。更新完成后服务可能需要重启。"}
+        _write_status({
+            "state": "running",
+            "phase": "preflight",
+            "started_at": __import__("datetime").datetime.now().isoformat(),
+            "pid": _running.pid,
+        })
+        return {"ok": True, "message": "事务更新已开始；验证或健康检查失败时将自动回滚。"}
     except Exception as e:
         _write_status({"state": "error", "error": str(e)})
         return {"ok": False, "message": f"启动更新失败：{e}"}
@@ -210,16 +234,22 @@ async def apply_update():
 async def update_status():
     """查询更新任务状态与最近日志。"""
     global _running
-    running = _running is not None and _running.poll() is None
     status = _read_status()
-    if not running and status.get("state") == "running":
+    local_running = _running is not None and _running.poll() is None
+    status_active = status.get("state") in {"running", "rolling_back"}
+    running = local_running or (status_active and _pid_alive(status.get("pid")))
+    if not running and status.get("state") in {"running", "rolling_back"}:
         # 进程已结束（成功或失败）
-        if _running is not None:
-            state = "error" if _running.returncode != 0 else "finished"
+        if _running is not None and _running.poll() is not None:
+            if status.get("state") == "rolling_back":
+                state = "rollback_failed"
+            else:
+                state = "error" if _running.returncode != 0 else "finished"
             _write_status({**status, "state": state, "exit_code": _running.returncode})
             status = _read_status()
         else:
-            _write_status({**status, "state": "error", "error": "进程异常退出"})
+            state = "rollback_failed" if status.get("state") == "rolling_back" else "error"
+            _write_status({**status, "state": state, "error": "进程异常退出"})
             status = _read_status()
     return {
         "running": running,
@@ -227,5 +257,66 @@ async def update_status():
         "started_at": status.get("started_at"),
         "exit_code": status.get("exit_code"),
         "error": status.get("error"),
+        "phase": status.get("phase"),
+        "pid": status.get("pid"),
+        "backup": status.get("backup"),
+        "before_commit": status.get("before_commit"),
+        "after_commit": status.get("after_commit"),
+        "rollback_performed": status.get("rollback_performed", False),
+        "rollback_reason": status.get("rollback_reason"),
+        "rollback_error": status.get("rollback_error"),
+        "service_restarted": status.get("service_restarted", False),
         "log_tail": _read_log(),
     }
+
+
+def _backup_items() -> list:
+    backup_root = ROOT / "data" / "backups"
+    items = []
+    for directory in sorted(backup_root.glob("update-*"), reverse=True):
+        manifest_path = directory / "manifest.json"
+        if not directory.is_dir() or not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            files = manifest.get("files") or {}
+            database = files.get("database") or {}
+            items.append({
+                "name": directory.name,
+                "created_at": manifest.get("created_at"),
+                "refreshed_at": manifest.get("refreshed_at"),
+                "commit": manifest.get("before_commit"),
+                "database_bytes": database.get("bytes"),
+                "database_sha256": database.get("sha256"),
+                "has_config": "config" in files,
+                "has_frontend": "frontend" in files,
+            })
+        except Exception:
+            continue
+    return items[:5]
+
+
+@router.get("/backups")
+async def list_update_backups():
+    return {"items": _backup_items()}
+
+
+@router.post("/backups")
+async def create_update_backup():
+    status = _read_status()
+    status_active = status.get("state") in {"running", "rolling_back"}
+    if (_running is not None and _running.poll() is None) or (status_active and _pid_alive(status.get("pid"))):
+        return {"ok": False, "message": "更新进行中，暂不能创建额外恢复点"}
+    try:
+        from scripts.update import backup_state
+
+        commit = _current_commit().get("sha") or "unknown"
+        bundle = await asyncio.to_thread(backup_state, commit)
+        return {
+            "ok": True,
+            "message": "恢复点已创建",
+            "backup": str(bundle.root.relative_to(ROOT)),
+            "items": _backup_items(),
+        }
+    except Exception as exc:
+        return {"ok": False, "message": f"创建恢复点失败：{exc}"}

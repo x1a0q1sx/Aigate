@@ -23,7 +23,7 @@ fi
 
 # ── 2. 暂存内容里的明文密钥 / 凭据 / 本机路径 ────────────────────────────────
 LEAK=$(git diff --cached -U0 | grep -E '^\+' | grep -Ei \
-  'encryption_key:[[:space:]]*[A-Za-z0-9+/=_-]{16,}|password_hash:[[:space:]]*\$|aigate_api_key:[[:space:]]*ak-|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|app_[A-Za-z0-9]{20,}|Iv1\.[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|[A-Za-z]:\\|/Users/[A-Za-z]|/home/[A-Za-z]' )
+  'encryption_key:[[:space:]]*[A-Za-z0-9+/=_-]{16,}|password_hash:[[:space:]]*\$|aigate_api_key:[[:space:]]*ak-|sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{30,}|app_[A-Za-z0-9]{20,}|Iv1\.[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16}|[A-Za-z]:\\[^[:space:]\\]+\\|[A-Za-z]:/[^/[:space:]]+/|/Users/[A-Za-z]|/home/[A-Za-z]' )
 
 if [ -n "$LEAK" ]; then
   echo "${RED}✗ 提交被拦截：改动内容里疑似包含明文密钥 / OAuth client_id / 本机绝对路径${RST}"

@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: 检出源码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -32,6 +32,21 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "PKG=aigate-$VERSION" >> "$GITHUB_ENV"
           echo "本次发布版本：$VERSION"
+
+      - name: 准备 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: 发布门禁：后端测试与迁移
+        run: |
+          python -m pip install -r requirements.txt
+          python -m compileall -q server start.py scripts
+          python -m pytest -q tests
+          python scripts/verify_install.py \
+            --database "$RUNNER_TEMP/aigate-release.db" \
+            --config "$RUNNER_TEMP/aigate-release.yaml"
 
       - name: 准备 Node 环境
         uses: actions/setup-node@v4
@@ -91,6 +106,7 @@ jobs:
         run: |
           cd release
           zip -qr "$PKG.zip" "$PKG"
+          sha256sum "$PKG.zip" > "$PKG.zip.sha256"
           echo "--- 发布包大小 ---"
           du -h "$PKG.zip"
           echo "--- 顶层内容 ---"
@@ -101,6 +117,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$VERSION" "release/$PKG.zip" \
+            "release/$PKG.zip.sha256" \
             --title "AIGate $VERSION" \
             --notes-file .github/release-notes.md \
             --generate-notes

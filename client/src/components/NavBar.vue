@@ -77,6 +77,7 @@ export default {
         { path: '/models', name: '模型', icon: 'cpu' },
         { path: '/health', name: '健康', icon: 'activity' },
         { path: '/auto', name: 'Auto 选举', icon: 'scale' },
+        { path: '/route-decisions', name: '路由决策', icon: 'route' },
         { path: '/token-saver', name: '省 Token', icon: 'zap' },
         { path: '/combos', name: '组合路由', icon: 'layers' },
         { path: '/proxies', name: '代理池', icon: 'globe' },

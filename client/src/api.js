@@ -84,6 +84,8 @@ export default {
   checkUpdate: () => apiGet('/admin/api/update/check'),
   applyUpdate: () => apiPost('/admin/api/update/apply', {}),
   updateStatus: () => apiGet('/admin/api/update/status'),
+  getUpdateBackups: () => apiGet('/admin/api/update/backups'),
+  createUpdateBackup: () => apiPost('/admin/api/update/backups', {}),
   // 服务商
   getProviders: () => apiGet('/admin/api/providers'),
   createProvider: (data) => apiPost('/admin/api/providers', data),
@@ -145,6 +147,15 @@ export default {
   getLegacyAutoRanking: () => apiGet('/admin/api/auto/ranking'),
   getRoutingWeights: () => apiGet('/admin/api/routing/weights'),
   updateRoutingWeights: (data) => apiPut('/admin/api/routing/weights', data),
+  // 路由决策中心
+  getRouteDecisions: (params = {}) => {
+    const qs = new URLSearchParams()
+    Object.entries(params).forEach(([key, value]) => {
+      if (value !== undefined && value !== null && value !== '') qs.append(key, value)
+    })
+    return apiGet(`/admin/api/route-decisions?${qs.toString()}`)
+  },
+  getRouteDecision: (id) => apiGet(`/admin/api/route-decisions/${id}`),
   // 请求日志
   getLogs: (params) => {
     const qs = new URLSearchParams()

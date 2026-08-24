@@ -36,6 +36,7 @@ from .models.intelligence import IntelligenceStatic
 from .models.routing_config import RoutingWeights, RoutingPin, AdminAuditLog
 from .models.combo import Combo
 from .models.oauth_token import OAuthToken
+from .models.route_decision import RouteDecision
 from .config import get_config
 config = get_config()
 db_path = Path(config.database.path)

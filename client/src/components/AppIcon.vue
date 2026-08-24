@@ -29,6 +29,7 @@ const ICONS = {
   cpu: '<rect x="8" y="8" width="8" height="8" rx="1.5"/><rect x="3" y="3" width="18" height="18" rx="3"/><line x1="9" y1="1.5" x2="9" y2="3"/><line x1="15" y1="1.5" x2="15" y2="3"/><line x1="9" y1="21" x2="9" y2="22.5"/><line x1="15" y1="21" x2="15" y2="22.5"/><line x1="1.5" y1="9" x2="3" y2="9"/><line x1="1.5" y1="15" x2="3" y2="15"/><line x1="21" y1="9" x2="22.5" y2="9"/><line x1="21" y1="15" x2="22.5" y2="15"/>',
   activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
   scale: '<path d="M12 3v18"/><path d="M5 7h14"/><path d="M5 7l-3 6h6z"/><path d="M19 7l-3 6h6z"/><path d="M8 21h8"/>',
+  route: '<circle cx="6" cy="18" r="2"/><circle cx="18" cy="6" r="2"/><path d="M8 18h3a3 3 0 003-3V9a3 3 0 013-3"/><path d="M14 10l-3-3 3-3"/>',
   zap: '<path d="M13 2L4.5 13H11l-1 9 8.5-11H12l1-9z"/>',
   layers: '<path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/>',
   globe: '<circle cx="12" cy="12" r="9.5"/><line x1="2.5" y1="12" x2="21.5" y2="12"/><path d="M12 2.5a15 15 0 014 9.5 15 15 0 01-4 9.5 15 15 0 01-4-9.5 15 15 0 014-9.5z"/>',

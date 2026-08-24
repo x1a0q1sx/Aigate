@@ -20,6 +20,16 @@ from server.core.auto_router import AutoRouter
 from server.core.request_logger import write_log, dedup_log_row  # v3.6 消息级去重写入
 from server.core.model_catalog import ModelCatalog
 from server.core.auto_router import RouteResult
+from server.core.route_decision import (
+    add_attempt as _decision_attempt,
+    begin_decision as _decision_begin,
+    capture_candidates as _decision_candidates,
+    configure_decision as _decision_configure,
+    finish_decision as _decision_finish,
+    ingest_attempt_errors as _decision_ingest_attempts,
+    mark_candidate_skipped as _decision_skip,
+    mark_selected as _decision_select,
+)
 from server.core.context_guard import (
     estimate_request_tokens,
     is_context_error,
@@ -742,11 +752,19 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
                 "error": f"skip: est ~{est_tokens} tokens > context window {candidate.model.context_length}",
             })
+            _decision_skip(
+                conversation_id,
+                model_pk=candidate.model.id,
+                provider=candidate.provider.name,
+                model=candidate.model.model_id,
+                reason="context window too small",
+            )
             continue
         # 发起完整业务请求（非探测）
         upstream_request = request.model_copy(update={"model": candidate.model.model_id})
         extra_headers = candidate.provider.headers
         try:
+            _attempt_started = time.time()
             _diag(conversation_id, "upstream_start", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
             result = await candidate.adapter.chat_completion(
                 upstream_request,
@@ -781,6 +799,14 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 result["model"] = f"{candidate.provider.name}/{candidate.model.model_id}"
             if ar.health_checker:
                 ar.health_checker.mark_success(candidate.model.id)
+            _decision_attempt(
+                conversation_id,
+                provider=candidate.provider.name,
+                model=candidate.model.model_id,
+                status="success",
+                attempt=attempt,
+                latency_ms=int((time.time() - _attempt_started) * 1000),
+            )
             return route, result, attempt_errors
         except Exception as e:
             _diag(conversation_id, "upstream_error", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, error=type(e).__name__)
@@ -790,6 +816,15 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
                 "error": err_short,
             })
+            _decision_attempt(
+                conversation_id,
+                provider=candidate.provider.name,
+                model=candidate.model.model_id,
+                status="failed",
+                attempt=attempt,
+                latency_ms=int((time.time() - _attempt_started) * 1000),
+                error=err_short,
+            )
             if ar.health_checker and not is_context_error(err_short):
                 # 上下文超限不进冷却（漏网的预检由上游 400 兜底识别）
                 ar.health_checker.mark_failure(candidate.model.id)
@@ -830,7 +865,12 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             continue
     # 全部失败
     print(f"[CASCADE-NONSTREAM] all {max_retries+1} attempts exhausted", flush=True)
-    failed = RouteResult(success=False, error=last_result.error if last_result else "no candidates available")
+    terminal_error = None
+    if attempt_errors:
+        terminal_error = attempt_errors[-1].get("error")
+    if not terminal_error and last_result:
+        terminal_error = last_result.error
+    failed = RouteResult(success=False, error=terminal_error or "all candidates failed")
     return failed, {"error": failed.error, "attempts": attempt_errors}, attempt_errors
 
 
@@ -844,6 +884,31 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
     routed_provider_id 与 estimated_cost_usd，不再写入平行的 quota_usage 表。
     """
     try:
+        _decision_ingest_attempts(conversation_id, attempt_errors)
+        if routed_provider and routed_model:
+            _decision_select(
+                conversation_id,
+                provider=routed_provider,
+                model=routed_model,
+                reason="completed upstream attempt",
+            )
+        terminal_decision = status == "success" or attempt_errors is not None or not routed_provider
+        if terminal_decision:
+            decision_total_ms = int((time.time() - diag_start_ts) * 1000) if diag_start_ts else latency_ms
+            decision_fallback_count = int(fallback_count or 0)
+            if attempt_errors:
+                decision_fallback_count = max(decision_fallback_count, len(attempt_errors) - 1)
+            await _decision_finish(
+                conversation_id,
+                status=status,
+                provider=routed_provider,
+                model=routed_model,
+                fallback_count=decision_fallback_count,
+                total_latency_ms=decision_total_ms,
+                ttft_ms=ttft_ms,
+                failure_reason=error_msg,
+                attempts=attempt_errors,
+            )
         if diag_start_ts:
             _diag(conversation_id, "stream_log_start", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
         import json as _json_mod
@@ -1016,6 +1081,14 @@ async def chat_completions(
                   base=_base_name, effort=_upd.get("reasoning_effort"))
     # 上下文窗口预检的请求体量估算（跳过装不下的候选，避免 400 + 误冷却）
     est_req_tokens = estimate_request_tokens(request)
+    _decision_begin(
+        conversation_id,
+        request.model,
+        "auto" if request.is_auto else "direct",
+        stream=bool(request.stream),
+        estimated_tokens=est_req_tokens,
+        strategy="ranked-fallback" if request.is_auto else "direct",
+    )
     http_status_code = 200
     _send_time = time.time()  # 提前设，级联路径也需要
     route_result: Optional[RouteResult] = None
@@ -1032,8 +1105,14 @@ async def chat_completions(
             _diag(conversation_id, "combo_route_start", _diag_start, combo=combo_name)
             combo = await find_combo_by_name(db, combo_name)
             if not combo:
+                await _decision_finish(conversation_id, status="error", failure_reason=f"Combo '{combo_name}' not found")
                 return JSONResponse(status_code=404, content={"error": f"Combo '{combo_name}' not found"})
             targets = await resolve_combo_targets(db, combo)
+            _decision_configure(
+                conversation_id,
+                route_type="combo",
+                strategy=getattr(combo, "strategy", None) or "fallback",
+            )
             if not targets:
                 try:
                     await _write_stream_log(
@@ -1043,9 +1122,23 @@ async def chat_completions(
                     )
                 except Exception:
                     pass
+                await _decision_finish(
+                    conversation_id,
+                    status="error",
+                    failure_reason=f"Combo '{combo_name}' no available targets",
+                )
                 return JSONResponse(status_code=503, content={"error": f"Combo '{combo_name}' no available targets"})
             _diag(conversation_id, "combo_targets", _diag_start, count=len(targets))
             combo_full_ids = [t["full_id"] for t in targets]
+            _decision_candidates(conversation_id, [
+                {
+                    "rank": index,
+                    "provider": full_id.split("/", 1)[0] if "/" in full_id else None,
+                    "model": full_id.split("/", 1)[1] if "/" in full_id else full_id,
+                    "eligible": True,
+                }
+                for index, full_id in enumerate(combo_full_ids, start=1)
+            ])
             # ─── 流式 combo：统一级联回退（带冷却），与 auto 流式行为一致 ───
             if request.stream:
                 _diag(conversation_id, "combo_stream_start", _diag_start, count=len(combo_full_ids))
@@ -1071,20 +1164,24 @@ async def chat_completions(
                             # v4.0: 服务商被禁用 → 跳过该候选（不删除组合配置）
                             if _prov is not None and not getattr(_prov, "enabled", True):
                                 stream_errs.append({"attempt": st_attempt, "error": f"provider disabled: {full_id}"})
+                                _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider disabled")
                                 continue
                             m_r = await cdb.execute(_sel(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
                             _mdl = m_r.scalar_one_or_none() if m_r is not None else None
                             if not _prov or not _mdl:
                                 stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
+                                _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
                                 continue
                             # 上下文预检：装不下的候选直接跳过
                             if context_overflows(_mdl, est_req_tokens):
                                 stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{est_req_tokens} tokens): {full_id}"})
+                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="context window too small")
                                 continue
                             from server.core.key_rotator import get_key_rotator as _gkr
                             _picked = await _gkr().pick_key_for_model(cdb, _mdl)
                             if not _picked or _picked[0] is None:
                                 stream_errs.append({"attempt": st_attempt, "error": f"no key for {_prov.name}"})
+                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="no active API key")
                                 continue
                             _ak = _picked[1]
                             from server.core.model_catalog import create_adapter_for_provider as _caf
@@ -1092,8 +1189,10 @@ async def chat_completions(
                             # 跳过处于冷却（被惩罚）中的 target，避免反复打到坏模型
                             if ar.health_checker and ar.health_checker.is_cooling(_mdl.id):
                                 stream_errs.append({"attempt": st_attempt, "error": f"skipped (cooling) {full_id}"})
+                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="model is cooling down")
                                 continue
                             mid_full = f"{_prov.name}/{_mdl.model_id}"
+                            _decision_select(conversation_id, provider=_prov.name, model=_mdl.model_id, model_pk=_mdl.id, reason="next combo target")
                             up_req = request.model_copy(update={"model": _mdl.model_id})
                             _start = time.time()
                             try:
@@ -1102,6 +1201,7 @@ async def chat_completions(
                                 _cbuf = []
                                 _cu = {}
                                 _cb_ttft_ms = None
+                                _cb_attempt_ttft_ms = None
                                 _fb_eh = _merge_oauth_headers(_prov, _prov.headers)
                                 _fbmov = getattr(_mdl, "request_overrides", None) or {}
                                 if isinstance(_fbmov, dict) and _fbmov.get("headers"):
@@ -1110,6 +1210,7 @@ async def chat_completions(
                                     # 首字延迟：首个 chunk 距请求开始的时间
                                     if _cb_ttft_ms is None:
                                         _cb_ttft_ms = int((time.time() - _send_time) * 1000)
+                                        _cb_attempt_ttft_ms = int((time.time() - _start) * 1000)
                                     if isinstance(ck, dict) and "error" in ck:
                                         raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
                                     _csc += 1
@@ -1125,6 +1226,7 @@ async def chat_completions(
                                 if _stream_content_is_empty(_cbuf):
                                     err_s = "empty_stream_output: 上游返回成功但无内容"
                                     stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
+                                    _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                                     if ar.health_checker:
                                         ar.health_checker.mark_failure(_mdl.id)
                                         ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
@@ -1144,6 +1246,7 @@ async def chat_completions(
                                 _ct = int(_cu.get("completion_tokens") or _cu.get("output_tokens") or 0)
                                 _crd, _cwt = _extract_cache_tokens(_cu)
                                 _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_chunks(_cbuf))
+                                _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="success", attempt=st_attempt, latency_ms=_combo_latency, ttft_ms=_cb_attempt_ttft_ms)
                                 await _write_stream_log(conversation_id, request, raw_request, "success",
                                     _prov.name, _mdl.model_id, None, st_attempt, None,
                                     stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
@@ -1156,6 +1259,7 @@ async def chat_completions(
                             except Exception as se:
                                 err_s = f"{type(se).__name__}: {str(se)[:200]}"
                                 stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
+                                _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                                 # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
                                 if ar.health_checker and not is_context_error(err_s):
                                     # 上下文超限不进冷却
@@ -1174,6 +1278,16 @@ async def chat_completions(
                             None, None, "combo all targets failed", 0, stream_errs, diag_start_ts=_diag_start)
                     finally:
                         await cdb.close()
+                        try:
+                            await asyncio.shield(_decision_finish(
+                                conversation_id,
+                                status="error",
+                                fallback_count=max(0, len(stream_errs) - 1),
+                                failure_reason="stream ended before a terminal routing result",
+                                attempts=stream_errs,
+                            ))
+                        except Exception:
+                            pass
 
                 return StreamingResponse(_combo_cascade_stream(), media_type="text/event-stream")
             # ─── 非流式 combo：循环尝试（含冷却），不再走 is_auto 级联路径 ───
@@ -1192,14 +1306,17 @@ async def chat_completions(
                 )).scalar_one_or_none() if provider else None
                 if not provider or not model:
                     combo_attempts.append({"target": full_id, "error": "provider or model not found"})
+                    _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
                     continue
                 # 上下文预检：装不下的候选直接跳过
                 if context_overflows(model, est_req_tokens):
                     combo_attempts.append({"target": full_id, "error": f"skip: est ~{est_req_tokens} tokens > context window {model.context_length}"})
+                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="context window too small")
                     continue
                 # 跳过处于冷却（被惩罚）中的 target，让后续健康候选顶上
                 if ar.health_checker and ar.health_checker.is_cooling(model.id):
                     combo_attempts.append({"target": full_id, "error": "skipped (cooling)"})
+                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="model is cooling down")
                     continue
                 # 取 key（v3.5：按模型归属集合选）
                 try:
@@ -1209,6 +1326,7 @@ async def chat_completions(
                     _picked = None
                 if not _picked or _picked[0] is None:
                     combo_attempts.append({"target": full_id, "error": f"no active key for {provider.name}"})
+                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="no active API key")
                     continue
                 api_key = _picked[1]
                 adapter = _cafp(provider.api_type)
@@ -1230,6 +1348,7 @@ async def chat_completions(
                             pass
                 try:
                     _combo_send_time = time.time()
+                    _decision_select(conversation_id, provider=provider.name, model=model.model_id, model_pk=model.id, reason="next combo target")
                     result = await adapter.chat_completion(
                         upstream_req, api_key, provider.base_url, extra_hdr
                     )
@@ -1241,6 +1360,7 @@ async def chat_completions(
                         err_str = "empty_output: upstream 返回 200 但无内容/tool_calls/usage"
                         combo_attempts.append({"target": full_id, "error": err_str})
                         last_error = err_str
+                        _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000), error=err_str)
                         if ar.health_checker:
                             ar.health_checker.mark_failure(model.id)
                             ar.health_checker.mark_cooling(model.id, ar.config.cooling_period_seconds)
@@ -1248,6 +1368,7 @@ async def chat_completions(
                         continue
                     if ar.health_checker:
                         ar.health_checker.mark_success(model.id)
+                    _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000))
                     # combo 分支独立于集中日志（964 行），需自行写请求日志
                     try:
                         import json as _j
@@ -1274,6 +1395,7 @@ async def chat_completions(
                     err_str = f"{type(e).__name__}: {str(e)[:200]}"
                     combo_attempts.append({"target": full_id, "error": err_str})
                     last_error = err_str
+                    _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000), error=err_str)
                     # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
                     if ar.health_checker and model and not is_context_error(err_str):
                         # 上下文超限不进冷却
@@ -1308,14 +1430,17 @@ async def chat_completions(
                 model = next((m for m in models if m.model_id == request.model), None)
             if not model:
                 _diag(conversation_id, "direct_route_not_found", _diag_start, model=request.model)
+                await _decision_finish(conversation_id, status="error", failure_reason=f"Model {request.model} not found")
                 return JSONResponse(status_code=404, content={"error": f"Model {request.model} not found"})
             _diag(conversation_id, "direct_model_done", _diag_start, routed_model=model.model_id)
             provider = await db.get(Provider, model.provider_id)
             # v4.0: 服务商被禁用 → 直连同样不可用
             if provider is None or not getattr(provider, "enabled", True):
+                await _decision_finish(conversation_id, status="error", failure_reason=f"Provider for model {request.model} is disabled")
                 return JSONResponse(status_code=404, content={"error": f"Provider for model {request.model} is disabled"})
             # Free Tier / OAuth providers — key 可空（无需密钥直发 / OAuth token 走 OAuth client）
             api_key = None
+            _kid = None
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                 _diag(conversation_id, "direct_key_skipped_" + provider.credential_type, _diag_start, provider=provider.name)
                 if provider.credential_type == "oauth":
@@ -1329,6 +1454,7 @@ async def chat_completions(
                     if oauth_p:
                         api_key = await get_oauth_client().pick_access_token(oauth_code, db)
                     if not api_key:
+                        await _decision_finish(conversation_id, status="error", failure_reason=f"OAuth provider '{oauth_code}' not connected")
                         return JSONResponse(status_code=503, content={"error": f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)"})
                 else:
                     api_key = ""   # free_tier：decoder 时 adapter 用空字符串鉴权头
@@ -1350,6 +1476,7 @@ async def chat_completions(
                     key = result.scalar_one_or_none()
                     if not key:
                         _diag(conversation_id, "direct_key_missing", _diag_start, provider=provider.name)
+                        await _decision_finish(conversation_id, status="error", failure_reason=f"No active API key for provider {provider.name}")
                         return JSONResponse(status_code=503, content={"error": f"No active API key for provider {provider.name}"})
                     _diag(conversation_id, "direct_key_done", _diag_start, provider=provider.name)
                     _kid, api_key = key.id, get_crypto_service().decrypt(key.key_encrypted)
@@ -1359,6 +1486,16 @@ async def chat_completions(
                 success=True, model=model, provider=provider, api_key=api_key, key_id=_kid,
                 adapter=adapter, fallback_count=0
             )
+            _decision_candidates(conversation_id, [{
+                "rank": 1,
+                "model_pk": model.id,
+                "provider": provider.name,
+                "model": model.model_id,
+                "eligible": True,
+                "selected": True,
+                "selection_reason": "explicit model request",
+            }])
+            _decision_select(conversation_id, provider=provider.name, model=model.model_id, model_pk=model.id, reason="explicit model request")
             _diag(conversation_id, "direct_route_done", _diag_start, provider=provider.name, model=model.model_id)
 
             # ─── v3.2 free_tier 专用 provider (opencode / mimo-free) 直走 free executor ───
@@ -1375,6 +1512,7 @@ async def chat_completions(
                         async def _free_stream():
                             _free_stream_start = time.time()
                             _free_ttft_ms = None
+                            _free_err = None
                             try:
                                 async for ck in free_exec.execute_stream(free_req):
                                     if _free_ttft_ms is None:
@@ -1382,6 +1520,7 @@ async def chat_completions(
                                     yield _format_sse_chunk(ck, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             except Exception as e:
+                                _free_err = f"{type(e).__name__}: {str(e)[:200]}"
                                 err_data = {"error": f"free_provider_stream_failed: {e}"}
                                 yield _format_sse_chunk(err_data, model.full_id)
                                 yield b"data: [DONE]\n\n"
@@ -1389,8 +1528,19 @@ async def chat_completions(
                                 try:
                                     from server.db import AsyncSessionLocal as _AS
                                     async with _AS() as sdb:
+                                        _decision_attempt(
+                                            conversation_id,
+                                            provider=provider.name,
+                                            model=model.model_id,
+                                            status="failed" if _free_err else "success",
+                                            attempt=0,
+                                            latency_ms=int((time.time() - _free_stream_start) * 1000),
+                                            ttft_ms=_free_ttft_ms,
+                                            error=_free_err,
+                                        )
                                         await _write_stream_log(conversation_id, request, raw_request,
-                                            "success", provider.name, model.model_id, None, 0, None,
+                                            "error" if _free_err else "success", provider.name, model.model_id, _free_err, 0,
+                                            [] if _free_err else None,
                                             latency_ms=int((time.time() - _free_stream_start) * 1000),
                                             ttft_ms=_free_ttft_ms)
                                 except Exception:
@@ -1398,15 +1548,24 @@ async def chat_completions(
                         return StreamingResponse(_free_stream(), media_type="text/event-stream")
                     else:
                         try:
+                            _free_started = time.time()
                             data = await free_exec.execute_non_stream(free_req)
+                            _free_latency = int((time.time() - _free_started) * 1000)
+                            _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=0, latency_ms=_free_latency)
+                            await _decision_finish(conversation_id, status="success", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency)
                             return JSONResponse(content=data)
                         except Exception as e:
+                            _free_latency = int((time.time() - _free_started) * 1000)
+                            _free_err = f"{type(e).__name__}: {str(e)[:200]}"
+                            _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
+                            await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
                             return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {e}"})
                 else:
                     # free_tier provider 找不到对应 executor — 不回退 adapter（避免 URL 被错误二次追加）
                     _diag(conversation_id, "free_provider_executor_miss", _diag_start,
                           name=provider.name, oauth_code=getattr(provider, "oauth_code", None))
                     known_codes = ", ".join(f"'{c}' ({_FREE_PROVIDERS_META[c]['name']})" for c in _FREE_PROVIDERS_META)
+                    await _decision_finish(conversation_id, status="error", failure_reason=f"free_tier provider '{provider.name}' has no matching executor")
                     return JSONResponse(
                         status_code=400,
                         content={
@@ -1508,10 +1667,13 @@ async def chat_completions(
                     _cand_ctx_len = int(getattr(cand.model, "context_length", 0) or 0)
                     if _cand_ctx_len > 0 and est_req_tokens + 1024 > _cand_ctx_len:
                         stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{est_req_tokens} tokens)"})
+                        _decision_skip(conversation_id, model_pk=cand_model_pk, provider=cand_provider_name, model=cand_model_id, reason="context window too small")
                         continue
                     up_req = request.model_copy(update={"model": cand_model_id})
+                    _decision_select(conversation_id, provider=cand_provider_name, model=cand_model_id, model_pk=cand_model_pk, reason=getattr(cand, "selection_reason", None) or "next ranked candidate")
                     gen = None
                     sc = 0
+                    _candidate_started = time.time()
                     try:
                         _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id)
                         _cascade_eh = _merge_oauth_headers(cand.provider, cand_provider_headers)
@@ -1526,11 +1688,13 @@ async def chat_completions(
                         stream_has_error = False
                         stream_err_detail = ""
                         _cascade_ttft_ms = None
+                        _candidate_ttft_ms = None
                         candidate_first_chunk_timeout = min(first_chunk_timeout, remaining_first_response)
                         async for ck in _stream_with_first_chunk_timeout(gen, candidate_first_chunk_timeout):
                             # 首字延迟：首个 chunk 距请求开始的时间
                             if _cascade_ttft_ms is None:
                                 _cascade_ttft_ms = int((time.time() - _send_time) * 1000)
+                                _candidate_ttft_ms = int((time.time() - _candidate_started) * 1000)
                             sc += 1
                             if isinstance(ck, dict) and "error" in ck:
                                 stream_has_error = True
@@ -1549,6 +1713,7 @@ async def chat_completions(
                         if _stream_content_is_empty(stream_buf):
                             err_s = "empty_stream_output: 上游返回成功但无内容"
                             stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
+                            _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
                             if ar.health_checker:
                                 ar.health_checker.mark_failure(cand_model_pk)
                                 ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
@@ -1568,6 +1733,7 @@ async def chat_completions(
                         _crd, _cwt = _extract_cache_tokens(last_usage)
                         # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
                         _pt, _ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(stream_buf))
+                        _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="success", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms)
                         await _write_stream_log(conversation_id, request, raw_request, "success",
                             cand_provider_name, cand_model_id, None, st_attempt, None,
                             stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
@@ -1582,6 +1748,7 @@ async def chat_completions(
                         _diag(conversation_id, "upstream_stream_error", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id, error=type(se).__name__)
                         err_s = f"{type(se).__name__}: {str(se)[:200]}"
                         stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
+                        _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
                         if ar.health_checker and not is_context_error(err_s):
                             # 上下文超限不进冷却（请求体过大不是候选的错）
                             ar.health_checker.mark_failure(cand_model_pk)
@@ -1617,6 +1784,16 @@ async def chat_completions(
                     diag_start_ts=_diag_start)
             finally:
                 await cascade_db.close()
+                try:
+                    await asyncio.shield(_decision_finish(
+                        conversation_id,
+                        status="error",
+                        fallback_count=max(0, len(stream_errs) - 1),
+                        failure_reason="stream ended before a terminal routing result",
+                        attempts=stream_errs,
+                    ))
+                except Exception:
+                    pass
 
         return StreamingResponse(cascade_stream(), media_type="text/event-stream")
 
@@ -1649,6 +1826,14 @@ async def chat_completions(
             except Exception:
                 _diag(conversation_id, "final_error_log_error", _diag_start)
                 pass
+            await _decision_finish(
+                conversation_id,
+                status="error",
+                fallback_count=max(0, len(_attempt_errors) - 1),
+                total_latency_ms=int((time.time() - _send_time) * 1000),
+                failure_reason=response.get("error", "all_candidates_failed"),
+                attempts=_attempt_errors,
+            )
             return JSONResponse(
                 status_code=503,
                 content={"error": response.get("error", "all_candidates_failed"), "attempts": _attempt_errors},
@@ -1740,6 +1925,16 @@ async def chat_completions(
                     # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
                     pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(_stream_chunks_log))
                     try:
+                        _decision_attempt(
+                            conversation_id,
+                            provider=route_result.provider.name,
+                            model=route_result.model.model_id,
+                            status="failed" if _stream_err else "success",
+                            attempt=0,
+                            latency_ms=int((time.time() - _send_time) * 1000),
+                            ttft_ms=_stream_ttft_ms,
+                            error=_stream_err,
+                        )
                         _diag(conversation_id, "stream_log_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
                         from server.db import AsyncSessionLocal as _LS
                         from server.models.request_log import RequestLog as _RL
@@ -1773,8 +1968,31 @@ async def chat_completions(
                 **_proxy_log_fields(),
                             )
                             _diag(conversation_id, "stream_log_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
+                        await _decision_finish(
+                            conversation_id,
+                            status="error" if _stream_err else "success",
+                            provider=route_result.provider.name,
+                            model=route_result.model.model_id,
+                            fallback_count=route_result.fallback_count if route_result else 0,
+                            total_latency_ms=int((time.time() - _send_time) * 1000),
+                            ttft_ms=_stream_ttft_ms,
+                            failure_reason=_stream_err,
+                        )
                     except Exception:
                         _diag(conversation_id, "stream_log_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
+                        pass
+                    try:
+                        await asyncio.shield(_decision_finish(
+                            conversation_id,
+                            status="error" if _stream_err else "success",
+                            provider=route_result.provider.name,
+                            model=route_result.model.model_id,
+                            fallback_count=route_result.fallback_count if route_result else 0,
+                            total_latency_ms=int((time.time() - _send_time) * 1000),
+                            ttft_ms=_stream_ttft_ms,
+                            failure_reason=_stream_err,
+                        ))
+                    except Exception:
                         pass
             response = StreamingResponse(wrap_stream(), media_type="text/event-stream")
         else:
@@ -1790,6 +2008,7 @@ async def chat_completions(
                 result = None
                 _cur_kid, _cur_key = route_result.key_id, route_result.api_key
                 for _attempt in range(8):
+                    _direct_attempt_started = time.time()
                     if _attempt > 0:
                         _nk = await _rot.next_key_for_model(db, route_result.model, _tried)
                         if not _nk or _nk[0] is None:
@@ -1804,11 +2023,30 @@ async def chat_completions(
                         route_result.api_key = _cur_key
                         route_result.key_id = _cur_kid
                         _rot.mark_success(_cur_kid)
+                        _decision_attempt(
+                            conversation_id,
+                            provider=route_result.provider.name,
+                            model=route_result.model.model_id,
+                            status="success",
+                            attempt=_attempt,
+                            latency_ms=int((time.time() - _direct_attempt_started) * 1000),
+                            reason="key rotation attempt" if _attempt else None,
+                        )
                         _diag(conversation_id, "upstream_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False)
                         _done = True
                         break
                     except Exception as e:
                         _last_err = e
+                        _decision_attempt(
+                            conversation_id,
+                            provider=route_result.provider.name,
+                            model=route_result.model.model_id,
+                            status="failed",
+                            attempt=_attempt,
+                            latency_ms=int((time.time() - _direct_attempt_started) * 1000),
+                            error=f"{type(e).__name__}: {str(e)[:200]}",
+                            reason="retrying another key",
+                        )
                         _rot.mark_failure(_cur_kid, getattr(e, "status_code", None))
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                         continue
@@ -1893,6 +2131,25 @@ async def chat_completions(
                 _ldb.add(_rlog)
                 await _ldb.commit()
                 _diag(conversation_id, "request_log_done", _diag_start, status="error" if is_err else "success")
+            if not made_by_cascade:
+                _decision_attempt(
+                    conversation_id,
+                    provider=route_result.provider.name if (route_result and route_result.success) else None,
+                    model=route_result.model.model_id if (route_result and route_result.success) else None,
+                    status="failed" if is_err else "success",
+                    attempt=route_result.fallback_count if route_result else 0,
+                    latency_ms=_latency,
+                    error=str(response.get("error", "")) if is_err else None,
+                )
+            await _decision_finish(
+                conversation_id,
+                status="error" if is_err else "success",
+                provider=route_result.provider.name if (route_result and route_result.success) else None,
+                model=route_result.model.model_id if (route_result and route_result.success) else None,
+                fallback_count=route_result.fallback_count if route_result else 0,
+                total_latency_ms=_latency,
+                failure_reason=str(response.get("error", "")) if is_err else None,
+            )
         except Exception as _e:
             _diag(conversation_id, "request_log_error", _diag_start, error=type(_e).__name__)
             print(f"[WARN] request log write failed: {_e}")

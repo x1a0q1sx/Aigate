@@ -263,6 +263,7 @@
       <div class="modal-content detail-modal">
         <h3>请求详情</h3>
         <table class="detail-meta" style="width: 100%; margin: 16px 0; table-layout: fixed;">
+          <tbody>
           <tr>
             <td class="k">时间</td><td class="v">{{ fmtTime(detailRow.created_at) }}</td>
             <td class="k">状态</td><td class="v">{{ detailRow.status }}</td>
@@ -301,6 +302,7 @@
           <tr v-if="detailRow.error_msg">
             <td class="k">错误信息</td><td class="v" colspan="3" style="word-break: break-all;">{{ detailRow.error_msg }}</td>
           </tr>
+          </tbody>
         </table>
         <!-- 请求内容 + 返回内容 并排展示 -->
         <div class="detail-grid">
