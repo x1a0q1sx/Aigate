@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from scripts import update
@@ -118,3 +120,37 @@ def test_refresh_mutable_backup_captures_latest_pre_restart_state(tmp_path, monk
     assert _database_value(database) == "latest-before-restart"
     assert "latest-before-restart" in bundle.config.read_text(encoding="utf-8")
     update.verify_bundle(bundle)
+
+
+def test_smoke_check_bypasses_inherited_http_proxy(tmp_path, monkeypatch):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"name":"AIGate"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        root = tmp_path / "aigate"
+        root.mkdir()
+        (root / "config.yaml").write_text(
+            f"server:\n  port: {server.server_address[1]}\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(update, "ROOT", root)
+        monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+
+        update.smoke_check(timeout_seconds=2)
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)

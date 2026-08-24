@@ -442,11 +442,14 @@ def _server_port() -> int:
 def smoke_check(timeout_seconds: int = 40) -> None:
     step("Post-restart health check")
     url = f"http://127.0.0.1:{_server_port()}/"
+    # Update commands may inherit HTTP(S)_PROXY for GitHub access. A local
+    # health probe must never leave the machine or depend on that proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     deadline = time.monotonic() + timeout_seconds
     last_error = "no response"
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=3) as response:
+            with opener.open(url, timeout=3) as response:
                 status = response.status
                 payload = json.loads(response.read().decode("utf-8"))
             if status == 200 and payload.get("name") == "AIGate":
