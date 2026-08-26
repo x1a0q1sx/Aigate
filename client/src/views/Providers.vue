@@ -313,11 +313,11 @@
       <div v-if="activeTab === 'basic'">
         <div class="form-group">
           <label class="form-label">名称 *</label>
-          <input v-model="form.name" placeholder="例如 lyclaude" />
+          <input v-model="form.name" type="text" placeholder="例如 lyclaude" />
         </div>
         <div class="form-group">
           <label class="form-label">API Base URL *</label>
-          <input v-model="form.base_url" placeholder="https://api.example.com/v1" />
+          <input v-model="form.base_url" type="url" placeholder="https://api.example.com/v1" />
         </div>
         <div class="form-group">
           <label class="checkbox-label">
