@@ -48,7 +48,7 @@
 
     <!-- 已启用服务商 -->
     <section v-if="pageTab === 'enabled'" class="card">
-      <div class="toolbar">
+      <div class="provider-toolbar">
         <div class="toolbar-left">
           <div class="segmented">
             <button v-for="f in providerFilters" :key="f.value" :class="{ active: providerFilter === f.value }" @click="providerFilter = f.value">
@@ -56,7 +56,7 @@
             </button>
           </div>
         </div>
-        <div class="toolbar-right">
+        <div class="toolbar-controls">
           <div class="input-group">
             <AppIcon name="search" :size="14" />
             <input v-model.trim="providerSearch" placeholder="搜索服务商 / URL" />
@@ -74,6 +74,18 @@
       <EmptyState v-if="filteredProviders.length === 0" icon="inbox" title="暂无匹配服务商" />
       <div v-else class="table-wrap provider-table-wrap">
         <table class="provider-table">
+          <colgroup>
+            <col class="col-pin">
+            <col class="col-name">
+            <col class="col-url">
+            <col class="col-credential">
+            <col class="col-type">
+            <col class="col-count">
+            <col class="col-count">
+            <col class="col-status-col">
+            <col class="col-proxy">
+            <col class="col-action-width">
+          </colgroup>
           <thead>
             <tr>
               <th class="col-pin" aria-label="固定"></th>
@@ -123,12 +135,14 @@
                 </label>
               </td>
               <td class="col-actions">
-                <button class="icon-btn" @click="refreshProviderModels(p)" :disabled="busy.refreshModels" title="刷新模型" aria-label="刷新模型"><AppIcon name="refresh" :size="13" /></button>
-                <button class="icon-btn" @click="editProvider(p)" title="编辑" aria-label="编辑"><AppIcon name="edit" :size="13" /></button>
-                <button v-if="(p.credential_type || 'api_key') === 'api_key'" class="icon-btn" @click="editProviderKeys(p)" title="密钥" aria-label="密钥"><AppIcon name="key" :size="13" /></button>
-                <button class="icon-btn" @click="openImportPricing(p)" title="导入定价" aria-label="导入定价"><AppIcon name="dollar" :size="13" /></button>
-                <button v-if="p.api_type === 'atomcode'" class="icon-btn" :class="{ warning: !atomExeStatus.found }" @click="openAtomExeConfig(p)" title="配置可执行文件" aria-label="配置可执行文件"><AppIcon name="scan" :size="13" /></button>
-                <button class="icon-btn danger" @click="deleteProvider(p)" title="删除" aria-label="删除"><AppIcon name="trash" :size="13" /></button>
+                <div class="action-stack">
+                  <button class="icon-btn" @click="refreshProviderModels(p)" :disabled="busy.refreshModels" title="刷新模型" aria-label="刷新模型"><AppIcon name="refresh" :size="13" /></button>
+                  <button class="icon-btn" @click="editProvider(p)" title="编辑" aria-label="编辑"><AppIcon name="edit" :size="13" /></button>
+                  <button v-if="(p.credential_type || 'api_key') === 'api_key'" class="icon-btn" @click="editProviderKeys(p)" title="密钥" aria-label="密钥"><AppIcon name="key" :size="13" /></button>
+                  <button class="icon-btn" @click="openImportPricing(p)" title="导入定价" aria-label="导入定价"><AppIcon name="dollar" :size="13" /></button>
+                  <button v-if="p.api_type === 'atomcode'" class="icon-btn" :class="{ warning: !atomExeStatus.found }" @click="openAtomExeConfig(p)" title="配置可执行文件" aria-label="配置可执行文件"><AppIcon name="scan" :size="13" /></button>
+                  <button class="icon-btn danger" @click="deleteProvider(p)" title="删除" aria-label="删除"><AppIcon name="trash" :size="13" /></button>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -1492,18 +1506,51 @@ export default {
   color: #fff;
 }
 
+.provider-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.toolbar-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex: 1 1 360px;
+  min-width: 280px;
+  max-width: 460px;
+  gap: var(--space-2);
+}
+.toolbar-controls .input-group {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.toolbar-controls .input-group input {
+  width: 100%;
+  min-width: 0;
+}
+.toolbar-controls select {
+  flex: 0 0 126px;
+  width: 126px;
+  min-height: 32px;
+  padding-left: var(--space-2);
+}
+
 /* 服务商列表 */
 .provider-table-wrap {
-  overflow-x: auto;
+  overflow-x: clip;
 }
 .provider-table {
+  table-layout: fixed;
   width: 100%;
-  min-width: 1080px;
+  min-width: 0;
   border-collapse: collapse;
   font-size: 12px;
 }
 .provider-table th,
 .provider-table td {
+  overflow: hidden;
   padding: 6px 8px;
   border-bottom: 1px solid var(--border-base);
   vertical-align: middle;
@@ -1530,17 +1577,24 @@ export default {
 }
 .provider-table th.col-pin,
 .provider-table td.col-pin {
-  width: 30px;
+  width: 36px;
   padding-right: 0;
 }
+.provider-table col.col-name { width: 15%; }
+.provider-table col.col-url { width: 20%; }
+.provider-table col.col-credential { width: 8%; }
+.provider-table col.col-type { width: 9%; }
+.provider-table col.col-count { width: 5%; }
+.provider-table col.col-status-col { width: 18%; }
+.provider-table col.col-proxy { width: 6%; }
+.provider-table col.col-action-width { width: 42px; }
 .provider-table th.num,
 .provider-table td.num {
   text-align: right;
   width: 48px;
 }
 .provider-table .col-url {
-  max-width: 280px;
-  width: 280px;
+  width: 20%;
 }
 .provider-table .url-text {
   display: block;
@@ -1548,26 +1602,37 @@ export default {
   text-overflow: ellipsis;
 }
 .cell-name {
-  max-width: 220px;
-}
-.cell-name strong {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-size: 13px;
-}
-.cell-status {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 6px;
-  max-width: 260px;
+  min-width: 0;
+}
+.cell-name strong {
+  flex: 1 1 auto;
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+.cell-name .badge {
+  flex: 0 0 auto;
+}
+.cell-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 .col-actions {
   text-align: right;
+  vertical-align: top;
+  padding-top: 7px !important;
 }
-.col-actions .icon-btn:last-child {
-  margin-right: 0;
+.action-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
 }
 .icon-btn {
   display: inline-flex;
@@ -1576,7 +1641,6 @@ export default {
   width: 25px;
   height: 25px;
   padding: 0;
-  margin-right: 4px;
   border: 1px solid var(--border-base);
   border-radius: 6px;
   background: var(--surface-2);
@@ -1594,6 +1658,15 @@ export default {
 .icon-btn.danger:hover {
   border-color: var(--danger);
   color: var(--danger);
+}
+@media (max-width: 900px) {
+  .provider-toolbar {
+    flex-wrap: wrap;
+  }
+  .toolbar-controls {
+    width: 100%;
+    max-width: none;
+  }
 }
 .pin-btn {
   border: 0;
@@ -1654,6 +1727,27 @@ export default {
 }
 .toggle-switch.compact input:checked + .toggle-slider::before {
   transform: translateX(13px);
+}
+.provider-table .toggle-switch {
+  width: 34px !important;
+  height: 19px !important;
+}
+.provider-table .toggle-switch input[type='checkbox'] {
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+.provider-table .toggle-switch .toggle-slider::before {
+  width: 13px !important;
+  height: 13px !important;
+  left: 3px !important;
+  top: 3px !important;
+  margin: 0 !important;
+}
+.provider-table .toggle-switch input[type='checkbox']:checked + .toggle-slider::before {
+  transform: translateX(15px) !important;
 }
 .toggle-switch input:disabled + .toggle-slider {
   opacity: 0.5;
