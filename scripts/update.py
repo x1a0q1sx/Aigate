@@ -72,13 +72,18 @@ def _read_status() -> dict:
         return {}
 
 
-def set_status(state: str, **fields) -> None:
+def set_status(state: str, **fields) -> dict:
     STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
     payload = _read_status()
     payload.update({"state": state, "updated_at": datetime.now().isoformat(), **fields})
+    if state == "finished":
+        # A successful update must not inherit failure diagnostics from an earlier attempt.
+        payload.pop("rollback_reason", None)
+        payload.pop("rollback_error", None)
     temporary = STATUS_FILE.with_suffix(".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(STATUS_FILE)
+    return payload
 
 
 def run(cmd, cwd: Optional[Path] = None, *, capture: bool = True, check: bool = True, env: Optional[dict] = None):

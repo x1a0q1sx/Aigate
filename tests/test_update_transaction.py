@@ -101,6 +101,27 @@ def test_sqlite_integrity_rejects_corrupt_backup(tmp_path):
         raise AssertionError("corrupt SQLite backup was accepted")
 
 
+def test_finished_status_clears_stale_rollback_diagnostics(tmp_path, monkeypatch):
+    status_file = tmp_path / "data" / "update_status.json"
+    status_file.parent.mkdir(parents=True)
+    status_file.write_text(
+        json.dumps({
+            "state": "rolled_back",
+            "rollback_reason": "old failure",
+            "rollback_error": "old failure",
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(update, "STATUS_FILE", status_file)
+
+    payload = update.set_status("finished", after_commit="new")
+
+    assert payload["after_commit"] == "new"
+    assert "rollback_reason" not in payload
+    assert "rollback_error" not in payload
+    assert "rollback_reason" not in json.loads(status_file.read_text(encoding="utf-8"))
+
+
 def test_refresh_mutable_backup_captures_latest_pre_restart_state(tmp_path, monkeypatch):
     root = tmp_path / "aigate"
     database = root / "data" / "aigate.db"
