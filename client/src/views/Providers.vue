@@ -1587,7 +1587,7 @@ export default {
 .provider-table col.col-count { width: 5%; }
 .provider-table col.col-status-col { width: 18%; }
 .provider-table col.col-proxy { width: 6%; }
-.provider-table col.col-action-width { width: 42px; }
+.provider-table col.col-action-width { width: 180px; }
 .provider-table th.num,
 .provider-table td.num {
   text-align: right;
@@ -1625,13 +1625,13 @@ export default {
 }
 .col-actions {
   text-align: right;
-  vertical-align: top;
-  padding-top: 7px !important;
+  vertical-align: middle;
 }
 .action-stack {
   display: inline-flex;
-  flex-direction: column;
-  align-items: flex-end;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
   gap: 4px;
 }
 .icon-btn {
