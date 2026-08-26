@@ -959,6 +959,41 @@ async def delete_key(key_id: int, db: AsyncSession = Depends(get_db)):
     if not success:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"ok": True}
+
+@router.get("/providers/model-stats")
+async def get_provider_model_stats(db: AsyncSession = Depends(get_db)):
+    """轻量服务商模型统计，避免管理页为了两个计数器拉取全量模型。"""
+    from server.main import get_health_checker
+
+    rows = (await db.execute(
+        select(Model.id, Model.provider_id)
+        .join(Provider, Model.provider_id == Provider.id)
+        .where(Model.enabled == True)  # noqa: E712 - 与模型列表接口保持同一可见性
+        .where(Provider.enabled == True)  # noqa: E712 - 禁用服务商原先也不返回模型
+        .order_by(Model.provider_id, Model.id)
+    )).all()
+
+    counts: dict[int, int] = {}
+    provider_ids: dict[int, int] = {}
+    model_provider_ids: dict[int, int] = {}
+    for model_id, provider_id in rows:
+        counts[provider_id] = counts.get(provider_id, 0) + 1
+        provider_ids[provider_id] = provider_id
+        model_provider_ids[model_id] = provider_id
+
+    failures: dict[int, int] = {provider_id: 0 for provider_id in provider_ids}
+    hc = get_health_checker()
+    if hc:
+        for model_id, fail_count in hc._fail_count.items():
+            provider_id = model_provider_ids.get(model_id)
+            if provider_id is not None:
+                failures[provider_id] += int(fail_count or 0)
+
+    return [
+        {"provider_id": provider_id, "model_count": count, "fail_count": failures.get(provider_id, 0)}
+        for provider_id, count in sorted(counts.items())
+    ]
+
 @router.get("/models")
 async def list_models(
     provider_id: Optional[int] = None,

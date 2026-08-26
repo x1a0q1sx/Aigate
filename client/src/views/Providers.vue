@@ -620,7 +620,7 @@ export default {
     return {
       providers: [],
       allKeys: [],
-      models: [],
+      providerStats: {},
       oauthProvidersState: [],
       oauthConnections: [],
       pageTab: 'enabled',
@@ -769,17 +769,22 @@ export default {
   },
   methods: {
     async load() {
-      const [providers, keys, models, oauthProviders, oauthConnections, atomExe] = await Promise.all([
+      const [providers, keys, modelStats, oauthProviders, oauthConnections, atomExe] = await Promise.all([
         api.getProviders(),
         api.getKeys().catch(() => []),
-        api.getModels().catch(() => []),
+        api.getProviderModelStats().catch(() => []),
         api.getOAuthProviders().catch(() => []),
         api.getOAuthConnections().catch(() => []),
         api.getAtomExeStatus().catch(() => ({ found: true })),
       ])
       this.providers = providers || []
       this.allKeys = keys || []
-      this.models = models || []
+      this.providerStats = Object.fromEntries(
+        (modelStats || []).map((item) => [Number(item.provider_id), {
+          model_count: Number(item.model_count) || 0,
+          fail_count: Number(item.fail_count) || 0,
+        }])
+      )
       this.oauthProvidersState = oauthProviders || []
       this.oauthConnections = oauthConnections || []
       this.atomExeStatus = atomExe && atomExe.found !== undefined ? atomExe : { found: true }
@@ -811,10 +816,10 @@ export default {
       return this.allKeys.filter((k) => k.provider_id === id)
     },
     modelCount(id) {
-      return this.models.filter((m) => m.provider_id === id).length
+      return this.providerStats[id]?.model_count || 0
     },
     failCount(id) {
-      return this.models.filter((m) => m.provider_id === id).reduce((n, m) => n + (Number(m.fail_count) || 0), 0)
+      return this.providerStats[id]?.fail_count || 0
     },
     oauthConnectionCount(p) {
       return this.oauthConnections.filter((c) => c.provider_code === p.oauth_code || c.provider_code === p.name).length
@@ -1878,5 +1883,4 @@ export default {
   }
 }
 </style>
-
 

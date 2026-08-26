@@ -88,6 +88,7 @@ export default {
   createUpdateBackup: () => apiPost('/admin/api/update/backups', {}),
   // 服务商
   getProviders: () => apiGet('/admin/api/providers'),
+  getProviderModelStats: () => apiGet('/admin/api/providers/model-stats'),
   createProvider: (data) => apiPost('/admin/api/providers', data),
   updateProvider: (id, data) => apiPut(`/admin/api/providers/${id}`, data),
   deleteProvider: (id) => apiDelete(`/admin/api/providers/${id}`),

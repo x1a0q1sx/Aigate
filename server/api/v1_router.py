@@ -240,6 +240,30 @@ def _stream_usage_dict(chunk) -> dict:
     return usage if isinstance(usage, dict) else {}
 
 
+_STREAM_CONTENT_VALIDATION_MARKERS = (
+    "stream content validation failed",
+    "stream disconnected before valid content",
+    "stream disconnected before completion",
+    "idle timeout",
+    "waiting for sse",
+    "content is insufficient",
+    "received 0 chars",
+)
+
+
+def _is_stream_content_validation_error(text) -> bool:
+    """识别上游转发网关（new-api / one-api 类）在流式内容校验失败时返回的错误。
+
+    这类错误常出现在思考型模型只产出 reasoning_content、或模型达到 max_tokens 上限后
+    没有吐出任何正文的场景。它表示候选上游没有得到可用正文，而不是模型网络/健康故障，
+    因此：A）在级联路由中应静默回退到下一个候选；B）不应据此对模型计失败或冷却。
+    """
+    if not text:
+        return False
+    lowered = str(text).lower()
+    return any(marker in lowered for marker in _STREAM_CONTENT_VALIDATION_MARKERS)
+
+
 async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
     """Yield an upstream stream, failing quickly when it never produces a chunk."""
     try:
@@ -1261,8 +1285,8 @@ async def chat_completions(
                                 stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
                                 _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                                 # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                                if ar.health_checker and not is_context_error(err_s):
-                                    # 上下文超限不进冷却
+                                # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却
+                                if ar.health_checker and not is_context_error(err_s) and not _is_stream_content_validation_error(err_s):
                                     ar.health_checker.mark_failure(_mdl.id)
                                     ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
                                 raw_err = _extract_error_body(se) or err_s
@@ -1673,6 +1697,7 @@ async def chat_completions(
                     _decision_select(conversation_id, provider=cand_provider_name, model=cand_model_id, model_pk=cand_model_pk, reason=getattr(cand, "selection_reason", None) or "next ranked candidate")
                     gen = None
                     sc = 0
+                    stream_buf = []
                     _candidate_started = time.time()
                     try:
                         _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id)
@@ -1751,14 +1776,18 @@ async def chat_completions(
                         _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
                         if ar.health_checker and not is_context_error(err_s):
                             # 上下文超限不进冷却（请求体过大不是候选的错）
-                            ar.health_checker.mark_failure(cand_model_pk)
-                            ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
+                            # 上游内容校验失败（如思考模型零正文）同样不代表模型故障，不冷却
+                            if not _is_stream_content_validation_error(err_s):
+                                ar.health_checker.mark_failure(cand_model_pk)
+                                ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
                         cd_seconds = ar.config.cooling_period_seconds
                         fc = (ar.health_checker._fail_count.get(cand_model_pk, 0) if ar.health_checker else 0)
                         cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
                         err_s_annotated = f"{err_s} | cooldown={cd_actual}s fail#{fc}"
                         raw_err = _extract_error_body(se) or err_s
-                        if sc > 0:
+                        # 只有已经向客户端吐出过真实内容（正文/tool_calls）的中途失败才应截断；
+                        # 如果错误发生在任何实质内容之前（典型：上游内容校验失败），应回退下一候选
+                        if not _stream_content_is_empty(stream_buf):
                             yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
                             yield b"data: [DONE]\n\n"
                             await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -1879,35 +1908,67 @@ async def chat_completions(
             async def wrap_stream():
                 nonlocal _stream_usage, _stream_err, _stream_ttft_ms
                 _diag(conversation_id, "direct_stream_generator_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
-                stream_has_error = False
-                stream_err_detail = ""
+                # 直连流对“正文出现前断流”（内容校验失败 / 空闲超时等）最多重试一次：
+                # 只有尚未向客户端吐出任何实质 chunk 时才重试，避免重复输出对客户端可见。
                 try:
-                    _diag(conversation_id, "upstream_stream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
-                    async for chunk in generator:
-                        # 首字延迟：首个到达 chunk 距请求开始的时间
-                        if _stream_ttft_ms is None:
-                            _stream_ttft_ms = int((time.time() - _send_time) * 1000)
-                        if isinstance(chunk, dict):
-                            # 检测上游在 SSE 流中返回的错误
-                            if "error" in chunk and "choices" not in chunk:
-                                stream_has_error = True
-                                stream_err_detail = str(chunk.get("error", "unknown"))[:200]
-                                break  # 跳出循环再抛，避免 aclose() 竞态
-                            u = _stream_usage_dict(chunk)
-                            if u:
-                                _stream_usage = u
-                            _stream_chunks_log.append(chunk)
-                        yield _format_sse_chunk(chunk, model_id_full)
-                    if stream_has_error:
-                        raise RuntimeError(f"upstream_stream_error: {stream_err_detail}")
-                    _diag(conversation_id, "upstream_stream_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, chunks=len(_stream_chunks_log))
-                    yield b"data: [DONE]\n\n"
-                except Exception as e:
-                    _diag(conversation_id, "upstream_stream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, error=type(e).__name__)
-                    _stream_err = f"{type(e).__name__}: {str(e)[:200]}"
-                    error_chunk = {"error": f"upstream_stream_failed: {_stream_err}"}
-                    yield _format_sse_chunk(error_chunk, model_id_full)
-                    yield b"data: [DONE]\n\n"
+                    for _attempt_no in range(2):
+                        _attempt_gen = generator if _attempt_no == 0 else route_result.adapter.stream_chat_completion(
+                            upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
+                        )
+                        if _attempt_no > 0:
+                            # 上一轮可能只收到 role/reasoning/usage 元数据；重试前清空，避免污染日志和 usage。
+                            _stream_chunks_log.clear()
+                            _stream_usage = {}
+                            _stream_ttft_ms = None
+                        stream_has_error = False
+                        stream_err_detail = ""
+                        try:
+                            _diag(conversation_id, "upstream_stream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
+                            async for chunk in _attempt_gen:
+                                # 首字延迟：首个到达 chunk 距请求开始的时间
+                                if _stream_ttft_ms is None:
+                                    _stream_ttft_ms = int((time.time() - _send_time) * 1000)
+                                if isinstance(chunk, dict):
+                                    # 检测上游在 SSE 流中返回的错误
+                                    if "error" in chunk and "choices" not in chunk:
+                                        stream_has_error = True
+                                        stream_err_detail = str(chunk.get("error", "unknown"))[:200]
+                                        break  # 跳出循环再抛，避免 aclose() 竞态
+                                    u = _stream_usage_dict(chunk)
+                                    if u:
+                                        _stream_usage = u
+                                    _stream_chunks_log.append(chunk)
+                                yield _format_sse_chunk(chunk, model_id_full)
+                            if stream_has_error:
+                                if (
+                                    _attempt_no == 0
+                                    and _stream_content_is_empty(_stream_chunks_log)
+                                    and _is_stream_content_validation_error(stream_err_detail)
+                                ):
+                                    continue
+                                raise RuntimeError(f"upstream_stream_error: {stream_err_detail}")
+                            _diag(conversation_id, "upstream_stream_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, chunks=len(_stream_chunks_log))
+                            yield b"data: [DONE]\n\n"
+                            return
+                        except Exception as e:
+                            _diag(conversation_id, "upstream_stream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, error=type(e).__name__)
+                            _err_text = f"{type(e).__name__}: {str(e)[:200]}"
+                            if (
+                                _attempt_no == 0
+                                and _stream_content_is_empty(_stream_chunks_log)
+                                and _is_stream_content_validation_error(_err_text)
+                            ):
+                                continue
+                            _stream_err = _err_text
+                            error_chunk = {"error": f"upstream_stream_failed: {_stream_err}"}
+                            yield _format_sse_chunk(error_chunk, model_id_full)
+                            yield b"data: [DONE]\n\n"
+                            return
+                        finally:
+                            try:
+                                await _attempt_gen.aclose()
+                            except Exception:
+                                pass
                 finally:
                     # 显式关闭上游 async generator，防止 GC 时 aclose() 竞态
                     try:
