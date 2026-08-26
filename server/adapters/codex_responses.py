@@ -153,10 +153,14 @@ class CodexResponsesAdapter(BaseAdapter):
         self.timeout = timeout
         self.last_proxy_url = None
 
-    def _proxy(self) -> dict:
+    def _proxy(self, override_url: str = None) -> dict:
         """取代理参数并记下本次线请求实际使用的代理 URL（写入 ContextVar，供日志落库）。"""
-        pk = _proxy_kwargs()
-        url = pk.get("proxy")
+        if override_url:
+            pk = {"proxy": override_url}
+            url = override_url
+        else:
+            pk = _proxy_kwargs()
+            url = pk.get("proxy")
         self.last_proxy_url = url
         from server.core.proxy_pool import CURRENT_PROXY_URL
         CURRENT_PROXY_URL.set(url)
@@ -215,7 +219,7 @@ class CodexResponsesAdapter(BaseAdapter):
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
-            headers.update(extra_headers)
+            headers.update({k: v for k, v in extra_headers.items() if k != "__proxy_url"})
         if not headers.get("originator"):
             headers["originator"] = "codex_cli_rs"
         if not headers.get("session_id"):
@@ -542,7 +546,7 @@ class CodexResponsesAdapter(BaseAdapter):
         active_calls = {}
         saw_tool_call = False
 
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
@@ -739,15 +743,18 @@ class CodexResponsesAdapter(BaseAdapter):
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
-            headers.update(extra_headers)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
+            headers.update({k: v for k, v in extra_headers.items() if k != "__proxy_url"})
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400 and "backend-api/codex" in (base_url or ""):
                 return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in CODEX_BUILTIN_MODELS]
             resp.raise_for_status()
             data = resp.json()
         return [
-            ModelInfo(model_id=item.get("id", ""), display_name=item.get("id", ""), supports_streaming=True)
+            ModelInfo(
+                model_id=item.get("id", ""), display_name=item.get("id", ""),
+                supports_streaming=True, supports_reasoning_effort=True,
+            )
             for item in data.get("data", [])
             if item.get("id")
         ]

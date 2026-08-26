@@ -267,7 +267,11 @@ async def _call_one_candidate(db, target: dict, request, conversation_id: str) -
             "messages": new_msgs,
             "stream": False,
         })
+        if getattr(model, "supports_reasoning_effort", None) is False:
+            upstream_req = upstream_req.model_copy(update={"reasoning_effort": None, "reasoning": None})
         extra_headers = provider.headers or None
+        if getattr(provider, "proxy_url", None):
+            extra_headers = {**(extra_headers or {}), "__proxy_url": provider.proxy_url}
         result = await adapter.chat_completion(upstream_req, key_plain, provider.base_url, extra_headers)
         content = ""
         if isinstance(result, dict):

@@ -73,6 +73,7 @@
               </th>
               <th>免费</th>
               <th>Auto</th>
+              <th>思考</th>
               <th>延迟/TPS</th>
               <th>干预</th>
               <th>操作</th>
@@ -80,7 +81,7 @@
           </thead>
           <tbody>
             <tr v-if="models.length === 0">
-              <td colspan="10">
+                <td colspan="11">
                 <EmptyState icon="cpu" title="没有匹配的模型" small />
               </td>
             </tr>
@@ -131,6 +132,11 @@
                   {{ statusLabel(m.health_status) }}
                 </span>
                 <div v-if="m.avg_tps" class="text-xs text-muted">{{ Number(m.avg_tps).toFixed(2) }} t/s</div>
+              </td>
+              <td>
+                <span class="badge" :class="reasoningBadgeClass(m.supports_reasoning_effort)">
+                  {{ reasoningLabel(m.supports_reasoning_effort) }}
+                </span>
               </td>
               <td>
                 <div class="action-row">
@@ -213,6 +219,14 @@
         <label class="checkbox-label">
           <input type="checkbox" v-model="editForm.auto_excluded" /> 强制排除 Auto
         </label>
+      </div>
+      <div class="form-group">
+        <label class="form-label">思考强度支持</label>
+        <select v-model="editForm.supports_reasoning_effort">
+          <option :value="''">未知（按模型名推断）</option>
+          <option :value="true">支持</option>
+          <option :value="false">不支持</option>
+        </select>
       </div>
       <div class="form-group">
         <label class="form-label">优先级加成 (-100 ~ 100)</label>
@@ -487,6 +501,14 @@ export default {
     statusLabel(s) {
       return { healthy: '健康', degraded: '延迟', rate_limited: '限流', unhealthy: '故障' }[s] || s
     },
+    reasoningLabel(value) {
+      return { true: '支持', false: '不支持' }[String(value)] || '未知'
+    },
+    reasoningBadgeClass(value) {
+      if (value === true) return 'badge-success'
+      if (value === false) return 'badge-neutral'
+      return 'badge-warning'
+    },
     cooldownRemaining(m) {
       if (!m.cooldown_until) return ''
       const diff = new Date(m.cooldown_until) - Date.now()
@@ -585,6 +607,7 @@ export default {
         enabled: m.enabled,
         priority_boost: m.priority_boost || 0,
         auto_excluded: m.auto_excluded || false,
+        supports_reasoning_effort: m.supports_reasoning_effort === true || m.supports_reasoning_effort === false ? m.supports_reasoning_effort : '',
         model_alias: overrides.model_alias || '',
       }
       this.overrideHeadersText = overrides.headers ? JSON.stringify(overrides.headers, null, 2) : ''
@@ -595,7 +618,12 @@ export default {
       this.saving = true
       try {
         const requestOverrides = this.cleanRequestOverrides()
-        const payload = { ...this.editForm, request_overrides: requestOverrides }
+        const capability = this.editForm.supports_reasoning_effort
+        const payload = {
+          ...this.editForm,
+          supports_reasoning_effort: capability === true || capability === false ? capability : null,
+          request_overrides: requestOverrides,
+        }
         delete payload.model_alias
         await api.updateModel(this.editForm.id, payload)
         this.showEditModal = false

@@ -3,7 +3,7 @@ Provider 适配器基类
 定义统一接口
 """
 from abc import ABC, abstractmethod
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Optional
 from dataclasses import dataclass
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 @dataclass
@@ -17,6 +17,7 @@ class ModelInfo:
     is_free: bool = False
     supports_streaming: bool = True
     supports_vision: bool = False
+    supports_reasoning_effort: Optional[bool] = None
     context_length: int = 4096
 @dataclass
 class HealthResult:

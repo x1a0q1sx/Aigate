@@ -309,6 +309,10 @@
           <input v-model="form.base_url" placeholder="https://api.example.com/v1" />
         </div>
         <div class="form-group">
+          <label class="form-label">专用代理 URL</label>
+          <input v-model.trim="form.proxy_url" placeholder="留空则跟随全局代理设置" />
+        </div>
+        <div class="form-group">
           <label class="form-label">API 类型</label>
           <select v-model="form.api_type">
             <option value="openai_compat">OpenAI 兼容</option>
@@ -832,6 +836,7 @@ export default {
       if (this.modelCount(p.id) === 0) labels.push('无模型')
       if (type === 'oauth' && this.oauthConnectionCount(p) === 0) labels.push('OAuth 未连接')
       if (!/^https?:\/\//i.test(p.base_url || '') && type !== 'free_tier') labels.push('URL 异常')
+      if (p.proxy_url) labels.push('代理')
       if (this.failCount(p.id) > 0) labels.push(`失败 ${this.failCount(p.id)}`)
       return labels
     },
@@ -894,6 +899,7 @@ export default {
         api_type: p.api_type,
         credential_type: p.credential_type || 'api_key',
         oauth_code: p.oauth_code || null,
+        proxy_url: p.proxy_url || '',
         description: p.description || '',
       }
       this.isEditing = true
@@ -907,7 +913,7 @@ export default {
       this.activeTab = 'keys'
     },
     resetForm() {
-      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, description: '' }
+      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, proxy_url: '', description: '' }
       this.isEditing = false
       this.editingId = null
       this.activeTab = 'basic'
@@ -926,6 +932,7 @@ export default {
           name: this.form.name.trim(),
           base_url: this.form.base_url.trim(),
           api_type: this.form.api_type,
+          proxy_url: this.form.proxy_url || null,
           description: this.form.description || '',
         }
         if (this.isEditing) {
@@ -1151,6 +1158,7 @@ export default {
         api_type: c.id === 'codex' || c.alias === 'cx' ? 'codex_responses' : 'openai_compat',
         credential_type: 'api_key',
         oauth_code: null,
+        proxy_url: '',
         description: '',
       }
       this.isEditing = false
@@ -1478,16 +1486,35 @@ export default {
 
 /* 服务商网格 */
 .providers-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
-  gap: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .provider-card {
+  display: grid;
+  grid-template-columns: minmax(230px, 300px) minmax(220px, 1fr) max-content;
+  grid-template-areas:
+    "name url actions"
+    "meta meta actions"
+    "diag diag actions";
+  align-items: center;
+  column-gap: 14px;
+  row-gap: 4px;
   border: 1px solid var(--border-base);
   background: var(--surface-2);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
+  border-radius: 8px;
+  padding: 10px 12px;
   transition: all 0.2s;
+}
+.provider-top { grid-area: name; }
+.provider-url { grid-area: url; margin-bottom: 0; }
+.provider-meta { grid-area: meta; margin-bottom: 0; }
+.provider-diagnostics { grid-area: diag; margin-bottom: 0; }
+.provider-desc { display: none; }
+.provider-actions {
+  grid-area: actions;
+  justify-content: flex-end;
+  max-width: 330px;
 }
 .provider-card.highlight {
   border-color: var(--primary);
@@ -1503,7 +1530,7 @@ export default {
   justify-content: space-between;
   align-items: flex-start;
   gap: var(--space-2);
-  margin-bottom: var(--space-3);
+  margin-bottom: 0;
 }
 .provider-header {
   display: flex;
@@ -1587,7 +1614,6 @@ export default {
   word-break: break-word;
 }
 .provider-url {
-  margin-bottom: var(--space-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1597,7 +1623,7 @@ export default {
   align-items: center;
   gap: var(--space-3);
   flex-wrap: wrap;
-  margin-bottom: var(--space-2);
+  margin-bottom: 0;
 }
 .provider-meta span {
   display: inline-flex;
@@ -1608,7 +1634,7 @@ export default {
   display: flex;
   gap: var(--space-2);
   flex-wrap: wrap;
-  margin-bottom: var(--space-2);
+  margin-bottom: 0;
 }
 .provider-desc {
   margin-bottom: var(--space-3);
@@ -1618,6 +1644,19 @@ export default {
   display: flex;
   gap: var(--space-2);
   flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .provider-card {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "name"
+      "url"
+      "meta"
+      "diag"
+      "actions";
+  }
+  .provider-actions { justify-content: flex-start; max-width: none; }
 }
 
 /* 目录网格 */
@@ -1883,4 +1922,3 @@ export default {
   }
 }
 </style>
-

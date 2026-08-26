@@ -241,6 +241,8 @@ class AutoRouter:
                                     pass
                                 adapter = create_adapter_for_provider(provider.api_type)
                                 _extra = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+                                if getattr(provider, "proxy_url", None):
+                                    _extra = {**(_extra or {}), "__proxy_url": provider.proxy_url}
                                 from .route_decision import capture_candidates, mark_selected
                                 capture_candidates(conversation_id, [{
                                     "rank": 1,
@@ -404,7 +406,7 @@ class AutoRouter:
             # 防 MissingGreenlet：rate_limiter 内部可能 commit/rollback 导致 provider 对象属性过期，
             # 此处显式刷新需要的属性，避免后续 provider.api_type 触发隐式 lazy-load
             try:
-                await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
+                await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code", "proxy_url"])
             except Exception:
                 pass  # 对象可能已 detached，后续 getattr 会用缓存值
             # 防 MissingGreenlet：上方 check_limit / 选 key 过程中 rate_limiter 可能 rollback，
@@ -432,6 +434,8 @@ class AutoRouter:
                     reason="highest ranked available candidate",
                 )
             _extra_a = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+            if getattr(provider, "proxy_url", None):
+                _extra_a = {**(_extra_a or {}), "__proxy_url": provider.proxy_url}
             return RouteResult(
                 success=True,
                 model=candidate,

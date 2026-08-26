@@ -13,6 +13,7 @@ class ProviderCreate(BaseModel):
     oauth_code: Optional[str] = None   # 当 credential_type=oauth 时填 OAuthRegistry code（如 "claude_code"）
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
+    proxy_url: Optional[str] = None
     description: Optional[str] = None
 class ProviderUpdate(BaseModel):
     name: Optional[str] = None
@@ -22,6 +23,7 @@ class ProviderUpdate(BaseModel):
     oauth_code: Optional[str] = None
     enabled: Optional[bool] = None     # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
+    proxy_url: Optional[str] = None
     description: Optional[str] = None
 class ProviderResponse(BaseModel):
     id: int
@@ -32,6 +34,7 @@ class ProviderResponse(BaseModel):
     oauth_code: Optional[str] = None
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]]
+    proxy_url: Optional[str] = None
     description: Optional[str]
     class Config:
         from_attributes = True
@@ -67,6 +70,7 @@ class ModelInfoResponse(BaseModel):
     enabled: bool
     supports_streaming: bool
     supports_vision: bool
+    supports_reasoning_effort: Optional[bool] = None
     context_length: int
     full_id: str
     provider_name: str = ""
@@ -105,6 +109,7 @@ class ModelInfoResponse(BaseModel):
             enabled=model.enabled,
             supports_streaming=model.supports_streaming,
             supports_vision=model.supports_vision,
+            supports_reasoning_effort=getattr(model, "supports_reasoning_effort", None),
             context_length=model.context_length,
             full_id=model.full_id,
             provider_name=model.provider.name if hasattr(model, 'provider') and model.provider else "",
@@ -125,6 +130,7 @@ class ModelUpdate(BaseModel):
     # v2.0 新增
     priority_boost: Optional[int] = None
     auto_excluded: Optional[bool] = None
+    supports_reasoning_effort: Optional[bool] = None
     # v3.4: per-model request overrides (headers/body_patch/model_alias)
     request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):

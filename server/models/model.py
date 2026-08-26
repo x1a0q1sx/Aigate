@@ -28,6 +28,8 @@ class Model(Base):
     enabled = Column(Boolean, nullable=False, default=True)
     supports_streaming = Column(Boolean, nullable=False, default=True)
     supports_vision = Column(Boolean, nullable=False, default=False)
+    # NULL=unknown, False=strip reasoning fields, True=pass reasoning effort through.
+    supports_reasoning_effort = Column(Boolean, nullable=True, default=None)
     context_length = Column(Integer, nullable=False, default=4096)
     capabilities = Column(JSON, nullable=True, default=dict)
     # v0.2 新增：人工手动冷却截止时间

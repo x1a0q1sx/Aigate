@@ -88,6 +88,7 @@ async def init_db():
             "ALTER TABLE providers ADD COLUMN oauth_code VARCHAR(50) DEFAULT NULL",
             # v4.0: 服务商启用/禁用开关（默认启用）
             "ALTER TABLE providers ADD COLUMN enabled BOOLEAN DEFAULT 1",
+            "ALTER TABLE providers ADD COLUMN proxy_url VARCHAR(500) DEFAULT NULL",
         ]:
             try:
                 await conn.execute(text(sql))
@@ -166,6 +167,7 @@ async def init_db():
             # v10: 精细化计费 —— 模型缓存价 + 请求日志缓存 token
             "ALTER TABLE models ADD COLUMN cache_read_input_price REAL DEFAULT 0.0",
             "ALTER TABLE models ADD COLUMN cache_write_input_price REAL DEFAULT 0.0",
+            "ALTER TABLE models ADD COLUMN supports_reasoning_effort BOOLEAN DEFAULT NULL",
             "ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER",
             "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER",
             # v11: 请求日志首字延迟（time-to-first-token），流式请求记录

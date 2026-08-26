@@ -280,11 +280,14 @@ async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
 
 
 def _merge_oauth_headers(provider, base_headers=None):
-    """OAuth provider ? anthropic adapter ?????? __oauth=True ? adapter ? Bearer ???"""
+    """Merge auth and per-provider routing metadata into outbound header hints."""
     eh = dict(base_headers) if base_headers else None
     if provider and getattr(provider, "credential_type", "") == "oauth":
         eh = eh or {}
         eh["__oauth"] = True
+    if provider and getattr(provider, "proxy_url", None):
+        eh = eh or {}
+        eh["__proxy_url"] = provider.proxy_url
     return eh
 
 config = get_config()
@@ -785,7 +788,9 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             )
             continue
         # 发起完整业务请求（非探测）
-        upstream_request = request.model_copy(update={"model": candidate.model.model_id})
+        upstream_request = _without_unsupported_reasoning(
+            request.model_copy(update={"model": candidate.model.model_id}), candidate.model
+        )
         extra_headers = candidate.provider.headers
         try:
             _attempt_started = time.time()
@@ -1025,6 +1030,22 @@ def _split_effort_suffix(model_name: str):
     return model_name, None
 
 
+def _reasoning_effort_supported(model) -> bool:
+    """Explicit admin capability wins; otherwise use a conservative model-name heuristic."""
+    explicit = getattr(model, "supports_reasoning_effort", None)
+    if explicit is not None:
+        return bool(explicit)
+    from server.core.model_capabilities import infer_reasoning_effort_support
+    return bool(infer_reasoning_effort_support("", getattr(model, "model_id", "")))
+
+
+def _without_unsupported_reasoning(request, model):
+    """Some strict OpenAI-compatible upstreams reject reasoning_effort outright."""
+    if _reasoning_effort_supported(model):
+        return request
+    return request.model_copy(update={"reasoning_effort": None, "reasoning": None})
+
+
 async def _model_name_resolves(db: AsyncSession, name: str) -> bool:
     """名称能否解析为启用中的组合或启用模型（provider/model_id 或裸 model_id）。
 
@@ -1132,10 +1153,11 @@ async def chat_completions(
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Combo '{combo_name}' not found")
                 return JSONResponse(status_code=404, content={"error": f"Combo '{combo_name}' not found"})
             targets = await resolve_combo_targets(db, combo)
+            combo_strategy = getattr(combo, "strategy", None) or "fallback"
             _decision_configure(
                 conversation_id,
                 route_type="combo",
-                strategy=getattr(combo, "strategy", None) or "fallback",
+                strategy=combo_strategy,
             )
             if not targets:
                 try:
@@ -1153,7 +1175,9 @@ async def chat_completions(
                 )
                 return JSONResponse(status_code=503, content={"error": f"Combo '{combo_name}' no available targets"})
             _diag(conversation_id, "combo_targets", _diag_start, count=len(targets))
-            combo_full_ids = [t["full_id"] for t in targets]
+            _combo_start = pick_next_index(combo.id, len(targets), combo_strategy)
+            ordered_targets = targets[_combo_start:] + targets[:_combo_start]
+            combo_full_ids = [t["full_id"] for t in ordered_targets]
             _decision_candidates(conversation_id, [
                 {
                     "rank": index,
@@ -1217,7 +1241,9 @@ async def chat_completions(
                                 continue
                             mid_full = f"{_prov.name}/{_mdl.model_id}"
                             _decision_select(conversation_id, provider=_prov.name, model=_mdl.model_id, model_pk=_mdl.id, reason="next combo target")
-                            up_req = request.model_copy(update={"model": _mdl.model_id})
+                            up_req = _without_unsupported_reasoning(
+                                request.model_copy(update={"model": _mdl.model_id}), _mdl
+                            )
                             _start = time.time()
                             try:
                                 _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt, provider=_prov.name, model=_mdl.model_id)
@@ -1318,7 +1344,7 @@ async def chat_completions(
             from server.core.model_catalog import create_adapter_for_provider as _cafp
             combo_attempts = []
             last_error = None
-            for t_idx, t in enumerate(targets):
+            for t_idx, t in enumerate(ordered_targets):
                 full_id = t["full_id"]
                 prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
                 # 查找 provider + model
@@ -1354,7 +1380,9 @@ async def chat_completions(
                     continue
                 api_key = _picked[1]
                 adapter = _cafp(provider.api_type)
-                upstream_req = request.model_copy(update={"model": model.model_id})
+                upstream_req = _without_unsupported_reasoning(
+                    request.model_copy(update={"model": model.model_id}), model
+                )
                 extra_hdr = _merge_oauth_headers(provider, provider.headers if provider.headers else None)
                 model_overrides = getattr(model, "request_overrides", None) or {}
                 if isinstance(model_overrides, dict):
@@ -1531,7 +1559,9 @@ async def chat_completions(
                 if free_exec:
                     _diag(conversation_id, "free_provider_executor_hit", _diag_start, code=free_code)
                     # free executor 直接用裸 model_id 调上游，不带 provider 前缀
-                    free_req = request.model_copy(update={"model": model.model_id})
+                    free_req = _without_unsupported_reasoning(
+                        request.model_copy(update={"model": model.model_id}), model
+                    )
                     if request.stream:
                         async def _free_stream():
                             _free_stream_start = time.time()
@@ -1677,8 +1707,8 @@ async def chat_completions(
                     # 防 MissingGreenlet：流式回退过程中 session 可能因限流/日志写入发生 commit/rollback，
                     # ORM 对象属性可能过期。这里先显式刷新并把后续要用的字段拷贝成普通 Python 值。
                     try:
-                        await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code"])
-                        await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides", "context_length"])
+                        await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_url"])
+                        await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort"])
                     except Exception:
                         pass
                     cand_model_pk = cand.model.id
@@ -1693,7 +1723,9 @@ async def chat_completions(
                         stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{est_req_tokens} tokens)"})
                         _decision_skip(conversation_id, model_pk=cand_model_pk, provider=cand_provider_name, model=cand_model_id, reason="context window too small")
                         continue
-                    up_req = request.model_copy(update={"model": cand_model_id})
+                    up_req = _without_unsupported_reasoning(
+                        request.model_copy(update={"model": cand_model_id}), cand.model
+                    )
                     _decision_select(conversation_id, provider=cand_provider_name, model=cand_model_id, model_pk=cand_model_pk, reason=getattr(cand, "selection_reason", None) or "next ranked candidate")
                     gen = None
                     sc = 0
@@ -1874,7 +1906,9 @@ async def chat_completions(
     if not made_by_cascade:
         # 只有直接路由才需要在此发起实际 API 调用
         model_id_full = f"{route_result.provider.name}/{route_result.model.model_id}"
-        upstream_request = request.model_copy(update={"model": route_result.model.model_id})
+        upstream_request = _without_unsupported_reasoning(
+            request.model_copy(update={"model": route_result.model.model_id}), route_result.model
+        )
         extra_headers = route_result.provider.headers if route_result.provider.headers else None
         if getattr(route_result, "extra_headers", None):
             extra_headers = {**(extra_headers or {}), **route_result.extra_headers}
@@ -2254,6 +2288,7 @@ async def list_models(
             "capabilities": {
                 "streaming": model.supports_streaming,
                 "vision": model.supports_vision,
+                "reasoning_effort": getattr(model, "supports_reasoning_effort", None),
                 "context_length": model.context_length
             }
         })

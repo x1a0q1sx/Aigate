@@ -30,6 +30,7 @@ def _proxy_kwargs() -> dict:
     return get_proxy_pool().proxied_kwargs()
 
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.model_capabilities import infer_reasoning_effort_support
 from server.schemas.chat import ChatCompletionRequest
 
 
@@ -118,10 +119,14 @@ class AnthropicAdapter(BaseAdapter):
         self.timeout = timeout
         self.last_proxy_url = None
 
-    def _proxy(self) -> dict:
+    def _proxy(self, override_url: str = None) -> dict:
         """取代理参数并记下本次线请求实际使用的代理 URL（写入 ContextVar，供日志落库）。"""
-        pk = _proxy_kwargs()
-        url = pk.get("proxy")
+        if override_url:
+            pk = {"proxy": override_url}
+            url = override_url
+        else:
+            pk = _proxy_kwargs()
+            url = pk.get("proxy")
         self.last_proxy_url = url
         from server.core.proxy_pool import CURRENT_PROXY_URL
         CURRENT_PROXY_URL.set(url)
@@ -173,6 +178,7 @@ class AnthropicAdapter(BaseAdapter):
                     headers["Authorization"] = f"Bearer {api_key}"
         headers.pop("__baseUrl", None)
         headers.pop("__oauth", None)
+        headers.pop("__proxy_url", None)
         return headers
 
     def _content_blocks(self, content: Any) -> list:
@@ -371,7 +377,7 @@ class AnthropicAdapter(BaseAdapter):
         headers = self._get_headers(api_key, eh, oauth=oauth, full_fingerprint=True)
         payload = self._build_payload(request, "", stream=False)
         created = int(time.time())
-        async with httpx.AsyncClient(timeout=self.timeout * 5, **self._proxy()) as client:
+        async with httpx.AsyncClient(timeout=self.timeout * 5, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
                 raise httpx.HTTPStatusError(
@@ -394,7 +400,7 @@ class AnthropicAdapter(BaseAdapter):
         tool_buf = {}
         text_done_marker = False
         _produced = False  # 整个流是否产出过任何有效事件（内容/思考/工具/usage）
-        async with httpx.AsyncClient(timeout=(5, self.timeout * 5), **self._proxy()) as client:
+        async with httpx.AsyncClient(timeout=(5, self.timeout * 5), **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
                     body = await resp.aread()
@@ -537,7 +543,9 @@ class AnthropicAdapter(BaseAdapter):
     def _builtin_models(self) -> List[ModelInfo]:
         return [
             ModelInfo(model_id=mid, display_name=name, input_price=15.0 if "opus" in mid else 3.0,
-                      output_price=75.0 if "opus" in mid else 15.0, is_free=False, supports_streaming=True)
+                      output_price=75.0 if "opus" in mid else 15.0, is_free=False,
+                      supports_streaming=True,
+                      supports_reasoning_effort=infer_reasoning_effort_support("anthropic", mid))
             for mid, name in CLAUDE_BUILTIN_MODELS
         ]
 
@@ -558,7 +566,7 @@ class AnthropicAdapter(BaseAdapter):
         headers = self._get_headers(api_key, eh, oauth=oauth, full_fingerprint=True)
         headers.pop("Content-Type", None)
         try:
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True, **self._proxy()) as client:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
                 resp = await client.get(f"{base}/v1/models", headers=headers)
                 if resp.status_code != 200:
                     print(f"[anthropic] list_models {base} -> HTTP {resp.status_code}，回退内置列表")
@@ -577,6 +585,7 @@ class AnthropicAdapter(BaseAdapter):
                         output_price=75.0 if "opus" in mid else 15.0,
                         is_free=False,
                         supports_streaming=True,
+                        supports_reasoning_effort=infer_reasoning_effort_support("anthropic", mid),
                     ))
                 if not models:
                     return self._builtin_models()
@@ -599,7 +608,7 @@ class AnthropicAdapter(BaseAdapter):
         }
         start_time = time.time()
         try:
-            async with httpx.AsyncClient(timeout=timeout * 5, **self._proxy()) as client:
+            async with httpx.AsyncClient(timeout=timeout * 5, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:

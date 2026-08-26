@@ -30,6 +30,7 @@ from server.schemas.admin import (
 )
 from server.core.key_manager import KeyManager
 from server.core.model_catalog import ModelCatalog
+from server.core.model_capabilities import infer_reasoning_effort_support
 from server.core.health_checker import HealthChecker
 from server.core.crypto_service import get_crypto_service
 from server.config import get_config, save_config
@@ -361,6 +362,8 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
                     provider.headers = entry.get("headers") or {}
+                if "proxy_url" in entry:
+                    provider.proxy_url = entry.get("proxy_url")
                 if entry.get("description") is not None:
                     provider.description = entry.get("description") or ""
                 stats["providers_updated"] += 1
@@ -376,6 +379,7 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                     oauth_code=entry.get("oauth_code"),
                     enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
+                    proxy_url=entry.get("proxy_url"),
                     description=entry.get("description") or "",
                 )
                 db.add(provider)
@@ -572,6 +576,7 @@ _MODEL_FIELDS = (
     "model_id", "display_name", "input_price", "output_price", "is_free",
     "enabled", "auto_enabled", "auto_excluded", "supports_streaming",
     "supports_vision", "context_length", "priority_boost", "is_manual",
+    "supports_reasoning_effort",
     "request_overrides", "pricing_source",
 )
 
@@ -640,6 +645,7 @@ async def export_providers(
             "oauth_code": p.oauth_code,
             "enabled": p.enabled if p.enabled is not None else True,
             "headers": p.headers or {},
+            "proxy_url": p.proxy_url,
             "description": p.description or "",
             "models": [_serialize_model_for_export(m) for m in models],
         }
@@ -754,6 +760,8 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
                     provider.headers = entry.get("headers") or {}
+                if "proxy_url" in entry:
+                    provider.proxy_url = entry.get("proxy_url")
                 if entry.get("description") is not None:
                     provider.description = entry.get("description") or ""
                 action = "updated"
@@ -772,6 +780,7 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                     oauth_code=entry.get("oauth_code"),
                     enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
+                    proxy_url=entry.get("proxy_url"),
                     description=entry.get("description") or "",
                 )
                 db.add(provider)
@@ -867,6 +876,7 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         oauth_code=data.oauth_code,
         enabled=data.enabled,
         headers=data.headers or {},
+        proxy_url=data.proxy_url,
         description=data.description or ""
     )
     db.add(provider)
@@ -892,6 +902,8 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.enabled = data.enabled
     if data.headers is not None:
         provider.headers = data.headers
+    if data.proxy_url is not None:
+        provider.proxy_url = (data.proxy_url or "").strip() or None
     if data.description is not None:
         provider.description = data.description
     await db.commit()
@@ -1056,6 +1068,7 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         is_free=data.is_free,
         priority_boost=data.priority_boost,
         auto_excluded=data.auto_excluded,
+        supports_reasoning_effort=data.supports_reasoning_effort,
         request_overrides=data.request_overrides
     )
     if not model:
@@ -1199,6 +1212,7 @@ async def add_model_to_provider(provider_id: int, data: ManualModelAdd, db: Asyn
         enabled=True,
         auto_enabled=True,
         supports_streaming=True,
+        supports_reasoning_effort=infer_reasoning_effort_support(provider.api_type, data.model_id),
         context_length=4096,
         created_at=now,
         is_manual=True,

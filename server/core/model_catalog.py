@@ -185,6 +185,7 @@ class ModelCatalog:
         is_free: Optional[bool] = None,
         priority_boost: Optional[int] = None,
         auto_excluded: Optional[bool] = None,
+        supports_reasoning_effort: Optional[bool] = None,
         request_overrides: Optional[dict] = None
     ) -> Optional[Model]:
         """更新模型配置"""
@@ -217,6 +218,9 @@ class ModelCatalog:
             model.priority_boost = max(-100, min(100, priority_boost))  # 限制范围
         if auto_excluded is not None:
             model.auto_excluded = auto_excluded
+        # The API uses None as "unknown"; explicit True/False is a durable admin override.
+        if supports_reasoning_effort is not None:
+            model.supports_reasoning_effort = supports_reasoning_effort
         if request_overrides is not None:
             model.request_overrides = request_overrides
         await session.commit()
@@ -395,6 +399,8 @@ class ModelCatalog:
                     existing_model.is_free = model_info.is_free
                 existing_model.supports_streaming = model_info.supports_streaming
                 existing_model.supports_vision = model_info.supports_vision
+                if existing_model.supports_reasoning_effort is None and model_info.supports_reasoning_effort is not None:
+                    existing_model.supports_reasoning_effort = model_info.supports_reasoning_effort
                 # 窗口只在仍是默认 4096 时补齐，用户手动改过的窗口不动
                 if existing_model.context_length == 4096 and model_info.context_length != 4096:
                     existing_model.context_length = model_info.context_length
@@ -440,6 +446,7 @@ class ModelCatalog:
                     enabled=True,
                     supports_streaming=model_info.supports_streaming,
                     supports_vision=model_info.supports_vision,
+                    supports_reasoning_effort=model_info.supports_reasoning_effort,
                     context_length=model_info.context_length,
                     priority_boost=0,
                     auto_excluded=False

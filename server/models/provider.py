@@ -20,6 +20,8 @@ class Provider(Base):
     # 避免歧义：用户可以给 OAuth 类型的 provider 起任意名字（如 "ClaudeCode 迷你"），不会影响 OAuth 凭证拾取。
     oauth_code = Column(String(50), nullable=True, default=None)
     headers = Column(JSON, nullable=True, default=dict)
+    # Empty means inherit the global proxy pool; a URL forces this provider through that proxy.
+    proxy_url = Column(String(500), nullable=True, default=None)
     description = Column(Text, nullable=True, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
