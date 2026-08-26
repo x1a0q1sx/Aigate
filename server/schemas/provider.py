@@ -14,6 +14,7 @@ class ProviderCreate(BaseModel):
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     proxy_url: Optional[str] = None
+    proxy_enabled: bool = False
     description: Optional[str] = None
 class ProviderUpdate(BaseModel):
     name: Optional[str] = None
@@ -24,6 +25,7 @@ class ProviderUpdate(BaseModel):
     enabled: Optional[bool] = None     # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     proxy_url: Optional[str] = None
+    proxy_enabled: Optional[bool] = None
     description: Optional[str] = None
 class ProviderResponse(BaseModel):
     id: int
@@ -35,6 +37,7 @@ class ProviderResponse(BaseModel):
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]]
     proxy_url: Optional[str] = None
+    proxy_enabled: bool = False
     description: Optional[str]
     class Config:
         from_attributes = True

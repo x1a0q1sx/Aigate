@@ -89,11 +89,17 @@ async def init_db():
             # v4.0: 服务商启用/禁用开关（默认启用）
             "ALTER TABLE providers ADD COLUMN enabled BOOLEAN DEFAULT 1",
             "ALTER TABLE providers ADD COLUMN proxy_url VARCHAR(500) DEFAULT NULL",
+            "ALTER TABLE providers ADD COLUMN proxy_enabled BOOLEAN DEFAULT 0",
         ]:
             try:
                 await conn.execute(text(sql))
             except Exception:
                 pass
+        # Providers configured during the short-lived per-provider URL experiment become switches.
+        await conn.execute(text(
+            "UPDATE providers SET proxy_enabled = 1 "
+            "WHERE proxy_enabled = 0 AND proxy_url IS NOT NULL AND TRIM(proxy_url) != ''"
+        ))
         # 新增 combos 表
         for sql in [
             """CREATE TABLE IF NOT EXISTS combos (

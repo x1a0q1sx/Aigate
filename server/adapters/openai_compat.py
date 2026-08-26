@@ -95,7 +95,7 @@ class OpenAICompatAdapter(BaseAdapter):
         self.timeout = timeout
         self.last_proxy_url = None
 
-    def _proxy(self, base_url: str = None, override_url: str = None) -> dict:
+    def _proxy(self, base_url: str = None, force: bool = False) -> dict:
         """取代理参数并记下本次线请求实际使用的代理 URL（写入 ContextVar，供日志落库）。
         本地目标(127.0.0.1/localhost/::1)绕过代理，避免环回地址被发往 socks5 代理而连接失败。"""
         if _is_local_url(base_url):
@@ -103,12 +103,8 @@ class OpenAICompatAdapter(BaseAdapter):
             from server.core.proxy_pool import CURRENT_PROXY_URL
             CURRENT_PROXY_URL.set(None)
             return {}
-        if override_url:
-            pk = {"proxy": override_url}
-            url = override_url
-        else:
-            pk = _proxy_kwargs()
-            url = pk.get("proxy")
+        pk = _proxy_kwargs(force=force)
+        url = pk.get("proxy")
         self.last_proxy_url = url
         from server.core.proxy_pool import CURRENT_PROXY_URL
         CURRENT_PROXY_URL.set(url)
@@ -146,9 +142,9 @@ class OpenAICompatAdapter(BaseAdapter):
         else:
             # 无密钥请求（部分本地/免费端点接受匿名调用）
             headers = {"Content-Type": "application/json"}
-        # __proxy_url is routing metadata and must never become an upstream header.
+        # Proxy metadata is routing state and must never become an upstream header.
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k != "__proxy_url"})
+            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
         return headers
     async def chat_completion(
         self,
@@ -159,13 +155,13 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> ChatCompletionResponse:
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        proxy_override = (extra_headers or {}).pop("__proxy_url", None)
+        force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         # reasoning dict 是网关内部思考控制提示（anthropic 出站方言）；OpenAI 兼容上游
         # 只认 reasoning_effort，透传非标字段有被严格上游 400 的风险
         payload.pop("reasoning", None)
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, proxy_override)) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
                 body = resp.text[:500]
@@ -191,13 +187,13 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> AsyncGenerator[dict, None]:
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        proxy_override = (extra_headers or {}).pop("__proxy_url", None)
+        force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
         timeout_error = None
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, proxy_override)) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
                 async with client.stream('POST', url, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode('utf-8', errors='replace')
@@ -247,8 +243,8 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> List[ModelInfo]:
         url = self._build_models_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        proxy_override = (extra_headers or {}).pop("__proxy_url", None)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, proxy_override)) as client:
+        force_proxy = bool((extra_headers or {}).get("__proxy_force"))
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -279,7 +275,7 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> HealthResult:
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        proxy_override = (extra_headers or {}).pop("__proxy_url", None)
+        force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = {
             "model": model,
             "messages": [{"role": "user", "content": "ping"}],
@@ -288,7 +284,7 @@ class OpenAICompatAdapter(BaseAdapter):
         }
         start_time = time.time()
         try:
-            async with httpx.AsyncClient(timeout=timeout, **self._proxy(base_url, proxy_override)) as client:
+            async with httpx.AsyncClient(timeout=timeout, **self._proxy(base_url, force_proxy)) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:

@@ -41,6 +41,7 @@ _COOLDOWN_SECONDS = 30
 # 由 adapter 在创建 httpx 客户端前 set，由请求日志写入处读取；
 # 每个请求在独立 asyncio 任务中处理，ContextVar 天然隔离并发，不会串号。
 CURRENT_PROXY_URL = ContextVar("current_proxy_url", default=None)
+FORCE_PROXY = ContextVar("force_proxy", default=False)
 
 # 传输层错误（代理抖动 / 连接中断 / SOCKS 握手失败）→ 可换代理重试
 _TRANSPORT_EXCEPTIONS = (httpx.TransportError, httpx.ProtocolError) + _SOCKS_PROTOCOL_ERROR
@@ -82,9 +83,9 @@ class ProxyPool:
         self._alive: Dict[int, Optional[bool]] = {}  # index → 端口存活探测结果（None=未探/视为可用）
         self._lock = threading.Lock()               # 保护 cursor
 
-    def next_proxy(self) -> Optional[str]:
+    def next_proxy(self, *, force: bool = False) -> Optional[str]:
         """挑一个可用代理 URL，无可用时返回 None（等价于不走代理）"""
-        if not self.enabled or not self._proxies:
+        if not (self.enabled or force) or not self._proxies:
             return None
         with self._lock:
             avail = [
@@ -106,11 +107,11 @@ class ProxyPool:
                 self._cursor = (idx + 1) % len(avail)
             return chosen[1]["url"]
 
-    def proxied_kwargs(self) -> dict:
+    def proxied_kwargs(self, *, force: bool = False) -> dict:
         """返回传给 httpx.AsyncClient 的 proxies 参数，代理池关闭时返回空 dict"""
-        if not self.enabled:
+        if not (self.enabled or force):
             return {}
-        proxy = self.next_proxy()
+        proxy = self.next_proxy(force=force)
         if not proxy:
             return {}
         return {"proxy": proxy}

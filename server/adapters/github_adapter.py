@@ -56,14 +56,10 @@ class GitHubAdapter(BaseAdapter):
         self.timeout = timeout
         self.last_proxy_url = None
 
-    def _proxy(self, override_url: str = None) -> dict:
+    def _proxy(self, force: bool = False) -> dict:
         """取代理参数并记下本次线请求实际使用的代理 URL（写入 ContextVar，供日志落库）。"""
-        if override_url:
-            pk = {"proxy": override_url}
-            url = override_url
-        else:
-            pk = _proxy_kwargs()
-            url = pk.get("proxy")
+        pk = _proxy_kwargs(force=force)
+        url = pk.get("proxy")
         self.last_proxy_url = url
         from server.core.proxy_pool import CURRENT_PROXY_URL
         CURRENT_PROXY_URL.set(url)
@@ -87,7 +83,7 @@ class GitHubAdapter(BaseAdapter):
             "Content-Type": "application/json",
         }
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k != "__proxy_url"})
+            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
         return headers
     async def chat_completion(
         self,
@@ -99,7 +95,7 @@ class GitHubAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -113,7 +109,7 @@ class GitHubAdapter(BaseAdapter):
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
         payload = request.model_dump(exclude_none=True)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             async with client.stream('POST', url, headers=headers, json=payload) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():
@@ -137,7 +133,7 @@ class GitHubAdapter(BaseAdapter):
         """从 GitHub Models API 获取模型列表"""
         url = self._build_models_url(base_url)
         headers = self._get_headers(api_key, extra_headers)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -194,7 +190,7 @@ class GitHubAdapter(BaseAdapter):
         }
         start_time = time.time()
         try:
-            async with httpx.AsyncClient(timeout=timeout, **self._proxy((extra_headers or {}).get("__proxy_url"))) as client:
+            async with httpx.AsyncClient(timeout=timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:

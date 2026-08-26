@@ -362,8 +362,10 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
                     provider.headers = entry.get("headers") or {}
-                if "proxy_url" in entry:
-                    provider.proxy_url = entry.get("proxy_url")
+                if "proxy_enabled" in entry:
+                    provider.proxy_enabled = bool(entry.get("proxy_enabled"))
+                elif entry.get("proxy_url"):
+                    provider.proxy_enabled = True
                 if entry.get("description") is not None:
                     provider.description = entry.get("description") or ""
                 stats["providers_updated"] += 1
@@ -380,6 +382,7 @@ async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends
                     enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
                     proxy_url=entry.get("proxy_url"),
+                    proxy_enabled=bool(entry.get("proxy_enabled", bool(entry.get("proxy_url")))),
                     description=entry.get("description") or "",
                 )
                 db.add(provider)
@@ -645,7 +648,7 @@ async def export_providers(
             "oauth_code": p.oauth_code,
             "enabled": p.enabled if p.enabled is not None else True,
             "headers": p.headers or {},
-            "proxy_url": p.proxy_url,
+            "proxy_enabled": bool(p.proxy_enabled),
             "description": p.description or "",
             "models": [_serialize_model_for_export(m) for m in models],
         }
@@ -760,8 +763,10 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                     provider.oauth_code = entry.get("oauth_code")
                 if entry.get("headers") is not None:
                     provider.headers = entry.get("headers") or {}
-                if "proxy_url" in entry:
-                    provider.proxy_url = entry.get("proxy_url")
+                if "proxy_enabled" in entry:
+                    provider.proxy_enabled = bool(entry.get("proxy_enabled"))
+                elif entry.get("proxy_url"):
+                    provider.proxy_enabled = True
                 if entry.get("description") is not None:
                     provider.description = entry.get("description") or ""
                 action = "updated"
@@ -781,6 +786,7 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
                     enabled=bool(entry.get("enabled", True)),
                     headers=entry.get("headers") or {},
                     proxy_url=entry.get("proxy_url"),
+                    proxy_enabled=bool(entry.get("proxy_enabled", bool(entry.get("proxy_url")))),
                     description=entry.get("description") or "",
                 )
                 db.add(provider)
@@ -877,6 +883,7 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         enabled=data.enabled,
         headers=data.headers or {},
         proxy_url=data.proxy_url,
+        proxy_enabled=data.proxy_enabled,
         description=data.description or ""
     )
     db.add(provider)
@@ -904,6 +911,8 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.headers = data.headers
     if data.proxy_url is not None:
         provider.proxy_url = (data.proxy_url or "").strip() or None
+    if data.proxy_enabled is not None:
+        provider.proxy_enabled = data.proxy_enabled
     if data.description is not None:
         provider.description = data.description
     await db.commit()

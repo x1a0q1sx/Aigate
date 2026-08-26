@@ -28,7 +28,8 @@ import httpx
 def _proxy_kwargs() -> dict:
     """从代理池取 httpx 代理参数；代理池关闭时返回空 dict（即直连）"""
     from server.core.proxy_pool import get_proxy_pool
-    return get_proxy_pool().proxied_kwargs()
+    from server.core.proxy_pool import FORCE_PROXY
+    return get_proxy_pool().proxied_kwargs(force=bool(FORCE_PROXY.get()))
 
 
 from server.schemas.chat import ChatCompletionRequest

@@ -285,9 +285,9 @@ def _merge_oauth_headers(provider, base_headers=None):
     if provider and getattr(provider, "credential_type", "") == "oauth":
         eh = eh or {}
         eh["__oauth"] = True
-    if provider and getattr(provider, "proxy_url", None):
+    if provider and getattr(provider, "proxy_enabled", False):
         eh = eh or {}
-        eh["__proxy_url"] = provider.proxy_url
+        eh["__proxy_force"] = True
     return eh
 
 config = get_config()
@@ -1558,6 +1558,7 @@ async def chat_completions(
                 free_exec = get_free_executor(free_code) if free_code else None
                 if free_exec:
                     _diag(conversation_id, "free_provider_executor_hit", _diag_start, code=free_code)
+                    from server.core.proxy_pool import FORCE_PROXY as _FORCE_PROXY
                     # free executor 直接用裸 model_id 调上游，不带 provider 前缀
                     free_req = _without_unsupported_reasoning(
                         request.model_copy(update={"model": model.model_id}), model
@@ -1567,6 +1568,7 @@ async def chat_completions(
                             _free_stream_start = time.time()
                             _free_ttft_ms = None
                             _free_err = None
+                            _proxy_token = _FORCE_PROXY.set(bool(getattr(provider, "proxy_enabled", False)))
                             try:
                                 async for ck in free_exec.execute_stream(free_req):
                                     if _free_ttft_ms is None:
@@ -1579,6 +1581,7 @@ async def chat_completions(
                                 yield _format_sse_chunk(err_data, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             finally:
+                                _FORCE_PROXY.reset(_proxy_token)
                                 try:
                                     from server.db import AsyncSessionLocal as _AS
                                     async with _AS() as sdb:
@@ -1603,6 +1606,7 @@ async def chat_completions(
                     else:
                         try:
                             _free_started = time.time()
+                            _proxy_token = _FORCE_PROXY.set(bool(getattr(provider, "proxy_enabled", False)))
                             data = await free_exec.execute_non_stream(free_req)
                             _free_latency = int((time.time() - _free_started) * 1000)
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=0, latency_ms=_free_latency)
@@ -1614,6 +1618,8 @@ async def chat_completions(
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
                             await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
                             return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {e}"})
+                        finally:
+                            _FORCE_PROXY.reset(_proxy_token)
                 else:
                     # free_tier provider 找不到对应 executor — 不回退 adapter（避免 URL 被错误二次追加）
                     _diag(conversation_id, "free_provider_executor_miss", _diag_start,
@@ -1707,7 +1713,7 @@ async def chat_completions(
                     # 防 MissingGreenlet：流式回退过程中 session 可能因限流/日志写入发生 commit/rollback，
                     # ORM 对象属性可能过期。这里先显式刷新并把后续要用的字段拷贝成普通 Python 值。
                     try:
-                        await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_url"])
+                        await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_enabled"])
                         await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort"])
                     except Exception:
                         pass

@@ -72,70 +72,67 @@
       </div>
 
       <EmptyState v-if="filteredProviders.length === 0" icon="inbox" title="暂无匹配服务商" />
-      <div v-else class="providers-grid">
-        <article v-for="p in filteredProviders" :key="p.id" :class="['provider-card', { highlight: highlightProviderId === p.id, disabled: isProviderDisabled(p) }]">
-          <div class="provider-top">
-            <div class="provider-header">
-              <button class="pin-btn" :class="{ pinned: isPinned(p.id) }" @click="togglePin(p.id)" :aria-label="isPinned(p.id) ? '取消固定' : '固定常用'">
+      <div v-else class="table-wrap provider-table-wrap">
+        <table class="provider-table">
+          <thead>
+            <tr>
+              <th class="col-pin" aria-label="固定"></th>
+              <th>服务商</th>
+              <th class="col-url">Base URL</th>
+              <th>凭证</th>
+              <th>类型</th>
+              <th class="num">模型</th>
+              <th class="num">密钥</th>
+              <th>状态</th>
+              <th>代理</th>
+              <th class="col-actions">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="p in filteredProviders" :key="p.id" :class="{ highlight: highlightProviderId === p.id, disabled: isProviderDisabled(p) }">
+              <td class="col-pin">
+                <button class="icon-btn pin-btn" :class="{ pinned: isPinned(p.id) }" @click="togglePin(p.id)" :aria-label="isPinned(p.id) ? '取消固定' : '固定常用'" title="固定常用">
                 <AppIcon name="pin" :size="14" />
               </button>
-              <div class="provider-title">
-                <strong>{{ p.name }}</strong>
+              </td>
+              <td class="cell-name">
+                <strong :title="p.description || p.name">{{ p.name }}</strong>
                 <span class="badge" :class="credBadgeClass(p.credential_type)">{{ credLabel(p.credential_type) }}</span>
-              </div>
-            </div>
-            <div class="provider-top-right">
-              <label class="toggle-switch" :title="isProviderDisabled(p) ? '启用该服务商' : '禁用该服务商（请求时自动跳过，配置与组合顺序保留）'">
-                <input type="checkbox" :checked="!isProviderDisabled(p)" @change="toggleProviderEnabled(p, $event.target.checked)" />
-                <span class="toggle-slider"></span>
-              </label>
-              <StatusBadge :status="providerStatus(p).level" :label="providerStatus(p).text" />
-            </div>
-          </div>
-
-          <div class="provider-url mono text-sm text-muted" :title="p.base_url">{{ p.base_url }}</div>
-
-          <div class="provider-meta text-sm text-muted">
-            <span><AppIcon name="cpu" :size="12" />模型 {{ modelCount(p.id) }}</span>
-            <span v-if="(p.credential_type || 'api_key') === 'api_key'">
-              <AppIcon name="key" :size="12" />密钥 {{ keyCount(p.id) }}
-            </span>
-            <span v-else-if="(p.credential_type || 'api_key') === 'free_tier'">
-              <AppIcon name="gift" :size="12" />无需密钥
-            </span>
-            <span v-else>
-              <AppIcon name="shield" :size="12" />OAuth {{ oauthConnectionCount(p) }}
-            </span>
-            <code class="text-xs">{{ p.api_type }}</code>
-          </div>
-
-          <div v-if="statusLabels(p).length" class="provider-diagnostics">
-            <span v-for="s in statusLabels(p)" :key="s" class="badge badge-warning">{{ s }}</span>
-          </div>
-
-          <p v-if="p.description" class="provider-desc text-sm text-muted">{{ p.description }}</p>
-
-          <div class="provider-actions">
-            <button class="btn btn-outline btn-sm" @click="refreshProviderModels(p)" :disabled="busy.refreshModels">
-              <AppIcon name="refresh" :size="12" />刷新模型
-            </button>
-            <button class="btn btn-outline btn-sm" @click="editProvider(p)">
-              <AppIcon name="edit" :size="12" />编辑
-            </button>
-            <button v-if="(p.credential_type || 'api_key') === 'api_key'" class="btn btn-outline btn-sm" @click="editProviderKeys(p)">
-              <AppIcon name="key" :size="12" />密钥
-            </button>
-            <button class="btn btn-outline btn-sm" @click="openImportPricing(p)">
-              <AppIcon name="dollar" :size="12" />导入定价
-            </button>
-            <button v-if="p.api_type === 'atomcode'" class="btn btn-outline btn-sm" :class="{ 'btn-warning': !atomExeStatus.found }" @click="openAtomExeConfig(p)">
-              <AppIcon name="scan" :size="12" />配置可执行文件
-            </button>
-            <button class="btn btn-danger btn-sm" @click="deleteProvider(p)">
-              <AppIcon name="trash" :size="12" />删除
-            </button>
-          </div>
-        </article>
+              </td>
+              <td class="mono text-xs text-muted col-url"><span class="url-text" :title="p.base_url">{{ p.base_url }}</span></td>
+              <td class="text-xs">
+                <span v-if="(p.credential_type || 'api_key') === 'api_key'">API Key</span>
+                <span v-else-if="(p.credential_type || 'api_key') === 'free_tier'">无需密钥</span>
+                <span v-else>OAuth {{ oauthConnectionCount(p) }}</span>
+              </td>
+              <td><code class="text-xs">{{ p.api_type }}</code></td>
+              <td class="num tabular">{{ modelCount(p.id) }}</td>
+              <td class="num tabular">{{ (p.credential_type || 'api_key') === 'api_key' ? keyCount(p.id) : '-' }}</td>
+              <td class="cell-status">
+                <label class="toggle-switch compact" title="启用或禁用该服务商；禁用后请求自动跳过，配置保留">
+                  <input type="checkbox" :checked="!isProviderDisabled(p)" @change="toggleProviderEnabled(p, $event.target.checked)" />
+                  <span class="toggle-slider"></span>
+                </label>
+                <StatusBadge :status="providerStatus(p).level" :label="providerStatus(p).text" />
+                <span v-for="s in statusLabels(p)" :key="s" class="badge badge-warning badge-sm" :title="s">{{ s }}</span>
+              </td>
+              <td>
+                <label class="toggle-switch compact" title="开启后强制走代理池；关闭后跟随全局代理池开关">
+                  <input type="checkbox" :checked="!!p.proxy_enabled" @change="toggleProviderProxy(p, $event.target.checked)" />
+                  <span class="toggle-slider"></span>
+                </label>
+              </td>
+              <td class="col-actions">
+                <button class="icon-btn" @click="refreshProviderModels(p)" :disabled="busy.refreshModels" title="刷新模型" aria-label="刷新模型"><AppIcon name="refresh" :size="13" /></button>
+                <button class="icon-btn" @click="editProvider(p)" title="编辑" aria-label="编辑"><AppIcon name="edit" :size="13" /></button>
+                <button v-if="(p.credential_type || 'api_key') === 'api_key'" class="icon-btn" @click="editProviderKeys(p)" title="密钥" aria-label="密钥"><AppIcon name="key" :size="13" /></button>
+                <button class="icon-btn" @click="openImportPricing(p)" title="导入定价" aria-label="导入定价"><AppIcon name="dollar" :size="13" /></button>
+                <button v-if="p.api_type === 'atomcode'" class="icon-btn" :class="{ warning: !atomExeStatus.found }" @click="openAtomExeConfig(p)" title="配置可执行文件" aria-label="配置可执行文件"><AppIcon name="scan" :size="13" /></button>
+                <button class="icon-btn danger" @click="deleteProvider(p)" title="删除" aria-label="删除"><AppIcon name="trash" :size="13" /></button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
@@ -309,8 +306,10 @@
           <input v-model="form.base_url" placeholder="https://api.example.com/v1" />
         </div>
         <div class="form-group">
-          <label class="form-label">专用代理 URL</label>
-          <input v-model.trim="form.proxy_url" placeholder="留空则跟随全局代理设置" />
+          <label class="checkbox-label">
+            <input v-model="form.proxy_enabled" type="checkbox" />
+            <span>强制使用代理池（开启后不受全局代理开关影响）</span>
+          </label>
         </div>
         <div class="form-group">
           <label class="form-label">API 类型</label>
@@ -836,7 +835,7 @@ export default {
       if (this.modelCount(p.id) === 0) labels.push('无模型')
       if (type === 'oauth' && this.oauthConnectionCount(p) === 0) labels.push('OAuth 未连接')
       if (!/^https?:\/\//i.test(p.base_url || '') && type !== 'free_tier') labels.push('URL 异常')
-      if (p.proxy_url) labels.push('代理')
+      if (p.proxy_enabled) labels.push('代理')
       if (this.failCount(p.id) > 0) labels.push(`失败 ${this.failCount(p.id)}`)
       return labels
     },
@@ -862,6 +861,15 @@ export default {
         toast.error(e.response?.data?.detail || '切换失败')
       } finally {
         this.busy.togglingProvider = false
+      }
+    },
+    async toggleProviderProxy(p, proxyEnabled) {
+      try {
+        await api.updateProvider(p.id, { proxy_enabled: proxyEnabled })
+        p.proxy_enabled = proxyEnabled
+        toast.success(proxyEnabled ? `服务商「${p.name}」已强制走代理池` : `服务商「${p.name}」已恢复跟随全局代理开关`)
+      } catch (e) {
+        toast.error(e.response?.data?.detail || '代理开关更新失败')
       }
     },
     credLabel(t) {
@@ -899,7 +907,7 @@ export default {
         api_type: p.api_type,
         credential_type: p.credential_type || 'api_key',
         oauth_code: p.oauth_code || null,
-        proxy_url: p.proxy_url || '',
+        proxy_enabled: !!p.proxy_enabled,
         description: p.description || '',
       }
       this.isEditing = true
@@ -913,7 +921,7 @@ export default {
       this.activeTab = 'keys'
     },
     resetForm() {
-      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, proxy_url: '', description: '' }
+      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, proxy_enabled: false, description: '' }
       this.isEditing = false
       this.editingId = null
       this.activeTab = 'basic'
@@ -932,7 +940,7 @@ export default {
           name: this.form.name.trim(),
           base_url: this.form.base_url.trim(),
           api_type: this.form.api_type,
-          proxy_url: this.form.proxy_url || null,
+          proxy_enabled: !!this.form.proxy_enabled,
           description: this.form.description || '',
         }
         if (this.isEditing) {
@@ -1158,7 +1166,7 @@ export default {
         api_type: c.id === 'codex' || c.alias === 'cx' ? 'codex_responses' : 'openai_compat',
         credential_type: 'api_key',
         oauth_code: null,
-        proxy_url: '',
+        proxy_enabled: false,
         description: '',
       }
       this.isEditing = false
@@ -1484,60 +1492,108 @@ export default {
   color: #fff;
 }
 
-/* 服务商网格 */
-.providers-grid {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+/* 服务商列表 */
+.provider-table-wrap {
+  overflow-x: auto;
 }
-.provider-card {
-  display: grid;
-  grid-template-columns: minmax(230px, 300px) minmax(220px, 1fr) max-content;
-  grid-template-areas:
-    "name url actions"
-    "meta meta actions"
-    "diag diag actions";
-  align-items: center;
-  column-gap: 14px;
-  row-gap: 4px;
-  border: 1px solid var(--border-base);
+.provider-table {
+  width: 100%;
+  min-width: 1080px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.provider-table th,
+.provider-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-base);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.provider-table thead th {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  background: var(--surface-1);
+  border-bottom-color: var(--border-medium);
+}
+.provider-table tbody tr:hover {
   background: var(--surface-2);
-  border-radius: 8px;
-  padding: 10px 12px;
-  transition: all 0.2s;
 }
-.provider-top { grid-area: name; }
-.provider-url { grid-area: url; margin-bottom: 0; }
-.provider-meta { grid-area: meta; margin-bottom: 0; }
-.provider-diagnostics { grid-area: diag; margin-bottom: 0; }
-.provider-desc { display: none; }
-.provider-actions {
-  grid-area: actions;
-  justify-content: flex-end;
-  max-width: 330px;
+.provider-table tbody tr.highlight {
+  box-shadow: inset 3px 0 0 var(--primary);
+  background: rgba(91, 141, 255, 0.07);
 }
-.provider-card.highlight {
+.provider-table tbody tr.disabled {
+  opacity: 0.58;
+  filter: grayscale(0.5);
+}
+.provider-table th.col-pin,
+.provider-table td.col-pin {
+  width: 30px;
+  padding-right: 0;
+}
+.provider-table th.num,
+.provider-table td.num {
+  text-align: right;
+  width: 48px;
+}
+.provider-table .col-url {
+  max-width: 280px;
+  width: 280px;
+}
+.provider-table .url-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cell-name {
+  max-width: 220px;
+}
+.cell-name strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+}
+.cell-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  overflow: hidden;
+}
+.col-actions {
+  text-align: right;
+}
+.col-actions .icon-btn:last-child {
+  margin-right: 0;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  margin-right: 4px;
+  border: 1px solid var(--border-base);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.icon-btn:hover {
   border-color: var(--primary);
-  box-shadow: 0 0 0 3px rgba(91, 141, 255, 0.15);
+  color: var(--primary);
 }
-.provider-card.disabled {
-  opacity: 0.55;
-  filter: grayscale(0.6);
-  border-style: dashed;
+.icon-btn.warning {
+  border-color: var(--warning);
+  color: var(--warning);
 }
-.provider-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: var(--space-2);
-  margin-bottom: 0;
-}
-.provider-header {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-2);
-  min-width: 0;
-  flex: 1;
+.icon-btn.danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
 }
 .pin-btn {
   border: 0;
@@ -1550,12 +1606,6 @@ export default {
 }
 .pin-btn.pinned {
   color: var(--warning);
-}
-.provider-top-right {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-shrink: 0;
 }
 /* 启用/禁用开关 */
 .toggle-switch {
@@ -1597,68 +1647,18 @@ export default {
 .toggle-switch input:checked + .toggle-slider::before {
   transform: translateX(16px);
 }
+.toggle-switch.compact {
+  width: 30px;
+  height: 17px;
+  flex-shrink: 0;
+}
+.toggle-switch.compact input:checked + .toggle-slider::before {
+  transform: translateX(13px);
+}
 .toggle-switch input:disabled + .toggle-slider {
   opacity: 0.5;
   cursor: not-allowed;
 }
-.provider-title {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-  min-width: 0;
-}
-.provider-title strong {
-  font-size: var(--text-base);
-  color: var(--text-primary);
-  word-break: break-word;
-}
-.provider-url {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.provider-meta {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-  margin-bottom: 0;
-}
-.provider-meta span {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.provider-diagnostics {
-  display: flex;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-  margin-bottom: 0;
-}
-.provider-desc {
-  margin-bottom: var(--space-3);
-  line-height: 1.5;
-}
-.provider-actions {
-  display: flex;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-
-@media (max-width: 900px) {
-  .provider-card {
-    grid-template-columns: 1fr;
-    grid-template-areas:
-      "name"
-      "url"
-      "meta"
-      "diag"
-      "actions";
-  }
-  .provider-actions { justify-content: flex-start; max-width: none; }
-}
-
 /* 目录网格 */
 .catalog-grid {
   display: grid;
@@ -1913,7 +1913,6 @@ export default {
 }
 
 @media (max-width: 900px) {
-  .providers-grid,
   .catalog-grid {
     grid-template-columns: 1fr;
   }
