@@ -24,10 +24,10 @@ from typing import AsyncGenerator, List, Optional, Any
 import httpx
 
 
-def _proxy_kwargs() -> dict:
+def _proxy_kwargs(*, force: bool = False) -> dict:
     """从代理池取 httpx 代理参数；代理池关闭时返回空 dict（即直连）"""
     from server.core.proxy_pool import get_proxy_pool
-    return get_proxy_pool().proxied_kwargs()
+    return get_proxy_pool().proxied_kwargs(force=force)
 
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.core.model_capabilities import infer_reasoning_effort_support

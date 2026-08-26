@@ -35,3 +35,15 @@ def test_provider_proxy_switch_can_force_a_globally_disabled_pool():
 
     assert pool.proxied_kwargs() == {}
     assert pool.proxied_kwargs(force=True) == {"proxy": "http://127.0.0.1:18080"}
+
+
+def test_adapter_proxy_kwargs_accept_force_flag(monkeypatch):
+    pool = ProxyPool(proxies=[{"url": "http://127.0.0.1:18080"}], enabled=False)
+    monkeypatch.setattr("server.core.proxy_pool.get_proxy_pool", lambda: pool)
+
+    from server.adapters import openai_compat, codex_responses, github_adapter, anthropic_adapter
+
+    assert openai_compat._proxy_kwargs(force=True) == {"proxy": "http://127.0.0.1:18080"}
+    assert codex_responses._proxy_kwargs(force=True) == {"proxy": "http://127.0.0.1:18080"}
+    assert github_adapter._proxy_kwargs(force=True) == {"proxy": "http://127.0.0.1:18080"}
+    assert anthropic_adapter._proxy_kwargs(force=True) == {"proxy": "http://127.0.0.1:18080"}
