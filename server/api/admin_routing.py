@@ -330,6 +330,7 @@ async def get_log(log_id: int, full: bool = Query(False, description="true 返�
         "used_proxy": bool(row.used_proxy), "proxy_url": row.proxy_url,
         "request_body": req_body, "request_body_truncated": req_trunc,
         "response_body": resp_body, "response_body_truncated": resp_trunc,
+        "archived_at": row.archived_at.isoformat() if getattr(row, "archived_at", None) else None,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 # ===================== 人工干预 =====================
@@ -474,6 +475,7 @@ async def list_request_logs(
             "fallback_count": r.fallback_count,
             "user_ip": r.user_ip,
             "used_proxy": bool(r.used_proxy), "proxy_url": r.proxy_url,
+            "archived": bool(getattr(r, "archived_at", None)),
             # request_body/response_body 不在列表接口返回，走 /logs/{id} 详情接口
             "created_at": r.created_at.isoformat() if r.created_at else None,
         } for r in rows],
@@ -803,11 +805,12 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
     with gzip.open(fpath, "wt", encoding="utf-8") as f:
         meta = {
             "_meta": {
-                "version": 1,
+                "version": 2,
                 "archived_at": datetime.utcnow().isoformat() + "Z",
                 "date_from": date_from,
                 "date_to": date_to,
                 "count": len(rows),
+                "mode": "slim",
             }
         }
         f.write(json.dumps(meta, ensure_ascii=False) + "\n")
@@ -838,35 +841,39 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             count += 1
 
-    # 归档前把被归档记录的统计累加到累计表（删除后统计仍保留）
-    arch_total = len(rows)
-    arch_success = sum(1 for r in rows if r.status == "success")
-    arch_auto = sum(1 for r in rows if r.requested_model == "auto")
-    arch_input = sum(r.prompt_tokens or 0 for r in rows)
-    arch_output = sum(r.completion_tokens or 0 for r in rows)
-    arch_lat_sum = sum(r.latency_ms or 0 for r in rows if r.latency_ms is not None)
-    arch_lat_cnt = sum(1 for r in rows if r.latency_ms is not None)
-    arch_ttft_sum = sum((getattr(r, "ttft_ms", None) or 0) for r in rows if getattr(r, "ttft_ms", None) is not None)
-    arch_ttft_cnt = sum(1 for r in rows if getattr(r, "ttft_ms", None) is not None)
-    await db.execute(text(
-        "UPDATE analytics_cumulative SET "
-        "total_requests=total_requests+:t, success_count=success_count+:s, "
-        "auto_requests=auto_requests+:a, total_input_tokens=total_input_tokens+:i, "
-        "total_output_tokens=total_output_tokens+:o, sum_latency_ms=sum_latency_ms+:ls, "
-        "latency_count=latency_count+:lc, "
-        "sum_ttft_ms=sum_ttft_ms+:ts, ttft_count=ttft_count+:tc WHERE id=1"
-    ), {"t": arch_total, "s": arch_success, "a": arch_auto, "i": arch_input,
-        "o": arch_output, "ls": arch_lat_sum, "lc": arch_lat_cnt,
-        "ts": arch_ttft_sum, "tc": arch_ttft_cnt})
-
-    # 从 DB 删除已归档记录
-    ids_to_delete = [r.id for r in rows]
-    placeholders = ",".join([":" + str(i) for i in range(len(ids_to_delete))])
-    params = {str(i): v for i, v in enumerate(ids_to_delete)}
+    # 归档瘦身：日志行保留（统计筛选继续可用），只清详细内容引用。
+    # 统计不再累加 analytics_cumulative —— 行还在 DB 内，summary/today 自动涵盖历史，
+    # 累加会造成双重计算；cumulative 保留旧值（代表更早已物理删除的行）。
+    _now = datetime.utcnow()
+    # 1) 先收集内容 blob 引用（清列之前，否则拿不到了）
+    all_hashes = []
+    for r in rows:
+        if getattr(r, "request_env_hash", None):
+            all_hashes.append(r.request_env_hash)
+        mh = getattr(r, "request_msg_hashes", None)
+        if mh and mh != "__raw__":
+            try:
+                all_hashes.extend(json.loads(mh))
+            except Exception:
+                pass
+        elif mh == "__raw__" and getattr(r, "request_env_hash", None):
+            pass  # 整包存储时 env hash 已收集
+        if getattr(r, "response_body_hash", None):
+            all_hashes.append(r.response_body_hash)
+    # 2) 清空行的内容列，打归档标记（统计元数据保留）
+    ids_to_archive = [r.id for r in rows]
+    placeholders = ",".join([":" + str(i) for i in range(len(ids_to_archive))])
+    params = {str(i): v for i, v in enumerate(ids_to_archive)}
+    params["now"] = _now
     await db.execute(
-        text(f"DELETE FROM request_logs WHERE id IN ({placeholders})"),
+        text(f"UPDATE request_logs SET request_body=NULL, response_body=NULL, "
+             f"request_env_hash=NULL, request_msg_hashes=NULL, response_body_hash=NULL, "
+             f"archived_at=:now WHERE id IN ({placeholders})"),
         params
     )
+    # 3) 递减 blob 引用，归零的 blob 物理删除（共享 blob 由 ref_count 保护）
+    from server.core.request_logger import release_blob_refs
+    blobs_deleted = await release_blob_refs(db, all_hashes)
     await db.commit()
 
     # VACUUM 回收空间
@@ -878,6 +885,8 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
     return {
         "ok": True,
         "archived_count": count,
+        "blobs_deleted": blobs_deleted,
+        "mode": "slim",
         "filename": filename,
         "date_range": f"{date_from} ~ {date_to}",
         "size_bytes": fpath.stat().st_size,
@@ -892,15 +901,13 @@ async def trigger_archive(date: str = Query(None, description="归档日期 YYYY
 
 @router.post("/logs/archives/{filename}/restore")
 async def restore_archive(filename: str, db: AsyncSession = Depends(get_db)):
-    """恢复归档：将归档文件解压并重新导入 DB，然后删除归档文件"""
+    """恢复归档：v2 瘦身归档 → 把详细内容重新挂回仍在 DB 的日志行；
+    旧版归档（行已删除）→ 重新插入整行。全部成功才删除归档文件。"""
     fpath = _get_archive_dir() / filename
     if not fpath.exists():
         raise HTTPException(404, f"归档文件不存在: {filename}")
 
     records = []
-    restored_count = 0
-    import_success = 0
-
     try:
         with gzip.open(fpath, "rt", encoding="utf-8") as f:
             for line in f:
@@ -920,13 +927,31 @@ async def restore_archive(filename: str, db: AsyncSession = Depends(get_db)):
     if not records:
         raise HTTPException(400, "归档文件为空")
 
-    # 批量插入
+    from server.core.request_logger import _store_request, _store_response
     from sqlalchemy import text as sa_text
-    import_success = 0
-    import_failed = 0
+    relinked = 0
+    inserted = 0
+    failed = 0
     for rec in records:
         try:
-            # JSON 中的 created_at 是 ISO 字符串，DB 需要 datetime
+            existing = await db.get(RequestLog, rec.get("id"))
+            if existing is not None:
+                # v2 瘦身归档：行还在，把详细内容重新去重入库并挂回引用
+                rb = rec.get("request_body")
+                resp = rec.get("response_body")
+                env_hash, msg_hashes = (None, None)
+                if rb:
+                    env_hash, msg_hashes = await _store_request(db, rb)
+                resp_hash = await _store_response(db, resp) if resp else None
+                existing.request_body = None
+                existing.response_body = None
+                existing.request_env_hash = env_hash
+                existing.request_msg_hashes = msg_hashes
+                existing.response_body_hash = resp_hash
+                existing.archived_at = None
+                relinked += 1
+                continue
+            # 旧版归档：行已被物理删除，重新插入
             if rec.get("created_at") and isinstance(rec["created_at"], str):
                 rec["created_at"] = datetime.fromisoformat(rec["created_at"].replace("Z", "+00:00"))
             rec.setdefault("cache_read_tokens", None)
@@ -946,22 +971,26 @@ async def restore_archive(filename: str, db: AsyncSession = Depends(get_db)):
                      :error_type, :error_msg, :fallback_count, :user_ip, :api_key_id,
                      :request_body, :response_body, :created_at)
             """), rec)
-            import_success += 1
-        except Exception as e:
-            import_failed += 1
+            inserted += 1
+        except Exception:
+            failed += 1
 
     await db.commit()
 
-    # 删除归档文件
-    fpath.unlink()
+    # 全部成功才删除归档文件；有失败的保留文件便于重试
+    ok_all = (relinked + inserted) == len(records) and failed == 0
+    if ok_all:
+        fpath.unlink()
 
     _invalidate_analytics_cache()
     return {
-        "ok": True,
-        "restored_count": import_success,
-        "failed_count": import_failed,
+        "ok": failed == 0,
+        "relinked_count": relinked,
+        "inserted_count": inserted,
+        "failed_count": failed,
         "total_in_archive": len(records),
-        "message": f"成功恢复 {import_success} 条（失败 {import_failed} 条），归档文件已删除",
+        "message": (f"成功恢复 {relinked + inserted} 条（挂回 {relinked} 条、重建 {inserted} 条，失败 {failed} 条）"
+                    + ("，归档文件已删除" if ok_all else "；存在失败项，归档文件已保留")),
     }
 
 

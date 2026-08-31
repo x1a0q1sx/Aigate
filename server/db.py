@@ -178,6 +178,8 @@ async def init_db():
             "ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER",
             # v11: 请求日志首字延迟（time-to-first-token），流式请求记录
             "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT NULL",
+            # v13: 归档瘦身标记（详细内容已归档，统计元数据保留在行内）
+            "ALTER TABLE request_logs ADD COLUMN archived_at DATETIME DEFAULT NULL",
             # v12: 累计统计表增加首字延迟累计列（平均首字延迟跨归档保留）
             "ALTER TABLE analytics_cumulative ADD COLUMN sum_ttft_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE analytics_cumulative ADD COLUMN ttft_count INTEGER NOT NULL DEFAULT 0",

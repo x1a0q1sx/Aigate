@@ -95,6 +95,7 @@
             </td>
             <td>
               <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 11px;">{{ r.status === 'success' ? '成功' : '失败' }}</span>
+              <span v-if="r.archived" title="详细内容已归档瘦身，可从归档列表恢复" style="font-size: 11px;">📦</span>
             </td>
             <td style="font-family: monospace;">{{ fmtLatency(r.ttft_ms, r.latency_ms) }}</td>
             <td style="font-family: monospace; font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}<span v-if="r.cache_read_tokens" style="color: #2b8aef;" :title="`缓存读 ${r.cache_read_tokens} / 写 ${r.cache_write_tokens || 0}`"> · 缓存{{ r.cache_read_tokens }}</span></td>
@@ -287,6 +288,12 @@
           <tr>
             <td class="k">时间</td><td class="v">{{ fmtTime(detailRow.created_at) }}</td>
             <td class="k">状态</td><td class="v">{{ detailRow.status }}</td>
+          </tr>
+          <tr v-if="detailRow.archived_at">
+            <td class="k">归档</td>
+            <td class="v" colspan="3" style="color: #f59e0b;">
+              📦 详细内容已归档瘦身（{{ fmtTime(detailRow.archived_at) }}），当前仅保留统计数据；可在归档列表恢复后查看
+            </td>
           </tr>
           <tr>
             <td class="k">请求模型</td><td class="v">{{ detailRow.requested_model || '-' }}</td>

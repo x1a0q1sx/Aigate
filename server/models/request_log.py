@@ -54,6 +54,7 @@ class RequestLog(Base):
     request_msg_hashes = Column(Text, nullable=True)      # JSON 数组：逐条消息的 blob hash（含顺序）
     response_body_hash = Column(String(64), nullable=True) # 响应整包的 blob hash
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    archived_at = Column(DateTime, nullable=True)  # 非空=详细内容已归档瘦身（统计元数据保留，body/blob 已清）
 class AnalyticsCumulative(Base):
     """累计统计数据（单行 id=1）。
 

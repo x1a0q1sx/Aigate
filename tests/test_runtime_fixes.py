@@ -494,3 +494,56 @@ def test_sanitize_estimates_completion_when_missing():
     # 无输出文本时 completion 保持 0
     pt, ct = _sanitize_token_counts(req, 0, 0, "")
     assert ct == 0
+
+
+# ===================== 归档瘦身：blob 引用释放（ref_count 安全递减） =====================
+
+@pytest.mark.asyncio
+async def test_release_blob_refs_dedup_safe():
+    """共享 blob（ref_count>1）只有在所有引用释放后才删除；独占 blob 释放即删。"""
+    import os
+    import tempfile
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from server.core.request_logger import release_blob_refs, _upsert_units
+    from server.models.base import Base
+    from server.models.request_log import LogMsgBlob
+
+    tmpfd, tmpname = tempfile.mkstemp(suffix=".db")
+    os.close(tmpfd)
+    try:
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmpname}")
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all, tables=[LogMsgBlob.__table__])
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        async with Session() as db:
+            # 行1 引用 [sys, a]，行2 引用 [sys, b]：sys 被共享（ref=2）
+            hs1 = await _upsert_units(db, [{"sys": "prompt"}])
+            ha = await _upsert_units(db, [{"msg": "a"}])
+            hs2 = await _upsert_units(db, [{"sys": "prompt"}])  # 同内容再引用 → ref=2
+            hb = await _upsert_units(db, [{"msg": "b"}])
+            sys_h, a_h, b_h = hs1[0], ha[0], hb[0]
+            assert hs2[0] == sys_h
+            await db.commit()
+            total = (await db.execute(__import__('sqlalchemy').text("SELECT COUNT(*) FROM log_msg_blobs"))).scalar_one()
+            assert total == 3
+
+            # 释放行1：sys ref 2→1 保留，a 独占删除
+            n = await release_blob_refs(db, [sys_h, a_h])
+            assert n == 1
+            await db.commit()
+            left = dict((await db.execute(__import__('sqlalchemy').text("SELECT hash, ref_count FROM log_msg_blobs"))).all())
+            assert left == {sys_h: 1, b_h: 1}
+
+            # 释放行2：sys 归零删除，b 独占删除
+            n = await release_blob_refs(db, [sys_h, b_h])
+            assert n == 2
+            await db.commit()
+            left = (await db.execute(__import__('sqlalchemy').text("SELECT COUNT(*) FROM log_msg_blobs"))).scalar_one()
+            assert left == 0
+
+            # 重复释放已删除的 hash：安全无副作用
+            n = await release_blob_refs(db, [sys_h, None, ""])
+            assert n == 0
+        await engine.dispose()
+    finally:
+        os.unlink(tmpname)

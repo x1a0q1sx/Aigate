@@ -126,6 +126,25 @@ async def _store_response(db: AsyncSession, response_body: Any) -> Optional[str]
     return hs[0] if hs else None
 
 
+async def release_blob_refs(db: AsyncSession, hashes) -> int:
+    """按引用递减 blob ref_count（_upsert_units 的逆操作），降到 0 的 blob 删除。
+
+    归档瘦身用：日志行保留、内容引用清空后，把行曾引用的 blob 逐一减引用；
+    内容寻址去重意味着同一 blob 可能被多行共享，按出现次数严格递减，
+    只有 ref_count 归零（无任何行再引用）才真正删除。返回删除的 blob 数。
+    """
+    from collections import Counter
+    cnt = Counter(h for h in (hashes or []) if h)
+    if not cnt:
+        return 0
+    await db.execute(
+        text("UPDATE log_msg_blobs SET ref_count = ref_count - :n WHERE hash = :h"),
+        [{"h": h, "n": v} for h, v in cnt.items()],
+    )
+    res = await db.execute(text("DELETE FROM log_msg_blobs WHERE ref_count <= 0"))
+    return res.rowcount or 0
+
+
 async def reassemble_request(db: AsyncSession, row: RequestLog) -> Optional[str]:
     """按哈希还原请求体。无哈希(遗留行)→回退旧 TEXT。"""
     if row.request_msg_hashes is None and row.request_env_hash is None:
