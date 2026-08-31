@@ -89,9 +89,10 @@ class ModelCatalog:
         provider_id: Optional[int] = None,
         is_free: Optional[bool] = None,
         auto_enabled: Optional[bool] = None,
-        enabled_only: bool = True
+        enabled_only: bool = True,
+        extra_conditions: Optional[list] = None
     ) -> List[Model]:
-        """列出模型，支持过滤"""
+        """列出模型，支持过滤；extra_conditions 可追加调用方自带的 SQL 条件（如模糊搜索）"""
         conditions = []
         if enabled_only:
             conditions.append(Model.enabled == True)
@@ -101,6 +102,8 @@ class ModelCatalog:
             conditions.append(Model.is_free == is_free)
         if auto_enabled is not None:
             conditions.append(Model.auto_enabled == auto_enabled)
+        if extra_conditions:
+            conditions.extend(extra_conditions)
         query = select(Model)
         if enabled_only:
             # v4.0: 服务商被禁用时其模型同样不参与任何请求（但仍保留在 DB 中）

@@ -23,6 +23,7 @@
         <textarea v-model="form.message" rows="4" placeholder="输入你的消息..."></textarea>
       </div>
       <button class="btn btn-primary" @click="send" :disabled="sending">{{ sending ? '发送中...' : '发送 🚀' }}</button>
+      <div v-if="loadError" class="error-box"><strong>加载失败:</strong> {{ loadError }}</div>
       <div v-if="response" class="response-box"><strong>响应:</strong><div style="margin-top: 8px;">{{ response }}</div></div>
       <div v-if="error" class="error-box"><strong>错误:</strong> {{ error }}</div>
     </div>
@@ -32,14 +33,22 @@
 import api from '../api.js'
 export default {
   name: 'PlaygroundView',
-  data() { return { providers: [], models: [], selectedProviderId: 'auto', selectedModelId: '', form: { model: 'auto', message: '' }, sending: false, response: '', error: '' } },
+  data() { return { providers: [], models: [], selectedProviderId: 'auto', selectedModelId: '', form: { model: 'auto', message: '' }, sending: false, response: '', error: '', loadError: '' } },
   computed: {
     providersWithModels() { return this.providers.filter(p => this.models.some(m => m.provider_id === p.id)) },
     filteredModels() { return this.models.filter(m => String(m.provider_id) === String(this.selectedProviderId)) }
   },
   async mounted() {
-    try { const [providers, models] = await Promise.all([api.getProviders().catch(() => []), api.getModels().catch(() => [])]); this.providers = providers || []; this.models = models || [] }
-    catch (e) { console.error('加载模型失败:', e) }
+    // 模型/服务商加载失败时给出可见提示（此前静默吞错导致服务商下拉为空）
+    const [providers, models] = await Promise.all([
+      api.getProviders().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
+      api.getModels().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
+    ])
+    if (providers.ok) this.providers = providers.d || []
+    if (models.ok) this.models = models.d || []
+    const failed = [providers, models].filter(x => !x.ok)
+    if (failed.length === 2) this.loadError = (failed[0].e?.message || String(failed[0].e)) + '（请检查网络后刷新）'
+    else if (failed.length === 1) console.error('Playground 部分加载失败:', failed[0].e)
   },
   methods: {
     modelCount(pid) { return this.models.filter(m => m.provider_id === pid).length },

@@ -1029,12 +1029,25 @@ async def list_models(
     from server.main import get_health_checker
     hc = get_health_checker()
     from server.models.provider import Provider as ProvModel
-    models = await _model_catalog.list_models(db, provider_id, is_free, auto_enabled)
-    # 预加载 provider 关系；v3.3 跳过 provider 已被删除的孤儿 model
+    from sqlalchemy import or_, func as _func
+    # 过滤条件尽量下推 SQL（q 模糊匹配 model_id/display_name/provider name），避免全量加载后 Python 过滤
+    conditions = []
+    if q and q.strip():
+        needle = f"%{q.strip().lower()}%"
+        conditions.append(or_(
+            _func.lower(Model.model_id).like(needle),
+            _func.lower(Model.display_name).like(needle),
+            _func.lower(ProvModel.name).like(needle),
+        ))
+    models = await _model_catalog.list_models(db, provider_id, is_free, auto_enabled, extra_conditions=conditions)
+    # 预加载 provider 关系：一次性取全部 provider 建 dict，替代逐模型 db.get（1147 模型时曾产生 1147 次点查）
+    prov_rows = (await db.execute(select(ProvModel))).scalars().all()
+    prov_map = {p.id: p for p in prov_rows}
+    # v3.3 跳过 provider 已被删除的孤儿 model
     orphan_count = 0
     valid_models = []
     for m in models:
-        provider = await db.get(ProvModel, m.provider_id)
+        provider = prov_map.get(m.provider_id)
         if not provider:
             orphan_count += 1
             continue
@@ -1042,9 +1055,6 @@ async def list_models(
         valid_models.append(m)
     models = valid_models
     result = []
-    if q:
-        needle = q.strip().lower()
-        models = [m for m in models if needle in (m.model_id or "").lower() or needle in (m.display_name or "").lower() or needle in ((m.provider.name if getattr(m, "provider", None) else "") or "").lower()]
     for m in models:
         item = ModelInfoResponse.from_orm(m)
         # 附加延迟 + 冷却信息

@@ -77,13 +77,14 @@
             <th>状态</th>
             <th title="首字延迟 / 总延迟">延迟（首字/总）</th>
             <th>Token</th>
+            <th title="按模型单价估算的本次请求成本">成本</th>
             <th>代理</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           <tr v-if="items.length === 0">
-            <td colspan="7" style="text-align: center; padding: 32px; color: var(--gray-500);">暂无请求日志</td>
+            <td colspan="8" style="text-align: center; padding: 32px; color: var(--gray-500);">暂无请求日志</td>
           </tr>
           <tr v-for="r in items" :key="r.id">
             <td style="font-size: 12px; white-space: nowrap;">{{ fmtTime(r.created_at) }}</td>
@@ -97,6 +98,7 @@
             </td>
             <td style="font-family: monospace;">{{ fmtLatency(r.ttft_ms, r.latency_ms) }}</td>
             <td style="font-family: monospace; font-size: 12px;">{{ r.prompt_tokens || 0 }}/{{ r.completion_tokens || 0 }}<span v-if="r.cache_read_tokens" style="color: #2b8aef;" :title="`缓存读 ${r.cache_read_tokens} / 写 ${r.cache_write_tokens || 0}`"> · 缓存{{ r.cache_read_tokens }}</span></td>
+            <td style="font-family: monospace; font-size: 12px;">{{ r.status === 'success' ? ('$' + (r.estimated_cost_usd || 0).toFixed(4)) : '-' }}</td>
             <td>
               <span v-if="r.used_proxy" style="color: #22c55e; font-size: 12px;">🟢 代理</span>
               <span v-else style="color: var(--gray-500); font-size: 12px;">⚪ 直连</span>
@@ -114,31 +116,49 @@
       </div>
     </div>
 
-    <!-- 今日用量概览（原配额追踪并入） -->
+    <!-- Token 用量（支持时间/服务商/模型筛选） -->
     <div class="usage-section" v-if="todayData">
       <div class="usage-header">
-        <h2>今日用量</h2>
-        <span class="muted">{{ todayData.day }}</span>
+        <h2>Token 用量</h2>
+        <span class="muted">{{ usageRangeLabel }}</span>
       </div>
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">今日请求</div>
+      <div class="usage-filters">
+        <label>开始 <input type="datetime-local" v-model="usageFilters.start"></label>
+        <label>结束 <input type="datetime-local" v-model="usageFilters.end"></label>
+        <label>服务商
+          <select v-model="usageFilters.provider">
+            <option value="">全部</option>
+            <option v-for="p in logProviders" :key="p" :value="p">{{ p }}</option>
+          </select>
+        </label>
+        <label>模型 <input type="text" v-model="usageFilters.model" placeholder="模型名模糊匹配"></label>
+        <button class="btn btn-primary btn-sm" @click="applyUsageFilters" :disabled="usageLoading">{{ usageLoading ? '查询中...' : '查询' }}</button>
+        <button class="btn btn-outline btn-sm" @click="resetUsageFilters">重置</button>
+      </div>
+      <div class="stats-grid usage-grid">
+        <div class="stat-card usage-card">
+          <div class="stat-label">请求</div>
           <div class="stat-number">{{ formatNum(todayData.requests) }}</div>
           <div class="stat-sub">成功 {{ formatNum(todayData.success_requests) }}</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">今日成功率</div>
+        <div class="stat-card usage-card">
+          <div class="stat-label">成功率</div>
           <div class="stat-number" :style="{color: todayData.success_rate >= 95 ? 'var(--success)' : todayData.success_rate >= 80 ? 'var(--warning)' : 'var(--danger)'}">{{ todayData.success_rate }}%</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">今日 Token</div>
+        <div class="stat-card usage-card">
+          <div class="stat-label">Token</div>
           <div class="stat-number">{{ formatTokens(todayData.total_tokens) }}</div>
           <div class="stat-sub">输入 {{ formatTokens(todayData.prompt_tokens) }} · 输出 {{ formatTokens(todayData.completion_tokens) }}</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">今日成本</div>
+        <div class="stat-card usage-card">
+          <div class="stat-label">成本</div>
           <div class="stat-number">${{ todayData.cost_usd.toFixed(4) }}</div>
           <div class="stat-sub">按模型单价估算</div>
+        </div>
+        <div class="stat-card usage-card" :title="`缓存读 ${formatNum(todayData.cache_read_tokens || 0)} / 输入 ${formatNum(todayData.prompt_tokens || 0)}`">
+          <div class="stat-label">缓存命中率</div>
+          <div class="stat-number" style="color: #2b8aef;">{{ todayData.cache_hit_rate != null ? todayData.cache_hit_rate + '%' : '--' }}</div>
+          <div class="stat-sub">缓存读 {{ formatTokens(todayData.cache_read_tokens || 0) }}</div>
         </div>
       </div>
     </div>
@@ -309,7 +329,11 @@
           <div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin: 0 0 8px;">
               <h4 style="margin: 0; color: var(--primary);">📤 请求内容</h4>
-              <button class="btn btn-outline btn-sm" @click="copy(prettyRequestBody)">复制</button>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <span v-if="detailRow.request_body_truncated" style="color: #f59e0b; font-size: 11px;">内容已截断</span>
+                <button v-if="detailRow.request_body_truncated" class="btn btn-outline btn-sm" @click="showDetail(detailRow, true)">查看完整</button>
+                <button class="btn btn-outline btn-sm" @click="copy(prettyRequestBody)">复制</button>
+              </div>
             </div>
             <div v-if="reqInfo" class="code-block" style="max-height: 500px;">
               <div v-if="reqInfo.model"><strong>模型:</strong> {{ reqInfo.model }}</div>
@@ -338,7 +362,11 @@
           <div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin: 0 0 8px;">
               <h4 style="margin: 0; color: var(--success);">📥 返回内容</h4>
-              <button class="btn btn-outline btn-sm" @click="copy(prettyResponseBody)">复制</button>
+              <div style="display: flex; gap: 6px; align-items: center;">
+                <span v-if="detailRow.response_body_truncated" style="color: #f59e0b; font-size: 11px;">内容已截断</span>
+                <button v-if="detailRow.response_body_truncated" class="btn btn-outline btn-sm" @click="showDetail(detailRow, true)">查看完整</button>
+                <button class="btn btn-outline btn-sm" @click="copy(prettyResponseBody)">复制</button>
+              </div>
             </div>
             <div v-if="mediaContent" class="code-block" style="max-height: 600px; overflow-y: auto;">
               <div style="font-size: 13px; color: #94a3b8; margin-bottom: 10px;">
@@ -431,6 +459,8 @@ export default {
       archives: [],
       archiveBusy: false,
       todayData: null,
+      usageFilters: { start: '', end: '', provider: '', model: '' },
+      usageLoading: false,
       trendDays: 7,
       trendData: [],
       providerData: [],
@@ -616,15 +646,26 @@ export default {
       }
       return []
     },
+    usageRangeLabel() {
+      const f = this.usageFilters
+      if (!f.start && !f.end && !f.provider && !f.model) return '今日（UTC）'
+      const s = f.start ? f.start.replace('T', ' ') : '不限'
+      const e = f.end ? f.end.replace('T', ' ') : '不限'
+      const scope = [f.provider, f.model].filter(Boolean).join(' / ')
+      return `${s} ~ ${e}${scope ? ' · ' + scope : ''}`
+    },
     prettyRequestBody() {
       const raw = this.detailRow?.request_body
       if (!raw) return ''
+      // 超大原文（>120KB）跳过递归美化：deepUnescape + stringify 在浏览器里会卡数秒
+      if (raw.length > 120 * 1024) return raw
       const parsed = safeParseJSON(raw)
       return parsed ? this.deepUnescape(parsed) : raw
     },
     prettyResponseBody() {
       const raw = this.detailRow?.response_body
       if (!raw) return ''
+      if (raw.length > 120 * 1024) return raw
       const parsed = safeParseJSON(raw)
       return parsed ? this.deepUnescape(parsed) : raw
     }
@@ -664,9 +705,15 @@ export default {
       } catch (e) { toast.error('重置失败: ' + e.message) }
     },
     async loadToday() {
-      try { this.todayData = await api.getAnalyticsToday() }
+      try {
+        this.usageLoading = true
+        this.todayData = await api.getAnalyticsToday(this.usageFilters)
+      }
       catch (e) { console.error('today load failed', e) }
+      finally { this.usageLoading = false }
     },
+    applyUsageFilters() { this.loadToday() },
+    resetUsageFilters() { this.usageFilters = { start: '', end: '', provider: '', model: '' }; this.loadToday() },
     async loadTrend() {
       try { this.trendData = await api.getAnalyticsTrend(this.trendDays) }
       catch (e) { console.error('trend load failed', e) }
@@ -725,11 +772,12 @@ export default {
         this.totalPages = data.total_pages || 1
       } catch (e) { toast.error('加载日志失败: ' + e.message) }
     },
-    showDetail(r) {
+    showDetail(r, full = false) {
       this.detailLoading = true
-      this.detailRow = { ...r }  // 先显示已有字段
-      api.getLogDetail(r.id).then(full => {
-        this.detailRow = full
+      if (!full) this.detailRow = { ...r }  // 先显示已有字段
+      api.getLogDetail(r.id, full).then(data => {
+        // 合并而非替换，保留 loading 等状态字段
+        this.detailRow = { ...(this.detailRow || {}), ...data }
       }).catch(e => {
         console.error('加载详情失败', e)
       }).finally(() => {
@@ -921,6 +969,47 @@ export default {
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 2px;
+}
+/* Token 用量区：筛选行 */
+.usage-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.usage-filters label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.usage-filters input, .usage-filters select {
+  padding: 5px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+/* Token 用量卡片：框小一点、数字大一点 */
+.usage-grid {
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
+.usage-card {
+  padding: 10px 12px;
+  border-radius: 10px;
+}
+.usage-card .stat-label {
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+.usage-card .stat-number {
+  font-size: 26px;
+}
+.usage-card .stat-sub {
+  font-size: 11px;
 }
 .modal-overlay {
   position: fixed; inset: 0; background: rgba(0,0,0,0.5);

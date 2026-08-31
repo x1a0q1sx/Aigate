@@ -166,7 +166,7 @@ export default {
     if (params.provider) qs.append('provider', params.provider)
     return apiGet(`/admin/api/logs?${qs.toString()}`)
   },
-  getLogDetail: (id) => apiGet(`/admin/api/logs/${id}`),
+  getLogDetail: (id, full = false) => apiGet(`/admin/api/logs/${id}${full ? '?full=1' : ''}`),
   getLogProviders: () => apiGet('/admin/api/logs/providers'),
   getAnalyticsSummary: () => apiGet('/admin/api/analytics/summary'),
   resetAnalyticsSummary: () => apiPost('/admin/api/analytics/summary/reset', {}),
@@ -193,7 +193,15 @@ export default {
   previewTokenSaver: (data) => apiPost('/admin/api/token-saver/preview', data),
 
   // ── 用量分析（配额已合并到分析页）──
-  getAnalyticsToday: () => apiGet('/admin/api/analytics/summary/today'),
+  getAnalyticsToday: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
+    if (params.provider) qs.append('provider', params.provider)
+    if (params.model) qs.append('model', params.model)
+    const s = qs.toString()
+    return apiGet(`/admin/api/analytics/summary/today${s ? '?' + s : ''}`)
+  },
   getAnalyticsTrend: (days = 7) => apiGet(`/admin/api/analytics/trend?days=${days}`),
   getAnalyticsByProvider: () => apiGet('/admin/api/analytics/by-provider'),
 

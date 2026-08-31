@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, desc, func
+from sqlalchemy import select, text, desc, func, and_
 from sqlalchemy.orm import defer
 from server.db import AsyncSessionLocal
 from server.models.request_log import RequestLog, AnalyticsCumulative
@@ -294,10 +294,25 @@ async def list_log_providers(db: AsyncSession = Depends(get_db)):
     return {"providers": [r for r in rows if r]}
 
 @router.get("/logs/{log_id}")
-async def get_log(log_id: int, db: AsyncSession = Depends(get_db)):
+async def get_log(log_id: int, full: bool = Query(False, description="true 返回完整 body；默认超过 160KB 截断（详情弹窗快速打开）"), db: AsyncSession = Depends(get_db)):
     row = await db.get(RequestLog, log_id)
     if not row:
         raise HTTPException(404, "Log not found")
+    req_body = await reassemble_request(db, row)
+    resp_body = await reassemble_response(db, row)
+    req_trunc = resp_trunc = False
+    if not full:
+        # Codex 等客户端单条请求 body 可达数 MB，全量返回导致详情弹窗加载/渲染极慢。
+        # 默认截断到 160KB；前端可传 full=1 或点「查看完整」拿原文。
+        _MAX_BODY = 160 * 1024
+        if req_body and len(req_body) > _MAX_BODY:
+            total = len(req_body)
+            req_body = req_body[:_MAX_BODY] + f"\n\n... [已截断，完整大小 {total//1024} KB，加 ?full=1 查看全部]"
+            req_trunc = True
+        if resp_body and len(resp_body) > _MAX_BODY:
+            total = len(resp_body)
+            resp_body = resp_body[:_MAX_BODY] + f"\n\n... [已截断，完整大小 {total//1024} KB，加 ?full=1 查看全部]"
+            resp_trunc = True
     return {
         "id": row.id, "conversation_id": row.conversation_id,
         "requested_model": row.requested_model,
@@ -306,14 +321,15 @@ async def get_log(log_id: int, db: AsyncSession = Depends(get_db)):
         "latency_ms": row.latency_ms,
         "ttft_ms": getattr(row, "ttft_ms", None),
         "prompt_tokens": row.prompt_tokens, "completion_tokens": row.completion_tokens,
+        "estimated_cost_usd": getattr(row, "estimated_cost_usd", None),
         "cache_read_tokens": getattr(row, "cache_read_tokens", None),
         "cache_write_tokens": getattr(row, "cache_write_tokens", None),
         "error_type": row.error_type, "error_msg": row.error_msg,
         "fallback_count": row.fallback_count,
         "user_ip": row.user_ip, "api_key_id": row.api_key_id,
         "used_proxy": bool(row.used_proxy), "proxy_url": row.proxy_url,
-        "request_body": await reassemble_request(db, row),
-        "response_body": await reassemble_response(db, row),
+        "request_body": req_body, "request_body_truncated": req_trunc,
+        "response_body": resp_body, "response_body_truncated": resp_trunc,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 # ===================== 人工干预 =====================
@@ -450,6 +466,7 @@ async def list_request_logs(
             "ttft_ms": getattr(r, "ttft_ms", None),
             "prompt_tokens": r.prompt_tokens,
             "completion_tokens": r.completion_tokens,
+            "estimated_cost_usd": getattr(r, "estimated_cost_usd", None),
             "cache_read_tokens": getattr(r, "cache_read_tokens", None),
             "cache_write_tokens": getattr(r, "cache_write_tokens", None),
             "error_type": r.error_type,
@@ -549,10 +566,43 @@ async def reset_analytics_summary(db: AsyncSession = Depends(get_db)):
 
 
 # ===================== 用量分析（配额追踪并入） =====================
+def _parse_dt_param(val: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+    """宽松解析时间参数：YYYY-MM-DD / YYYY-MM-DDTHH:MM[:SS]，按 UTC。date 形式可补足到当日 23:59:59。"""
+    if not val or not val.strip():
+        return None
+    v = val.strip().replace(" ", "T")
+    try:
+        if len(v) == 10:
+            d = datetime.fromisoformat(v)
+            return d.replace(hour=23, minute=59, second=59, microsecond=0) if end_of_day else d
+        if len(v) == 16:
+            v += ":00"
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
 @router.get("/analytics/summary/today")
-async def analytics_today(db: AsyncSession = Depends(get_db)):
-    """今日用量汇总：请求数 / Token / 成本 / 成功率（数据源 request_logs）"""
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+async def analytics_today(
+    start: Optional[str] = Query(None, description="起始时间 YYYY-MM-DD 或 YYYY-MM-DDTHH:MM（UTC），默认今日零点"),
+    end: Optional[str] = Query(None, description="结束时间（含），默认不限"),
+    provider: Optional[str] = Query(None, description="按路由服务商过滤"),
+    model: Optional[str] = Query(None, description="按路由模型名模糊过滤"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Token 用量汇总：请求数 / Token / 成本 / 成功率 / 缓存命中（数据源 request_logs）。
+
+    无筛选参数时默认统计今日（UTC 零点起），与历史行为兼容。
+    """
+    start_dt = _parse_dt_param(start) or datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = _parse_dt_param(end, end_of_day=True)
+    conditions = [RequestLog.is_health_check == 0, RequestLog.created_at >= start_dt]
+    if end_dt:
+        conditions.append(RequestLog.created_at <= end_dt)
+    if provider and provider.strip():
+        conditions.append(RequestLog.routed_provider == provider.strip())
+    if model and model.strip():
+        conditions.append(RequestLog.routed_model.like(f"%{model.strip()}%"))
     row = (await db.execute(
         select(
             func.count(RequestLog.id),
@@ -560,20 +610,27 @@ async def analytics_today(db: AsyncSession = Depends(get_db)):
             func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
             func.coalesce(func.sum(RequestLog.completion_tokens), 0),
             func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0.0),
-        ).where(RequestLog.created_at >= today_start)
+            func.coalesce(func.sum(RequestLog.cache_read_tokens), 0),
+        ).where(and_(*conditions))
     )).one()
-    total, success, pin, pout, cost = row
+    total, success, pin, pout, cost, crd = row
     total = int(total or 0)
     success = int(success or 0)
+    pin = int(pin or 0)
+    crd = int(crd or 0)
     return {
-        "day": today_start.strftime("%Y-%m-%d"),
+        "day": start_dt.strftime("%Y-%m-%d"),
+        "range_start": start_dt.strftime("%Y-%m-%d %H:%M"),
+        "range_end": end_dt.strftime("%Y-%m-%d %H:%M") if end_dt else None,
         "requests": total,
         "success_requests": success,
         "success_rate": round(success / (total or 1) * 100, 1),
-        "prompt_tokens": int(pin or 0),
+        "prompt_tokens": pin,
         "completion_tokens": int(pout or 0),
-        "total_tokens": int(pin or 0) + int(pout or 0),
+        "total_tokens": pin + int(pout or 0),
         "cost_usd": round(float(cost or 0), 4),
+        "cache_read_tokens": crd,
+        "cache_hit_rate": round(crd / pin * 100, 1) if pin > 0 else None,
     }
 
 
