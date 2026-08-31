@@ -874,6 +874,19 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
     # 3) 递减 blob 引用，归零的 blob 物理删除（共享 blob 由 ref_count 保护）
     from server.core.request_logger import release_blob_refs
     blobs_deleted = await release_blob_refs(db, all_hashes)
+    # 4) 孤儿 GC 兜底：删除不被任何日志行引用的 blob（历史遗留/行写入失败等造成的
+    #    ref_count>0 但无引用的孤儿，一次性全量回收）
+    res_gc = await db.execute(text("""
+        DELETE FROM log_msg_blobs WHERE hash NOT IN (
+            SELECT request_env_hash FROM request_logs WHERE request_env_hash IS NOT NULL
+            UNION
+            SELECT response_body_hash FROM request_logs WHERE response_body_hash IS NOT NULL
+            UNION
+            SELECT je.value FROM request_logs, json_each(request_logs.request_msg_hashes) je
+            WHERE request_msg_hashes IS NOT NULL AND request_msg_hashes != '__raw__'
+        )
+    """))
+    blobs_deleted += res_gc.rowcount or 0
     await db.commit()
 
     # VACUUM 回收空间
