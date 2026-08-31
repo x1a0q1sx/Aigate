@@ -566,9 +566,10 @@ async def reset_analytics_summary(db: AsyncSession = Depends(get_db)):
 
 
 # ===================== 用量分析（配额追踪并入） =====================
-def _parse_dt_param(val: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+def _parse_dt_param(val, end_of_day: bool = False) -> Optional[datetime]:
     """宽松解析时间参数：YYYY-MM-DD / YYYY-MM-DDTHH:MM[:SS]，按 UTC。date 形式可补足到当日 23:59:59。"""
-    if not val or not val.strip():
+    # FastAPI 未解析时可能传入 Query 默认对象（直接函数调用场景），非 str 一律视为未提供
+    if not isinstance(val, str) or not val.strip():
         return None
     v = val.strip().replace(" ", "T")
     try:
