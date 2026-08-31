@@ -600,9 +600,9 @@ async def analytics_today(
     conditions = [RequestLog.is_health_check == 0, RequestLog.created_at >= start_dt]
     if end_dt:
         conditions.append(RequestLog.created_at <= end_dt)
-    if provider and provider.strip():
+    if isinstance(provider, str) and provider.strip():
         conditions.append(RequestLog.routed_provider == provider.strip())
-    if model and model.strip():
+    if isinstance(model, str) and model.strip():
         conditions.append(RequestLog.routed_model.like(f"%{model.strip()}%"))
     row = (await db.execute(
         select(
