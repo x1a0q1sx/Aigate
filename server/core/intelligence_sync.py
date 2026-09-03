@@ -120,20 +120,26 @@ def _bridge_via_openrouter(model_id: str, or_map: Dict[str, dict], lm_entries: L
     return best
 
 
+_last_good_route: Optional[dict] = None  # 进程内记忆上次成功的出网路由，避免每页重复试错
+
+
 async def _http_get_json(url: str, params: dict = None) -> Optional[dict]:
     """GET JSON，带出网回退链：代理池启用 → 走池；否则直连 → config 代理列表依次回退。
     （HF/OpenRouter 从大陆服务器直连不可达，但海外部署直连即可，池未启用时不应直接放弃。）"""
+    global _last_good_route
     from server.config import get_config
     timeout = get_config().arena.timeout_seconds
     pool_kwargs = get_proxy_pool().proxied_kwargs()
     attempts: List[dict] = []
     if pool_kwargs:
         attempts.append(pool_kwargs)
+    elif _last_good_route is not None:
+        attempts.append(_last_good_route)  # 上次成功路由优先，省掉直连试错
     attempts.append({})
     if not pool_kwargs:
         for p in (get_config().proxy_pool.proxies or []):
             u = (p or {}).get("url")
-            if u:
+            if u and {"proxy": u} not in attempts:
                 attempts.append({"proxy": u})
     last_err: Optional[Exception] = None
     for kw in attempts:
@@ -141,7 +147,9 @@ async def _http_get_json(url: str, params: dict = None) -> Optional[dict]:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, **kw) as client:
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
-                return resp.json()
+                result = resp.json()
+                _last_good_route = kw if kw else None
+                return result
         except Exception as e:
             last_err = e
             logger.warning("GET %s via %s failed: %s", url, kw.get("proxy") or "direct", e)
