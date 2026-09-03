@@ -22,7 +22,7 @@
       <div class="stat-card">
         <div class="stat-label">总请求数</div>
         <div class="stat-number">{{ formatNum(summary.total_requests) }}</div>
-        <div class="stat-sub">auto路由 {{ summary.auto_requests }} · 直连 {{ summary.direct_requests }}</div>
+        <div class="stat-sub" title="含已归档日志的累计统计（归档瘦身只移除详细内容，统计保留）">auto {{ summary.auto_requests }} · 直连 {{ summary.direct_requests }} · 含归档</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">成功率</div>
@@ -451,6 +451,23 @@ function safeParseJSON(str) {
   try { return JSON.parse(str) } catch (e) { return null }
 }
 
+// Token 用量筛选默认值：今日 0 点 ~ 当前 +1 小时（本地时区，datetime-local 格式）
+function defaultUsageFilters() {
+  const pad = (n) => String(n).padStart(2, '0')
+  const toLocalInput = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const now = new Date()
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate())  // 今日 0 点（本地）
+  const end = new Date(now.getTime() + 60 * 60 * 1000)                      // 当前 +1 小时
+  return { start: toLocalInput(start), end: toLocalInput(end), provider: '', model: '' }
+}
+
+// datetime-local 值（本地时区）→ UTC ISO，供后端按 UTC 比较
+function localInputToUtcIso(v) {
+  if (!v) return ''
+  const d = new Date(v)
+  return Number.isNaN(d.getTime()) ? '' : d.toISOString()
+}
+
 export default {
   name: 'AnalyticsView',
   data() {
@@ -466,7 +483,7 @@ export default {
       archives: [],
       archiveBusy: false,
       todayData: null,
-      usageFilters: { start: '', end: '', provider: '', model: '' },
+      usageFilters: defaultUsageFilters(),
       usageLoading: false,
       trendDays: 7,
       trendData: [],
@@ -714,13 +731,20 @@ export default {
     async loadToday() {
       try {
         this.usageLoading = true
-        this.todayData = await api.getAnalyticsToday(this.usageFilters)
+        // datetime-local 是浏览器本地时间，转 UTC 再传后端（避免 8 小时口径错位）
+        const f = this.usageFilters
+        this.todayData = await api.getAnalyticsToday({
+          start: localInputToUtcIso(f.start),
+          end: localInputToUtcIso(f.end),
+          provider: f.provider,
+          model: f.model,
+        })
       }
       catch (e) { console.error('today load failed', e) }
       finally { this.usageLoading = false }
     },
     applyUsageFilters() { this.loadToday() },
-    resetUsageFilters() { this.usageFilters = { start: '', end: '', provider: '', model: '' }; this.loadToday() },
+    resetUsageFilters() { this.usageFilters = defaultUsageFilters(); this.loadToday() },
     async loadTrend() {
       try { this.trendData = await api.getAnalyticsTrend(this.trendDays) }
       catch (e) { console.error('trend load failed', e) }

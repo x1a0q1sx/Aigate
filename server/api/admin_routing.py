@@ -569,7 +569,11 @@ async def reset_analytics_summary(db: AsyncSession = Depends(get_db)):
 
 # ===================== 用量分析（配额追踪并入） =====================
 def _parse_dt_param(val, end_of_day: bool = False) -> Optional[datetime]:
-    """宽松解析时间参数：YYYY-MM-DD / YYYY-MM-DDTHH:MM[:SS]，按 UTC。date 形式可补足到当日 23:59:59。"""
+    """宽松解析时间参数为 naive UTC：
+    - 带 Z / ±HH:MM 时区的 ISO → 转 UTC 后去时区（前端 datetime-local 转换后传此格式）
+    - 无时区的 YYYY-MM-DD / YYYY-MM-DDTHH:MM[:SS] → 视为 UTC（向后兼容）
+    - date 形式可按 end_of_day 补足到当日 23:59:59
+    """
     # FastAPI 未解析时可能传入 Query 默认对象（直接函数调用场景），非 str 一律视为未提供
     if not isinstance(val, str) or not val.strip():
         return None
@@ -580,7 +584,11 @@ def _parse_dt_param(val, end_of_day: bool = False) -> Optional[datetime]:
             return d.replace(hour=23, minute=59, second=59, microsecond=0) if end_of_day else d
         if len(v) == 16:
             v += ":00"
-        return datetime.fromisoformat(v)
+        d = datetime.fromisoformat(v)
+        if d.tzinfo is not None:
+            from datetime import timezone as _tz
+            d = d.astimezone(_tz.utc).replace(tzinfo=None)
+        return d
     except ValueError:
         return None
 

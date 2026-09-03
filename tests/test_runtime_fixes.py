@@ -547,3 +547,73 @@ async def test_release_blob_refs_dedup_safe():
         await engine.dispose()
     finally:
         os.unlink(tmpname)
+
+
+# ===================== 智力评分 v2：归一化匹配 + OpenRouter 桥接 =====================
+
+def _lm_entry(name, rating, rank=1):
+    from server.core.intelligence_sync import _norm_name, _variant_tags
+    return {"name": name, "norm": _norm_name(name), "tags": _variant_tags(name),
+            "rating": rating, "rank": rank, "votes": 1000, "org": ""}
+
+
+def test_norm_name_strips_dates_and_decorations():
+    from server.core.intelligence_sync import _norm_name
+
+    assert _norm_name("deepseek-ai/DeepSeek-V4-Pro-0813") == "deepseek-v4-pro"
+    assert _norm_name("[次]deepseek-v4-pro") == "deepseek-v4-pro"
+    assert _norm_name("glm-5.3-flash-free") == "glm-5.3-flash"
+    assert _norm_name("claude-opus-4-5-20251101") == "claude-opus-4-5"
+    assert _norm_name("Anthropic/ Claude Opus 5 Max ") == "claude-opus-5-max"
+    # 非日期数字不被误剥
+    assert _norm_name("gpt-5.5") == "gpt-5.5"
+
+
+def test_match_entry_tiers():
+    from server.core.intelligence_sync import _match_entry
+
+    entries = [
+        _lm_entry("deepseek-v4-pro-high-20260813", 1450, 10),
+        _lm_entry("deepseek-v4-pro", 1430, 20),
+        _lm_entry("gpt-5.6-sol-xhigh", 1440, 15),
+        _lm_entry("glm-5.3-flash", 1400, 40),
+    ]
+    # tier1: 剥日期后精确
+    m = _match_entry("deepseek-ai/DeepSeek-V4-Pro-0813", entries)
+    assert m and m["norm"] == "deepseek-v4-pro"
+    # tier1: 精确
+    m = _match_entry("glm-5.3-flash", entries)
+    assert m and m["norm"] == "glm-5.3-flash"
+    # tier2: 前缀 + effort 跨档（无 effort 匹配到 xhigh 变体）
+    m = _match_entry("gpt-5.6-sol", entries)
+    assert m and m["norm"] == "gpt-5.6-sol-xhigh"
+    # 变体不兼容不匹配：flash ≠ 非 flash
+    assert _match_entry("glm-5.3-pro", entries) is None
+    # 完全未知
+    assert _match_entry("totally-unknown-model", entries) is None
+
+
+def test_bridge_via_openrouter():
+    from server.core.intelligence_sync import _bridge_via_openrouter, _norm_name
+
+    entries = [_lm_entry("gpt-5.6-sol-xhigh", 1440, 15)]
+    or_map = {_norm_name("openai/gpt-5.6-sol"): {"id": "openai/gpt-5.6-sol", "name": "GPT: 5.6 Sol"}}
+    # aigate 名与 or id 尾段一致，or name 归一化后前缀命中榜单
+    m = _bridge_via_openrouter("gpt-5.6-sol", or_map, entries)
+    assert m and m["norm"] == "gpt-5.6-sol-xhigh"
+    # or 无该模型 → None
+    assert _bridge_via_openrouter("no-such-model", or_map, entries) is None
+
+
+def test_parse_dt_param_timezone_aware():
+    from server.api.admin_routing import _parse_dt_param
+    from datetime import datetime, timezone
+
+    # 带时区 ISO → naive UTC
+    assert _parse_dt_param("2026-08-31T00:00:00+08:00") == datetime(2026, 8, 30, 16, 0)
+    assert _parse_dt_param("2026-08-31T00:00:00Z") == datetime(2026, 8, 31, 0, 0)
+    # 无时区 → 视为 UTC 原样
+    assert _parse_dt_param("2026-08-31T00:00") == datetime(2026, 8, 31, 0, 0)
+    # 非法/非 str
+    assert _parse_dt_param("garbage") is None
+    assert _parse_dt_param(None) is None

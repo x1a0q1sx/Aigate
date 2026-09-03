@@ -1,16 +1,26 @@
 """
-智力评分自动同步
-启动时从 LMSys Arena AI Leaderboard 拉取最新 ELO 排名，映射为 0-100 智力分
+智力评分自动同步 v2
+
+主源: LMArena 官方 HuggingFace 数据集 lmarena-ai/leaderboard-dataset
+     (text/latest, category=overall) —— 无 key 公开访问（HF datasets-server
+     filter API），每日更新，398+ 模型。旧 wulong.dev 镜像仅 20 个模型且频繁 429，已替换。
+
+兜底: OpenRouter /api/v1/models（无 key，424 模型）
+     - 桥接匹配：公益站自命名模型 → OpenRouter → 榜单条目
+     - 元数据回填：context_length（仍为默认 4096 时）、supports_reasoning_effort
+
+策略: 同步失败绝不清理既有分数（源不可达 ≠ 分数失效）；
+     手工校准 (source='manual') 永不覆盖。
 """
 import asyncio
 import logging
+import re
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
 
 from server.core.proxy_pool import get_proxy_pool
 from server.db import AsyncSessionLocal
@@ -19,127 +29,233 @@ from server.models.model import Model
 
 logger = logging.getLogger(__name__)
 
-ARENA_API = "https://api.wulong.dev/arena-ai-leaderboards/v1/leaderboard?name=text"
+LMARENA_FILTER_URL = "https://datasets-server.huggingface.co/filter"
+LMARENA_PARAMS = {
+    "dataset": "lmarena-ai/leaderboard-dataset",
+    "config": "text",
+    "split": "latest",
+    "where": "\"category\"='overall'",
+    "limit": 100,
+}
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+_DATE_SUFFIX_RE = re.compile(r"-(?:20\d{6}|\d{8}|\d{4})$")  # -20260813 / -0813 等 MMDD|YYYYMMDD 形式
+_DECOR_RE = re.compile(r"[\[\(（][^\]\)）]*[\]\)）]")
+# effort 类变体：匹配时可跨档兼容（分数差异小）；thinking/reasoning 等能力差异不可跨
+_EFFORT_TAGS = frozenset({"high", "medium", "low", "xhigh", "max"})
+_VARIANT_TAGS = ("xhigh", "thinking", "reasoning", "flash", "pro", "lite",
+                 "mini", "nano", "max", "air", "express", "high", "medium", "low")
 
 
 def _elo_to_intel(elo: float) -> int:
-    """ELO -> intelligence 0-100. Wide spread, close Arena ranks differ.
-
-    Arena leaderboard ELO clusters in ~1400-1510; map that window to 55-100,
-    clamping outliers so a low-ELO model never exceeds 55 and top models cap at 100.
-    """
-    lo, hi = 1400.0, 1510.0
+    """ELO -> intelligence 0-100。窗口 1395-1510 → 55-100，尾部低分模型不超 55。"""
+    lo, hi = 1395.0, 1510.0
     raw = 55.0 + (float(elo) - lo) / (hi - lo) * 45.0
     return round(max(0, min(100, raw)))
 
 
-def _model_name_match(aigate_model_id: str, arena_model_name: str) -> bool:
-    """严格模糊匹配：避免跨变体（thinking/flash/pro/...）错配。
+def _norm_name(s: str) -> str:
+    """模型名归一化：小写、剥厂商前缀、剥 [xx]/(xx) 装饰、非字母数字转 -、剥日期后缀、剥 -free。"""
+    s = (s or "").lower().strip()
+    s = s.rsplit("/", 1)[-1]
+    s = _DECOR_RE.sub("", s)
+    s = re.sub(r"[^a-z0-9._-]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    s = _DATE_SUFFIX_RE.sub("", s)
+    if s.endswith("-free"):
+        s = s[:-5]
+    return s.strip("-")
 
-    匹配顺序：
-      1) 精确（含变体后缀）   claude-opus-4-6 ↔ claude-opus-4-6
-      2) 去厂商前缀后相等      anthropic/claude-opus-4-6 ↔ claude-opus-4-6
-      3) 仅在「变体标签集合完全一致」时才允许子串包含，
-         杜绝 claude-opus-4-6(无 thinking) 错配到 ...-thinking 的分数
+
+def _variant_tags(s: str) -> frozenset:
+    s = (s or "").lower()
+    return frozenset(t for t in _VARIANT_TAGS if ("-" + t) in s or s.endswith(t))
+
+
+def _effort_compat(a: frozenset, b: frozenset) -> bool:
+    """非 effort 标签必须完全一致；effort 标签（high/max/xhigh...）可跨档兼容。"""
+    return (a - _EFFORT_TAGS) == (b - _EFFORT_TAGS)
+
+
+def _match_entry(model_id: str, entries: List[dict]) -> Optional[dict]:
+    """aigate 模型名 → 榜单条目。entries 已按 rank 升序。
+
+    tier1: 归一化名精确相等（含剥日期后缀）
+    tier2: 前缀兼容 + effort 可跨档（gpt-5.6-sol ↔ gpt-5.6-sol-xhigh），
+          多个候选取 rating 最高
     """
-    VARIANT_TAGS = ("thinking", "reasoning", "flash", "pro", "lite",
-                    "mini", "nano", "max", "air", "express", "high", "medium", "low")
-
-    def variant_tags(s: str) -> frozenset:
-        s = s.lower()
-        return frozenset(t for t in VARIANT_TAGS if ("-" + t) in s or s.endswith(t))
-
-    def norm(s: str) -> str:
-        s = s.lower().strip()
-        return s.rsplit("/", 1)[-1] if "/" in s else s
-
-    a, b = norm(aigate_model_id), norm(arena_model_name)
-    if a == b:
-        return True
-    # 变体标签不一致 → 绝不跨变体匹配
-    if variant_tags(aigate_model_id) != variant_tags(arena_model_name):
-        return False
-    # 标签一致时才允许短名子串包含
-    return a in b or b in a
+    nid = _norm_name(model_id)
+    if not nid:
+        return None
+    ntags = _variant_tags(model_id)
+    for e in entries:
+        if e["norm"] == nid:
+            return e
+    best = None
+    for e in entries:
+        if not _effort_compat(ntags, e["tags"]):
+            continue
+        prefix_hit = (e["norm"].startswith(nid + "-") or nid.startswith(e["norm"] + "-"))
+        if prefix_hit and (best is None or e["rating"] > best["rating"]):
+            best = e
+    return best
 
 
-async def fetch_arena_scores() -> Dict[str, dict]:
-    """拉取 Arena AI 排行榜，返回 {模型名: {score, rank, vendor, votes}}。
-    通过代理池出公网（网关通常需 socks5 才能访问外网），代理关闭时回退直连。"""
+def _bridge_via_openrouter(model_id: str, or_map: Dict[str, dict], lm_entries: List[dict]) -> Optional[dict]:
+    """OpenRouter 桥接：aigate 名 → or 条目（归一化精确）→ or 名称归一化 → 榜单前缀匹配。"""
+    nid = _norm_name(model_id)
+    or_entry = or_map.get(nid)
+    if not or_entry:
+        return None
+    # or 名称归一化后与 nid 常常相同（id 尾段即名称），此时仍用其做榜单前缀匹配
+    onid = _norm_name(or_entry["name"]) or nid
+    ntags = _variant_tags(model_id)
+    best = None
+    for e in lm_entries:
+        if not _effort_compat(ntags, e["tags"]):
+            continue
+        prefix_hit = (e["norm"].startswith(onid + "-") or onid.startswith(e["norm"] + "-") or e["norm"] == onid)
+        if prefix_hit and (best is None or e["rating"] > best["rating"]):
+            best = e
+    return best
+
+
+async def _http_get_json(url: str, params: dict = None) -> Optional[dict]:
+    """经代理池 GET JSON（代理关闭时回退直连）。失败返回 None。"""
     from server.config import get_config
     timeout = get_config().arena.timeout_seconds
-    proxy_kwargs = get_proxy_pool().proxied_kwargs()   # 启用时 {"proxy": "socks5://..."}, 否则 {}
+    proxy_kwargs = get_proxy_pool().proxied_kwargs()
     try:
-        async with httpx.AsyncClient(timeout=timeout, **proxy_kwargs) as client:
-            resp = await client.get(ARENA_API)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, **proxy_kwargs) as client:
+            resp = await client.get(url, params=params)
             resp.raise_for_status()
-            data = resp.json()
+            return resp.json()
     except Exception as e:
-        logger.warning("Failed to fetch Arena AI leaderboard: %s", e)
-        return {}
+        logger.warning("GET %s failed: %s", url, e)
+        return None
 
-    models = data.get("models", [])
-    result = {}
-    for entry in models:
-        name = entry.get("model", "").strip()
-        if not name:
+
+async def fetch_lmarena_scores() -> List[dict]:
+    """拉取 LMArena 官方数据集 overall 主榜（filter API 分页，每页 100，最多 10 页）。
+
+    返回按 rank 升序的去重条目列表：
+    [{name, norm, tags, rating, rank, votes, org}]
+    """
+    entries: List[dict] = []
+    offset = 0
+    total = None
+    for _page in range(10):
+        data = await _http_get_json(LMARENA_FILTER_URL, {**LMARENA_PARAMS, "offset": offset})
+        if not data:
+            break
+        rows = data.get("rows", []) or []
+        for r in rows:
+            row = r.get("row", {}) or {}
+            name = (row.get("model_name") or "").strip()
+            rating = row.get("rating")
+            if not name or not isinstance(rating, (int, float)):
+                continue
+            entries.append({
+                "name": name,
+                "norm": _norm_name(name),
+                "tags": _variant_tags(name),
+                "rating": float(rating),
+                "rank": int(row.get("rank") or 0),
+                "votes": int(row.get("vote_count") or 0),
+                "org": row.get("organization") or "",
+            })
+        total = int(data.get("num_rows_total") or 0)
+        offset += len(rows)
+        if not rows or (total and offset >= total):
+            break
+    if not entries:
+        logger.warning("LMArena leaderboard fetch returned empty")
+        return []
+    # 归一化撞名时保留 rating 最高的一条（避免前缀匹配命中重复项）
+    dedup: Dict[str, dict] = {}
+    for e in entries:
+        cur = dedup.get(e["norm"])
+        if cur is None or e["rating"] > cur["rating"]:
+            dedup[e["norm"]] = e
+    result = sorted(dedup.values(), key=lambda m: m["rank"] or 9999)
+    logger.info("Fetched %d models from LMArena official dataset", len(result))
+    return result
+
+
+async def fetch_openrouter_models() -> Dict[str, dict]:
+    """拉取 OpenRouter 模型元数据，返回 {norm_id: {id, name, context_length, supports_reasoning}}。"""
+    data = await _http_get_json(OPENROUTER_MODELS_URL)
+    if not data:
+        return {}
+    result: Dict[str, dict] = {}
+    for m in (data.get("data") or []):
+        mid = (m.get("id") or "").strip()
+        if not mid:
             continue
-        result[name] = {
-            "score": entry.get("score", 0),
-            "rank": entry.get("rank", 0),
-            "vendor": entry.get("vendor", ""),
-            "votes": entry.get("votes", 0),
+        sp = m.get("supported_parameters") or []
+        result[_norm_name(mid)] = {
+            "id": mid,
+            "name": m.get("name") or "",
+            "context_length": int(m.get("context_length") or 0),
+            "supports_reasoning": any(p in sp for p in ("reasoning_effort", "reasoning")),
         }
-    logger.info("Fetched %d models from Arena AI leaderboard", len(result))
+    logger.info("Fetched %d models from OpenRouter", len(result))
     return result
 
 
 async def sync_intelligence(db: AsyncSession) -> int:
-    """
-    同步智力评分：拉取 Arena 排行榜 → 匹配 AIGate 模型 → 写入 intelligence_static
-    返回更新的模型数量
-    """
-    scores = await fetch_arena_scores()
-    if not scores:
-        return 0
+    """同步智力评分：LMArena 官方榜 → 匹配 AIGate 模型 → upsert intelligence_static。
 
-    # 查找所有已启用模型
+    失败不删分：主源拉取失败时直接返回 0，既有分数原样保留。
+    返回更新的模型数量。
+    """
+    entries = await fetch_lmarena_scores()
+    if not entries:
+        logger.warning("LMArena sync skipped: leaderboard unavailable")
+        return 0
+    or_map = await fetch_openrouter_models()
+
     model_rows = (await db.execute(select(Model).where(Model.enabled == True))).scalars().all()
 
     updated = 0
-    matched_model_ids = set()
+    metadata_filled = 0
     for m in model_rows:
-        matched = None
-        # 精确匹配
-        if m.model_id in scores:
-            matched = scores[m.model_id]
-        else:
-            # 模糊匹配
-            for arena_name, info in scores.items():
-                if _model_name_match(m.model_id, arena_name):
-                    matched = info
-                    break
+        # OpenRouter 元数据回填（与分数匹配解耦，归一化精确命中即回填）
+        or_entry = or_map.get(_norm_name(m.model_id)) if or_map else None
+        if or_entry:
+            if getattr(m, "context_length", 4096) == 4096 and or_entry.get("context_length"):
+                m.context_length = int(or_entry["context_length"])
+                metadata_filled += 1
+            if getattr(m, "supports_reasoning_effort", None) is None and or_entry.get("supports_reasoning"):
+                m.supports_reasoning_effort = True
+                metadata_filled += 1
 
-        if not matched:
+        matched = _match_entry(m.model_id, entries)
+        bridged = False
+        if matched is None and or_map:
+            matched = _bridge_via_openrouter(m.model_id, or_map, entries)
+            bridged = matched is not None
+        if matched is None:
+            # 未匹配：保留既有分数（如有），绝不清理
             continue
-        matched_model_ids.add(m.model_id)
 
-        intel_score = _elo_to_intel(matched["score"])
+        intel_score = _elo_to_intel(matched["rating"])
         tier = "S" if intel_score >= 85 else "A" if intel_score >= 70 else "B" if intel_score >= 50 else "C"
 
-        # upsert into intelligence_static
         existing = (await db.execute(
             select(IntelligenceStatic).where(IntelligenceStatic.pattern == m.model_id)
         )).scalar_one_or_none()
 
-        # 非破坏性：手工校准(source='manual') 永不覆盖
+        # 手工校准永不覆盖
         if existing and existing.source == "manual":
             continue
+        notes = (f"LMArena rank#{matched['rank']} elo={matched['rating']:.0f} "
+                 f"votes={matched['votes']} via={'openrouter' if bridged else 'direct'}")
         if existing:
             existing.score = intel_score
             existing.tier = tier
             existing.source = "arena"
-            existing.notes = f"Arena rank#{matched['rank']} score={matched['score']} votes={matched['votes']}"
+            existing.notes = notes
             existing.updated_at = datetime.utcnow()
         else:
             db.add(IntelligenceStatic(
@@ -147,28 +263,12 @@ async def sync_intelligence(db: AsyncSession) -> int:
                 score=intel_score,
                 tier=tier,
                 source="arena",
-                notes=f"Arena rank#{matched['rank']} score={matched['score']} votes={matched['votes']}",
+                notes=notes,
             ))
         updated += 1
 
-    # 清理：已启用模型中「未匹配到 Arena」且来源为 arena 的过期行
-    # → 删除后改走 estimate_intel（家族基线），避免残留的松散错配分数
-    cleaned = 0
-    for m in model_rows:
-        if m.model_id in matched_model_ids:
-            continue
-        stale = (await db.execute(
-            select(IntelligenceStatic).where(
-                IntelligenceStatic.pattern == m.model_id,
-                IntelligenceStatic.source == "arena",
-            )
-        )).scalar_one_or_none()
-        if stale:
-            await db.delete(stale)
-            cleaned += 1
-
     await db.commit()
-    logger.info("Intelligence sync complete: %d updated, %d stale cleaned", updated, cleaned)
+    logger.info("Intelligence sync complete: %d scored, %d metadata filled", updated, metadata_filled)
     return updated
 
 
