@@ -12,7 +12,9 @@
         </div>
         <div class="form-group" v-if="selectedProviderId !== 'auto'">
           <label>模型</label>
-          <select v-model="selectedModelId" @change="syncModel">
+          <select v-model="selectedModelId" @change="syncModel" :disabled="modelsLoading">
+            <option v-if="modelsLoading" value="">模型加载中...</option>
+            <option v-else-if="filteredModels.length === 0" value="">（该服务商暂无可用模型）</option>
             <option v-for="m in filteredModels" :key="m.id" :value="String(m.id)">{{ m.display_name || m.model_id }}</option>
           </select>
         </div>
@@ -33,27 +35,54 @@
 import api from '../api.js'
 export default {
   name: 'PlaygroundView',
-  data() { return { providers: [], models: [], selectedProviderId: 'auto', selectedModelId: '', form: { model: 'auto', message: '' }, sending: false, response: '', error: '', loadError: '' } },
+  data() { return { providers: [], modelStats: {}, models: [], loadedPid: null, modelsLoading: false, selectedProviderId: 'auto', selectedModelId: '', form: { model: 'auto', message: '' }, sending: false, response: '', error: '', loadError: '' } },
   computed: {
-    providersWithModels() { return this.providers.filter(p => this.models.some(m => m.provider_id === p.id)) },
+    // 懒加载：服务商下拉只依赖轻量的 model-stats（每家模型数），不再等全量模型列表
+    providersWithModels() { return this.providers.filter(p => (this.modelStats[p.id] || 0) > 0) },
     filteredModels() { return this.models.filter(m => String(m.provider_id) === String(this.selectedProviderId)) }
   },
   async mounted() {
-    // 模型/服务商加载失败时给出可见提示（此前静默吞错导致服务商下拉为空）
-    const [providers, models] = await Promise.all([
+    // 服务商 + 每家模型数都是轻量接口，首屏秒开；模型列表等选中服务商后再按需拉取
+    const [providers, stats] = await Promise.all([
       api.getProviders().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
-      api.getModels().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
+      api.getProviderModelStats().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
     ])
     if (providers.ok) this.providers = providers.d || []
-    if (models.ok) this.models = models.d || []
-    const failed = [providers, models].filter(x => !x.ok)
+    if (stats.ok) {
+      const map = {}
+      for (const s of (stats.d || [])) map[s.provider_id] = s.model_count
+      this.modelStats = map
+    }
+    const failed = [providers, stats].filter(x => !x.ok)
     if (failed.length === 2) this.loadError = (failed[0].e?.message || String(failed[0].e)) + '（请检查网络后刷新）'
     else if (failed.length === 1) console.error('Playground 部分加载失败:', failed[0].e)
   },
   methods: {
-    modelCount(pid) { return this.models.filter(m => m.provider_id === pid).length },
+    modelCount(pid) { return this.modelStats[pid] || 0 },
     fullId(m) { return m.full_id || ((m.provider_name || this.providers.find(p => p.id === m.provider_id)?.name || '') + '/' + m.model_id) },
-    onProviderChange() { if (this.selectedProviderId === 'auto') { this.form.model = 'auto'; this.selectedModelId = ''; return } const first = this.filteredModels[0]; this.selectedModelId = first ? String(first.id) : ''; this.syncModel() },
+    async onProviderChange() {
+      if (this.selectedProviderId === 'auto') { this.form.model = 'auto'; this.selectedModelId = ''; return }
+      await this.loadModelsFor(this.selectedProviderId)
+    },
+    async loadModelsFor(pid) {
+      if (this.loadedPid === String(pid) && this.models.length) return
+      this.modelsLoading = true
+      this.models = []
+      this.selectedModelId = ''
+      try {
+        const list = await api.getModels({ provider_id: pid })
+        this.models = list || []
+        this.loadedPid = String(pid)
+        const first = this.models[0]
+        this.selectedModelId = first ? String(first.id) : ''
+        this.syncModel()
+      } catch (e) {
+        console.error('加载模型失败:', e)
+        this.error = '模型加载失败: ' + (e.message || e)
+      } finally {
+        this.modelsLoading = false
+      }
+    },
     syncModel() { const m = this.models.find(x => String(x.id) === String(this.selectedModelId)); this.form.model = m ? this.fullId(m) : 'auto' },
     async send() { if (!this.form.message.trim()) return; this.sending = true; this.response = ''; this.error = ''; try { const res = await api.playground({ model: this.form.model, messages: [{ role: 'user', content: this.form.message }] }); const data = res?.data || res; this.response = data?.choices?.[0]?.message?.content || JSON.stringify(data, null, 2) } catch (e) { this.error = e.response?.data?.detail || e.message || String(e) } finally { this.sending = false } }
   }
