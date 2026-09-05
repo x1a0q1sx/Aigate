@@ -170,6 +170,9 @@ async def init_db():
             "DROP TABLE IF EXISTS quota_usage",
             # v8.1: 清理 rate_limits 历史重复行（并发创建导致 (model_id,key_id) 重复，会引发 MultipleResultsFound）
             "DELETE FROM rate_limits WHERE id NOT IN (SELECT MIN(id) FROM rate_limits GROUP BY model_id, key_id)",
+            # v13.1: 清理 model_api_keys 孤儿关联（SQLite 外键默认关闭，删模型/密钥时未级联）
+            "DELETE FROM model_api_keys WHERE model_id NOT IN (SELECT id FROM models)",
+            "DELETE FROM model_api_keys WHERE api_key_id NOT IN (SELECT id FROM api_keys)",
             # v10: 精细化计费 —— 模型缓存价 + 请求日志缓存 token
             "ALTER TABLE models ADD COLUMN cache_read_input_price REAL DEFAULT 0.0",
             "ALTER TABLE models ADD COLUMN cache_write_input_price REAL DEFAULT 0.0",
