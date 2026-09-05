@@ -215,6 +215,17 @@ def _convert_streaming_response(openai_response: StreamingResponse, openai_req: 
                         openai_chunk = json.loads(data_str)
                     except Exception:
                         continue
+                    # ── 终态错误：网关全部候选失败时发 {"error": ...} chunk（不带 choices），
+                    #    必须翻译为 Anthropic error 事件终止，而不是伪装成正常 message_stop ──
+                    if isinstance(openai_chunk, dict) and openai_chunk.get("error") and not openai_chunk.get("choices"):
+                        _err = openai_chunk.get("error")
+                        _msg = _err.get("message", "") if isinstance(_err, dict) else str(_err)
+                        err_data = json.dumps({
+                            "type": "error",
+                            "error": {"type": "api_error", "message": _msg[:500]},
+                        }, ensure_ascii=False)
+                        yield f"event: error\ndata: {err_data}\n\n".encode("utf-8")
+                        return
                     for ev in openai_stream_to_anthropic_events(openai_chunk, state):
                         yield format_anthropic_sse(ev)
         except Exception as e:
@@ -228,8 +239,8 @@ def _convert_streaming_response(openai_response: StreamingResponse, openai_req: 
             }, ensure_ascii=False)
             yield f"event: error\ndata: {err_data}\n\n".encode("utf-8")
 
-    # 先关闭原响应（释放连接）
-    del openai_response
+    # 注：不要再 del openai_response —— anthropic_stream 闭包引用它读取 body_iterator，
+    # del 会让流式迭代抛 NameError（引用释放交给响应结束后 GC 即可）
 
     return StreamingResponse(
         anthropic_stream(),

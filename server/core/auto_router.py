@@ -449,39 +449,6 @@ class AutoRouter:
             )
         print(f"[AUTO] get_best_candidate exhausted all candidates (rate-limited or no key)")
         return RouteResult(success=False, error="All candidates are rate-limited. Try again later.")
-    async def route_with_fallback(
-        self,
-        session: AsyncSession,
-        request: ChatCompletionRequest,
-        conversation_id: Optional[str] = None
-    ) -> RouteResult:
-        """带回退的路由"""
-        tried = []
-        max_retries = self.config.max_fallbacks
-        fallback_count = 0
-        current = await self.get_best_candidate(session, conversation_id)
-        while current.success and fallback_count < max_retries:
-            # 检查是否成功
-            if current.success:
-                return RouteResult(
-                    success=True,
-                    model=current.model,
-                    provider=current.provider,
-                    api_key=current.api_key,
-                    adapter=current.adapter,
-                    fallback_count=fallback_count,
-                    extra_headers=current.extra_headers,
-                )
-            tried.append(current.model.id)
-            if self.health_checker and current.model:
-                self.health_checker.mark_cooling(
-                    current.model.id,
-                    self.config.cooling_period_seconds
-                )
-            fallback_count += 1
-            current = await self.get_best_candidate(session, conversation_id)
-        # 全部失败
-        return current if current else RouteResult(success=False, error="All fallbacks failed")
     def _get_sticky_model(self, conversation_id: str) -> Optional[int]:
         """返回会话粘滞模型，过期则清理。"""
         cached = self._sticky_cache.get(conversation_id)

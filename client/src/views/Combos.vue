@@ -52,7 +52,7 @@
           <select v-model="form.strategy">
             <option value="fallback">fallback 顺序兜底（第一个失败 → 下一个）</option>
             <option value="round_robin">round_robin 轮询（每次请求轮到下一个）</option>
-            <option value="fusion" disabled>fusion 扇出合并（暂未实现）</option>
+            <option value="fusion" disabled>fusion 扇出合并（实验中：当前按 fallback 顺序处理）</option>
           </select>
         </div>
 

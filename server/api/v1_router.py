@@ -232,6 +232,32 @@ def _stream_content_is_empty(buf) -> bool:
     return total == 0
 
 
+def _chunk_has_substance(ck) -> bool:
+    """chunk 是否携带实质输出：正文 / 思考内容 / 工具调用任一非空。
+
+    role-only、usage-only、finish-only 等 chunk 均为元数据。
+    用于流式回退的『锁定』语义：实质 chunk 一旦出现即锁定候选，
+    此前只缓冲元数据（客户端无感），流结束仍无实质 → 丢弃缓冲无感回退。
+    """
+    if not isinstance(ck, dict):
+        return False
+    for ch in (ck.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        d = ch.get("delta") or {}
+        if isinstance(d.get("content"), str) and d.get("content"):
+            return True
+        rc = d.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            return True
+        if d.get("tool_calls"):
+            return True
+        m = ch.get("message")
+        if isinstance(m, dict) and (m.get("content") or m.get("tool_calls")):
+            return True
+    return False
+
+
 def _stream_usage_dict(chunk) -> dict:
     """Return usage only when an upstream chunk provides the OpenAI object shape."""
     if not isinstance(chunk, dict):
@@ -740,6 +766,15 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             if not _prov or not _mdl:
                 attempt_errors.append({"target": full_id, "error": "provider or model not found"})
                 continue
+            # free_tier/oauth/atomcode 候选不查 api_keys（调用点经 credential_resolver dispatch）；
+            # 此前在此处 pick_key 失败会把它们整条跳过，导致这类候选永远无法在 combo/auto 中被调用
+            if getattr(_prov, "credential_type", "api_key") in ("free_tier", "oauth") or getattr(_prov, "api_type", "") == "atomcode":
+                from server.core.model_catalog import create_adapter_for_provider as _caf
+                combo_candidates.append(RouteResult(
+                    success=True, model=_mdl, provider=_prov,
+                    api_key="", adapter=_caf(_prov.api_type), fallback_count=0,
+                ))
+                continue
             from server.core.key_rotator import get_key_rotator as _gkr
             _picked = await _gkr().pick_key_for_model(db, _mdl)
             if not _picked or _picked[0] is None:
@@ -795,12 +830,21 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         try:
             _attempt_started = time.time()
             _diag(conversation_id, "upstream_start", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
-            result = await candidate.adapter.chat_completion(
-                upstream_request,
-                candidate.api_key,
-                candidate.provider.base_url,
-                extra_headers,
-            )
+            # free_tier/oauth/atomcode 候选走统一凭证解析（free executor / OAuth token / daemon 通道）
+            if (getattr(candidate.provider, "credential_type", "api_key") in ("free_tier", "oauth")
+                    or getattr(candidate.provider, "api_type", "") == "atomcode"):
+                from server.core.credential_resolver import resolve_credential_async, call_via
+                _rc = await resolve_credential_async(candidate.provider, candidate.model, db)
+                if not _rc.ok:
+                    raise RuntimeError(_rc.error)
+                result = await call_via(_rc, upstream_request, candidate.provider, candidate.model)
+            else:
+                result = await candidate.adapter.chat_completion(
+                    upstream_request,
+                    candidate.api_key,
+                    candidate.provider.base_url,
+                    extra_headers,
+                )
             # 校验返回内容有效性（含 tool_calls）
             if isinstance(result, dict):
                 choices = result.get("choices", [])
@@ -1196,7 +1240,8 @@ async def chat_completions(
                     cdb = _CS()
                     tried_sids = set()
                     stream_errs = []
-                    max_r = max(1, ar.config.max_fallbacks, len(combo_full_ids))
+                    # max_fallbacks 契约与 auto 对齐：总尝试 = min(候选数, max_fallbacks + 1)
+                    max_r = min(len(combo_full_ids), max(1, ar.config.max_fallbacks + 1))
                     yield b": keepalive\n\n"
                     try:
                         for st_attempt in range(max_r):
@@ -1225,15 +1270,14 @@ async def chat_completions(
                                 stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{est_req_tokens} tokens): {full_id}"})
                                 _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="context window too small")
                                 continue
-                            from server.core.key_rotator import get_key_rotator as _gkr
-                            _picked = await _gkr().pick_key_for_model(cdb, _mdl)
-                            if not _picked or _picked[0] is None:
-                                stream_errs.append({"attempt": st_attempt, "error": f"no key for {_prov.name}"})
-                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="no active API key")
+                            # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
+                            # （此前 free_tier/oauth 候选被无条件跳过，可能耗尽回退）
+                            from server.core.credential_resolver import resolve_credential_async, stream_via
+                            _rc = await resolve_credential_async(_prov, _mdl, cdb)
+                            if not _rc.ok:
+                                stream_errs.append({"attempt": st_attempt, "error": _rc.error})
+                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason=_rc.error)
                                 continue
-                            _ak = _picked[1]
-                            from server.core.model_catalog import create_adapter_for_provider as _caf
-                            _adapter = _caf(_prov.api_type)
                             # 跳过处于冷却（被惩罚）中的 target，避免反复打到坏模型
                             if ar.health_checker and ar.health_checker.is_cooling(_mdl.id):
                                 stream_errs.append({"attempt": st_attempt, "error": f"skipped (cooling) {full_id}"})
@@ -1256,7 +1300,17 @@ async def chat_completions(
                                 _fbmov = getattr(_mdl, "request_overrides", None) or {}
                                 if isinstance(_fbmov, dict) and _fbmov.get("headers"):
                                     _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
-                                async for ck in _adapter.stream_chat_completion(up_req, _ak, _prov.base_url, _fb_eh):
+                                # free_tier 走专用 executor（FORCE_PROXY/裸 model_id 由 resolver 处理）
+                                if _rc.kind == "free_tier":
+                                    gen = stream_via(_rc, up_req, _prov, _mdl)
+                                else:
+                                    gen = _rc.adapter.stream_chat_completion(up_req, _rc.api_key, _prov.base_url, _fb_eh)
+                                # ── 实质 chunk 锁定语义：实质（正文/思考/工具调用）出现前只缓冲元数据；
+                                #    出现即 flush 锁定候选；流结束仍无实质 → 丢弃缓冲无感回退，
+                                #    彻底避免"候选A的 reasoning + 候选B的正文"拼接 ──
+                                _prebuf = []
+                                _committed = False
+                                async for ck in gen:
                                     # 首字延迟：首个 chunk 距请求开始的时间
                                     if _cb_ttft_ms is None:
                                         _cb_ttft_ms = int((time.time() - _send_time) * 1000)
@@ -1265,16 +1319,24 @@ async def chat_completions(
                                         raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
                                     _csc += 1
                                     _cbuf.append(ck)
-                                    u = ck.get("usage", {}) if isinstance(ck, dict) else {}
+                                    u = _stream_usage_dict(ck) if isinstance(ck, dict) else {}
                                     if u:
                                         _cu = u
-                                    yield _format_sse_chunk(ck, mid_full)
+                                    if not _committed:
+                                        if _chunk_has_substance(ck):
+                                            _committed = True
+                                            for _pb in _prebuf:
+                                                yield _format_sse_chunk(_pb, mid_full)
+                                            _prebuf.clear()
+                                            yield _format_sse_chunk(ck, mid_full)
+                                        else:
+                                            _prebuf.append(ck)
+                                    else:
+                                        yield _format_sse_chunk(ck, mid_full)
                                 _diag(conversation_id, "upstream_stream_done", _diag_start, attempt=st_attempt, provider=_prov.name, model=_mdl.model_id, chunks=_csc)
-                                # ── 空输出判定（combo 专用）：HTTP 成功但零内容 → 视为候选失败，继续 fallback ──
-                                # 只要整个流累计的 delta.content 全为空（无论上游发了多少空 chunk），
-                                # 就判为空输出。空 content 的 chunk 客户端渲染不出任何东西，回退对客户端无感、安全。
-                                if _stream_content_is_empty(_cbuf):
-                                    err_s = "empty_stream_output: 上游返回成功但无内容"
+                                # ── 空输出判定：已锁定（外发过实质内容）→ 成功；否则缓冲未外发，无感回退 ──
+                                if not _committed:
+                                    err_s = "empty_stream_output: 上游返回成功但无实质内容"
                                     stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
                                     _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                                     if ar.health_checker:
@@ -1316,6 +1378,15 @@ async def chat_completions(
                                     ar.health_checker.mark_failure(_mdl.id)
                                     ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
                                 raw_err = _extract_error_body(se) or err_s
+                                # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端；
+                                # 实质内容前失败（仅缓冲元数据）→ 丢弃缓冲，回退下一候选
+                                if _committed:
+                                    yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
+                                    yield b"data: [DONE]\n\n"
+                                    await _write_stream_log(conversation_id, request, raw_request, "error",
+                                        _prov.name, _mdl.model_id, err_s, st_attempt, stream_errs,
+                                        stream_body=raw_err, diag_start_ts=_diag_start)
+                                    return
                                 await _write_stream_log(conversation_id, request, raw_request, "error",
                                     _prov.name, _mdl.model_id, err_s, st_attempt, None,
                                     stream_body=raw_err, diag_start_ts=_diag_start)
@@ -1341,10 +1412,11 @@ async def chat_completions(
 
                 return StreamingResponse(_combo_cascade_stream(), media_type="text/event-stream")
             # ─── 非流式 combo：循环尝试（含冷却），不再走 is_auto 级联路径 ───
-            from server.core.model_catalog import create_adapter_for_provider as _cafp
             combo_attempts = []
             last_error = None
-            for t_idx, t in enumerate(ordered_targets):
+            # max_fallbacks 契约与 auto/流式对齐：总尝试 = min(候选数, max_fallbacks + 1)
+            _attempt_limit = min(len(ordered_targets), max(1, ar.config.max_fallbacks + 1))
+            for t_idx, t in enumerate(ordered_targets[:_attempt_limit]):
                 full_id = t["full_id"]
                 prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
                 # 查找 provider + model
@@ -1368,22 +1440,21 @@ async def chat_completions(
                     combo_attempts.append({"target": full_id, "error": "skipped (cooling)"})
                     _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="model is cooling down")
                     continue
-                # 取 key（v3.5：按模型归属集合选）
-                try:
-                    from server.core.key_rotator import get_key_rotator
-                    _picked = await get_key_rotator().pick_key_for_model(db, model)
-                except Exception:
-                    _picked = None
-                if not _picked or _picked[0] is None:
-                    combo_attempts.append({"target": full_id, "error": f"no active key for {provider.name}"})
-                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="no active API key")
+                # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
+                from server.core.credential_resolver import resolve_credential_async, call_via
+                _rc = await resolve_credential_async(provider, model, db)
+                if not _rc.ok:
+                    combo_attempts.append({"target": full_id, "error": _rc.error})
+                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason=_rc.error)
                     continue
-                api_key = _picked[1]
-                adapter = _cafp(provider.api_type)
+                api_key = _rc.api_key
+                adapter = _rc.adapter
                 upstream_req = _without_unsupported_reasoning(
                     request.model_copy(update={"model": model.model_id}), model
                 )
                 extra_hdr = _merge_oauth_headers(provider, provider.headers if provider.headers else None)
+                if _rc.extra_headers:
+                    extra_hdr = {**(extra_hdr or {}), **_rc.extra_headers}
                 model_overrides = getattr(model, "request_overrides", None) or {}
                 if isinstance(model_overrides, dict):
                     ov_headers = model_overrides.get("headers") or {}
@@ -1401,9 +1472,12 @@ async def chat_completions(
                 try:
                     _combo_send_time = time.time()
                     _decision_select(conversation_id, provider=provider.name, model=model.model_id, model_pk=model.id, reason="next combo target")
-                    result = await adapter.chat_completion(
-                        upstream_req, api_key, provider.base_url, extra_hdr
-                    )
+                    if _rc.kind == "free_tier":
+                        result = await call_via(_rc, upstream_req, provider, model)
+                    else:
+                        result = await adapter.chat_completion(
+                            upstream_req, api_key, provider.base_url, extra_hdr
+                        )
                     if isinstance(result, dict):
                         result["model"] = f"{provider.name}/{model.model_id}"
                     # ── 空输出判定：HTTP 成功但无 content/无 tool_calls/无 completion token
@@ -1687,16 +1761,15 @@ async def chat_completions(
                         if not _prov or not _mdl:
                             stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
                             continue
-                        from server.core.model_catalog import create_adapter_for_provider as _caf
-                        from server.core.key_rotator import get_key_rotator as _gkr
-                        _picked = await _gkr().pick_key_for_model(cascade_db, _mdl)
-                        if not _picked or _picked[0] is None:
-                            stream_errs.append({"attempt": st_attempt, "error": f"no key for {_prov.name}"})
+                        # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
+                        from server.core.credential_resolver import resolve_credential_async, stream_via
+                        _rc = await resolve_credential_async(_prov, _mdl, cascade_db)
+                        if not _rc.ok:
+                            stream_errs.append({"attempt": st_attempt, "error": _rc.error})
                             continue
-                        _ak = _picked[1]
                         from server.core.auto_router import RouteResult as _RR
-                        cand = _RR(success=True, model=_mdl, provider=_prov, api_key=_ak,
-                                   adapter=_caf(_prov.api_type), fallback_count=st_attempt)
+                        cand = _RR(success=True, model=_mdl, provider=_prov, api_key=_rc.api_key,
+                                   adapter=_rc.adapter, extra_headers=_rc.extra_headers, fallback_count=st_attempt)
                     else:
                         cand = await ar.get_best_candidate(cascade_db, conversation_id, exclude_model_ids=tried_sids)
                     _diag(conversation_id, "auto_stream_candidate_done", _diag_start, attempt=st_attempt, success=cand.success if cand else None)
@@ -1743,15 +1816,28 @@ async def chat_completions(
                         _cmov = getattr(cand.model, "request_overrides", None) or {}
                         if isinstance(_cmov, dict) and _cmov.get("headers"):
                             _cascade_eh = {**(_cascade_eh or {}), **_cmov["headers"]}
-                        gen = cand.adapter.stream_chat_completion(
-                            up_req, cand.api_key, cand_provider_base_url, _cascade_eh
-                        )
+                        # free_tier/oauth/atomcode 走统一凭证解析通道（free executor / OAuth token / daemon）
+                        if (getattr(cand.provider, "credential_type", "api_key") in ("free_tier", "oauth")
+                                or getattr(cand.provider, "api_type", "") == "atomcode"):
+                            from server.core.credential_resolver import resolve_credential_async, stream_via
+                            _rc = await resolve_credential_async(cand.provider, cand.model, cascade_db)
+                            if not _rc.ok:
+                                raise RuntimeError(_rc.error)
+                            gen = stream_via(_rc, up_req, cand.provider, cand.model)
+                        else:
+                            gen = cand.adapter.stream_chat_completion(
+                                up_req, cand.api_key, cand_provider_base_url, _cascade_eh
+                            )
                         stream_buf = []
                         last_usage = {}
                         stream_has_error = False
                         stream_err_detail = ""
                         _cascade_ttft_ms = None
                         _candidate_ttft_ms = None
+                        # 实质 chunk 锁定语义（与 combo 流式一致）：实质（正文/思考/工具调用）出现前
+                        # 只缓冲元数据；出现即 flush 锁定候选；结束仍无实质 → 丢弃缓冲无感回退
+                        _prebuf = []
+                        _committed = False
                         candidate_first_chunk_timeout = min(first_chunk_timeout, remaining_first_response)
                         async for ck in _stream_with_first_chunk_timeout(gen, candidate_first_chunk_timeout):
                             # 首字延迟：首个 chunk 距请求开始的时间
@@ -1763,17 +1849,25 @@ async def chat_completions(
                                 stream_has_error = True
                                 stream_err_detail = str(ck.get("error", "unknown"))[:200]
                                 break
-                            yield _format_sse_chunk(ck, mid_full)
                             stream_buf.append(ck)
                             u = _stream_usage_dict(ck)
                             if u:
                                 last_usage = u
+                            if not _committed:
+                                if _chunk_has_substance(ck):
+                                    _committed = True
+                                    for _pb in _prebuf:
+                                        yield _format_sse_chunk(_pb, mid_full)
+                                    _prebuf.clear()
+                                    yield _format_sse_chunk(ck, mid_full)
+                                else:
+                                    _prebuf.append(ck)
+                            else:
+                                yield _format_sse_chunk(ck, mid_full)
                         if stream_has_error:
                             raise RuntimeError(f"upstream_stream_error: {stream_err_detail}")
-                        # ── 空输出判定（combo 专用）：HTTP 成功但零内容 → 视为候选失败，继续 fallback ──
-                        # 只要整个流累计的 delta.content 全为空（无论上游发了多少空 chunk），就判为空输出。
-                        # 空 content 的 chunk 客户端渲染不出任何东西，回退对客户端无感、安全。
-                        if _stream_content_is_empty(stream_buf):
+                        # ── 空输出判定：已锁定 → 成功；否则缓冲未外发，无感回退 ──
+                        if not _committed:
                             err_s = "empty_stream_output: 上游返回成功但无内容"
                             stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
                             _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
@@ -1823,9 +1917,9 @@ async def chat_completions(
                         cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
                         err_s_annotated = f"{err_s} | cooldown={cd_actual}s fail#{fc}"
                         raw_err = _extract_error_body(se) or err_s
-                        # 只有已经向客户端吐出过真实内容（正文/tool_calls）的中途失败才应截断；
-                        # 如果错误发生在任何实质内容之前（典型：上游内容校验失败），应回退下一候选
-                        if not _stream_content_is_empty(stream_buf):
+                        # 只有已经向客户端吐出过实质内容（正文/思考/tool_calls）的中途失败才应截断；
+                        # 错误发生在实质内容之前（仅缓冲了元数据）→ 丢弃缓冲，回退下一候选
+                        if _committed:
                             yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
                             yield b"data: [DONE]\n\n"
                             await _write_stream_log(conversation_id, request, raw_request, "error",

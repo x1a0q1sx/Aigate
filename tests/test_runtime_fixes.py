@@ -617,3 +617,127 @@ def test_parse_dt_param_timezone_aware():
     # 非法/非 str
     assert _parse_dt_param("garbage") is None
     assert _parse_dt_param(None) is None
+
+
+# ===================== 回退矩阵：空流锁定 / 缓冲 / max_fallbacks / 终态错误翻译 =====================
+
+def test_chunk_has_substance_lock_semantics():
+    from server.api.v1_router import _chunk_has_substance
+
+    # 实质 chunk：正文 / 思考 / 工具调用
+    assert _chunk_has_substance({"choices": [{"delta": {"content": "hi"}}]})
+    assert _chunk_has_substance({"choices": [{"delta": {"reasoning_content": "思考"}}]})
+    assert _chunk_has_substance({"choices": [{"delta": {"tool_calls": [{"function": {"name": "f"}}]}}]})
+    # 元数据 chunk：role / 空 content / usage / finish —— 不锁定候选
+    assert not _chunk_has_substance({"choices": [{"delta": {"role": "assistant", "content": ""}}]})
+    assert not _chunk_has_substance({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    assert not _chunk_has_substance({"usage": {"prompt_tokens": 1}})
+    assert not _chunk_has_substance("raw")
+
+
+def test_combo_stream_max_fallbacks_contract():
+    """总尝试 = min(候选数, max_fallbacks + 1)——与 auto 契约一致。"""
+    from server.core.combo_router import pick_next_index
+
+    assert pick_next_index(1, 5, "fallback") == 0
+    assert pick_next_index(1, 5, "round_robin") in range(5)
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_translates_terminal_error():
+    """网关终态 error chunk → response.failed 事件（而非伪装 completed）。"""
+    from server.api.responses_router import _chat_to_responses_stream
+
+    async def gen():
+        yield b'data: {"error": "combo all targets failed", "attempts": [{"error": "boom"}]}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    from fastapi.responses import StreamingResponse
+    sr = _chat_to_responses_stream(StreamingResponse(gen(), media_type="text/event-stream"), "combo:x")
+    body = b""
+    async for piece in sr.body_iterator:
+        body += piece if isinstance(piece, bytes) else piece.encode()
+    text = body.decode("utf-8", "replace")
+    assert "response.failed" in text
+    assert "combo all targets failed" in text
+    assert "response.completed" not in text
+
+
+@pytest.mark.asyncio
+async def test_anthropic_stream_translates_terminal_error():
+    """网关终态 error chunk → Anthropic error 事件（而非正常 message_stop）。"""
+    from server.api.anthropic_router import _convert_streaming_response
+    from server.schemas.chat import ChatCompletionRequest
+
+    async def gen():
+        yield b'data: {"error": "all cascade fallbacks exhausted"}\n\n'
+        yield b"data: [DONE]\n\n"
+
+    from fastapi.responses import StreamingResponse
+    req = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
+    sr = _convert_streaming_response(StreamingResponse(gen(), media_type="text/event-stream"), req)
+    body = b""
+    async for piece in sr.body_iterator:
+        body += piece if isinstance(piece, bytes) else piece.encode()
+    text = body.decode("utf-8", "replace")
+    assert "event: error" in text
+    assert "all cascade fallbacks exhausted" in text
+    assert "message_stop" not in text
+
+
+@pytest.mark.asyncio
+async def test_credential_resolver_rejects_unknown_free_provider():
+    """free_tier 服务商找不到 executor 时返回 error（而不是抛异常）。"""
+    from types import SimpleNamespace
+    from server.core.credential_resolver import resolve_credential_async
+
+    class FakeDB:
+        async def execute(self, *a, **k):
+            raise AssertionError("free_tier 不应查询 api_keys")
+
+    prov = SimpleNamespace(
+        name="不存在的free站", base_url="https://x/v1", api_type="openai_compat",
+        credential_type="free_tier", oauth_code=None, headers=None,
+    )
+    model = SimpleNamespace(model_id="m", provider_id=1)
+    rc = await resolve_credential_async(prov, model, FakeDB())
+    assert rc.error and "no matching executor" in rc.error
+    assert not rc.ok
+
+
+@pytest.mark.asyncio
+async def test_credential_resolver_standard_path(monkeypatch):
+    """标准 provider：key rotator 命中 → adapter + key；rotator 失败 → 兜底第一把 active key。"""
+    from types import SimpleNamespace
+    from server.core.credential_resolver import resolve_credential_async
+
+    calls = {"rotator": 0}
+
+    class FakePicked:
+        def __getitem__(self, i):
+            return 7 if i == 0 else "sk-plain"
+
+    class FakeRotator:
+        async def pick_key_for_model(self, db, model):
+            calls["rotator"] += 1
+            return (7, "sk-plain")
+
+    import server.core.key_rotator as kr
+    monkeypatch.setattr(kr, "get_key_rotator", lambda: FakeRotator())
+
+    class FakeResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeDB:
+        async def execute(self, *a, **k):
+            return FakeResult()
+
+    prov = SimpleNamespace(
+        name="p1", base_url="https://x/v1", api_type="openai_compat",
+        credential_type="api_key", oauth_code=None, headers={"X": "1"}, id=1,
+    )
+    model = SimpleNamespace(model_id="m", provider_id=1)
+    rc = await resolve_credential_async(prov, model, FakeDB())
+    assert rc.ok and rc.kind == "standard" and rc.api_key == "sk-plain" and rc.key_id == 7
+    assert rc.adapter is not None

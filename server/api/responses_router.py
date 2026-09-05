@@ -356,6 +356,23 @@ def _chat_to_responses_stream(openai_stream: StreamingResponse, model: str) -> S
                         chunk = json.loads(data_str)
                     except Exception:
                         continue
+                    # ── 终态错误：网关全部候选失败时发 {"error": ...} chunk（不带 choices），
+                    #    必须翻译为 response.failed，而不是继续走正常 completed 流程伪装成功 ──
+                    if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                        _err = chunk.get("error")
+                        _msg = _err.get("message", "") if isinstance(_err, dict) else str(_err)
+                        yield _sse({
+                            "type": "response.failed",
+                            "response": {
+                                "id": resp_id,
+                                "object": "response",
+                                "created_at": created,
+                                "status": "failed",
+                                "error": {"code": "upstream_error", "message": _msg[:500]},
+                                "output": [],
+                            },
+                        })
+                        return
                     # usage
                     u = chunk.get("usage") or {}
                     if u:

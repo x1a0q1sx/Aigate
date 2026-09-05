@@ -1603,7 +1603,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     """Playground 测试聊天（含请求日志写入）"""
     import time, uuid, json as _json_mod
     from server.schemas.chat import ChatCompletionRequest, ChatMessage
-    from server.api.v1_router import get_auto_router, _auto_route_with_runtime_fallback, _format_sse_chunk, _auto_request_with_cascade_fallback, _proxy_log_fields
+    from server.api.v1_router import get_auto_router, _format_sse_chunk, _auto_request_with_cascade_fallback, _proxy_log_fields
     from server.models.request_log import RequestLog as _RL
     from server.core.request_logger import write_log  # v3.6 消息级去重写入
     ar = get_auto_router()
@@ -1755,22 +1755,18 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 success=True, model=model, provider=provider,
                 api_key=api_key, adapter=adapter, fallback_count=0
             )
-    elif data.stream:
-        route_result, _ = await _auto_route_with_runtime_fallback(ar, db, request, conversation_id)
-        if not route_result.success:
-            # 写失败日志
-            try:
-                from server.db import AsyncSessionLocal as _LogSession
-                async with _LogSession() as _ldb:
-                    await write_log(_ldb,
-                        conversation_id=conversation_id, requested_model=request.model,
-                        status="error", error_type="playground_routing_error",
-                        error_msg=str(route_result.error)[:500],
-                        user_ip=raw_request.client.host if raw_request.client else None,
-                        request_body=_json_mod.dumps(request.model_dump(), ensure_ascii=False),
-                    )
-            except Exception: pass
-            return JSONResponse(status_code=503, content={"error": route_result.error})
+    elif data.stream and is_auto:
+        # 统一 cascade：内部转调 /v1 核心流式（候选回退/首块超时/实质锁定/日志全量一致）。
+        # 此前 probe 成功即锁定候选，真实流式失败不再回退，与 /v1 行为不一致。
+        from server.api.v1_router import chat_completions as _v1_chat
+        from server.config import get_config as _get_cfg
+        _gate_key = _get_cfg().security.aigate_api_key or ""
+        if _gate_key and not raw_request.headers.get("authorization"):
+            # 管理面板请求无 aigate Bearer —— 注入服务端 key 以通过 v1 鉴权
+            _hdrs = [(k, v) for k, v in raw_request.scope.get("headers", []) if k != b"authorization"]
+            _hdrs.append((b"authorization", f"Bearer {_gate_key}".encode()))
+            raw_request.scope["headers"] = _hdrs
+        return await _v1_chat(request, raw_request, db)
     else:
         route_result, response, _attempt_errors = await _auto_request_with_cascade_fallback(ar, db, request, conversation_id)
         if not route_result.success:
