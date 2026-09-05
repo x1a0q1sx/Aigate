@@ -43,7 +43,7 @@
 ## P1 — 数据质量与性能
 
 - [x] P1-4 usage 统一归一化（✅ 2026-09 完成，commit 5be9499）：NormalizedUsage 三方言字段驱动提取，Anthropic 缓存口径并入 prompt，v1 五处提取链 + anthropic 适配器统一
-- [ ] P1-5 上下文估算校准：按模型历史 usage 估算系数 + 上游"内容超限"错误学习（记录 provider 实际可用窗口）
+- [x] P1-5 上下文估算校准（✅ 2026-09 完成，commit 62b8748）：est_prompt_tokens 落日志、get_estimate_factor 动态系数（TTL 缓存+钳制）、observed_context_limit 超限学习收紧预检窗口、4 处预检全部生效
 - [ ] P1-6 元数据来源分层：price/context/capability 各自 source 字段（manual > provider > public > default）
 - [ ] P1-7 评分查询聚合化：RankingService 批量 GROUP BY + 30s TTL 内存缓存
 - [ ] P1-8 日志脱敏（Authorization/x-api-key/api_key 写入前打码）+ 归档索引 + 归档状态展示
