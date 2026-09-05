@@ -30,9 +30,9 @@
 - [x] A 删除死代码 auto_router.route_with_fallback（不可达且无调用者）
 - 验收：新增回退测试 ≥6 项全绿；首候选失败→次候选成功；reasoning-only 不再拼接跨候选正文
 
-### P0-2 模型刷新 / Auto 候选 N+1 批量化
-- [ ] get_auto_candidates 逐模型查 ApiKey → 一次预加载映射（model_catalog.py:125-153）
-- [ ] refresh_models_from_provider 循环内 select/commit → 批量 upsert 单事务（model_catalog.py:386-510）
+### P0-2 模型刷新 / Auto 候选 N+1 批量化（✅ 2026-09 完成，commit 10e58be/aa69660）
+- [x] get_auto_candidates 逐模型查 ApiKey → 一次预加载映射（model_catalog.py:125-153）
+- [x] refresh_models_from_provider 循环内 select/commit → 批量 upsert 单事务（model_catalog.py:386-510）
 - 验收：1782 模型下刷新耗时下降 ≥50%，SQL 数量从 O(模型×密钥) 降为 O(1) 组查询
 
 ### P0-3 SQLite 写入队列化
