@@ -35,9 +35,9 @@
 - [x] refresh_models_from_provider 循环内 select/commit → 批量 upsert 单事务（model_catalog.py:386-510）
 - 验收：1782 模型下刷新耗时下降 ≥50%，SQL 数量从 O(模型×密钥) 降为 O(1) 组查询
 
-### P0-3 SQLite 写入队列化
-- [ ] 请求日志改 asyncio.Queue 后台批量 commit（50 条/500ms 阈值），请求路径不再等日志落库
-- [ ] WAL checkpoint 定时任务；写入失败重试与丢弃计数
+### P0-3 SQLite 写入队列化（✅ 2026-09 完成，commit 280489d；压测 20 并发 0 locked）
+- [x] 请求日志改 asyncio.Queue 后台批量 commit（50 条/500ms 阈值），请求路径不再等日志落库
+- [x] WAL checkpoint 定时任务；写入失败重试与丢弃计数
 - 验收：压测 50 并发下无 database is locked；请求 P95 不受日志写入影响
 
 ## P1 — 数据质量与性能
