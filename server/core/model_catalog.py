@@ -135,6 +135,16 @@ class ModelCatalog:
         )
         result = await session.execute(query)
         rows = result.all()
+        # 有 active key 的 provider 一次查清（此前逐模型查询，模型多时 O(N) 次 SQL）
+        has_key_providers = {
+            pid for (pid,) in (
+                await session.execute(
+                    select(ApiKey.provider_id)
+                    .where(ApiKey.is_active == True)  # noqa: E712
+                    .distinct()
+                )
+            ).all()
+        }
         valid = []
         for model, provider in rows:
             cred = getattr(provider, "credential_type", "api_key")
@@ -142,13 +152,7 @@ class ModelCatalog:
                 # 免费层 / OAuth 供应商无需 ApiKey 表中的密钥
                 valid.append(model)
                 continue
-            key_result = await session.execute(
-                select(ApiKey).where(
-                    ApiKey.provider_id == model.provider_id,
-                    ApiKey.is_active == True
-                )
-            )
-            if key_result.first() is not None:
+            if model.provider_id in has_key_providers:
                 valid.append(model)
         return valid
     async def get_by_id(self, session: AsyncSession, model_id: int) -> Optional[Model]:
@@ -364,6 +368,12 @@ class ModelCatalog:
         metric_updated = 0
         added_models = []
         removed_models = []
+        # 批量预加载该 provider 现有模型（此前每个 model_info 一次 select，N+1）
+        existing_models_map = {
+            m.model_id: m for m in (await session.execute(
+                select(Model).where(Model.provider_id == provider.id)
+            )).scalars().all()
+        }
         for model_info in models:
             # 价格来源只有两个：服务商自己的 /api/pricing（公益站自定义价）> 内置表；
             # 拿不到就留 0（未知），由用户在管理面板手动填，不用第三方"标准价"猜测
@@ -383,13 +393,7 @@ class ModelCatalog:
             # 用户可在管理面板手动设置价格
             # 免费模型不再自动开启 auto（用户反馈不好使），默认 auto_enabled=False，需手动开启
             auto_enabled = False
-            existing = await session.execute(
-                select(Model).where(
-                    Model.provider_id == provider.id,
-                    Model.model_id == model_info.model_id
-                )
-            )
-            existing_model = existing.scalar_one_or_none()
+            existing_model = existing_models_map.get(model_info.model_id)
             if existing_model:
                 existing_model.display_name = model_info.display_name or existing_model.display_name
                 # 手动维护的价格（pricing_source == "manual"）不被刷新覆盖
@@ -462,52 +466,58 @@ class ModelCatalog:
                     "model_id": model_info.model_id,
                     "display_name": model_info.display_name or model_info.model_id,
                 })
-        # v3.5：写模型 ↔ key 归属（model_api_keys）
+                # 新增模型登记进预加载映射：后续同名校走"更新"分支；关联段 flush 前暂无 pk，
+                # 由下方关联段的批量查询统一获取
+                existing_models_map[model_info.model_id] = new_model
+        # v3.5：写模型 ↔ key 归属（model_api_keys）——批量预加载，替代逐 mid 两次查询
         if not atomcode_no_key and key_models:
             now = datetime.utcnow()
+            # 一次取 provider 全部模型（含本批新增，flush 后有 pk）
+            await session.flush()
+            prov_models = (await session.execute(
+                select(Model).where(Model.provider_id == provider.id)
+            )).scalars().all()
+            prov_mid_to_pk = {m.model_id: m.id for m in prov_models}
+            existing_rel_set = {
+                (r[0], r[1]) for r in (await session.execute(
+                    select(ModelApiKey.model_id, ModelApiKey.api_key_id)
+                    .join(Model, ModelApiKey.model_id == Model.id)
+                    .where(Model.provider_id == provider.id)
+                )).all()
+            }
             for api_key_id, mids in key_models.items():
                 for mid in mids:
-                    mrow = (await session.execute(
-                        select(Model).where(Model.provider_id == provider.id, Model.model_id == mid)
-                    )).scalar_one_or_none()
-                    if not mrow:
+                    mpk = prov_mid_to_pk.get(mid)
+                    if mpk is None:
                         continue
-                    rel = (await session.execute(
-                        select(ModelApiKey).where(
-                            ModelApiKey.model_id == mrow.id,
-                            ModelApiKey.api_key_id == api_key_id
+                    if (mpk, api_key_id) in existing_rel_set:
+                        await session.execute(
+                            update(ModelApiKey)
+                            .where(ModelApiKey.model_id == mpk, ModelApiKey.api_key_id == api_key_id)
+                            .values(last_seen_at=now)
                         )
-                    )).scalar_one_or_none()
-                    if rel:
-                        rel.last_seen_at = now
                     else:
-                        session.add(ModelApiKey(model_id=mrow.id, api_key_id=api_key_id, last_seen_at=now))
+                        session.add(ModelApiKey(model_id=mpk, api_key_id=api_key_id, last_seen_at=now))
+                        existing_rel_set.add((mpk, api_key_id))
             # 初始兜底：对 provider 下尚无任何归属记录的 model，归属 provider 全部 active key
             # （老数据 / 手动模型在首次 refresh 后即可轮询，无需等各 key 实际返回）
-            existing_rel = (await session.execute(
-                select(ModelApiKey.model_id)
-                .join(Model, ModelApiKey.model_id == Model.id)
-                .where(Model.provider_id == provider.id)
-            )).scalars().all()
-            existing_rel_set = set(existing_rel)
             all_keys_ids = list(key_models.keys())
             if all_keys_ids:
-                all_models = (await session.execute(
-                    select(Model).where(Model.provider_id == provider.id)
-                )).scalars().all()
-                for m in all_models:
-                    if m.id not in existing_rel_set:
+                touched_models = {mpk for mpk, _ in existing_rel_set}
+                for m in prov_models:
+                    if m.id not in touched_models:
                         for akid in all_keys_ids:
                             session.add(ModelApiKey(model_id=m.id, api_key_id=akid, last_seen_at=now))
-            # 过期清理：last_seen_at 早于阈值（7 天）的归属删除
+                            existing_rel_set.add((m.id, akid))
+            # 过期清理：last_seen_at 早于阈值（7 天）的归属批量删除
             expiry = now - timedelta(days=7)
-            stale = (await session.execute(
-                select(ModelApiKey)
+            stale_ids = (await session.execute(
+                select(ModelApiKey.id)
                 .join(Model, ModelApiKey.model_id == Model.id)
                 .where(Model.provider_id == provider.id, ModelApiKey.last_seen_at < expiry)
             )).scalars().all()
-            for r in stale:
-                await session.delete(r)
+            if stale_ids:
+                await session.execute(delete(ModelApiKey).where(ModelApiKey.id.in_(stale_ids)))
 
         # 清理已从上游下架、但本地仍存在的自动同步模型（失效模型）
         # 安全约束：仅在 list_models 成功(list_ok)且返回非空(models)时才清理，
