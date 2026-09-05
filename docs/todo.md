@@ -20,14 +20,14 @@
 
 ## P0 — 稳定性与正确性
 
-### P0-1 Fallback 审计修复（本轮，findings §F1–F8）
-- [ ] D+E 统一凭证解析器：free_tier/oauth/atomcode/标准密钥一个入口，combo 与 auto cascade 共用
-- [ ] B 流式空输出语义：实质 chunk（content/reasoning/tool_calls）出现前缓冲不外发，reasoning 算实质并锁定候选；纯元数据结束才无感回退
-- [ ] C max_fallbacks 契约统一：combo 流式/非流式对齐 auto（总尝试 = min(候选数, max_fallbacks+1)）
-- [ ] F Playground 流式复用统一 cascade（probe 成功 ≠ 真实请求成功）
-- [ ] G 终态错误协议：Responses/Anthropic SSE 包装检测 chunk 顶层 error，不再伪装成正常空响应
-- [ ] H Fusion 策略明确禁用（501 + 前端标注"实验中"），不再伪造空响应
-- [ ] A 删除死代码 auto_router.route_with_fallback（不可达且无调用者）
+### P0-1 Fallback 审计修复（✅ 2026-09 完成，commit 2fc6a31，findings §F1–F8）
+- [x] D+E 统一凭证解析器：free_tier/oauth/atomcode/标准密钥一个入口，combo 与 auto cascade 共用
+- [x] B 流式空输出语义：实质 chunk（content/reasoning/tool_calls）出现前缓冲不外发，reasoning 算实质并锁定候选；纯元数据结束才无感回退
+- [x] C max_fallbacks 契约统一：combo 流式/非流式对齐 auto（总尝试 = min(候选数, max_fallbacks+1)）
+- [x] F Playground 流式复用统一 cascade（probe 成功 ≠ 真实请求成功）
+- [x] G 终态错误协议：Responses/Anthropic SSE 包装检测 chunk 顶层 error，不再伪装成正常空响应
+- [x] H Fusion 策略明确禁用（501 + 前端标注"实验中"），不再伪造空响应
+- [x] A 删除死代码 auto_router.route_with_fallback（不可达且无调用者）
 - 验收：新增回退测试 ≥6 项全绿；首候选失败→次候选成功；reasoning-only 不再拼接跨候选正文
 
 ### P0-2 模型刷新 / Auto 候选 N+1 批量化
