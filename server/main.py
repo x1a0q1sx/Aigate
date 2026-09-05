@@ -133,6 +133,10 @@ async def lifespan(app: FastAPI):
     from server.api.oauth_router import start_oauth_refresh_scheduler
     start_oauth_refresh_scheduler()
     print("✓ OAuth token 主动刷新调度器已启动（60s 扫一次）")
+    # P0-3: 日志写入队列（请求路径零落库，后台批量 commit + WAL 周期 checkpoint）
+    from server.core.log_queue import start_log_queue
+    start_log_queue()
+    print("✓ 日志写入队列已启动（批量落库，请求路径零等待）")
     # 同步智力评分（从 Arena AI 排行榜）—— 后台执行，不阻塞启动
     global _intel_sync_task
     if config.arena.sync_on_startup:
@@ -153,6 +157,12 @@ async def lifespan(app: FastAPI):
     # 取消可能仍在进行的后台智力评分同步，避免 engine.dispose 后回调
     if _intel_sync_task is not None and not _intel_sync_task.done():
         _intel_sync_task.cancel()
+    # P0-3: flush 日志队列剩余内容后再释放 engine
+    try:
+        from server.core.log_queue import stop_log_queue
+        await stop_log_queue()
+    except Exception as e:
+        logger.warning("log queue shutdown: %s", e)
     await engine.dispose()
     print("\n✓ AIGate 已关闭")
 # 创建 FastAPI 应用

@@ -214,9 +214,20 @@ async def dedup_log_row(db: AsyncSession, rec: RequestLog) -> None:
 
 
 async def write_log(db: AsyncSession, **kwargs) -> int:
-    """构造 RequestLog + 消息级去重 + 落库提交，返回 id。
-    取代各处直接的 db.add(RequestLog(...)); await db.commit() 写法，
-    让所有日志写入点统一走消息级去重。"""
+    """构造 RequestLog 并入队后台批量落库（P0-3 写入队列化）。
+
+    请求路径不再等待日志 commit（SQLite 锁竞争 / 延迟的主要来源）。
+    返回：-2 = 已入队（异步落库），-1 = 队列满被丢弃或队列不可用。
+    db 参数保留以兼容既有调用签名；队列化后不再在请求路径上使用。
+    worker 停止（服务关闭 flush 后）时回退同步写，保证关闭瞬间的日志不丢。"""
+    try:
+        from server.core.log_queue import enqueue_log, is_running
+        if is_running():
+            ok = await enqueue_log(**kwargs)
+            return -2 if ok else -1
+    except Exception as e:
+        print(f"⚠️ 日志入队失败(回退同步写): {e}")
+    # 队列不可用（如测试环境/关闭中）→ 原同步路径兜底
     rec = RequestLog(**kwargs)
     await dedup_log_row(db, rec)
     db.add(rec)

@@ -2292,40 +2292,38 @@ async def chat_completions(
                 raw = response.get("_raw_response", "")
                 if raw:
                     resp_body_str = raw[:5000]
-            async with _LogSession() as _ldb:
-                _rlog = _RL(
-                    conversation_id=conversation_id,
-                    requested_model=request.model,
-                    routed_provider=route_result.provider.name if (route_result and route_result.success) else None,
-                    routed_provider_id=route_result.provider.id if (route_result and route_result.success) else None,
-                    routed_model=route_result.model.model_id if (route_result and route_result.success) else None,
-                    status="error" if is_err else "success",
-                    latency_ms=_latency,
-                    prompt_tokens=int(pt) if pt else 0,
-                    completion_tokens=int(ct) if ct else 0,
-                    cache_read_tokens=_crd or None,
-                    cache_write_tokens=_cwt or None,
-                    estimated_cost_usd=(
-                        _segmented_cost({
-                            "input_price": float(route_result.model.input_price or 0),
-                            "output_price": float(route_result.model.output_price or 0),
-                            "cache_read_input_price": float(getattr(route_result.model, "cache_read_input_price", 0) or 0),
-                            "cache_write_input_price": float(getattr(route_result.model, "cache_write_input_price", 0) or 0),
-                        }, pt, ct, _crd, _cwt)
-                        if (not is_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
-                    ),
-                    fallback_count=route_result.fallback_count if route_result else 0,
-                    user_ip=raw_request.client.host if raw_request.client else None,
-                    error_type="upstream_error" if is_err else None,
-                    error_msg=str(response.get("error", "")) if is_err else None,
-                    request_body=req_body_str,
-                    response_body=resp_body_str,
-                    **_proxy_log_fields(),
-                )
-                await dedup_log_row(_ldb, _rlog)
-                _ldb.add(_rlog)
-                await _ldb.commit()
-                _diag(conversation_id, "request_log_done", _diag_start, status="error" if is_err else "success")
+            # P0-3: 日志入队后台批量落库，不再阻塞响应返回
+            from server.core.log_queue import enqueue_log
+            await enqueue_log(
+                conversation_id=conversation_id,
+                requested_model=request.model,
+                routed_provider=route_result.provider.name if (route_result and route_result.success) else None,
+                routed_provider_id=route_result.provider.id if (route_result and route_result.success) else None,
+                routed_model=route_result.model.model_id if (route_result and route_result.success) else None,
+                status="error" if is_err else "success",
+                latency_ms=_latency,
+                prompt_tokens=int(pt) if pt else 0,
+                completion_tokens=int(ct) if ct else 0,
+                cache_read_tokens=_crd or None,
+                cache_write_tokens=_cwt or None,
+                estimated_cost_usd=(
+                    _segmented_cost({
+                        "input_price": float(route_result.model.input_price or 0),
+                        "output_price": float(route_result.model.output_price or 0),
+                        "cache_read_input_price": float(getattr(route_result.model, "cache_read_input_price", 0) or 0),
+                        "cache_write_input_price": float(getattr(route_result.model, "cache_write_input_price", 0) or 0),
+                    }, pt, ct, _crd, _cwt)
+                    if (not is_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
+                ),
+                fallback_count=route_result.fallback_count if route_result else 0,
+                user_ip=raw_request.client.host if raw_request.client else None,
+                error_type="upstream_error" if is_err else None,
+                error_msg=str(response.get("error", "")) if is_err else None,
+                request_body=req_body_str,
+                response_body=resp_body_str,
+                **_proxy_log_fields(),
+            )
+            _diag(conversation_id, "request_log_done", _diag_start, status="error" if is_err else "success")
             if not made_by_cascade:
                 _decision_attempt(
                     conversation_id,

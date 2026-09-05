@@ -44,9 +44,14 @@ async def _audit(db: AsyncSession, action: str, target_id: Optional[int] = None,
 # ===================== 请求诊断日志开关 =====================
 @router.get("/diag")
 async def get_diag():
-    """读取请求诊断日志是否全量输出（verbose_diag）"""
+    """读取请求诊断日志是否全量输出（verbose_diag）+ 日志写入队列统计（P0-3）"""
     from server.api.v1_router import get_diag_verbose
-    return {"verbose": get_diag_verbose()}
+    try:
+        from server.core.log_queue import stats as _lq_stats
+        lq = dict(_lq_stats)
+    except Exception:
+        lq = None
+    return {"verbose": get_diag_verbose(), "log_queue": lq}
 
 @router.put("/diag")
 async def set_diag(verbose: bool = Query(..., description="true=全量输出所有阶段；false=仅关键里程碑"),

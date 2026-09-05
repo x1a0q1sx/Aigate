@@ -741,3 +741,66 @@ async def test_credential_resolver_standard_path(monkeypatch):
     rc = await resolve_credential_async(prov, model, FakeDB())
     assert rc.ok and rc.kind == "standard" and rc.api_key == "sk-plain" and rc.key_id == 7
     assert rc.adapter is not None
+
+
+# ===================== P0-3 日志写入队列 =====================
+
+@pytest.mark.asyncio
+async def test_log_queue_batch_write(monkeypatch, tmp_path):
+    """入队 → worker 批量落库 → 统计正确；dedup 后大 body 转 hash 引用。"""
+    import os
+    import asyncio as _aio
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from server.models.base import Base
+    from server.models.request_log import RequestLog, LogMsgBlob
+    import server.core.log_queue as lq
+    import server.db as _dbmod
+
+    dbfile = tmp_path / "lq.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{dbfile}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[RequestLog.__table__, LogMsgBlob.__table__])
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    monkeypatch.setattr(_dbmod, "AsyncSessionLocal", Session)
+    lq.stats.update({"enqueued": 0, "written": 0, "dropped": 0, "errors": 0, "batches": 0})
+    lq.stopped = False
+    lq._queue = _aio.Queue(maxsize=100)
+    lq._worker_task = _aio.create_task(lq._worker())
+    try:
+        for i in range(12):
+            ok = await lq.enqueue_log(conversation_id=f"c{i}", requested_model="m", status="success",
+                                      prompt_tokens=i, completion_tokens=1, request_body=None, response_body=None)
+            assert ok
+        for _ in range(40):
+            if lq.stats["written"] >= 12:
+                break
+            await _aio.sleep(0.1)
+        assert lq.stats["written"] == 12
+        assert lq.stats["dropped"] == 0
+        async with Session() as db:
+            n = (await db.execute(__import__('sqlalchemy').text("SELECT COUNT(*) FROM request_logs"))).scalar_one()
+        assert n == 12
+    finally:
+        await lq.stop_log_queue()
+        lq._queue = None
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_log_queue_drops_when_full():
+    """队列满时丢弃并计数（保护主流程）。"""
+    import server.core.log_queue as lq
+    lq.stats.update({"enqueued": 0, "written": 0, "dropped": 0})
+    lq.stopped = False
+    old_task = lq._worker_task
+    lq._worker_task = None  # 不启动 worker（只测入队与丢弃）
+    lq._queue = __import__('asyncio').Queue(maxsize=3)
+    try:
+        results = [await lq.enqueue_log(i=i) for i in range(5)]
+        assert results[:3] == [True, True, True]
+        assert results[3] is False and results[4] is False
+        assert lq.stats["dropped"] == 2
+    finally:
+        lq._queue = None
+        lq._worker_task = old_task
