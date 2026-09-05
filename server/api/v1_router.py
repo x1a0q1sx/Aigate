@@ -30,6 +30,7 @@ from server.core.route_decision import (
     mark_candidate_skipped as _decision_skip,
     mark_selected as _decision_select,
 )
+from server.core.usage_normalize import normalize_usage as _normalize_usage
 from server.core.context_guard import (
     estimate_request_tokens,
     is_context_error,
@@ -162,33 +163,11 @@ def _output_text_from_result(result: dict) -> str:
 
 
 def _extract_cache_tokens(usage: dict):
-    """从 usage 提取缓存读/写 token 数，兼容多种上游格式。返回 (cache_read, cache_write)。"""
-    if not usage:
-        return 0, 0
-    # OpenAI 格式：usage.prompt_tokens_details.{cached_tokens, cache_creation_tokens}
-    ptd = usage.get("prompt_tokens_details") or {}
-    if isinstance(ptd, dict):
-        crt = int(ptd.get("cached_tokens") or 0)
-        cwt = int(ptd.get("cache_creation_tokens") or 0)
-        if crt or cwt:
-            return crt, cwt
-    # Anthropic 格式：usage.cache_read_input_tokens / cache_creation_input_tokens
-    crt = int(usage.get("cache_read_input_tokens") or 0)
-    cwt = int(usage.get("cache_creation_input_tokens") or 0)
-    if crt or cwt:
-        return crt, cwt
-    # Responses API 格式：usage.input_tokens_details.{cached_tokens, cache_write_tokens, cache_creation_tokens}
-    # / usage.cache_creation_details.total_tokens（部分上游把缓存写放在 input_tokens_details.cache_write_tokens）
-    itd = usage.get("input_tokens_details") or {}
-    if isinstance(itd, dict):
-        if not crt:
-            crt = int(itd.get("cached_tokens") or 0)
-        if not cwt:
-            cwt = int(itd.get("cache_write_tokens") or itd.get("cache_creation_tokens") or 0)
-    ccd = usage.get("cache_creation_details") or {}
-    if isinstance(ccd, dict) and not cwt:
-        cwt = int(ccd.get("total_tokens") or 0)
-    return crt, cwt
+    """缓存读/写 token 提取（P1-4：统一走 usage_normalize，兼容三种方言）。
+    返回 (cache_read, cache_write)。"""
+    from server.core.usage_normalize import normalize_usage
+    nu = normalize_usage(usage)
+    return nu.cache_read_tokens, nu.cache_write_tokens
 
 
 def _segmented_cost(prices: dict, pt: int, ct: int, crt: int, cwt: int) -> float:
@@ -1354,9 +1333,9 @@ async def chat_completions(
                                 import json as _cj
                                 _combo_latency = int((time.time() - _start) * 1000)
                                 _combo_body = _cj.dumps(_cbuf, ensure_ascii=False) if _cbuf else None
-                                _pt = int(_cu.get("prompt_tokens") or _cu.get("input_tokens") or 0)
-                                _ct = int(_cu.get("completion_tokens") or _cu.get("output_tokens") or 0)
-                                _crd, _cwt = _extract_cache_tokens(_cu)
+                                _nu = _normalize_usage(_cu)
+                                _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
+                                _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
                                 _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_chunks(_cbuf))
                                 _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="success", attempt=st_attempt, latency_ms=_combo_latency, ttft_ms=_cb_attempt_ttft_ms)
                                 await _write_stream_log(conversation_id, request, raw_request, "success",
@@ -1499,9 +1478,9 @@ async def chat_completions(
                     try:
                         import json as _j
                         _usage = result.get("usage", {}) if isinstance(result, dict) else {}
-                        _pt = int(_usage.get("prompt_tokens") or _usage.get("input_tokens") or 0)
-                        _ct = int(_usage.get("completion_tokens") or _usage.get("output_tokens") or 0)
-                        _crd, _cwt = _extract_cache_tokens(_usage)
+                        _nu = _normalize_usage(_usage)
+                        _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
+                        _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
                         _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_result(result))
                         await _write_stream_log(
                             conversation_id, request, raw_request, "success",
@@ -1885,9 +1864,9 @@ async def chat_completions(
                         if stream_buf:
                             import json as _json_mod
                             resp_snapshot = _json_mod.dumps(stream_buf, ensure_ascii=False)
-                        pt = int(last_usage.get("prompt_tokens") or last_usage.get("input_tokens") or 0)
-                        ct = int(last_usage.get("completion_tokens") or last_usage.get("output_tokens") or 0)
-                        _crd, _cwt = _extract_cache_tokens(last_usage)
+                        _nu = _normalize_usage(last_usage)
+                        pt, ct = _nu.prompt_tokens, _nu.completion_tokens
+                        _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
                         # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
                         _pt, _ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(stream_buf))
                         _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="success", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms)
@@ -2114,9 +2093,9 @@ async def chat_completions(
                     if _stream_chunks_log:
                         import json as _j
                         resp_snapshot = _j.dumps(_stream_chunks_log, ensure_ascii=False)
-                    pt = int(_stream_usage.get("prompt_tokens") or _stream_usage.get("input_tokens") or 0)
-                    ct = int(_stream_usage.get("completion_tokens") or _stream_usage.get("output_tokens") or 0)
-                    _crd, _cwt = _extract_cache_tokens(_stream_usage)
+                    _nu = _normalize_usage(_stream_usage)
+                    pt, ct = _nu.prompt_tokens, _nu.completion_tokens
+                    _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
                     # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
                     pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(_stream_chunks_log))
                     try:
@@ -2277,8 +2256,8 @@ async def chat_completions(
             is_err = isinstance(response, dict) and "error" in response
             resp_dict = response if isinstance(response, dict) else None
             usage = resp_dict.get("usage", {}) if resp_dict else {}
-            pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            _nu = _normalize_usage(usage)
+            pt, ct = _nu.prompt_tokens, _nu.completion_tokens
             pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_result(resp_dict) if resp_dict else "")
             _crd, _cwt = _extract_cache_tokens(usage)
             _latency = int((time.time() - _send_time) * 1000) if _send_time else None

@@ -29,6 +29,7 @@ def _proxy_kwargs(*, force: bool = False) -> dict:
     from server.core.proxy_pool import get_proxy_pool
     return get_proxy_pool().proxied_kwargs(force=force)
 
+from server.core.usage_normalize import normalize_usage
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.schemas.chat import ChatCompletionRequest
@@ -358,13 +359,8 @@ class AnthropicAdapter(BaseAdapter):
             "created": created,
             "model": request.model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish}],
-            "usage": {
-                "prompt_tokens": int(usage.get("input_tokens") or 0),
-                "completion_tokens": int(usage.get("output_tokens") or 0),
-                "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
-                "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
-                "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-            },
+            # P1-4: 统一归一化 —— prompt 含缓存（OpenAI 口径），details 带 cached/write/reasoning
+            "usage": normalize_usage(usage).to_openai_chat(),
         }
     async def chat_completion(self, request: ChatCompletionRequest, api_key: str, base_url: str, extra_headers: dict = None) -> dict:
         url = self._build_url(base_url)
@@ -511,13 +507,8 @@ class AnthropicAdapter(BaseAdapter):
                                 "id": chunk_id, "object": "chat.completion.chunk",
                                 "created": created, "model": model_name,
                                 "choices": [],
-                                "usage": {
-                                    "prompt_tokens": int(usage.get("input_tokens") or 0),
-                                    "completion_tokens": int(usage.get("output_tokens") or 0),
-                                    "total_tokens": int(usage.get("input_tokens") or 0) + int(usage.get("output_tokens") or 0),
-                                    "cache_read_input_tokens": int(usage.get("cache_read_input_tokens") or 0),
-                                    "cache_creation_input_tokens": int(usage.get("cache_creation_input_tokens") or 0),
-                                },
+                                # P1-4: 统一归一化（prompt 含缓存）
+                                "usage": normalize_usage(usage).to_openai_chat(),
                             }
                         continue
                     if evt == "message_stop":

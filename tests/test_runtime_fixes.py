@@ -804,3 +804,44 @@ async def test_log_queue_drops_when_full():
     finally:
         lq._queue = None
         lq._worker_task = old_task
+
+
+# ===================== P1-4 usage 三方言归一化 =====================
+
+def test_normalize_usage_openai_chat():
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"prompt_tokens": 1000, "completion_tokens": 200,
+                         "prompt_tokens_details": {"cached_tokens": 800},
+                         "completion_tokens_details": {"reasoning_tokens": 150}})
+    assert (u.prompt_tokens, u.completion_tokens, u.cache_read_tokens, u.reasoning_tokens) == (1000, 200, 800, 150)
+    assert u.source == "openai_chat" and u.cache_hit_rate == 80.0
+    d = u.to_openai_chat()
+    assert d["prompt_tokens_details"] == {"cached_tokens": 800, "cache_write_tokens": 0}
+
+
+def test_normalize_usage_responses_and_anthropic():
+    from server.core.usage_normalize import normalize_usage
+    # Responses
+    u = normalize_usage({"input_tokens": 500, "output_tokens": 100,
+                         "input_tokens_details": {"cached_tokens": 300},
+                         "output_tokens_details": {"reasoning_tokens": 60}})
+    assert (u.source, u.prompt_tokens, u.cache_read_tokens, u.reasoning_tokens) == ("openai_responses", 500, 300, 60)
+    # Anthropic：input 不含缓存 → 归一化并入 prompt（OpenAI 口径）
+    u = normalize_usage({"input_tokens": 200, "output_tokens": 50,
+                         "cache_read_input_tokens": 700, "cache_creation_input_tokens": 100})
+    assert (u.source, u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens) == ("anthropic", 1000, 700, 100)
+    assert abs(u.cache_hit_rate - 70.0) < 0.01
+    # 新版 cache_creation 结构
+    u = normalize_usage({"input_tokens": 100, "cache_creation": {"ephemeral_5m_input_tokens": 50, "ephemeral_1h_input_tokens": 30}})
+    assert u.cache_write_tokens == 80
+    # Anthropic 非缓存请求（input/output 命名无缓存字段）口径仍正确
+    u = normalize_usage({"input_tokens": 300, "output_tokens": 40})
+    assert (u.prompt_tokens, u.completion_tokens) == (300, 40)
+
+
+def test_normalize_usage_empty_and_garbage():
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage(None)
+    assert u.prompt_tokens == 0 and u.source == "unknown"
+    u = normalize_usage("garbage")
+    assert u.total_tokens == 0
