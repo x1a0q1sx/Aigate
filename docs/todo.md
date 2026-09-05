@@ -42,7 +42,7 @@
 
 ## P1 — 数据质量与性能
 
-- [ ] P1-4 usage 统一归一化：NormalizedUsage(prompt/completion/cache_read/cache_write/reasoning/usage_source)，三个协议面共用
+- [x] P1-4 usage 统一归一化（✅ 2026-09 完成，commit 5be9499）：NormalizedUsage 三方言字段驱动提取，Anthropic 缓存口径并入 prompt，v1 五处提取链 + anthropic 适配器统一
 - [ ] P1-5 上下文估算校准：按模型历史 usage 估算系数 + 上游"内容超限"错误学习（记录 provider 实际可用窗口）
 - [ ] P1-6 元数据来源分层：price/context/capability 各自 source 字段（manual > provider > public > default）
 - [ ] P1-7 评分查询聚合化：RankingService 批量 GROUP BY + 30s TTL 内存缓存
