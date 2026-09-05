@@ -183,6 +183,9 @@ async def init_db():
             "ALTER TABLE request_logs ADD COLUMN ttft_ms INTEGER DEFAULT NULL",
             # v13: 归档瘦身标记（详细内容已归档，统计元数据保留在行内）
             "ALTER TABLE request_logs ADD COLUMN archived_at DATETIME DEFAULT NULL",
+            # v14: 上下文估算校准（预检估算值落日志 + 上游超限学习的观察窗口）
+            "ALTER TABLE request_logs ADD COLUMN est_prompt_tokens INTEGER DEFAULT NULL",
+            "ALTER TABLE models ADD COLUMN observed_context_limit INTEGER DEFAULT NULL",
             # v12: 累计统计表增加首字延迟累计列（平均首字延迟跨归档保留）
             "ALTER TABLE analytics_cumulative ADD COLUMN sum_ttft_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE analytics_cumulative ADD COLUMN ttft_count INTEGER NOT NULL DEFAULT 0",

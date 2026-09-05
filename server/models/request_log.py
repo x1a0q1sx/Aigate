@@ -55,6 +55,7 @@ class RequestLog(Base):
     response_body_hash = Column(String(64), nullable=True) # 响应整包的 blob hash
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     archived_at = Column(DateTime, nullable=True)  # 非空=详细内容已归档瘦身（统计元数据保留，body/blob 已清）
+    est_prompt_tokens = Column(Integer, nullable=True)  # P1-5 预检估算输入 token（用于动态校准估算系数）
 class AnalyticsCumulative(Base):
     """累计统计数据（单行 id=1）。
 

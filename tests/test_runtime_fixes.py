@@ -845,3 +845,51 @@ def test_normalize_usage_empty_and_garbage():
     assert u.prompt_tokens == 0 and u.source == "unknown"
     u = normalize_usage("garbage")
     assert u.total_tokens == 0
+
+
+# ===================== P1-5 上下文估算校准 =====================
+
+def test_context_overflows_with_observed_limit():
+    from types import SimpleNamespace
+    from server.core.context_guard import context_overflows
+
+    m = SimpleNamespace(context_length=1000000)
+    # 标称 1M 但观察到的实际上限 32K：est 超过 32K 即拦截
+    assert context_overflows(m, 40000, observed_limit=32000) is True
+    assert context_overflows(m, 30000, observed_limit=32000) is False
+    # observed 为 0 → 用标称窗口
+    assert context_overflows(m, 500000, observed_limit=0) is False
+    # observed 比标称还大 → 取 min（不放大窗口）
+    assert context_overflows(m, 900000, observed_limit=2000000) is False
+
+
+def test_estimate_factor_clamp():
+    from server.core.context_guard import get_estimate_factor
+    import asyncio as _aio
+
+    class FakeRow:
+        def __init__(self, v):
+            self._v = v
+
+        def first(self):
+            return (self._v,) if self._v is not None else None
+
+    class FakeSession:
+        def __init__(self, v):
+            self.v = v
+
+        async def execute(self, *a, **k):
+            return FakeRow(self.v)
+
+    async def _run():
+        # 异常样本拉飞 → 被钳制在 4.0
+        f = await get_estimate_factor(FakeSession(50.0), 1, "m")
+        assert f == 4.0
+        # 正常样本
+        f = await get_estimate_factor(FakeSession(1.25), 2, "m")
+        assert abs(f - 1.25) < 0.001
+        # 无样本 → 1.0
+        f = await get_estimate_factor(FakeSession(None), 3, "m")
+        assert f == 1.0
+
+    _aio.run(_run())

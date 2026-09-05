@@ -35,6 +35,8 @@ from server.core.context_guard import (
     estimate_request_tokens,
     is_context_error,
     context_overflows,
+    get_estimate_factor,
+    record_context_overflow,
 )
 from server.config import get_config, save_config
 
@@ -787,11 +789,16 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         if candidate.model:
             tried_ids.add(candidate.model.id)
         # 上下文预检：估算输入装不进窗口的候选直接跳过（不打上游、不进冷却）
-        if candidate.model and context_overflows(candidate.model, est_tokens):
+        # P1-5: 按该服务商+模型的历史估算系数校准；observed_context_limit 收紧标称窗口
+        if candidate.model:
+            _pf = await get_estimate_factor(db, candidate.provider.id, candidate.model.model_id)
+            _est_adj = int(est_tokens * _pf)
+            _obs = int(getattr(candidate.model, "observed_context_limit", 0) or 0)
+        if candidate.model and context_overflows(candidate.model, _est_adj, observed_limit=_obs):
             attempt_errors.append({
                 "attempt": attempt,
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
-                "error": f"skip: est ~{est_tokens} tokens > context window {candidate.model.context_length}",
+                "error": f"skip: est ~{_est_adj} tokens (x{_pf:.2f}) > context window {candidate.model.context_length}",
             })
             _decision_skip(
                 conversation_id,
@@ -877,8 +884,9 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 latency_ms=int((time.time() - _attempt_started) * 1000),
                 error=err_short,
             )
-            if ar.health_checker and not is_context_error(err_short):
-                # 上下文超限不进冷却（漏网的预检由上游 400 兜底识别）
+            if is_context_error(err_short) and candidate.model:
+                await record_context_overflow(candidate.model.id, est_tokens)
+            elif ar.health_checker:
                 ar.health_checker.mark_failure(candidate.model.id)
                 ar.health_checker.mark_cooling(
                     candidate.model.id,
@@ -929,7 +937,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
 async def _write_stream_log(conversation_id, request, raw_request, status,
                            routed_provider, routed_model, error_msg, fallback_count, attempt_errors,
                            stream_body=None, prompt_tokens=0, completion_tokens=0, latency_ms=None,
-                           ttft_ms=None, cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None):
+                           ttft_ms=None, cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None,
+                           est_prompt_tokens=None):
     """在流式生成器内异步写请求日志。
 
     方案A：request_logs 作为唯一用量数据源，直接在此写入
@@ -1008,6 +1017,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                 fallback_count=fallback_count or 0,
                 latency_ms=latency_ms,
                 ttft_ms=ttft_ms,
+                est_prompt_tokens=est_prompt_tokens,
                 user_ip=raw_request.client.host if raw_request.client else None,
                 **_proxy_log_fields(),
                 request_body=req_s,
@@ -1244,9 +1254,12 @@ async def chat_completions(
                                 stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
                                 _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
                                 continue
-                            # 上下文预检：装不下的候选直接跳过
-                            if context_overflows(_mdl, est_req_tokens):
-                                stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{est_req_tokens} tokens): {full_id}"})
+                            # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
+                            _pf = await get_estimate_factor(cdb, _prov.id, _mdl.model_id)
+                            _est_adj = int(est_req_tokens * _pf)
+                            _obs = int(getattr(_mdl, "observed_context_limit", 0) or 0)
+                            if context_overflows(_mdl, _est_adj, observed_limit=_obs):
+                                stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{_est_adj} tokens x{_pf:.2f}): {full_id}"})
                                 _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="context window too small")
                                 continue
                             # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
@@ -1342,7 +1355,8 @@ async def chat_completions(
                                     _prov.name, _mdl.model_id, None, st_attempt, None,
                                     stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
                                     cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                                    latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms, diag_start_ts=_diag_start)
+                                    latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms, diag_start_ts=_diag_start,
+                                    est_prompt_tokens=est_req_tokens)
                                 if ar.health_checker:
                                     ar.health_checker.mark_success(_mdl.id)
                                 yield b"data: [DONE]\n\n"
@@ -1353,7 +1367,9 @@ async def chat_completions(
                                 _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                                 # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
                                 # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却
-                                if ar.health_checker and not is_context_error(err_s) and not _is_stream_content_validation_error(err_s):
+                                if is_context_error(err_s):
+                                    await record_context_overflow(_mdl.id, est_req_tokens)
+                                elif ar.health_checker and not _is_stream_content_validation_error(err_s):
                                     ar.health_checker.mark_failure(_mdl.id)
                                     ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
                                 raw_err = _extract_error_body(se) or err_s
@@ -1409,9 +1425,12 @@ async def chat_completions(
                     combo_attempts.append({"target": full_id, "error": "provider or model not found"})
                     _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
                     continue
-                # 上下文预检：装不下的候选直接跳过
-                if context_overflows(model, est_req_tokens):
-                    combo_attempts.append({"target": full_id, "error": f"skip: est ~{est_req_tokens} tokens > context window {model.context_length}"})
+                # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
+                _pf = await get_estimate_factor(db, provider.id, model.model_id)
+                _est_adj = int(est_req_tokens * _pf)
+                _obs = int(getattr(model, "observed_context_limit", 0) or 0)
+                if context_overflows(model, _est_adj, observed_limit=_obs):
+                    combo_attempts.append({"target": full_id, "error": f"skip: est ~{_est_adj} tokens (x{_pf:.2f}) > context window {model.context_length}"})
                     _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="context window too small")
                     continue
                 # 跳过处于冷却（被惩罚）中的 target，让后续健康候选顶上
@@ -1502,8 +1521,9 @@ async def chat_completions(
                     last_error = err_str
                     _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000), error=err_str)
                     # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                    if ar.health_checker and model and not is_context_error(err_str):
-                        # 上下文超限不进冷却
+                    if is_context_error(err_str) and model:
+                        await record_context_overflow(model.id, est_req_tokens)
+                    elif ar.health_checker and model:
                         ar.health_checker.mark_failure(model.id)
                         ar.health_checker.mark_cooling(model.id, ar.config.cooling_period_seconds)
                     print(f"[组合路由] 目标 {full_id} 失败：{err_str}，正在尝试下一个候选", flush=True)
@@ -1775,10 +1795,13 @@ async def chat_completions(
                     cand_provider_base_url = cand.provider.base_url
                     cand_provider_headers = cand.provider.headers
                     mid_full = f"{cand_provider_name}/{cand_model_id}"
-                    # 上下文预检：装不下的候选直接跳过（不打上游、不进冷却）
+                    # 上下文预检：装不下的候选直接跳过（不打上游、不进冷却；动态因子 + observed 窗口）
                     _cand_ctx_len = int(getattr(cand.model, "context_length", 0) or 0)
-                    if _cand_ctx_len > 0 and est_req_tokens + 1024 > _cand_ctx_len:
-                        stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{est_req_tokens} tokens)"})
+                    _pf = await get_estimate_factor(cascade_db, cand.provider.id, cand_model_id)
+                    _est_adj = int(est_req_tokens * _pf)
+                    _obs = int(getattr(cand.model, "observed_context_limit", 0) or 0)
+                    if (_cand_ctx_len > 0 and _est_adj + 1024 > _cand_ctx_len) or (_obs > 0 and _est_adj + 1024 > _obs):
+                        stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{_est_adj} tokens x{_pf:.2f})"})
                         _decision_skip(conversation_id, model_pk=cand_model_pk, provider=cand_provider_name, model=cand_model_id, reason="context window too small")
                         continue
                     up_req = _without_unsupported_reasoning(
@@ -1875,7 +1898,8 @@ async def chat_completions(
                             stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
                             cache_read_tokens=_crd, cache_write_tokens=_cwt,
                             latency_ms=int((time.time() - _send_time) * 1000),
-                            ttft_ms=_cascade_ttft_ms, diag_start_ts=_diag_start)
+                            ttft_ms=_cascade_ttft_ms, diag_start_ts=_diag_start,
+                            est_prompt_tokens=est_req_tokens)
                         if ar.health_checker:
                             ar.health_checker.mark_success(cand_model_pk)
                         yield b"data: [DONE]\n\n"
@@ -1885,12 +1909,12 @@ async def chat_completions(
                         err_s = f"{type(se).__name__}: {str(se)[:200]}"
                         stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
                         _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
-                        if ar.health_checker and not is_context_error(err_s):
-                            # 上下文超限不进冷却（请求体过大不是候选的错）
+                        if is_context_error(err_s):
+                            await record_context_overflow(cand_model_pk, est_req_tokens)
+                        elif ar.health_checker and not _is_stream_content_validation_error(err_s):
                             # 上游内容校验失败（如思考模型零正文）同样不代表模型故障，不冷却
-                            if not _is_stream_content_validation_error(err_s):
-                                ar.health_checker.mark_failure(cand_model_pk)
-                                ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
+                            ar.health_checker.mark_failure(cand_model_pk)
+                            ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
                         cd_seconds = ar.config.cooling_period_seconds
                         fc = (ar.health_checker._fail_count.get(cand_model_pk, 0) if ar.health_checker else 0)
                         cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
@@ -2298,6 +2322,7 @@ async def chat_completions(
                 user_ip=raw_request.client.host if raw_request.client else None,
                 error_type="upstream_error" if is_err else None,
                 error_msg=str(response.get("error", "")) if is_err else None,
+                est_prompt_tokens=est_req_tokens,
                 request_body=req_body_str,
                 response_body=resp_body_str,
                 **_proxy_log_fields(),

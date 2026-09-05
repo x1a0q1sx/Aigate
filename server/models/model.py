@@ -31,6 +31,7 @@ class Model(Base):
     # NULL=unknown, False=strip reasoning fields, True=pass reasoning effort through.
     supports_reasoning_effort = Column(Boolean, nullable=True, default=None)
     context_length = Column(Integer, nullable=False, default=4096)
+    observed_context_limit = Column(Integer, nullable=True)  # P1-5 上游超限错误学习到的实际可用窗口（provider 粒度）
     capabilities = Column(JSON, nullable=True, default=dict)
     # v0.2 新增：人工手动冷却截止时间
     manual_cooldown_until = Column(DateTime, nullable=True)
