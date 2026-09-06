@@ -39,20 +39,22 @@ from .models.oauth_token import OAuthToken
 from .models.route_decision import RouteDecision
 from .config import get_config
 config = get_config()
+# P2-11: DATABASE_URL 环境变量优先（postgresql+asyncpg://...），未设置时用 SQLite 单机默认
+import os as _os
+DATABASE_URL = _os.environ.get("AIGATE_DATABASE_URL") or f"sqlite+aiosqlite:///{config.database.path}"
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 db_path = Path(config.database.path)
 db_path.parent.mkdir(parents=True, exist_ok=True)
-DATABASE_URL = f"sqlite+aiosqlite:///{config.database.path}"
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args={
+
+_engine_kwargs = dict(echo=False, pool_pre_ping=True)
+if IS_SQLITE:
+    _engine_kwargs["connect_args"] = {
         "check_same_thread": False,
         "timeout": 15,  # 等待锁的超时（秒），默认 5 秒对并发场景偏短
-    },
-    pool_size=20,      # 连接池大小，适应并发刷新+多请求并发
-    max_overflow=10,    # 超出 pool_size 时可额外创建的数量（并发刷新不饿死其它请求）
-    pool_pre_ping=True, # 连接复用前检测有效性
-)
+    }
+_engine_kwargs["pool_size"] = 20      # 连接池大小，适应并发刷新+多请求并发
+_engine_kwargs["max_overflow"] = 10   # 超出 pool_size 时可额外创建的数量
+engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 # v0.2 智力静态种子（业界普遍认知）
 INTEL_SEEDS = [
@@ -76,10 +78,10 @@ INTEL_SEEDS = [
 async def init_db():
     """初始化数据库表 + 增量迁移 + WAL 模式 + v0.2 种子"""
     async with engine.begin() as conn:
-        # 启用 WAL 模式：允许并发读写，避免 SQLITE_BUSY
-        await conn.execute(text("PRAGMA journal_mode=WAL"))
-        # 启用外键约束：SQLite 默认不执行 ON DELETE CASCADE，必须显式开启
-        await conn.execute(text("PRAGMA foreign_keys=ON"))
+        if IS_SQLITE:
+            # SQLite 专用：WAL 允许并发读写避免 SQLITE_BUSY；外键需显式开启
+            await conn.execute(text("PRAGMA journal_mode=WAL"))
+            await conn.execute(text("PRAGMA foreign_keys=ON"))
         await conn.run_sync(Base.metadata.create_all)
         # v3.0 增量迁移
         for sql in [
@@ -198,24 +200,32 @@ async def init_db():
             except Exception:
                 pass
         # v0.2 单行配置
-        await conn.execute(text(
-            "INSERT OR IGNORE INTO routing_weights (id, w_speed, w_intel, w_stab) "
-            "VALUES (1, 0.30, 0.50, 0.20)"
-        ))
-        await conn.execute(text("INSERT OR IGNORE INTO routing_pin (id) VALUES (1)"))
+        # P2-11: 种子改为查后插（方言无关；幂等）
+        if not (await conn.execute(text("SELECT 1 FROM routing_weights WHERE id=1"))).first():
+            await conn.execute(text(
+                "INSERT INTO routing_weights (id, w_speed, w_intel, w_stab) "
+                "VALUES (1, 0.30, 0.50, 0.20)"
+            ))
+        if not (await conn.execute(text("SELECT 1 FROM routing_pin WHERE id=1"))).first():
+            await conn.execute(text("INSERT INTO routing_pin (id) VALUES (1)"))
         # v11: 累计统计数据单行（归档后统计仍保留，重置按钮清零）
         # 显式带全字段 + updated_at，兼容旧表结构（列无 SQL DEFAULT 时裸 INSERT 会 NOT NULL 失败被吞）
-        await conn.execute(text(
-            "INSERT OR IGNORE INTO analytics_cumulative "
-            "(id, total_requests, success_count, auto_requests, total_input_tokens, "
-            "total_output_tokens, sum_latency_ms, latency_count, sum_ttft_ms, ttft_count, updated_at) "
-            "VALUES (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)"
-        ))
+        if not (await conn.execute(text("SELECT 1 FROM analytics_cumulative WHERE id=1"))).first():
+            await conn.execute(text(
+                "INSERT INTO analytics_cumulative "
+                "(id, total_requests, success_count, auto_requests, total_input_tokens, "
+                "total_output_tokens, sum_latency_ms, latency_count, sum_ttft_ms, ttft_count, updated_at) "
+                "VALUES (1, 0, 0, 0, 0, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)"
+            ))
         # v0.2 智力种子（避免重复灌）
         # 标记为 source='manual'：原始手工校准基线，Arena 同步绝不覆盖
         for pattern, score, tier, notes in INTEL_SEEDS:
+            if (await conn.execute(text(
+                "SELECT 1 FROM intelligence_static WHERE pattern = :p"
+            ), {"p": pattern})).first():
+                continue
             await conn.execute(text(
-                "INSERT OR IGNORE INTO intelligence_static (pattern, score, tier, notes, source) "
+                "INSERT INTO intelligence_static (pattern, score, tier, notes, source) "
                 "VALUES (:p, :s, :t, :n, 'manual')"
             ), {"p": pattern, "s": score, "t": tier, "n": notes})
         # 索引（SQLite CREATE INDEX IF NOT EXISTS）

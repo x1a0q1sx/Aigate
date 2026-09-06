@@ -107,10 +107,19 @@ async def _upsert_units(db: AsyncSession, objs: List[Any]) -> List[str]:
         })
     if not vals:
         return []
-    stmt = sqlite_insert(LogMsgBlob).values(vals).on_conflict_do_update(
-        index_elements=[LogMsgBlob.hash],
-        set_={LogMsgBlob.ref_count: LogMsgBlob.ref_count + 1},
-    )
+    # P2-11: 方言分支 upsert（SQLite/PG 语义一致：冲突则 ref_count+1）
+    from server.db import IS_SQLITE
+    if IS_SQLITE:
+        stmt = sqlite_insert(LogMsgBlob).values(vals).on_conflict_do_update(
+            index_elements=[LogMsgBlob.hash],
+            set_={LogMsgBlob.ref_count: LogMsgBlob.ref_count + 1},
+        )
+    else:
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        stmt = pg_insert(LogMsgBlob).values(vals).on_conflict_do_update(
+            index_elements=[LogMsgBlob.hash],
+            set_={LogMsgBlob.ref_count: LogMsgBlob.ref_count + 1},
+        )
     await db.execute(stmt)
     return [v["hash"] for v in vals]
 

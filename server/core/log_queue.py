@@ -131,6 +131,9 @@ async def _worker():
 
 
 async def _wal_checkpoint_loop():
+    from server.db import IS_SQLITE
+    if not IS_SQLITE:
+        return  # PostgreSQL 无 WAL checkpoint（autovacuum 兜底）
     while not stopped:
         await asyncio.sleep(_CHECKPOINT_INTERVAL)
         try:

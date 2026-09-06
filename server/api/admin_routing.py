@@ -654,15 +654,21 @@ async def analytics_today(
 async def analytics_trend(days: int = Query(7, ge=1, le=90), db: AsyncSession = Depends(get_db)):
     """最近 N 天每日趋势：请求数 / Token / 成本（数据源 request_logs）"""
     since = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
+    # P2-11: 日聚合按方言选函数（SQLite: strftime / PostgreSQL: to_char）
+    from server.db import IS_SQLITE as _is_sqlite
+    if _is_sqlite:
+        _day = func.strftime("%Y-%m-%d", RequestLog.created_at)
+    else:
+        _day = func.to_char(RequestLog.created_at, "YYYY-MM-DD")
     rows = (await db.execute(
         select(
-            func.strftime("%Y-%m-%d", RequestLog.created_at),
+            _day,
             func.count(RequestLog.id),
             func.coalesce(func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens), 0),
             func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0.0),
         ).where(RequestLog.created_at >= since)
-        .group_by(func.strftime("%Y-%m-%d", RequestLog.created_at))
-        .order_by(func.strftime("%Y-%m-%d", RequestLog.created_at))
+        .group_by(_day)
+        .order_by(_day)
     )).all()
     day_map = {str(r[0]): {"day": str(r[0]), "requests": int(r[1] or 0),
                            "tokens": int(r[2] or 0), "cost_usd": round(float(r[3] or 0), 4)} for r in rows}
@@ -894,23 +900,36 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
     blobs_deleted = await release_blob_refs(db, all_hashes)
     # 4) 孤儿 GC 兜底：删除不被任何日志行引用的 blob（历史遗留/行写入失败等造成的
     #    ref_count>0 但无引用的孤儿，一次性全量回收）
-    res_gc = await db.execute(text("""
-        DELETE FROM log_msg_blobs WHERE hash NOT IN (
-            SELECT request_env_hash FROM request_logs WHERE request_env_hash IS NOT NULL
-            UNION
-            SELECT response_body_hash FROM request_logs WHERE response_body_hash IS NOT NULL
-            UNION
-            SELECT je.value FROM request_logs, json_each(request_logs.request_msg_hashes) je
-            WHERE request_msg_hashes IS NOT NULL AND request_msg_hashes != '__raw__'
-        )
-    """))
+    # P2-11: 方言无关实现——Python 侧收集全部引用 hash（不再依赖 SQLite json_each）
+    ref_hashes = set()
+    for env_h, msg_h, resp_h in (await db.execute(
+        select(RequestLog.request_env_hash, RequestLog.request_msg_hashes, RequestLog.response_body_hash)
+    )).all():
+        if env_h:
+            ref_hashes.add(env_h)
+        if resp_h:
+            ref_hashes.add(resp_h)
+        if msg_h and msg_h != "__raw__":
+            try:
+                ref_hashes.update(json.loads(msg_h))
+            except Exception:
+                pass
+    if ref_hashes:
+        res_gc = await db.execute(text(
+            "DELETE FROM log_msg_blobs WHERE hash NOT IN (" +
+            ",".join(f"'{h}'" for h in ref_hashes) + ")"
+        ))
+    else:
+        res_gc = await db.execute(text("DELETE FROM log_msg_blobs"))
     blobs_deleted += res_gc.rowcount or 0
     await db.commit()
 
-    # VACUUM 回收空间
-    from server.db import engine as _engine
-    async with _engine.begin() as conn:
-        await conn.execute(text("VACUUM"))
+    # VACUUM 回收空间（PG 无 VACUUM 语法，autovacuum 兜底）
+    from server.db import IS_SQLITE as _is_sq
+    if _is_sq:
+        from server.db import engine as _engine
+        async with _engine.begin() as conn:
+            await conn.execute(text("VACUUM"))
 
     _invalidate_analytics_cache()
     _last_archive_info.update({
@@ -1084,10 +1103,12 @@ async def clear_logs(db: AsyncSession = Depends(get_db)):
     )
     await db.commit()
 
-    # VACUUM 回收空间
-    from server.db import engine as _engine
-    async with _engine.begin() as conn:
-        await conn.execute(text("VACUUM"))
+    # VACUUM 回收空间（PG 无 VACUUM 语法，autovacuum 兜底）
+    from server.db import IS_SQLITE as _is_sq
+    if _is_sq:
+        from server.db import engine as _engine
+        async with _engine.begin() as conn:
+            await conn.execute(text("VACUUM"))
 
     _invalidate_analytics_cache()
     return {"ok": True, "deleted": count, "message": f"已清空 {count} 条日志并回收磁盘空间"}
