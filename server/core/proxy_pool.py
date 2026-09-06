@@ -81,6 +81,9 @@ class ProxyPool:
         self._fail_count: Dict[int, int] = {}        # index → 连续失败次数
         self._cooldown_until: Dict[int, datetime] = {}  # index → 恢复时间
         self._alive: Dict[int, Optional[bool]] = {}  # index → 端口存活探测结果（None=未探/视为可用）
+        self._ok_count: Dict[int, int] = {}          # index → 累计成功次数（P2-10）
+        self._err_total: Dict[int, int] = {}         # index → 累计失败次数
+        self._last_used: Dict[int, float] = {}       # index → 最近一次被选中/成功的时间戳
         self._lock = threading.Lock()               # 保护 cursor
 
     def next_proxy(self, *, force: bool = False) -> Optional[str]:
@@ -130,7 +133,10 @@ class ProxyPool:
             CURRENT_PROXY_URL.set(pu)
             try:
                 async with httpx.AsyncClient(timeout=timeout, **proxy_kwargs) as client:
-                    return await client.request(method, url, **kwargs)
+                    resp = await client.request(method, url, **kwargs)
+                    if pu:
+                        self.mark_success_by_url(pu)
+                    return resp
             except Exception as e:
                 if not _is_transport_err(e):
                     raise  # 应用层错误不重试
@@ -155,12 +161,17 @@ class ProxyPool:
         return True
 
     def mark_success(self, proxy_index: Optional[int] = None):
+        if proxy_index is not None:
+            self._ok_count[proxy_index] = self._ok_count.get(proxy_index, 0) + 1
+            self._last_used[proxy_index] = time.time()
         if proxy_index is None:
             return
         self._fail_count.pop(proxy_index, None)
         self._cooldown_until.pop(proxy_index, None)
 
     def mark_failure(self, proxy_index: Optional[int]):
+        if proxy_index is not None:
+            self._err_total[proxy_index] = self._err_total.get(proxy_index, 0) + 1
         if proxy_index is None:
             return
         self._fail_count[proxy_index] = self._fail_count.get(proxy_index, 0) + 1
@@ -168,6 +179,16 @@ class ProxyPool:
             self._cooldown_until[proxy_index] = datetime.utcnow() + timedelta(seconds=_COOLDOWN_SECONDS)
             logger.info("[ProxyPool] proxy #%d entering cooldown %ds",
                         proxy_index, _COOLDOWN_SECONDS)
+
+    def mark_success_by_url(self, url: Optional[str]):
+        """按代理 URL 记成功（request_with_fallback 成功路径用）"""
+        if not url:
+            return
+        with self._lock:
+            for i, p in enumerate(self._proxies):
+                if p.get("url") == url:
+                    self.mark_success(i)
+                    return
 
     def mark_failure_by_url(self, url: Optional[str]):
         """按代理 URL 标记失败（adapter 在请求时拿到的是 URL，不是 index）"""
@@ -189,6 +210,9 @@ class ProxyPool:
                     "url": _mask_url(p.get("url", "")),
                     "weight": p.get("weight", 1),
                     "fail_count": self._fail_count.get(i, 0),
+                    "ok_count": self._ok_count.get(i, 0),
+                    "err_total": self._err_total.get(i, 0),
+                    "last_used_ts": self._last_used.get(i),
                     "cooldown_until": self._cooldown_until[i].isoformat() + "Z" if i in self._cooldown_until else None,
                 }
                 for i, p in enumerate(self._proxies)
