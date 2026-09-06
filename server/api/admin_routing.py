@@ -432,10 +432,10 @@ async def list_request_logs(
     provider: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    base_q = select(RequestLog).where(RequestLog.is_health_check == 0).options(
+    base_q = select(RequestLog).where(RequestLog.is_health_check.is_(False)).options(
         defer(RequestLog.request_body), defer(RequestLog.response_body)
     )
-    count_q = select(func.count(RequestLog.id)).where(RequestLog.is_health_check == 0)
+    count_q = select(func.count(RequestLog.id)).where(RequestLog.is_health_check.is_(False))
     if status:
         base_q = base_q.where(RequestLog.status == status)
         count_q = count_q.where(RequestLog.status == status)
@@ -517,7 +517,7 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
             func.count(RequestLog.id).filter(RequestLog.requested_model == "auto"),
             func.coalesce(func.sum(RequestLog.ttft_ms).filter(RequestLog.ttft_ms.isnot(None)), 0),
             func.count(RequestLog.id).filter(RequestLog.ttft_ms.isnot(None)),
-        ).where(RequestLog.is_health_check == 0)
+        ).where(RequestLog.is_health_check.is_(False))
     )).one()
     total, success_count, total_input, total_output, lat_sum, lat_cnt, auto_count, ttft_sum, ttft_cnt = row
 
@@ -612,7 +612,7 @@ async def analytics_today(
     """
     start_dt = _parse_dt_param(start) or datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     end_dt = _parse_dt_param(end, end_of_day=True)
-    conditions = [RequestLog.is_health_check == 0, RequestLog.created_at >= start_dt]
+    conditions = [RequestLog.is_health_check.is_(False), RequestLog.created_at >= start_dt]
     if end_dt:
         conditions.append(RequestLog.created_at <= end_dt)
     if isinstance(provider, str) and provider.strip():
@@ -792,7 +792,7 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
         # 归档全部日志
         rows = (await db.execute(
             select(RequestLog).where(
-                RequestLog.is_health_check == 0
+                RequestLog.is_health_check.is_(False)
             ).order_by(RequestLog.created_at.asc())
         )).scalars().all()
         if not rows:
@@ -808,7 +808,7 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
         day_end = day_start + timedelta(days=1)
         rows = (await db.execute(
             select(RequestLog).where(
-                RequestLog.is_health_check == 0,
+                RequestLog.is_health_check.is_(False),
                 RequestLog.created_at >= day_start,
                 RequestLog.created_at < day_end
             ).order_by(RequestLog.created_at.asc())
