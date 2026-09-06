@@ -1088,7 +1088,8 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         priority_boost=data.priority_boost,
         auto_excluded=data.auto_excluded,
         supports_reasoning_effort=data.supports_reasoning_effort,
-        request_overrides=data.request_overrides
+        request_overrides=data.request_overrides,
+        context_length=data.context_length
     )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")

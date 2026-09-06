@@ -186,6 +186,9 @@ async def init_db():
             # v14: 上下文估算校准（预检估算值落日志 + 上游超限学习的观察窗口）
             "ALTER TABLE request_logs ADD COLUMN est_prompt_tokens INTEGER DEFAULT NULL",
             "ALTER TABLE models ADD COLUMN observed_context_limit INTEGER DEFAULT NULL",
+            # v15: 元数据来源分层（manual > provider > public/openrouter > default）
+            "ALTER TABLE models ADD COLUMN context_source VARCHAR(50) DEFAULT ''",
+            "ALTER TABLE models ADD COLUMN capability_source VARCHAR(50) DEFAULT ''",
             # v12: 累计统计表增加首字延迟累计列（平均首字延迟跨归档保留）
             "ALTER TABLE analytics_cumulative ADD COLUMN sum_ttft_ms INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE analytics_cumulative ADD COLUMN ttft_count INTEGER NOT NULL DEFAULT 0",

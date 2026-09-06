@@ -245,11 +245,14 @@ async def sync_intelligence(db: AsyncSession) -> int:
         # OpenRouter 元数据回填（与分数匹配解耦，归一化精确命中即回填）
         or_entry = or_map.get(_norm_name(m.model_id)) if or_map else None
         if or_entry:
-            if getattr(m, "context_length", 4096) == 4096 and or_entry.get("context_length"):
+            # P1-6: 回填时标记来源（manual 的窗口/能力永不覆盖）
+            if getattr(m, "context_length", 4096) == 4096 and or_entry.get("context_length")                     and not (getattr(m, "context_source", "") or ""):
                 m.context_length = int(or_entry["context_length"])
+                m.context_source = "openrouter"
                 metadata_filled += 1
             if getattr(m, "supports_reasoning_effort", None) is None and or_entry.get("supports_reasoning"):
                 m.supports_reasoning_effort = True
+                m.capability_source = "openrouter"
                 metadata_filled += 1
 
         matched = _match_entry(m.model_id, entries)

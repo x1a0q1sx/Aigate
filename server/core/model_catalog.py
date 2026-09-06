@@ -193,7 +193,8 @@ class ModelCatalog:
         priority_boost: Optional[int] = None,
         auto_excluded: Optional[bool] = None,
         supports_reasoning_effort: Optional[bool] = None,
-        request_overrides: Optional[dict] = None
+        request_overrides: Optional[dict] = None,
+        context_length: Optional[int] = None
     ) -> Optional[Model]:
         """更新模型配置"""
         model = await self.get_by_id(session, model_id)
@@ -228,6 +229,11 @@ class ModelCatalog:
         # The API uses None as "unknown"; explicit True/False is a durable admin override.
         if supports_reasoning_effort is not None:
             model.supports_reasoning_effort = supports_reasoning_effort
+            model.capability_source = "manual"
+        if context_length is not None and context_length > 0:
+            # P1-6: 手动改窗口 → 标记 manual，刷新/回填永不覆盖
+            model.context_length = int(context_length)
+            model.context_source = "manual"
         if request_overrides is not None:
             model.request_overrides = request_overrides
         await session.commit()
@@ -408,8 +414,8 @@ class ModelCatalog:
                 existing_model.supports_vision = model_info.supports_vision
                 if existing_model.supports_reasoning_effort is None and model_info.supports_reasoning_effort is not None:
                     existing_model.supports_reasoning_effort = model_info.supports_reasoning_effort
-                # 窗口只在仍是默认 4096 时补齐，用户手动改过的窗口不动
-                if existing_model.context_length == 4096 and model_info.context_length != 4096:
+                # 窗口只在仍为默认（4096 且无来源标记）时补齐，用户手动改过的窗口不动
+                if existing_model.context_length == 4096 and model_info.context_length != 4096                         and not (existing_model.context_source or ""):
                     existing_model.context_length = model_info.context_length
                 if remote_metadata:
                     existing_model.success_rate = remote_metadata.get("success_rate")
@@ -455,6 +461,7 @@ class ModelCatalog:
                     supports_vision=model_info.supports_vision,
                     supports_reasoning_effort=model_info.supports_reasoning_effort,
                     context_length=model_info.context_length,
+                    context_source="default" if model_info.context_length == 4096 else "provider",
                     priority_boost=0,
                     auto_excluded=False
                 )

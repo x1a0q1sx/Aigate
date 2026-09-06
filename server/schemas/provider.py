@@ -75,6 +75,8 @@ class ModelInfoResponse(BaseModel):
     supports_vision: bool
     supports_reasoning_effort: Optional[bool] = None
     context_length: int
+    context_source: Optional[str] = ""
+    capability_source: Optional[str] = ""
     full_id: str
     provider_name: str = ""
     # v2.0 新增
@@ -134,6 +136,7 @@ class ModelUpdate(BaseModel):
     priority_boost: Optional[int] = None
     auto_excluded: Optional[bool] = None
     supports_reasoning_effort: Optional[bool] = None
+    context_length: Optional[int] = None  # P1-6: 手动改窗口 → context_source=manual（刷新不覆盖）
     # v3.4: per-model request overrides (headers/body_patch/model_alias)
     request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):
