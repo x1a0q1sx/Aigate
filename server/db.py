@@ -198,11 +198,11 @@ async def init_db():
     async with engine.begin() as conn:
         if not (await conn.execute(text("SELECT 1 FROM routing_weights WHERE id=1"))).first():
             await conn.execute(text(
-                "INSERT INTO routing_weights (id, w_speed, w_intel, w_stab) "
-                "VALUES (1, 0.30, 0.50, 0.20)"
+                "INSERT INTO routing_weights (id, w_speed, w_intel, w_stab, updated_at) "
+                "VALUES (1, 0.30, 0.50, 0.20, CURRENT_TIMESTAMP)"
             ))
         if not (await conn.execute(text("SELECT 1 FROM routing_pin WHERE id=1"))).first():
-            await conn.execute(text("INSERT INTO routing_pin (id) VALUES (1)"))
+            await conn.execute(text("INSERT INTO routing_pin (id, updated_at) VALUES (1, CURRENT_TIMESTAMP)"))
         if not (await conn.execute(text("SELECT 1 FROM analytics_cumulative WHERE id=1"))).first():
             await conn.execute(text(
                 "INSERT INTO analytics_cumulative "
