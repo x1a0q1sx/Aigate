@@ -51,6 +51,6 @@
 ## P2 — 体验与扩展
 
 - [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）
-- [ ] P2-10 代理池：get_proxy_pool 读 config、目标站探测（HF/OpenRouter/GitHub）、成功率展示、per-provider 强制直连/代理
+- [x] P2-10 代理池完善（✅ 2026-09 完成）：成功/失败累计计数 + 快照字段（ok_count/err_total/last_used_ts）+ request_with_fallback 成功路径标记；get_proxy_pool 读 config 与 per-provider 强制直连/代理已有（init_proxy_pool/proxy_enabled）；目标站探测经评估不加——第三方站点无法判断真实上游可达性，会误杀可用代理（代码注释有据）
 - [ ] P2-11 PostgreSQL 支持（DATABASE_URL 切换，SQLite 保持单机默认）
 - [ ] P2-12 压测：10/50/100 并发聊天，观察 P95 首字、locked 次数、WAL 增长
