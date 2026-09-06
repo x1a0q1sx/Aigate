@@ -284,7 +284,7 @@ async def list_archives():
         info = _parse_archive_meta(fp.name)
         if info:
             archives.append(info)
-    return {"archives": archives}
+    return {"archives": archives, "last_archive": _last_archive_info}
 
 # 必须在 /logs/{log_id} 之前注册，否则 providers 会被当作 log_id
 @router.get("/logs/providers")
@@ -735,6 +735,11 @@ async def upsert_intel(data: IntelIn, db: AsyncSession = Depends(get_db)):
 
 # ===================== 日志归档管理 =====================
 
+# P1-8: 最近一次归档状态（内存态；归档是每天/手动的低频运维动作，重启清空可接受）
+_last_archive_info = {"ok": None, "at": None, "count": 0, "blobs_deleted": 0,
+                      "filename": "", "error": ""}
+
+
 def _get_archive_dir() -> Path:
     cfg = get_config()
     d = Path(cfg.log_archive.archive_dir)
@@ -908,6 +913,10 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
         await conn.execute(text("VACUUM"))
 
     _invalidate_analytics_cache()
+    _last_archive_info.update({
+        "ok": True, "at": datetime.utcnow().isoformat()[:19],
+        "count": count, "blobs_deleted": blobs_deleted, "filename": filename, "error": "",
+    })
     return {
         "ok": True,
         "archived_count": count,
@@ -922,7 +931,14 @@ async def _do_archive(db: AsyncSession, target_date: str = None) -> dict:
 @router.post("/logs/archive")
 async def trigger_archive(date: str = Query(None, description="归档日期 YYYY-MM-DD，或 'all' 归档全部，默认全部"), db: AsyncSession = Depends(get_db)):
     """手动触发归档：默认归档全部日志，可指定日期"""
-    return await _do_archive(db, date or "all")
+    try:
+        return await _do_archive(db, date or "all")
+    except Exception as e:
+        _last_archive_info.update({
+            "ok": False, "at": datetime.utcnow().isoformat()[:19],
+            "count": 0, "blobs_deleted": 0, "filename": "", "error": str(e)[:300],
+        })
+        raise
 
 
 @router.post("/logs/archives/{filename}/restore")

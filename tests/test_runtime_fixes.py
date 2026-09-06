@@ -893,3 +893,23 @@ def test_estimate_factor_clamp():
         assert f == 1.0
 
     _aio.run(_run())
+
+
+# ===================== P1-8 日志脱敏 =====================
+
+def test_redact_text_masks_secrets():
+    from server.core.request_logger import redact_text
+
+    s = 'Authorization: Bearer ak-TESTFAKEKEY0000000000000000000000000aaa and key=sk-TESTFAKEKEY0000000000000000000000000bbb'
+    out = redact_text(s)
+    assert "ak-pTSFhq" not in out and "sk-LYqYo" not in out
+    assert "Bearer ***" in out
+    # wk- Modal 风格 key
+    out2 = redact_text('auth: wk-TESTFAKEKEY0000000000000000000000.ccc')
+    assert "wk-R7eylU" not in out2
+    # api_key KV 形态
+    out3 = redact_text('{"api_key": "wk-R7eylUesyT4F0JI2QFzLgU"}')
+    assert "wk-R7eylU" not in out3
+    # 非字符串/短文本原样
+    assert redact_text(123) == 123
+    assert redact_text("short") == "short"

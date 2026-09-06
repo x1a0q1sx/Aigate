@@ -41,6 +41,30 @@ def _ungz(b: bytes) -> bytes:
     return gzip.decompress(b)
 
 
+# ── P1-8 日志脱敏：写 blob 前对常见密钥形态打码（Authorization / sk- / api_key= 等） ──
+import re as _re
+_RE_BEARER = _re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}", _re.IGNORECASE)
+_RE_SK = _re.compile(r"(sk-)[A-Za-z0-9_-]{12,}")
+_RE_WK = _re.compile(r"(wk-)[A-Za-z0-9_.-]{12,}")
+_RE_KV = _re.compile(
+    r"((?:api[_-]?key|access[_-]?token|token|authorization|password)\s*[\"'=:\s]+)"
+    r"([A-Za-z0-9._~+/=-]{8,})", _re.IGNORECASE,
+)
+
+
+def redact_text(s: Any) -> Any:
+    """对字符串做密钥打码；非字符串原样返回。日志仅用于诊断，密钥无保留价值。"""
+    if not isinstance(s, str):
+        return s
+    if len(s) < 12:
+        return s
+    s = _RE_BEARER.sub(r"\1***", s)
+    s = _RE_SK.sub(r"\1***", s)
+    s = _RE_WK.sub(r"\1***", s)
+    s = _RE_KV.sub(r"\1***", s)
+    return s
+
+
 def _parse_body(body: Any) -> Optional[dict]:
     """接受 None / str(JSON) / dict / pydantic，统一返回 dict 或 None。"""
     if body is None:
@@ -93,6 +117,7 @@ async def _upsert_units(db: AsyncSession, objs: List[Any]) -> List[str]:
 
 async def _store_request(db: AsyncSession, request_body: Any) -> Tuple[Optional[str], Optional[str]]:
     """拆请求体：信封(去掉 messages) + 逐条消息。返回 (env_hash, msg_hashes_json)。"""
+    request_body = redact_text(request_body) if isinstance(request_body, str) else request_body
     d = _parse_body(request_body)
     if not isinstance(d, dict):
         return None, None
@@ -116,6 +141,7 @@ async def _store_request(db: AsyncSession, request_body: Any) -> Tuple[Optional[
 
 async def _store_response(db: AsyncSession, response_body: Any) -> Optional[str]:
     """响应整包作为一个单元（响应体量小，整包去重足够）。"""
+    response_body = redact_text(response_body) if isinstance(response_body, str) else response_body
     d = _parse_body(response_body)
     if not isinstance(d, dict):
         if isinstance(response_body, str):  # 如 "[stream]" 占位

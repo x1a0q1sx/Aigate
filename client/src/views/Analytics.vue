@@ -249,6 +249,10 @@
       <p style="color: var(--gray-500); font-size: 13px; margin-bottom: 12px;">
         每天凌晨 2:00 自动将昨日日志归档为 gzip 压缩文件。也可手动归档，随时解压恢复或永久删除。
       </p>
+      <div v-if="lastArchive" style="margin-bottom: 10px; font-size: 12px;" :style="{color: lastArchive.ok === false ? 'var(--danger)' : 'var(--gray-500)'}">
+        最近归档：<template v-if="lastArchive.ok === true">✅ {{ fmtTime(lastArchive.at) }} · {{ lastArchive.count }} 条 · 释放 blob {{ lastArchive.blobs_deleted }} 个<template v-if="lastArchive.filename">（{{ lastArchive.filename }}）</template></template>
+        <template v-else-if="lastArchive.ok === false">❌ {{ fmtTime(lastArchive.at) }} 失败：{{ lastArchive.error || '未知错误' }}</template>
+      </div>
       <table v-if="archives.length > 0">
         <thead>
           <tr>
@@ -482,6 +486,7 @@ export default {
       detailLoading: false,
       archives: [],
       archiveBusy: false,
+      lastArchive: null,
       todayData: null,
       usageFilters: defaultUsageFilters(),
       usageLoading: false,
@@ -819,6 +824,7 @@ export default {
       try {
         const data = await api.listArchives()
         this.archives = data.archives || []
+        this.lastArchive = data.last_archive || null
       } catch (e) { console.error('加载归档列表失败', e) }
     },
     async doArchive() {
