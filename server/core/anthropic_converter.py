@@ -224,6 +224,9 @@ def openai_response_to_anthropic(openai_resp: dict, model_name: str) -> dict:
         content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     # 检查 tool_calls
     tool_calls = openai_msg.get("tool_calls") or []
+    if text:
+        # 顺序契约：thinking → text → tool_use（Anthropic 习惯：先文字再调用）
+        content_blocks.append({"type": "text", "text": text})
     for tc in tool_calls:
         fn = tc.get("function", {})
         try:
@@ -236,8 +239,6 @@ def openai_response_to_anthropic(openai_resp: dict, model_name: str) -> dict:
             "name": fn.get("name", ""),
             "input": args,
         })
-    if text:
-        content_blocks.insert(0, {"type": "text", "text": text})
 
     finish_reason = choice.get("finish_reason", "stop")
     stop_reason = _openai_finish_to_anthropic_stop(finish_reason)

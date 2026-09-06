@@ -194,8 +194,8 @@ def _convert_streaming_response(openai_response: StreamingResponse, openai_req: 
 
     async def anthropic_stream():
         try:
-            # 先发 ping 事件防客户端超时
-            yield b"event: ping\ndata: {}\n\n"
+            # keepalive：SSE 注释行（非事件），防上游思考期客户端超时
+            yield b": keepalive\n\n"
             async for chunk_bytes in openai_response.body_iterator:
                 if isinstance(chunk_bytes, bytes):
                     chunk_str = chunk_bytes.decode("utf-8", errors="replace")
@@ -226,7 +226,7 @@ def _convert_streaming_response(openai_response: StreamingResponse, openai_req: 
                         }, ensure_ascii=False)
                         yield f"event: error\ndata: {err_data}\n\n".encode("utf-8")
                         return
-                    for ev in openai_stream_to_anthropic_events(openai_chunk, state):
+                    for ev in await openai_stream_to_anthropic_events(openai_chunk, state):
                         yield format_anthropic_sse(ev)
         except Exception as e:
             # 流中出错：发出 error 事件
