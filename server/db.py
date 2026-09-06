@@ -216,8 +216,8 @@ async def init_db():
             ), {"p": pattern})).first():
                 continue
             await conn.execute(text(
-                "INSERT INTO intelligence_static (pattern, score, tier, notes, source) "
-                "VALUES (:p, :s, :t, :n, 'manual')"
+                "INSERT INTO intelligence_static (pattern, score, tier, notes, source, updated_at) "
+                "VALUES (:p, :s, :t, :n, 'manual', CURRENT_TIMESTAMP)"
             ), {"p": pattern, "s": score, "t": tier, "n": notes})
 
 
