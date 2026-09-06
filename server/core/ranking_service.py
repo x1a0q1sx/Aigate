@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, desc, and_
+from sqlalchemy import select, func, text, desc, and_
 from server.models.model import Model
 from server.models.provider import Provider
 from server.models.request_log import RequestLog
@@ -231,8 +231,11 @@ class RankingService:
         仅取历史「成功调用」(request_logs.status='success') 的延迟求均值；
         映射曲线高延迟也永不为 0：score = max(FLOOR, 100*REF/(REF+avg))，REF≈3000ms 对应 50 分。"""
         since = datetime.utcnow() - timedelta(seconds=self.speed_window_seconds)
-        model = await db.get(Model, model_id)
-        needle = (model.model_id if model else None) or model_id_str
+        # P1-7: 调用方（rank_all）已传 model_id_str 时跳过 db.get（每模型一次点查）
+        needle = model_id_str
+        if not needle:
+            model = await db.get(Model, model_id)
+            needle = model.model_id if model else None
         if not needle:
             return 0.0, None
         rows = (await db.execute(
@@ -256,8 +259,10 @@ class RankingService:
         """返回 stab_score (0-100) 或 None(样本不足)。
         仅基于 request_logs 真实调用历史计算成功率（不依赖已停用的自动探测）。"""
         since = datetime.utcnow() - timedelta(seconds=self.stab_window_seconds)
-        model = await db.get(Model, model_id)
-        needle = (model.model_id if model else None) or model_id_str
+        needle = model_id_str
+        if not needle:
+            model = await db.get(Model, model_id)
+            needle = model.model_id if model else None
         if not needle:
             return None
         rows = (await db.execute(
@@ -337,15 +342,61 @@ class RankingService:
             "last_checked": last_checked,
             "error_message": err_msg,
         }
+    _rank_cache: dict = {}   # cache_key -> (scores, ts)
+    _RANK_TTL = 10           # 秒；health_cooling 变化会改变 cache_key，不受影响
+
     async def rank_all(
         self, db: AsyncSession,
         models: List[Model],
         providers: Dict[int, Provider],
         health_cooling: Dict[int, datetime] = None,
     ) -> List[ModelScore]:
-        """对所有候选模型打分排序"""
+        """对所有候选模型打分排序。
+
+        P1-7: ① 结果 TTL 缓存（10s，key 含模型集合与冷却集，冷却变化即时失效）；
+        ② 速度/稳定性统计批量聚合（此前每个模型 2 次查询，千级模型 = 数千次 SQL）。"""
+        import time as _time
+        import hashlib as _hashlib
+        _ck_src = (
+            tuple(sorted(m.id for m in models)),
+            tuple(sorted((k, str(v)) for k, v in (health_cooling or {}).items())),
+        )
+        ck = _hashlib.md5(repr(_ck_src).encode()).hexdigest()
+        cached = self._rank_cache.get(ck)
+        if cached and _time.time() - cached[1] < self._RANK_TTL:
+            return cached[0]
+
         weights = await self.get_weights(db)
         intel_rows = (await db.execute(select(IntelligenceStatic))).scalars().all()
+
+        # 批量聚合：速度（窗口内成功请求平均延迟）与稳定性（窗口内状态序列）一次取回
+        speed_since = datetime.utcnow() - timedelta(seconds=self.speed_window_seconds)
+        lat_rows = (await db.execute(
+            select(RequestLog.routed_model, func.avg(RequestLog.latency_ms))
+            .where(
+                RequestLog.created_at >= speed_since,
+                RequestLog.status == "success",
+                RequestLog.latency_ms.isnot(None),
+                RequestLog.is_health_check == False,  # noqa: E712
+            )
+            .group_by(RequestLog.routed_model)
+        )).all()
+        avg_by_model = {r[0]: float(r[1]) for r in lat_rows if r[0]}
+
+        stab_since = datetime.utcnow() - timedelta(seconds=self.stab_window_seconds)
+        stat_rows = (await db.execute(
+            select(RequestLog.routed_model, RequestLog.status)
+            .where(
+                RequestLog.created_at >= stab_since,
+                RequestLog.is_health_check == False,  # noqa: E712
+            )
+            .order_by(RequestLog.created_at.desc())
+            .limit(200000)
+        )).all()
+        statuses_by_model: Dict[str, List[str]] = {}
+        for rm, st in stat_rows:
+            if rm:
+                statuses_by_model.setdefault(rm, []).append(st)
         scores: List[ModelScore] = []
         health_cooling = health_cooling or {}
         now = datetime.utcnow()
@@ -377,14 +428,40 @@ class RankingService:
             if m.id in health_cooling and health_cooling[m.id] > now:
                 ms.excluded_reason = "健康冷却中"
                 scores.append(ms); continue
-            # 计算三维
-            ms.speed_score, ms.avg_ms = await self.compute_speed_score(db, m.id, m.model_id)
+            # 计算三维（P1-7：速度/稳定性来自批量聚合，不再逐模型查库）
+            avg_ms = avg_by_model.get(m.model_id)
+            if avg_ms is not None:
+                REF = 3000.0   # 参考延迟：3000ms → 50 分
+                FLOOR = 5.0    # 高延迟也不低于此分（永不为 0）
+                ms.speed_score = round(max(FLOOR, min(100.0, 100.0 * REF / (REF + avg_ms))), 2)
+                ms.avg_ms = round(avg_ms, 1)
+            else:
+                ms.speed_score, ms.avg_ms = 0.0, None
             ms.intel_score, ms.intel_source = self.compute_intel(m.model_id, list(intel_rows), m.is_free)
             # manual boost lifts the effective intel tier (not final_score directly)
             if m.priority_boost:
                 ms.intel_score = round(min(100.0, ms.intel_score + m.priority_boost * 0.3), 2)
                 ms.intel_source = (ms.intel_source or "") + "-boosted"
-            ms.stab_score = await self.compute_stab_score(db, m.id, m.model_id)
+            # 稳定性：与 compute_stab_score 同一套公式，但数据来自批量聚合
+            all_statuses = statuses_by_model.get(m.model_id, [])
+            if not all_statuses:
+                ms.stab_score = 70.0  # baseline stability; unknown models enter Auto
+            else:
+                total = len(all_statuses)
+                success = sum(1 for s0 in all_statuses if s0 == "success" or s0 == "healthy")
+                sr = success / total
+                consecutive_fail = 0
+                for s0 in all_statuses:
+                    if s0 != "success":
+                        consecutive_fail += 1
+                    else:
+                        break
+                penalty = 0
+                if consecutive_fail >= 3:
+                    penalty = self.fail_penalty + max(0, consecutive_fail - 3) * 2
+                if total < self.min_requests:
+                    penalty += (self.min_requests - total) * 10
+                ms.stab_score = round(max(0.0, sr * 100 - penalty), 2)
             # stability is never None now (70 default), so models enter Auto
             speed_norm = min(1.0, max(0.0, (ms.speed_score or 0.0) / 100.0))
             stab_norm = min(1.0, max(0.0, (ms.stab_score or 70.0) / 100.0))
@@ -409,6 +486,7 @@ class RankingService:
                 0 if s.is_free else 1,
             )
         scores.sort(key=sort_key)
+        self._rank_cache[ck] = (scores, _time.time())
         return scores
     async def rank_top_speed(self, db: AsyncSession, limit: int = 5) -> List[Dict[str, Any]]:
         models = (await db.execute(select(Model, Provider)
