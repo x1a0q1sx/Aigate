@@ -46,7 +46,7 @@
 - [x] P1-5 上下文估算校准（✅ 2026-09 完成，commit 62b8748）：est_prompt_tokens 落日志、get_estimate_factor 动态系数（TTL 缓存+钳制）、observed_context_limit 超限学习收紧预检窗口、4 处预检全部生效
 - [x] P1-6 元数据来源分层（✅ 2026-09 完成，commit 8797b73）：context_source/capability_source 列 + manual 标记（刷新/OpenRouter 回填永不覆盖）+ ModelInfoResponse 暴露
 - [ ] P1-7 评分查询聚合化：RankingService 批量 GROUP BY + 30s TTL 内存缓存
-- [ ] P1-8 日志脱敏（Authorization/x-api-key/api_key 写入前打码）+ 归档索引 + 归档状态展示
+- [x] P1-8 日志脱敏 + 归档状态展示（✅ 2026-09 完成，commit 47fe63f）：redact_text 覆盖 Bearer/sk-/wk-/KV 形态（blob 与回退原文两路）、最近归档状态入 /logs/archives 与前端展示；归档行级索引暂缓（无单条恢复消费方）
 
 ## P2 — 体验与扩展
 
