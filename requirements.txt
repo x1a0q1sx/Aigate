@@ -10,3 +10,4 @@ httpx[socks]>=0.27.0
 apscheduler>=3.10.4
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
+asyncpg  # optional: PostgreSQL backend (set AIGATE_DATABASE_URL)

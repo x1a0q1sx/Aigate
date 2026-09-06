@@ -52,5 +52,5 @@
 
 - [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）
 - [x] P2-10 代理池完善（✅ 2026-09 完成）：成功/失败累计计数 + 快照字段（ok_count/err_total/last_used_ts）+ request_with_fallback 成功路径标记；get_proxy_pool 读 config 与 per-provider 强制直连/代理已有（init_proxy_pool/proxy_enabled）；目标站探测经评估不加——第三方站点无法判断真实上游可达性，会误杀可用代理（代码注释有据）
-- [!] P2-11 PostgreSQL 支持（阻塞：需 PG 测试环境）。engine 分流简单，但 strftime 趋势聚合、json_each 孤儿 GC、INSERT OR IGNORE、blob 去重 on_conflict、PRAGMA/WAL/VACUUM、naive datetime 均为 SQLite 专用实现，需方言化并逐项验证——无 PG 环境交付半吊子支持比不支持更危险
+- [x] P2-11 PostgreSQL 支持（✅ 2026-09 完成，服务器装 PG16 实测验证）：AIGATE_DATABASE_URL 环境变量切换（默认 SQLite 不变）；方言化全部完成——blob upsert 分支、趋势 strftime/to_char、孤儿 GC 改 Python 收集、种子查后插、VACUUM/checkpoint 仅 SQLite、布尔列比较修正；实测 PG 全链路 chat 200 + 日志落 PG。注意：跨库迁移时 JSON 列需反序列化（SQLite 原始行存字符串）
 - [x] P2-12 压测矩阵（✅ 2026-09 完成，scripts/load_test.py 可复用）：10 并发实测 20/20 日志落库完整、0 locked、p50=11s（瓶颈在上游公益站）；50/100 并发脚本参数已支持，建议配快速上游执行
