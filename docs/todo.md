@@ -50,7 +50,7 @@
 
 ## P2 — 体验与扩展
 
-- [ ] P2-9 协议 fixture 测试：Codex Responses / Anthropic Messages / OpenAI Chat 的 SSE 事件序列固定样例回归
+- [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）
 - [ ] P2-10 代理池：get_proxy_pool 读 config、目标站探测（HF/OpenRouter/GitHub）、成功率展示、per-provider 强制直连/代理
 - [ ] P2-11 PostgreSQL 支持（DATABASE_URL 切换，SQLite 保持单机默认）
 - [ ] P2-12 压测：10/50/100 并发聊天，观察 P95 首字、locked 次数、WAL 增长
