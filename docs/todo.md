@@ -45,12 +45,14 @@
 - [x] P1-4 usage 统一归一化（✅ 2026-09 完成，commit 5be9499）：NormalizedUsage 三方言字段驱动提取，Anthropic 缓存口径并入 prompt，v1 五处提取链 + anthropic 适配器统一
 - [x] P1-5 上下文估算校准（✅ 2026-09 完成，commit 62b8748）：est_prompt_tokens 落日志、get_estimate_factor 动态系数（TTL 缓存+钳制）、observed_context_limit 超限学习收紧预检窗口、4 处预检全部生效
 - [x] P1-6 元数据来源分层（✅ 2026-09 完成，commit 8797b73）：context_source/capability_source 列 + manual 标记（刷新/OpenRouter 回填永不覆盖）+ ModelInfoResponse 暴露
-- [ ] P1-7 评分查询聚合化：RankingService 批量 GROUP BY + 30s TTL 内存缓存
+- [x] P1-7 评分查询聚合化（✅ 2026-09 完成，commit f4a6507）：RankingService 批量 GROUP BY（avg_by_model + statuses_by_model 两条组查询）+ 10s TTL 内存缓存（key 含模型集合+冷却集）+ 聚合排除健康检查行
 - [x] P1-8 日志脱敏 + 归档状态展示（✅ 2026-09 完成，commit 47fe63f）：redact_text 覆盖 Bearer/sk-/wk-/KV 形态（blob 与回退原文两路）、最近归档状态入 /logs/archives 与前端展示；归档行级索引暂缓（无单条恢复消费方）
 
 ## P2 — 体验与扩展
 
 - [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）
 - [x] P2-10 代理池完善（✅ 2026-09 完成）：成功/失败累计计数 + 快照字段（ok_count/err_total/last_used_ts）+ request_with_fallback 成功路径标记；get_proxy_pool 读 config 与 per-provider 强制直连/代理已有（init_proxy_pool/proxy_enabled）；目标站探测经评估不加——第三方站点无法判断真实上游可达性，会误杀可用代理（代码注释有据）
-- [x] P2-11 PostgreSQL 支持（✅ 2026-09 完成，服务器装 PG16 实测验证）：AIGATE_DATABASE_URL 环境变量切换（默认 SQLite 不变）；方言化全部完成——blob upsert 分支、趋势 strftime/to_char、孤儿 GC 改 Python 收集、种子查后插、VACUUM/checkpoint 仅 SQLite、布尔列比较修正；实测 PG 全链路 chat 200 + 日志落 PG。注意：跨库迁移时 JSON 列需反序列化（SQLite 原始行存字符串）
+- [x] P2-11 PostgreSQL 支持（✅ 2026-09 完成，服务器装 PG16 实测验证）：AIGATE_DATABASE_URL 环境变量切换（默认 SQLite 不变）；方言化全部完成——blob upsert 分支、趋势 strftime/to_char、孤儿 GC 改 Python 收集、种子查后插、VACUUM/checkpoint 仅 SQLite、布尔列比较修正；实测 PG 全链路 chat 200 + 日志落 PG
+- [x] P2-11a 跨库迁移工具（✅ 2026-09 完成，scripts/migrate_to_pg.py，服务器实测 15693/15693 日志全量迁移）：只读打开源库、ORM create_all 补齐目标表、反射目标列类型驱动三类方言坑转换（JSON 字符串反序列化 / 0→1 布尔 / ISO 字符串→datetime 含剥时区）、FK 依赖序写入、逐批 ON CONFLICT DO NOTHING 幂等可重跑、批量失败降级逐行并报坏行详情、源库孤儿行预分类跳过（PG 迁移实测发现源库遗留 96 条孤儿：rate_limits 56 / health_checks 40，init_db 已加幂等清理）、收尾重置 id 序列 + VACUUM ANALYZE
+  - 切换 PG 步骤：低峰停写 → 跑迁移工具（先 --dry-run）→ .env 设 AIGATE_DATABASE_URL → 重启验证；详见脚本 docstring
 - [x] P2-12 压测矩阵（✅ 2026-09 完成，scripts/load_test.py 可复用）：10 并发实测 20/20 日志落库完整、0 locked、p50=11s（瓶颈在上游公益站）；50/100 并发脚本参数已支持，建议配快速上游执行

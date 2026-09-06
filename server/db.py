@@ -118,6 +118,11 @@ async def init_db():
         "DELETE FROM rate_limits WHERE id NOT IN (SELECT MIN(id) FROM rate_limits GROUP BY model_id, key_id)",
         "DELETE FROM model_api_keys WHERE model_id NOT IN (SELECT id FROM models)",
         "DELETE FROM model_api_keys WHERE api_key_id NOT IN (SELECT id FROM api_keys)",
+        # 孤儿清理（PG 迁移实测发现：SQLite 不强制外键，rate_limits/health_checks
+        # 残留引用已删除 model/key 的行；幂等，每次启动兜底扫一遍）
+        "DELETE FROM rate_limits WHERE model_id IS NOT NULL AND model_id NOT IN (SELECT id FROM models)",
+        "DELETE FROM rate_limits WHERE key_id IS NOT NULL AND key_id NOT IN (SELECT id FROM api_keys)",
+        "DELETE FROM health_checks WHERE model_id IS NOT NULL AND model_id NOT IN (SELECT id FROM models)",
         "ALTER TABLE models ADD COLUMN cache_read_input_price REAL DEFAULT 0.0",
         "ALTER TABLE models ADD COLUMN cache_write_input_price REAL DEFAULT 0.0",
         "ALTER TABLE models ADD COLUMN supports_reasoning_effort BOOLEAN DEFAULT NULL",
