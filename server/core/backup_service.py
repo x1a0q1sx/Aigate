@@ -25,8 +25,9 @@ def _backup_dir() -> Path:
 
 
 def _glob_backups() -> list:
-    return sorted(_backup_dir().glob("aigate-*.db") + tuple(_backup_dir().glob("aigate-*.sql")),
-                  key=lambda f: f.name)
+    d = _backup_dir()
+    files = list(d.glob("aigate-*.db")) + list(d.glob("aigate-*.sql"))
+    return sorted(files, key=lambda f: f.name)
 
 
 def prune_backups(keep: int) -> list:
