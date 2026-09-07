@@ -36,6 +36,15 @@ def get_downstream_key_id():
     return _downstream_key_id_var.get()
 
 
+def apply_downstream_key(kwargs: dict) -> None:
+    """调用方未显式传 downstream_key_id 时，用鉴权阶段设置的上下文值补上。
+    所有日志落库路径（write_log / enqueue_log / RequestLogger.log）都要走这一步。"""
+    if kwargs.get("downstream_key_id") is None:
+        dkid = get_downstream_key_id()
+        if dkid is not None:
+            kwargs["downstream_key_id"] = dkid
+
+
 # ── 规范化 / 哈希 / 压缩 ──
 def _canon(obj: Any) -> str:
     """规范化序列化：排序键 + 紧凑分隔符 + 保留非 ASCII。
@@ -270,10 +279,7 @@ async def write_log(db: AsyncSession, **kwargs) -> int:
     db 参数保留以兼容既有调用签名；队列化后不再在请求路径上使用。
     worker 停止（服务关闭 flush 后）时回退同步写，保证关闭瞬间的日志不丢。"""
     # D1: 鉴权阶段设置的下游网关密钥 id 自动随日志落库（调用方未显式传时）
-    if kwargs.get("downstream_key_id") is None:
-        dkid = get_downstream_key_id()
-        if dkid is not None:
-            kwargs["downstream_key_id"] = dkid
+    apply_downstream_key(kwargs)
     try:
         from server.core.log_queue import enqueue_log, is_running
         if is_running():
@@ -324,6 +330,7 @@ class RequestLogger:
                 else (json.dumps(resp, ensure_ascii=False) if resp is not None else None)
             )
 
+        apply_downstream_key(kwargs)
         rec = RequestLog(
             latency_ms=kwargs.pop("latency_ms", latency_ms),
             request_env_hash=env_hash,

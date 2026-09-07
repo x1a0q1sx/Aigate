@@ -48,6 +48,12 @@ def _get_queue() -> asyncio.Queue:
 
 async def enqueue_log(**kwargs) -> bool:
     """请求路径调用：入队立即返回。True=已入队（异步落库），False=队列满被丢弃。"""
+    # D1: 直连/流式路径直接走 enqueue_log，这里同样补下游网关密钥上下文
+    try:
+        from server.core.request_logger import apply_downstream_key
+        apply_downstream_key(kwargs)
+    except Exception:
+        pass
     if stopped:
         return False
     q = _get_queue()
