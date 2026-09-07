@@ -10,6 +10,8 @@
           <input type="checkbox" v-model="diagVerbose" @change="toggleDiag" style="cursor: pointer; width: 15px; height: 15px;" />
           请求诊断日志
         </label>
+        <button class="btn btn-outline" @click="exportLogs('csv')" title="导出近 7 天请求日志（CSV）">导出 CSV</button>
+        <button class="btn btn-outline" @click="exportLogs('json')" title="导出近 7 天请求日志（JSON）">导出 JSON</button>
         <button class="btn btn-outline" @click="loadAll">刷新</button>
         <button class="btn btn-outline" style="color: var(--warning);" @click="resetSummary">
           <span title="清零归档后保留的累计统计（实时日志统计保留）">重置统计数据</span>
@@ -232,6 +234,71 @@
       </table>
     </div>
 
+
+    <!-- 失败分析看板（B2） -->
+    <div class="card" style="margin-top: 20px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
+        <h2 style="margin: 0;">失败分析 🔍</h2>
+        <div style="display: flex; align-items: center; gap: 10px;">
+          <select v-model.number="failuresHours" @change="loadFailures" style="width: auto;">
+            <option :value="6">近 6 小时</option>
+            <option :value="24">近 24 小时</option>
+            <option :value="72">近 3 天</option>
+            <option :value="168">近 7 天</option>
+          </select>
+          <button class="btn btn-outline btn-sm" @click="loadFailures">刷新</button>
+        </div>
+      </div>
+      <template v-if="failures">
+        <div style="display: flex; gap: 12px; align-items: center; margin-bottom: 14px; flex-wrap: wrap;">
+          <span class="badge" :class="failures.total_errors > 0 ? 'badge-danger' : 'badge-success'">
+            失败 {{ failures.total_errors }} 次
+          </span>
+          <span v-if="failures.latest_error_sample" class="text-xs" style="color: var(--gray-500); overflow: hidden; text-overflow: ellipsis; max-width: 640px; white-space: nowrap;" :title="failures.latest_error_sample">
+            最近错误：{{ failures.latest_error_sample }}
+          </span>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px;">
+          <div>
+            <h3 style="font-size: 13px; color: var(--gray-500); margin: 0 0 8px;">按错误类型</h3>
+            <table v-if="failures.by_error_type.length" style="width: 100%; font-size: 13px;">
+              <tbody>
+                <tr v-for="g in failures.by_error_type" :key="g.error_type">
+                  <td><code>{{ g.error_type }}</code></td>
+                  <td style="text-align: right; font-weight: 600;">{{ g.count }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else style="color: var(--gray-500); font-size: 13px;">无失败记录</p>
+          </div>
+          <div>
+            <h3 style="font-size: 13px; color: var(--gray-500); margin: 0 0 8px;">按服务商</h3>
+            <table v-if="failures.by_provider.length" style="width: 100%; font-size: 13px;">
+              <tbody>
+                <tr v-for="g in failures.by_provider" :key="g.provider">
+                  <td>{{ g.provider }}</td>
+                  <td style="text-align: right; font-weight: 600;">{{ g.count }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else style="color: var(--gray-500); font-size: 13px;">无失败记录</p>
+          </div>
+          <div>
+            <h3 style="font-size: 13px; color: var(--gray-500); margin: 0 0 8px;">失败最多的模型 TOP10</h3>
+            <table v-if="failures.by_model.length" style="width: 100%; font-size: 13px;">
+              <tbody>
+                <tr v-for="(g, i) in failures.by_model.slice(0, 10)" :key="i">
+                  <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" :title="g.provider + '/' + g.model">{{ g.provider }}/{{ g.model }}</td>
+                  <td style="text-align: right; font-weight: 600;">{{ g.count }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <p v-else style="color: var(--gray-500); font-size: 13px;">无失败记录</p>
+          </div>
+        </div>
+      </template>
+      <p v-else style="text-align: center; padding: 16px; color: var(--gray-500); font-size: 13px;">加载中...</p>
+    </div>
 
     <!-- 日志归档管理 -->
     <div class="card" style="margin-top: 20px;">
@@ -501,7 +568,9 @@ export default {
       trendHover: -1,
       trendTipX: 0,
       trendTipY: 0,
-      diagVerbose: false
+      diagVerbose: false,
+      failures: null,
+      failuresHours: 24
     }
   },
     mounted() {
@@ -704,8 +773,19 @@ export default {
       await Promise.all([
         this.loadSummary(), this.loadPage(this.page), this.loadArchives(),
         this.loadToday(), this.loadTrend(), this.loadByProvider(), this.loadLogProviders(),
+        this.loadFailures(),
       ])
       this.loadDiag()
+    },
+    async loadFailures() {
+      try { this.failures = await api.getFailures(this.failuresHours) }
+      catch (e) { console.error('failures load failed', e) }
+    },
+    async exportLogs(format) {
+      try {
+        await api.exportLogs({ format, hours: 168, status: this.filterStatus || '', provider: this.filterProvider || '' })
+        toast.success('导出已开始下载')
+      } catch (e) { toast.error('导出失败: ' + e.message) }
     },
     async loadDiag() {
       try { this.diagVerbose = !!(await api.getDiag()).verbose } catch (e) { console.error('diag load failed', e) }

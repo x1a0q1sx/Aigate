@@ -52,6 +52,7 @@
           <select v-model="form.strategy">
             <option value="fallback">fallback 顺序兜底（第一个失败 → 下一个）</option>
             <option value="round_robin">round_robin 轮询（每次请求轮到下一个）</option>
+            <option value="weighted">weighted 加权随机（按候选权重分配流量）</option>
             <option value="fusion" disabled>fusion 扇出合并（实验中：当前按 fallback 顺序处理）</option>
           </select>
         </div>
@@ -62,7 +63,7 @@
         </div>
 
         <div class="form-group">
-          <label>候选模型 <span style="font-size: 12px; color: var(--text-muted); font-weight: 400;">（左侧服务商默认收起，点 ▶ 展开点选；右侧顺序即 fallback / 轮询顺序）</span></label>
+          <label>候选模型 <span style="font-size: 12px; color: var(--text-muted); font-weight: 400;">（左侧服务商默认收起，点 ▶ 展开点选；右侧顺序即 fallback / 轮询顺序；weighted 时可给每个候选填权重）</span></label>
 
           <div class="template-bar">
             <span class="template-label">模板</span>
@@ -153,6 +154,10 @@
                   <span class="sel-name">{{ m.provider }}/{{ m.model_id }}</span>
                   <span class="sel-meta" v-if="selMeta(m)">{{ selMeta(m) }}</span>
                   <span class="sel-spacer"></span>
+                  <input v-if="form.strategy === 'weighted'"
+                         class="weight-input" type="number" min="1" step="1"
+                         v-model.number="m.weight" title="权重（越大流量占比越高）"
+                         @click.stop @dragstart.stop />
                   <button class="btn btn-outline btn-xs" @click="moveUp(i)" :disabled="i === 0" title="上移">↑</button>
                   <button class="btn btn-outline btn-xs" @click="moveDown(i)" :disabled="i === form.model_ids.length - 1" title="下移">↓</button>
                   <button class="btn btn-danger btn-xs" @click="removeAt(i)" title="移除">×</button>
@@ -369,7 +374,7 @@ export default {
       this.templatePick = ''
     },
     stratLabel(s) {
-      return { fallback: '顺序兜底', round_robin: '轮询', fusion: '扇出合并' }[s] || s
+      return { fallback: '顺序兜底', round_robin: '轮询', weighted: '加权随机', fusion: '扇出合并' }[s] || s
     },
     isSel(provider, model_id) {
       return this.selectedSet.has(`${provider}::${model_id}`)
@@ -387,7 +392,7 @@ export default {
       const key = `${provider}::${model_id}`
       const idx = this.form.model_ids.findIndex(m => `${m.provider}::${m.model_id}` === key)
       if (idx >= 0) this.form.model_ids.splice(idx, 1)
-      else this.form.model_ids.push({ provider, model_id })
+      else this.form.model_ids.push({ provider, model_id, weight: 1 })
     },
     // 分组选择三态：none 一个都没选 / partial 选了部分 / all 全选
     groupSelState(g) {
@@ -555,14 +560,19 @@ export default {
         strategy: c.strategy,
         model_ids: (c.model_ids || []).map(m => ({
           provider: m.provider || (m.full_id ? m.full_id.split('/')[0] : ''),
-          model_id: m.model_id || (m.full_id ? m.full_id.split('/')[1] : '')
+          model_id: m.model_id || (m.full_id ? m.full_id.split('/')[1] : ''),
+          weight: m.weight || 1
         }))
       }
       this.showModal = true
     },
     async saveCombo() {
       if (!this.form.name.trim()) { toast.error('请填组合名'); return }
-      const cleaned = this.form.model_ids.filter(m => m.provider && m.model_id)
+      const cleaned = this.form.model_ids
+        .filter(m => m.provider && m.model_id)
+        .map(m => (this.form.strategy === 'weighted'
+          ? { ...m, weight: Number(m.weight) > 0 ? Number(m.weight) : 1 }
+          : m))
       if (cleaned.length === 0) { toast.error('至少添加一个候选模型'); return }
       this.saving = true
       try {
@@ -660,10 +670,25 @@ export default {
   color: var(--badge-free-fg);
   border-color: var(--badge-free-fg);
 }
+.cred-badge.strat-weighted {
+  background: var(--alert-warn-bg, rgba(245, 158, 11, .15));
+  color: var(--alert-warn-fg, #f59e0b);
+  border-color: var(--alert-warn-border, #f59e0b);
+}
 .cred-badge.strat-fusion {
   background: var(--badge-paid-bg);
   color: var(--badge-paid-fg);
   border-color: var(--badge-paid-fg);
+}
+.weight-input {
+  width: 56px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-base);
+  border-radius: 4px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  font-size: 12px;
+  text-align: right;
 }
 .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5);
   display: flex; align-items: center; justify-content: center; z-index: 1000; }

@@ -87,6 +87,74 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>数据库备份</h2>
+          <p>每日自动备份完整数据库（SQLite 在线备份 / PG pg_dump），保留 {{ backupInfo?.keep || 14 }} 份，超出自删最旧。</p>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <span class="status-pill" :class="backupInfo?.enabled ? 'ok' : 'muted'">{{ backupInfo?.enabled ? '自动备份已排程' : '自动备份关闭' }}</span>
+          <button class="btn btn-outline btn-sm" @click="loadDbBackups">刷新</button>
+          <button class="btn btn-primary btn-sm" @click="backupNow" :disabled="backing">{{ backing ? '备份中...' : '立即备份' }}</button>
+        </div>
+      </div>
+      <div class="db-backup-list">
+        <div v-for="b in dbBackups" :key="b.name" class="db-backup-row">
+          <code>{{ b.name }}</code>
+          <span>{{ fmtBytes(b.size) }}</span>
+          <span class="text-dim">{{ fmtTime(b.mtime) }}</span>
+        </div>
+        <div v-if="dbBackups.length === 0" class="backup-empty">暂无备份文件（等每日排程或点「立即备份」）</div>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
+          <h2>通知渠道</h2>
+          <p>模型进入冷却 / 组合与 auto 全部候选失败 / 网关密钥预算超限时推送提醒。</p>
+        </div>
+        <span class="status-pill" :class="notify.enabled ? 'ok' : 'muted'">{{ notify.enabled ? '已启用' : '未启用' }}</span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="notify.enabled" /> 启用通知</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="notify.notify_model_cooldown" /> 模型冷却</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="notify.notify_all_failed" /> 全候选失败</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="notify.notify_budget_exceeded" /> 预算超限</label>
+      </div>
+      <div class="notify-fields">
+        <label>通用 Webhook（POST {text}）<input v-model.trim="notify.webhook_url" placeholder="https://..." /></label>
+        <label>Telegram Bot Token<input v-model.trim="notify.telegram_bot_token" placeholder="123456:ABC-..." /></label>
+        <label>Telegram Chat ID<input v-model.trim="notify.telegram_chat_id" placeholder="123456789" /></label>
+        <label>钉钉机器人 Webhook<input v-model.trim="notify.dingtalk_webhook" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." /></label>
+        <label>同类事件节流（秒）<input v-model.number="notify.min_interval_seconds" type="number" min="5" /></label>
+      </div>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveNotify" :disabled="notifySaving">{{ notifySaving ? '保存中...' : '保存通知配置' }}</button>
+        <button class="btn btn-outline btn-sm" @click="doTestNotify" :disabled="testing">{{ testing ? '发送中...' : '发送测试通知' }}</button>
+      </div>
+      <p v-if="testResults" class="update-message" :class="{ ok: testOk }">{{ testOk ? '已发送：' : '部分失败：' }}{{ JSON.stringify(testResults) }}</p>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
+          <h2>响应缓存</h2>
+          <p>config.yaml 的 response_cache.enabled 开启后，相同请求指纹的非流式响应在 TTL 内直接复用。</p>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <span class="status-pill" :class="cacheInfo?.enabled ? 'ok' : 'muted'">{{ cacheInfo?.enabled ? '开启' : '关闭' }}</span>
+          <button class="btn btn-outline btn-sm" @click="clearCacheNow">清空缓存</button>
+        </div>
+      </div>
+      <div class="version-row" v-if="cacheInfo">
+        <div class="version-item"><span class="version-label">缓存条数</span><code class="mono">{{ cacheInfo.size }}</code></div>
+        <div class="version-item"><span class="version-label">命中 / 未命中</span><code class="mono">{{ cacheInfo.hits }} / {{ cacheInfo.misses }}</code></div>
+        <div class="version-item"><span class="version-label">TTL</span><code class="mono">{{ cacheInfo.ttl_seconds }}s</code></div>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>数据安全说明</h2>
           <p>更新过程中以下数据完整保留：</p>
         </div>
@@ -106,6 +174,7 @@
 
 <script>
 import api from '../api'
+import toast from '../toast'
 import AppIcon from '../components/AppIcon.vue'
 
 export default {
@@ -125,6 +194,15 @@ export default {
       backups: [],
       logTail: '',
       pollTimer: null,
+      dbBackups: [],
+      backupInfo: null,
+      backing: false,
+      notify: { enabled: false, webhook_url: '', telegram_bot_token: '', telegram_chat_id: '', dingtalk_webhook: '', notify_model_cooldown: true, notify_all_failed: true, notify_budget_exceeded: true, min_interval_seconds: 300 },
+      notifySaving: false,
+      testing: false,
+      testResults: null,
+      testOk: false,
+      cacheInfo: null,
     }
   },
   computed: {
@@ -160,7 +238,7 @@ export default {
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache()])
       } finally {
         this.loading = false
       }
@@ -237,6 +315,58 @@ export default {
       } finally {
         this.manualBacking = false
       }
+    },
+    async loadDbBackups() {
+      try {
+        const r = await api.getBackupFiles()
+        this.dbBackups = r.files || []
+        this.backupInfo = r
+      } catch (e) { this.dbBackups = [] }
+    },
+    async backupNow() {
+      this.backing = true
+      try {
+        const r = await api.runBackupNow()
+        toast.success(`备份完成：${r.file}（${Math.round(r.size / 1024)} KB）`)
+        await this.loadDbBackups()
+      } catch (e) {
+        toast.error('备份失败: ' + e.message)
+      } finally { this.backing = false }
+    },
+    async loadNotify() {
+      try { this.notify = { ...this.notify, ...(await api.getNotify()) } }
+      catch (e) { /* 配置加载失败保持默认 */ }
+    },
+    async saveNotify() {
+      this.notifySaving = true
+      try {
+        this.notify = await api.updateNotify(this.notify)
+        toast.success('通知配置已保存')
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.notifySaving = false }
+    },
+    async doTestNotify() {
+      this.testing = true
+      this.testResults = null
+      try {
+        const r = await api.testNotify()
+        this.testResults = r.results || r.detail
+        this.testOk = !!r.ok
+      } catch (e) {
+        this.testResults = e.message
+        this.testOk = false
+      } finally { this.testing = false }
+    },
+    async loadCache() {
+      try { this.cacheInfo = await api.getCacheInfo() } catch (e) { this.cacheInfo = null }
+    },
+    async clearCacheNow() {
+      try {
+        const r = await api.clearCache()
+        toast.success(`已清空 ${r.cleared} 条缓存`)
+        await this.loadCache()
+      } catch (e) { toast.error('清空失败: ' + e.message) }
     },
     phaseLabel(value) {
       return ({ preflight: '环境检查', pull: '拉取代码', build: '构建', verify: '隔离验证', health_check: '健康检查', rollback: '回滚', complete: '完成' })[value] || value || '—'
@@ -405,6 +535,14 @@ export default {
 .backup-row code, .checksum { font-family: var(--font-mono); }
 .backup-empty { padding: var(--space-5); text-align: center; color: var(--text-dim); font-size: var(--text-sm); }
 @media (max-width: 700px) { .backup-row { grid-template-columns: 1fr auto; padding: var(--space-2) 0; } .backup-row .checksum { display: none; } }
+.db-backup-list { border-top: 1px solid var(--border-base); }
+.db-backup-row { display: grid; grid-template-columns: minmax(220px, 1fr) 90px 180px; gap: var(--space-3); align-items: center; min-height: 40px; border-bottom: 1px solid var(--border-base); font-size: var(--text-sm); }
+.db-backup-row code { font-family: var(--font-mono); }
+.db-backup-row .text-dim { color: var(--text-dim); font-size: var(--text-xs); }
+.notify-grid { display: flex; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
+.notify-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--space-3); }
+.notify-fields label { display: flex; flex-direction: column; gap: 4px; font-size: var(--text-sm); color: var(--text-muted); }
+.notify-fields input { background: var(--surface-1); border: 1px solid var(--border-base); border-radius: 6px; padding: 8px 10px; color: var(--text-primary); font-size: var(--text-sm); }
 .safe-list {
   margin: 0;
   padding-left: var(--space-4);

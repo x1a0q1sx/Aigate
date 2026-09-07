@@ -68,11 +68,39 @@ async function apiDelete(path) {
   }
   return res.json()
 }
+async function apiPatch(path, data) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: 'PATCH',
+    headers: _addAuthHeader({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(data)
+  })
+  if (_handle401(res)) throw new Error('未登录或 session 已过期')
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+  }
+  return res.json()
+}
+async function apiDownload(path) {
+  const res = await fetch(`${BASE_URL}${path}`, { headers: _addAuthHeader() })
+  if (_handle401(res)) throw new Error('未登录或 session 已过期')
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const blob = await res.blob()
+  const cd = res.headers.get('Content-Disposition') || ''
+  const m = cd.match(/filename=(.+?)(?:;|$)/)
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = m ? m[1] : 'download'
+  a.click()
+  URL.revokeObjectURL(url)
+}
 export {
   apiGet,
   apiPost,
   apiPut,
-  apiDelete
+  apiDelete,
+  apiPatch,
+  apiDownload
 }
 export default {
   // 认证
@@ -238,4 +266,46 @@ export default {
   refreshOAuthConnection: (id) => apiPost(`/admin/oauth/refresh/${id}`),
   deleteOAuthConnection: (id) => apiDelete(`/admin/oauth/connections/${id}`),
   importOAuthToken: (data) => apiPost('/admin/oauth/import-token', data),
+
+  // ── v2 路线新增 ──
+  // D1 网关密钥（下游客户端钥匙）
+  getGatewayKeys: () => apiGet('/admin/api/gateway-keys'),
+  createGatewayKey: (data) => apiPost('/admin/api/gateway-keys', data),
+  updateGatewayKey: (id, data) => apiPatch(`/admin/api/gateway-keys/${id}`, data),
+  deleteGatewayKey: (id) => apiDelete(`/admin/api/gateway-keys/${id}`),
+  gatewayKeyUsage: (id) => apiGet(`/admin/api/gateway-keys/${id}/usage`),
+  // E1 模型别名
+  getAliases: () => apiGet('/admin/api/aliases'),
+  createAlias: (data) => apiPost('/admin/api/aliases', data),
+  updateAlias: (id, data) => apiPatch(`/admin/api/aliases/${id}`, data),
+  deleteAlias: (id) => apiDelete(`/admin/api/aliases/${id}`),
+  // B3 模型批量操作
+  batchModels: (ids, action) => apiPost('/admin/api/models/batch', { ids, action }),
+  // B4 一键诊断
+  diagnose: (data) => apiPost('/admin/api/diagnose', data),
+  // B2 失败分析
+  getFailures: (hours = 24) => apiGet(`/admin/api/analytics/failures?hours=${hours}`),
+  // B1 实时监控
+  getLiveSummary: () => apiGet('/admin/api/live/summary'),
+  // B5 日志导出
+  exportLogs: (params = {}) => {
+    const qs = new URLSearchParams({ format: params.format || 'csv', hours: params.hours || 168 })
+    if (params.status) qs.append('status', params.status)
+    if (params.provider) qs.append('provider', params.provider)
+    return apiDownload(`/admin/api/logs/export?${qs.toString()}`)
+  },
+  // D3 通知
+  getNotify: () => apiGet('/admin/api/notify'),
+  updateNotify: (data) => apiPut('/admin/api/notify', data),
+  testNotify: () => apiPost('/admin/api/notify/test', {}),
+  // D4 价格健康
+  getPriceHealth: () => apiGet('/admin/api/price-health'),
+  // C3 数据库备份文件
+  getBackupFiles: () => apiGet('/admin/api/backup/files'),
+  runBackupNow: () => apiPost('/admin/api/backup/files', {}),
+  // C4 版本
+  getVersion: () => apiGet('/admin/api/version'),
+  // A4 响应缓存
+  getCacheInfo: () => apiGet('/admin/api/cache'),
+  clearCache: () => apiDelete('/admin/api/cache'),
 }

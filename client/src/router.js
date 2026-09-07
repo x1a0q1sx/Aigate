@@ -12,6 +12,9 @@ import ProxyPool from './views/ProxyPool.vue'
 import Media from './views/Media.vue'
 import TokenSaver from './views/TokenSaver.vue'
 import Settings from './views/Settings.vue'
+import Keys from './views/Keys.vue'
+import Monitor from './views/Monitor.vue'
+import Aliases from './views/Aliases.vue'
 import Login from './views/Login.vue'
 
 const routes = [
@@ -20,7 +23,10 @@ const routes = [
   { path: '/dashboard', component: Dashboard, meta: { title: '仪表盘' } },
   { path: '/providers', component: Providers, meta: { title: '服务商' } },
   { path: '/models', component: Models, meta: { title: '模型' } },
+  { path: '/aliases', component: Aliases, meta: { title: '模型别名' } },
+  { path: '/keys', component: Keys, meta: { title: '网关密钥' } },
   { path: '/health', component: Health, meta: { title: '健康监控' } },
+  { path: '/monitor', component: Monitor, meta: { title: '实时监控' } },
   { path: '/auto', component: Auto, meta: { title: 'Auto 选举' } },
   { path: '/route-decisions', component: RouteDecisions, meta: { title: '路由决策' } },
   { path: '/analytics', component: Analytics, meta: { title: '分析' } },

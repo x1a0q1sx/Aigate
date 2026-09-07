@@ -52,6 +52,20 @@
       <label class="checkbox-label text-sm">
         <input type="checkbox" v-model="filterAuto" @change="load" /> 仅Auto候选
       </label>
+      <label class="checkbox-label text-sm">
+        <input type="checkbox" v-model="filterPriceIssue" @change="loadPriceHealth" /> 仅缺价/零价
+      </label>
+    </div>
+
+    <!-- 批量操作条 -->
+    <div v-if="selected.length" class="card batch-bar">
+      <span class="text-sm">已选 <b class="tabular">{{ selected.length }}</b> 项</span>
+      <button class="btn btn-outline btn-sm" @click="batch('enable')">启用</button>
+      <button class="btn btn-outline btn-sm" @click="batch('disable')">禁用</button>
+      <button class="btn btn-outline btn-sm" @click="batch('auto_include')">加入 Auto</button>
+      <button class="btn btn-outline btn-sm" @click="batch('auto_exclude')">移出 Auto</button>
+      <button class="btn btn-danger btn-sm" @click="batch('delete')">删除</button>
+      <button class="btn btn-ghost btn-sm" @click="selected = []">取消选择</button>
     </div>
 
     <!-- 模型表格 -->
@@ -60,6 +74,7 @@
         <table>
           <thead>
             <tr>
+              <th class="batch-check"><input type="checkbox" :checked="allSelected" @change="toggleAll" /></th>
               <th>模型 ID</th>
               <th class="sortable" @click="toggleSort('display_name')">
                 显示名
@@ -81,11 +96,12 @@
           </thead>
           <tbody>
             <tr v-if="models.length === 0">
-                <td colspan="11">
+                <td colspan="12">
                 <EmptyState icon="cpu" title="没有匹配的模型" small />
               </td>
             </tr>
             <tr v-for="m in sortedModels" :key="m.id" :class="{ 'row-disabled': !m.enabled }">
+              <td class="batch-check"><input type="checkbox" :value="m.id" v-model="selected" /></td>
               <td class="mono text-xs">{{ m.model_id }}</td>
               <td><strong>{{ m.display_name || m.model_id }}</strong></td>
               <td><strong>{{ getProviderName(m.provider_id) }}</strong></td>
@@ -158,6 +174,9 @@
                 <div class="action-row">
                   <button class="btn btn-outline btn-xs" @click="pingModel(m)" :disabled="m._pinging" title="测速">
                     <AppIcon :name="m._pinging ? 'clock' : 'zap'" :size="11" />
+                  </button>
+                  <button class="btn btn-outline btn-xs" @click="diagnose(m)" :disabled="m._diag" title="一键诊断（真实请求连通性/延迟报告）">
+                    <AppIcon :name="m._diag ? 'clock' : 'activity'" :size="11" />
                   </button>
                   <button class="btn btn-outline btn-xs" @click="editModel(m)" title="编辑">
                     <AppIcon name="edit" :size="11" />
@@ -254,6 +273,29 @@
       </template>
     </AppModal>
 
+    <!-- 诊断结果 -->
+    <AppModal v-model="showDiagModal" title="一键诊断报告" icon="activity" size="md">
+      <div v-if="diagResult">
+        <div class="diag-grid">
+          <div><span class="text-xs text-muted">模型</span><strong>{{ diagResult.full_id }}</strong></div>
+          <div><span class="text-xs text-muted">状态</span>
+            <span class="badge" :class="diagResult.ok ? 'badge-success' : 'badge-danger'">
+              {{ ({ healthy: '健康', degraded: '延迟', rate_limited: '限流', unhealthy: '故障' })[diagResult.status] || diagResult.status }}
+            </span>
+          </div>
+          <div><span class="text-xs text-muted">延迟</span><strong>{{ diagResult.latency_ms }}ms</strong></div>
+          <div><span class="text-xs text-muted">上下文</span><strong>{{ diagResult.context_length || '未知' }}</strong></div>
+          <div><span class="text-xs text-muted">价格</span><strong>{{ diagResult.is_free ? '免费' : ('$' + diagResult.input_price + ' / $' + diagResult.output_price + ' 每百万token') }}</strong></div>
+          <div><span class="text-xs text-muted">Auto</span><strong>{{ diagResult.auto_enabled ? '参与' : '不参与' }}</strong></div>
+        </div>
+        <p v-if="diagResult.error" class="diag-error">错误原文：{{ diagResult.error }}</p>
+        <p v-else class="diag-ok">真实探测请求成功，链路可用</p>
+      </div>
+      <template #footer>
+        <button class="btn btn-primary" @click="showDiagModal = false">关闭</button>
+      </template>
+    </AppModal>
+
     <!-- 添加模型 -->
     <AppModal v-model="showAddModel" title="手动添加模型" icon="plus" size="md">
       <div class="form-group">
@@ -337,6 +379,12 @@ export default {
       addModelForm: { provider_id: null, model_id: '', display_name: '', input_price: 0, output_price: 0, cache_read_input_price: 0, cache_write_input_price: 0 },
       showRefreshModal: false,
       refreshResult: null,
+      // B3 批量 / B4 诊断 / D4 缺价
+      selected: [],
+      showDiagModal: false,
+      diagResult: null,
+      filterPriceIssue: false,
+      priceIssueIds: [],
       // 分页 / 无限滚动
       limit: 100,
       offset: 0,
@@ -349,8 +397,14 @@ export default {
       if (this.pingTotal === 0) return 0
       return Math.round((this.pingDone / this.pingTotal) * 100)
     },
+    allSelected() {
+      return this.sortedModels.length > 0 && this.selected.length === this.sortedModels.length
+    },
     sortedModels() {
       let list = this.models || []
+      if (this.filterPriceIssue && this.priceIssueIds.length) {
+        list = list.filter((m) => this.priceIssueIds.includes(m.id))
+      }
       if (!this.sortKey) return list
       const order = this.sortOrder === 'asc' ? 1 : -1
       const key = this.sortKey
@@ -660,6 +714,47 @@ export default {
         this.addingModel = false
       }
     },
+    async batch(action) {
+      const labels = { enable: '启用', disable: '禁用', auto_include: '加入 Auto', auto_exclude: '移出 Auto', delete: '删除' }
+      if (action === 'delete' && !confirm(`确定删除选中的 ${this.selected.length} 个模型？不可撤销。`)) return
+      try {
+        const r = await api.batchModels(this.selected, action)
+        toast.success(`${labels[action]}完成：影响 ${r.affected} 个`)
+        this.selected = []
+        await this.load()
+      } catch (e) {
+        toast.error('批量操作失败: ' + e.message)
+      }
+    },
+    toggleAll() {
+      this.selected = this.allSelected ? [] : this.sortedModels.map((m) => m.id)
+    },
+    async diagnose(m) {
+      m._diag = true
+      try {
+        const r = await api.diagnose({ model_id: m.id })
+        this.diagResult = r.results && r.results[0]
+        this.showDiagModal = true
+      } catch (e) {
+        toast.error('诊断失败: ' + e.message)
+      } finally {
+        m._diag = false
+      }
+    },
+    async loadPriceHealth() {
+      if (!this.filterPriceIssue || this.priceIssueIds.length) return
+      try {
+        const r = await api.getPriceHealth()
+        const ids = []
+        ;(r.missing_price || []).forEach((x) => ids.push(x.model_id))
+        ;(r.zero_price || []).forEach((x) => ids.push(x.model_id))
+        this.priceIssueIds = ids
+        toast.info(`缺价 ${r.missing_count} / 零价 ${r.zero_count}，与当前列表交集过滤显示`)
+      } catch (e) {
+        toast.error('价格健康查询失败: ' + e.message)
+        this.filterPriceIssue = false
+      }
+    },
     async deleteModel(m) {
       if (!confirm(`确定要删除模型 "${m.display_name || m.model_id}" 吗？此操作不可撤销。`)) return
       try {
@@ -678,6 +773,24 @@ export default {
 </script>
 
 <style scoped>
+.batch-check { width: 34px; }
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-4);
+  padding: var(--space-2) var(--space-3);
+}
+.diag-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-3);
+}
+.diag-grid div { display: flex; flex-direction: column; gap: 4px; }
+.diag-error { color: var(--danger); font-size: var(--text-sm); margin-top: var(--space-3); word-break: break-all; }
+.diag-ok { color: var(--success); font-size: var(--text-sm); margin-top: var(--space-3); }
+
 /* 进度条 */
 .ping-progress {
   margin-bottom: var(--space-4);
