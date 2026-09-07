@@ -36,19 +36,10 @@ async def get_db():
         yield session
 
 
-def _verify_aigate_api_key(raw_request: Request):
-    """与 anthropic_router 相同的 API key 鉴权。"""
-    cfg = get_config()
-    expected = getattr(cfg.security, "aigate_api_key", "") or ""
-    if not expected:
-        return
-    token = raw_request.headers.get("x-api-key", "").strip()
-    if not token:
-        auth = raw_request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-    if token != expected:
-        raise HTTPException(status_code=401, detail="Invalid AIGate API key")
+async def _verify_aigate_api_key(raw_request: Request):
+    """主密钥或下游网关密钥（D1），委托 v1_router 统一实现。"""
+    from server.api.v1_router import verify_aigate_api_key
+    await verify_aigate_api_key(raw_request)
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +566,7 @@ async def responses_completions(
     db: AsyncSession = Depends(get_db),
 ):
     try:
-        _verify_aigate_api_key(raw_request)
+        await _verify_aigate_api_key(raw_request)
     except HTTPException as auth_err:
         raise auth_err
 

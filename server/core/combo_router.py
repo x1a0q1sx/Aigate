@@ -11,6 +11,7 @@ Combos 组合路由器
 """
 from __future__ import annotations
 import logging
+import random
 from typing import Optional, List, Dict, Any, Tuple
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -109,6 +110,8 @@ async def resolve_combo_targets(
                 "provider": provider,
                 "model": model,
                 "full_id": f"{prov_name}/{mod_id}",
+                # E2: 条目可带 weight（dict 条目），字符串旧格式无权重
+                "weight": item.get("weight") if isinstance(item, dict) else None,
             })
         except SQLAlchemyError as e:
             logger.warning("resolve combo item %s/%s failed: %s", prov_name, mod_id, e)
@@ -223,3 +226,24 @@ def pick_next_index(combo_id: int, total: int, strategy: str) -> int:
         return idx
     # fallback：永远从 0 开始
     return 0
+
+
+def _target_weight(target: Dict[str, Any]) -> float:
+    """E2: 候选权重（combo.model_ids 条目里的 weight 字段，缺省 1）。"""
+    try:
+        w = float(target.get("weight"))
+    except (TypeError, ValueError):
+        return 1.0
+    return w if w > 0 else 1.0
+
+
+def pick_start_index(targets: List[Dict[str, Any]], combo_id: int, strategy: str) -> int:
+    """E2: 选择起始候选下标。
+
+    weighted: 按 weight 加权随机抽一个起始候选（其余候选按原顺序作为
+    fallback 队列，抽中的失败后仍能落到别的候选）；
+    round_robin / fallback 维持 pick_next_index 原语义。"""
+    if strategy == "weighted" and targets:
+        weights = [_target_weight(t) for t in targets]
+        return random.choices(range(len(targets)), weights=weights, k=1)[0]
+    return pick_next_index(combo_id, len(targets), strategy)

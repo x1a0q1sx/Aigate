@@ -37,6 +37,8 @@ from .models.routing_config import RoutingWeights, RoutingPin, AdminAuditLog
 from .models.combo import Combo
 from .models.oauth_token import OAuthToken
 from .models.route_decision import RouteDecision
+from .models.gateway_key import GatewayKey   # D1 下游网关密钥
+from .models.model_alias import ModelAlias   # E1 模型别名
 from .config import get_config
 config = get_config()
 # P2-11: DATABASE_URL 环境变量优先（postgresql+asyncpg://...），未设置时用 SQLite 单机默认
@@ -139,6 +141,8 @@ async def init_db():
         "ALTER TABLE request_logs ADD COLUMN request_env_hash VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE request_logs ADD COLUMN request_msg_hashes TEXT DEFAULT NULL",
         "ALTER TABLE request_logs ADD COLUMN response_body_hash VARCHAR(64) DEFAULT NULL",
+        # D1: 下游网关密钥关联（哪个客户端 key 发起的请求）
+        "ALTER TABLE request_logs ADD COLUMN downstream_key_id INTEGER DEFAULT NULL",
     ]
     for sql in _migrations:
         try:
@@ -192,6 +196,8 @@ async def init_db():
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_rate_limits_model_key ON rate_limits(model_id, key_id)",
         "CREATE INDEX IF NOT EXISTS idx_log_msg_blobs_hash ON log_msg_blobs(hash)",
         "CREATE INDEX IF NOT EXISTS idx_oauth_provider_owner ON oauth_tokens(provider_code, owner)",
+        # D1: 按下游密钥+时间聚合预算用量
+        "CREATE INDEX IF NOT EXISTS idx_request_logs_dkey_time ON request_logs(downstream_key_id, created_at)",
     ]:
         try:
             async with engine.begin() as conn:

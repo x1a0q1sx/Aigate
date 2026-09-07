@@ -1,0 +1,138 @@
+"""v2 路线新特性纯逻辑测试（A4 缓存 / E2 权重 / A1 转换器 / D1 密钥工具）"""
+import json
+import time
+
+import pytest
+
+
+# ─────────────── A4: 响应缓存 ───────────────
+
+class _FakeReq:
+    def __init__(self, model="m1", stream=False, temperature=None):
+        self.model = model
+        self.stream = stream
+        self.temperature = temperature
+        self.messages = [{"role": "user", "content": "hi"}]
+
+    def model_dump(self):
+        return {"model": self.model, "stream": self.stream,
+                "temperature": self.temperature, "messages": self.messages}
+
+
+def _enable_cache(monkeypatch, enabled=True, ttl=300, max_items=2):
+    class _Cfg:
+        response_cache = type("C", (), {"enabled": enabled, "ttl_seconds": ttl,
+                                        "max_items": max_items, "max_body_bytes": 262144})()
+    monkeypatch.setattr("server.core.response_cache.get_config", lambda: _Cfg())
+
+
+def test_response_cache_hit_and_miss(monkeypatch):
+    from server.core.response_cache import ResponseCache
+    c = ResponseCache()
+    _enable_cache(monkeypatch)
+    req = _FakeReq()
+    assert c.get(req) is None            # miss
+    c.put(req, {"ok": True})
+    assert c.get(req) == {"ok": True}    # hit
+    assert c.get(_FakeReq(stream=True)) is None   # 流式不缓存
+    assert c.get(_FakeReq(model="other")) is None  # 不同指纹
+
+
+def test_response_cache_ttl_and_lru(monkeypatch):
+    from server.core.response_cache import ResponseCache
+    c = ResponseCache()
+    _enable_cache(monkeypatch, ttl=0.01, max_items=2)
+    r1, r2, r3 = _FakeReq("a"), _FakeReq("b"), _FakeReq("c")
+    c.put(r1, {"i": 1})
+    time.sleep(0.02)                     # r1 过期
+    c.put(r2, {"i": 2})
+    c.put(r3, {"i": 3})                  # 超容量淘汰最旧（r1 已过期）
+    assert c.get(r1) is None             # TTL 过期
+    assert c.get(r2) == {"i": 2}
+    assert c.get(r3) == {"i": 3}
+
+
+def test_response_cache_disabled(monkeypatch):
+    from server.core.response_cache import ResponseCache
+    c = ResponseCache()
+    _enable_cache(monkeypatch, enabled=False)
+    req = _FakeReq()
+    c.put(req, {"ok": True})
+    assert c.get(req) is None            # 关闭时完全不工作
+
+
+# ─────────────── E2: combo 权重抽签 ───────────────
+
+def test_pick_start_index_weighted_respects_weight():
+    from server.core.combo_router import pick_start_index
+    targets = [{"full_id": "a", "weight": 100}, {"full_id": "b", "weight": 0.001}]
+    picks = {pick_start_index(targets, 1, "weighted") for _ in range(200)}
+    assert picks == {0, 1} or picks == {0}   # 高权重几乎必中；允许极小概率出现 1
+    zero = [{"full_id": "a", "weight": 100}, {"full_id": "b", "weight": 0}]
+    assert pick_start_index(zero, 1, "weighted") == 0  # weight<=0 视为 1，不崩
+    assert pick_start_index(targets, 1, "fallback") == 0
+    assert pick_start_index(targets, 1, "round_robin") in (0, 1)
+
+
+# ─────────────── A1: Gemini 转换器 ───────────────
+
+def test_gemini_to_chat_basic_and_tools():
+    from server.core.gemini_converter import gemini_to_chat
+    body = {
+        "systemInstruction": {"parts": [{"text": "be nice"}]},
+        "contents": [
+            {"role": "user", "parts": [{"text": "hello"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {"x": 1}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"r": 2}}}]},
+        ],
+        "generationConfig": {"temperature": 0.5, "maxOutputTokens": 99, "thinkingConfig": {"thinkingBudget": 8192}},
+        "tools": [{"functionDeclarations": [{"name": "f", "description": "d", "parameters": {}}]}],
+    }
+    kwargs = gemini_to_chat("gemini-x", body)
+    assert kwargs["model"] == "gemini-x"
+    roles = [m["role"] for m in kwargs["messages"]]
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert kwargs["messages"][2]["tool_calls"][0]["function"]["name"] == "f"
+    assert kwargs["messages"][3]["tool_call_id"] == "call_f"
+    assert kwargs["temperature"] == 0.5 and kwargs["max_tokens"] == 99
+    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["tools"][0]["type"] == "function"
+
+
+def test_gemini_to_chat_inline_image():
+    from server.core.gemini_converter import gemini_to_chat
+    body = {"contents": [{"role": "user", "parts": [
+        {"text": "look"}, {"inlineData": {"mimeType": "image/png", "data": "QUJD"}}]}]}
+    kwargs = gemini_to_chat("m", body)
+    content = kwargs["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "look"}
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,QUJD")
+
+
+def test_chat_json_to_gemini_and_chunks():
+    from server.core.gemini_converter import chat_json_to_gemini, chunk_to_gemini
+    payload = {"choices": [{"message": {"content": "hi", "reasoning_content": "think"},
+                            "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}}
+    out = chat_json_to_gemini(payload, "m1")
+    assert out["candidates"][0]["content"]["parts"][0] == {"text": "think", "thought": True}
+    assert out["candidates"][0]["content"]["parts"][1] == {"text": "hi"}
+    assert out["candidates"][0]["finishReason"] == "STOP"
+    assert out["usageMetadata"]["totalTokenCount"] == 5
+    g = chunk_to_gemini({"choices": [{"delta": {"content": "a"}}]})
+    assert g["candidates"][0]["content"]["parts"] == [{"text": "a"}]
+    assert chunk_to_gemini({"choices": [{"delta": {}}]}) is None
+
+
+# ─────────────── D1: 网关密钥工具 ───────────────
+
+def test_gateway_key_hash_and_generate():
+    from server.core.gateway_keys import generate_key, hash_key, _check_rpm
+    k = generate_key()
+    assert k.startswith("gk-") and len(k) > 40
+    assert hash_key(k) == hash_key(k) and hash_key(k) != hash_key(k + "x")
+    row = type("R", (), {"rpm_limit": 2, "id": 999, "name": "t"})()
+    _check_rpm(row)
+    _check_rpm(row)
+    with pytest.raises(Exception):
+        _check_rpm(row)                  # 第 3 次超 2/min

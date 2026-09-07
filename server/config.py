@@ -72,6 +72,39 @@ class ArenaConfig(BaseModel):
     同步在启动时后台执行，不阻塞网关就绪。"""
     sync_on_startup: bool = True            # 是否在启动时拉取 Arena 排行榜同步智力分（false 则完全跳过，避免外网不可达时徒劳重试）
     timeout_seconds: int = 15               # 单次拉取超时（秒）
+    sync_weekly: bool = True                # 每周一凌晨自动再同步一次（保持新模型评分跟进）
+
+
+class BackupConfig(BaseModel):
+    """数据库定时备份（C3）：每日自动备份 + 保留 N 份。
+    SQLite 用在线备份 API（不锁库、不停服务）；PostgreSQL 调 pg_dump。"""
+    enabled: bool = True
+    dir: str = "./data/backups"             # 备份输出目录
+    keep: int = 14                          # 最多保留份数（超出删最旧）
+    hour: int = 3                           # 每日备份时刻（本地时区）
+    minute: int = 30
+
+
+class ResponseCacheConfig(BaseModel):
+    """A4: 可选响应缓存。相同请求指纹（模型+全部参数）短 TTL 直接复用，
+    省 token 与公益站额度。仅缓存非流式成功响应；默认关闭。"""
+    enabled: bool = False
+    ttl_seconds: int = 300                  # 缓存有效期
+    max_items: int = 200                    # 最大缓存条数（LRU 淘汰）
+    max_body_bytes: int = 262144            # 超过 256KB 的响应不缓存
+
+
+class NotifyConfig(BaseModel):
+    """D3: 事件通知。三类渠道可任选，事件可分别开关；同类事件节流防刷屏。"""
+    enabled: bool = False
+    webhook_url: str = ""                   # 通用 Webhook（POST JSON {text}）
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    dingtalk_webhook: str = ""              # 钉钉群机器人 Webhook
+    notify_model_cooldown: bool = True      # 模型进入冷却
+    notify_all_failed: bool = True          # 组合/auto 全部候选失败
+    notify_budget_exceeded: bool = True     # 网关密钥预算超限
+    min_interval_seconds: int = 300         # 同类事件最小间隔（节流）
 
 
 # 注：配额追踪已合并到分析页，原 QuotaConfig 阈值配置已删除
@@ -121,6 +154,9 @@ class Config(BaseModel):
     proxy_pool: ProxyPoolConfig = Field(default_factory=ProxyPoolConfig)
     model_refresh: ModelRefreshConfig = Field(default_factory=ModelRefreshConfig)
     arena: ArenaConfig = Field(default_factory=ArenaConfig)
+    backup: BackupConfig = Field(default_factory=BackupConfig)
+    response_cache: ResponseCacheConfig = Field(default_factory=ResponseCacheConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
     token_saver_extra: TokenSaverExtraConfig = Field(default_factory=TokenSaverExtraConfig)
     headroom: HeadroomConfig = Field(default_factory=HeadroomConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)

@@ -46,6 +46,7 @@ class RequestLog(Base):
     user_ip = Column(String(64), nullable=True)
     api_key_id = Column(Integer, nullable=True)
     routed_provider_id = Column(Integer, nullable=True)  # 关联 providers.id（方案A：配额并入分析，统一数据源）
+    downstream_key_id = Column(Integer, nullable=True)  # D1: 发起请求的下游网关密钥（gateway_keys.id），主密钥/无鉴权为 NULL
     estimated_cost_usd = Column(Float, nullable=True, default=0.0)  # 估算美元成本（建表时按模型单价计算）
     request_body = Column(Text, nullable=True)  # 请求包 JSON（遗留列；新日志改为存哈希引用，见下方三列）
     response_body = Column(Text, nullable=True)  # 返回包 JSON（遗留列）

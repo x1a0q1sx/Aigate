@@ -56,3 +56,41 @@
 - [x] P2-11a 跨库迁移工具（✅ 2026-09 完成，scripts/migrate_to_pg.py，服务器实测 15693/15693 日志全量迁移）：只读打开源库、ORM create_all 补齐目标表、反射目标列类型驱动三类方言坑转换（JSON 字符串反序列化 / 0→1 布尔 / ISO 字符串→datetime 含剥时区）、FK 依赖序写入、逐批 ON CONFLICT DO NOTHING 幂等可重跑、批量失败降级逐行并报坏行详情、源库孤儿行预分类跳过（PG 迁移实测发现源库遗留 96 条孤儿：rate_limits 56 / health_checks 40，init_db 已加幂等清理）、收尾重置 id 序列 + VACUUM ANALYZE
   - 切换 PG 步骤：低峰停写 → 跑迁移工具（先 --dry-run）→ .env 设 AIGATE_DATABASE_URL → 重启验证；详见脚本 docstring
 - [x] P2-12 压测矩阵（✅ 2026-09 完成，scripts/load_test.py 可复用）：10 并发实测 20/20 日志落库完整、0 locked、p50=11s（瓶颈在上游公益站）；50/100 并发脚本参数已支持，建议配快速上游执行
+
+# 体验与流程优化提案 v2（2026-09 调研，待用户筛选后逐项实施）
+
+> 状态：[ ] 待办 / [x] 完成。基于现状核实：/v1/models 与 CI 已有、Dashboard 为路由控制页、无 Docker/暗色模式/通知渠道、单一网关密钥。
+
+## A. 客户端接入与协议面
+- [ ] A1 Gemini 原生协议入口（generateContent/streamGenerateContent，复用 converter 层思路）——覆盖 Gemini CLI/LobeChat 类客户端
+- [ ] A2 /v1/models 增强：combo 别名与思考强度后缀模型进清单，客户端下拉可直接选
+- [ ] A3 /v1/embeddings、/v1/images 透传路由（轻接口统一计费统计）
+- [ ] A4 可选响应缓存（请求指纹短 TTL，复用 blob 哈希体系；省公益站额度）
+
+## B. Admin UI 体验
+- [ ] B1 实时监控仪表盘（SSE live tail 请求流 + 冷却中模型 + 今日成本/TTFT 卡片，复用 log_queue.stats）
+- [ ] B2 请求失败分析看板（error_type 分组 + 单请求 fallback 链路可视化，routing_decisions 数据已有）
+- [ ] B3 模型管理批量操作 + 多条件筛选 + 虚拟滚动（1955 模型逐个点太慢）
+- [ ] B4 一键诊断（模型/组合页内发真实小请求出连通性/TTFT/吞吐报告）
+- [ ] B5 日志与报表导出 CSV/JSON（按当前筛选条件）
+- [ ] B6 暗色模式 + 移动端响应式
+
+## C. 部署与运维流程（开源友好）
+- [ ] C1 Dockerfile + docker-compose（可选 PG service，一条命令部署）
+- [ ] C2 管理页一键升级（检查更新→备份 DB→pull→装依赖→构建→重启→失败回滚）
+- [ ] C3 定时备份策略（每日自动 + 保留 N 份 + 一键恢复；PG 时 pg_dump）
+- [ ] C4 启动自检摘要 + 页脚版本号/检查更新（对比 GitHub latest）
+- [ ] C5 社区模板（CONTRIBUTING/issue 模板/CHANGELOG；ci.yml 已有）
+
+## D. 成本、配额与安全
+- [ ] D1 多下游 API Key 管理（多 key/备注/过期/per-key 限速，日志 api_key_id 已在）
+- [ ] D2 预算与配额（per-key 每日 token/费用上限，超限动作可配：拒绝/降级/告警）
+- [ ] D3 通知渠道（Webhook/Telegram/钉钉：连续失败冷却、全候选失败、预算超限推送）
+- [ ] D4 价格健康度提醒（缺价/异常波动标黄，快捷手改入口，manual 保护已有）
+
+## E. 路由智能与数据沉淀
+- [ ] E1 模型别名/映射（请求名→实际模型，公益站命名五花八门）
+- [ ] E2 round_robin 升级权重路由（灰度新站/按额度分配流量）
+- [ ] E3 智力评分定时自动同步（每周任务 + 同步状态展示，失败不删分已有）
+
+> 推荐首批：B2 失败分析看板、B4 一键诊断、C1 Docker、D1 多 Key、D3 通知渠道（解决"出事要 SSH"与"部署门槛"两大高频痛点）

@@ -306,7 +306,7 @@ async def get_db():
 @router.post("/compress")
 async def compress_context(raw_request: Request):
     """Compress messages using AIGate token savers without routing to an upstream model."""
-    verify_aigate_api_key(raw_request)
+    await verify_aigate_api_key(raw_request)
     try:
         body = await raw_request.json()
     except Exception:
@@ -323,20 +323,42 @@ async def compress_context(raw_request: Request):
     )
     return JSONResponse(content={"object": "context.compression", **result})
 
-def verify_aigate_api_key(raw_request: Request):
+async def verify_aigate_api_key(raw_request: Request):
+    """鉴权：主密钥（config.security.aigate_api_key）或下游网关密钥（D1）。
+
+    Bearer（OpenAI/Codex 客户端）、x-api-key（Anthropic 客户端）、
+    x-goog-api-key（Gemini 客户端）都接受。
+    主密钥命中 → 放行（无预算约束）；未命中 → 查网关密钥（含 RPM/预算检查），
+    并把 key id 写入请求上下文（日志自动落 downstream_key_id）。
+    未配置任何密钥时保持开放（历史行为）。
+    """
+    from server.core.request_logger import set_downstream_key_id
+    from server.core.gateway_keys import check_gateway_key
     expected = getattr(config.security, "aigate_api_key", "") or ""
-    if not expected:
-        return
-    # Bearer（OpenAI/Codex 客户端）与 x-api-key（Anthropic 客户端）都接受
     auth = raw_request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
     else:
         token = raw_request.headers.get("x-api-key", "").strip()
     if not token:
+        token = raw_request.headers.get("x-goog-api-key", "").strip()
+    if not token:
+        token = (raw_request.query_params.get("key") or "").strip()  # Gemini SDK ?key= 形态
+    if not token:
+        if not expected:
+            return  # 网关未启用鉴权
         raise HTTPException(status_code=401, detail="Missing AIGate API key")
-    if token != expected:
+    if expected and token == expected:
+        set_downstream_key_id(None)  # 主密钥
+        return
+    info = await check_gateway_key(token)
+    if info is None:
+        if not expected:
+            set_downstream_key_id(None)
+            return  # 未启用鉴权且 token 不是任何网关密钥 → 保持开放
         raise HTTPException(status_code=401, detail="Invalid AIGate API key")
+    raw_request.state.downstream_key_id = info["id"]
+    set_downstream_key_id(info["id"])
 
 # 全局单例缓存
 from server.core.auto_router import AutoRouter
@@ -925,6 +947,11 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             continue
     # 全部失败
     print(f"[CASCADE-NONSTREAM] all {max_retries+1} attempts exhausted", flush=True)
+    try:
+        from server.core.notifier import notify_event as _notify_event
+        _notify_event("all_failed", f"auto 级联全部候选失败（非流式，{max_retries+1} 次尝试，末次错误：{str(attempt_errors[-1].get('error') if attempt_errors else '未知')[:120]}）")
+    except Exception:
+        pass
     terminal_error = None
     if attempt_errors:
         terminal_error = attempt_errors[-1].get("error")
@@ -1111,14 +1138,35 @@ async def chat_completions(
     raw_request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """OpenAI 兼容聊天补全端点"""
+    """OpenAI 兼容聊天补全端点。
+
+    A4: config.response_cache.enabled 开启时，相同请求指纹（模型+参数）的
+    非流式成功响应在 TTL 内直接复用，不走路由与上游。"""
+    from server.core.response_cache import response_cache
+    _cached = response_cache.get(request)
+    if _cached is not None:
+        return JSONResponse(content=_cached)
+    resp = await _chat_completions_impl(request, raw_request, db)
+    if isinstance(resp, JSONResponse) and resp.status_code == 200:
+        try:
+            response_cache.put(request, json.loads(resp.body))
+        except Exception:
+            pass
+    return resp
+
+async def _chat_completions_impl(
+    request: ChatCompletionRequest,
+    raw_request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenAI 兼容聊天补全端点（实现体）"""
     _diag_start = time.time()
     import uuid
     conversation_id = str(uuid.uuid4())
     _diag(conversation_id, "request_enter", _diag_start, model=getattr(request, "model", None), stream=getattr(request, "stream", None), client=raw_request.client.host if raw_request.client else None)
     try:
         _diag(conversation_id, "auth_start", _diag_start)
-        verify_aigate_api_key(raw_request)
+        await verify_aigate_api_key(raw_request)
         _diag(conversation_id, "auth_done", _diag_start)
     except HTTPException as auth_err:
         # 认证失败也写日志，方便排查
@@ -1157,6 +1205,17 @@ async def chat_completions(
             request = request.model_copy(update=_upd)
             _diag(conversation_id, "effort_suffix_applied", _diag_start,
                   base=_base_name, effort=_upd.get("reasoning_effort"))
+    # ─── E1: 模型别名（请求名 → 目标模型/组合）───
+    # 与 effort 后缀互不冲突：别名命中后按目标名重新解析一次后缀
+    if request.model and not request.is_auto:
+        from server.core.alias_service import resolve_alias
+        _alias_target = await resolve_alias(request.model)
+        if _alias_target:
+            _alias_name = request.model
+            request = request.model_copy(update={"model": _alias_target})
+            _diag(conversation_id, "alias_applied", _diag_start,
+                  alias=_alias_name, target=_alias_target)
+
     # 上下文窗口预检的请求体量估算（跳过装不下的候选，避免 400 + 误冷却）
     est_req_tokens = estimate_request_tokens(request)
     _decision_begin(
@@ -1177,7 +1236,7 @@ async def chat_completions(
     if not is_auto:
         _diag(conversation_id, "direct_route_start", _diag_start, model=request.model)
         # v3.0: combo 路由 — 形如 "combo:my-fast"
-        from server.core.combo_router import is_combo_request, find_combo_by_name, resolve_combo_targets, pick_next_index
+        from server.core.combo_router import is_combo_request, find_combo_by_name, resolve_combo_targets, pick_next_index, pick_start_index
         is_combo, combo_name = is_combo_request(request.model)
         if is_combo:
             _diag(conversation_id, "combo_route_start", _diag_start, combo=combo_name)
@@ -1208,7 +1267,7 @@ async def chat_completions(
                 )
                 return JSONResponse(status_code=503, content={"error": f"Combo '{combo_name}' no available targets"})
             _diag(conversation_id, "combo_targets", _diag_start, count=len(targets))
-            _combo_start = pick_next_index(combo.id, len(targets), combo_strategy)
+            _combo_start = pick_start_index(targets, combo.id, combo_strategy)  # E2: weighted 按权重抽签
             ordered_targets = targets[_combo_start:] + targets[:_combo_start]
             combo_full_ids = [t["full_id"] for t in ordered_targets]
             _decision_candidates(conversation_id, [
@@ -1388,6 +1447,11 @@ async def chat_completions(
                                 print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={_prov.name} 模型={_mdl.model_id} 失败：{err_s}，正在尝试下一个候选", flush=True)
                                 continue
                         # 全部候选失败
+                        try:
+                            from server.core.notifier import notify_event as _notify_event
+                            _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（流式，{st_attempt} 次尝试）")
+                        except Exception:
+                            pass
                         yield _format_sse_chunk({"error": "combo all targets failed", "attempts": stream_errs}, "unknown")
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -1529,6 +1593,11 @@ async def chat_completions(
                     print(f"[组合路由] 目标 {full_id} 失败：{err_str}，正在尝试下一个候选", flush=True)
                     continue
             # 全部 target 失败
+            try:
+                from server.core.notifier import notify_event as _notify_event
+                _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（{len(combo_attempts)} 个候选）")
+            except Exception:
+                pass
             _diag(conversation_id, "combo_all_failed", _diag_start, attempts=combo_attempts)
             try:
                 import json as _j
@@ -2362,9 +2431,13 @@ async def chat_completions(
     return response
 @router.get("/models")
 async def list_models(
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    include_effort: bool = False,
 ):
-    """OpenAI 兼容 models 端点"""
+    """OpenAI 兼容 models 端点。
+    A2: 组合路由作为伪模型（id=combo:名称）一并列出，客户端下拉框可直接选用；
+    include_effort=true 时为支持思考强度的模型追加 -minimal/-low/-medium/-high/-xhigh
+    后缀变体（后缀语义与请求入口的思考强度后缀一致）。"""
     mc = ModelCatalog()
     models = await mc.list_models(db, enabled_only=True)
     data = []
@@ -2394,6 +2467,55 @@ async def list_models(
                 "context_length": model.context_length
             }
         })
+    # A2: 组合路由伪模型（combo:名称 与请求入口的解析约定一致）
+    from server.models.combo import Combo
+    combos = (await db.execute(
+        select(Combo).where(Combo.enabled.is_(True)).order_by(Combo.name)
+    )).scalars().all()
+    for c in combos:
+        data.append({
+            "id": f"combo:{c.name}",
+            "object": "model",
+            "created": int(c.created_at.timestamp()) if c.created_at else int(time.time()),
+            "owned_by": "combo",
+            "pricing": {"input": 0, "output": 0, "cache_read_input": 0,
+                        "cache_write_input": 0, "unit": "per_1M_tokens", "currency": "USD"},
+            "is_free": False,
+            "auto_enabled": False,
+            "aigate_combo": True,
+            "strategy": getattr(c, "strategy", "fallback"),
+            "capabilities": {"streaming": True, "vision": None,
+                             "reasoning_effort": None, "context_length": None},
+        })
+    # E1: 别名作为可直接选用的模型名暴露
+    from server.models.model_alias import ModelAlias
+    aliases = (await db.execute(
+        select(ModelAlias).where(ModelAlias.enabled.is_(True)).order_by(ModelAlias.alias)
+    )).scalars().all()
+    for a in aliases:
+        data.append({
+            "id": a.alias,
+            "object": "model",
+            "created": int(a.created_at.timestamp()) if a.created_at else int(time.time()),
+            "owned_by": "alias",
+            "aigate_alias_of": a.target,
+            "pricing": {"input": 0, "output": 0, "cache_read_input": 0,
+                        "cache_write_input": 0, "unit": "per_1M_tokens", "currency": "USD"},
+            "is_free": False,
+            "auto_enabled": False,
+            "capabilities": {"streaming": True, "vision": None,
+                             "reasoning_effort": None, "context_length": None},
+        })
+    if include_effort:
+        extra = []
+        for entry in list(data):
+            if entry.get("aigate_combo"):
+                continue
+            if (entry.get("capabilities") or {}).get("reasoning_effort"):
+                for level in ("minimal", "low", "medium", "high", "xhigh"):
+                    extra.append({**entry, "id": f"{entry['id']}-{level}",
+                                  "aigate_effort_variant": level})
+        data.extend(extra)
     return {
         "object": "list",
         "data": data

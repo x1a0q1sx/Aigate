@@ -119,6 +119,19 @@ class HealthChecker:
         cool = min(seconds * (2 ** max(fc - 1, 0)), self.MAX_COOLING) if fc > 0 else seconds
         self._cooling[model_id] = datetime.utcnow() + timedelta(seconds=cool)
         self._persist_cooling(model_id)
+        # D3: 事件通知（同步入口内部调度异步发送；节流防刷屏）
+        try:
+            import asyncio as _asyncio
+            from server.core.notifier import notify_event, resolve_model_name
+
+            async def _notify():
+                name = await resolve_model_name(model_id)
+                notify_event("cooldown",
+                             f"模型进入冷却：{name}（{cool}s，连续失败 {max(fc, 1)} 次）")
+
+            _asyncio.get_running_loop().create_task(_notify())
+        except Exception:
+            pass
 
     def mark_failure(self, model_id: int):
         """记录一次失败"""

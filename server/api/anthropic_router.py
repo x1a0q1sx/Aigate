@@ -42,24 +42,14 @@ async def get_db():
         yield session
 
 
-def _verify_aigate_api_key(raw_request: Request):
-    """鉴权：AIGate 自身 API Key。
+async def _verify_aigate_api_key(raw_request: Request):
+    """鉴权：主密钥或下游网关密钥（D1），委托 v1_router 统一实现。
 
     Anthropic SDK 用 x-api-key 头，但 Claude Code 也会发 Authorization。
     这里两种都兼容。
     """
-    expected = getattr(config.security, "aigate_api_key", "") or ""
-    if not expected:
-        return
-    # 1. x-api-key
-    token = raw_request.headers.get("x-api-key", "").strip()
-    if not token:
-        # 2. Authorization: Bearer xxx
-        auth = raw_request.headers.get("authorization", "")
-        if auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-    if token != expected:
-        raise HTTPException(status_code=401, detail="Invalid AIGate API key")
+    from server.api.v1_router import verify_aigate_api_key
+    await verify_aigate_api_key(raw_request)
 
 
 def _extract_anthropic_error_message(e: Exception) -> str:
@@ -78,7 +68,7 @@ async def anthropic_messages(
     """Anthropic Messages API 兼容入口"""
     # 1. 鉴权
     try:
-        _verify_aigate_api_key(raw_request)
+        await _verify_aigate_api_key(raw_request)
     except HTTPException as auth_err:
         raise auth_err
 

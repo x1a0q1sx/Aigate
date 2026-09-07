@@ -12,6 +12,7 @@ import gzip
 import hashlib
 import json
 import time
+import contextvars
 from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
@@ -20,6 +21,19 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.models.request_log import LogMsgBlob, RequestLog
+
+
+# ── D1: 下游网关密钥请求上下文（鉴权时设置，落日志自动带上）──
+_downstream_key_id_var: contextvars.ContextVar = contextvars.ContextVar(
+    "downstream_key_id", default=None)
+
+
+def set_downstream_key_id(key_id) -> None:
+    _downstream_key_id_var.set(key_id)
+
+
+def get_downstream_key_id():
+    return _downstream_key_id_var.get()
 
 
 # ── 规范化 / 哈希 / 压缩 ──
@@ -255,6 +269,11 @@ async def write_log(db: AsyncSession, **kwargs) -> int:
     返回：-2 = 已入队（异步落库），-1 = 队列满被丢弃或队列不可用。
     db 参数保留以兼容既有调用签名；队列化后不再在请求路径上使用。
     worker 停止（服务关闭 flush 后）时回退同步写，保证关闭瞬间的日志不丢。"""
+    # D1: 鉴权阶段设置的下游网关密钥 id 自动随日志落库（调用方未显式传时）
+    if kwargs.get("downstream_key_id") is None:
+        dkid = get_downstream_key_id()
+        if dkid is not None:
+            kwargs["downstream_key_id"] = dkid
     try:
         from server.core.log_queue import enqueue_log, is_running
         if is_running():

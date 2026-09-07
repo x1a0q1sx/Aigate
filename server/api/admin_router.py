@@ -1849,3 +1849,42 @@ async def get_auto_ranking(db: AsyncSession = Depends(get_db)):
         "total_candidates": len(ranking),
         "timestamp": utc_iso(datetime.utcnow()),
     }
+
+
+# ==========================================================================
+# C4 版本信息 / C3 数据库备份文件（定时备份产物管理）
+# ==========================================================================
+
+@router.get("/version")
+async def version_info(db: AsyncSession = Depends(get_db)):
+    """当前版本与自检信息（设置页展示，与启动日志同源）"""
+    from server.core.selfcheck import get_version_info, run_selfcheck
+    vi = get_version_info()
+    try:
+        sc = await run_selfcheck()
+    except Exception as e:
+        sc = {"ok": False, "items": [], "error": str(e)[:200]}
+    return {**vi, "selfcheck": sc}
+
+
+@router.get("/backup/files")
+async def backup_files():
+    """数据库备份文件列表（C3 定时备份产物）"""
+    from server.core.backup_service import list_backups
+    cfg = getattr(get_config(), "backup", None)
+    return {
+        "enabled": bool(cfg and cfg.enabled),
+        "dir": str(cfg.dir) if cfg else "./data/backups",
+        "keep": cfg.keep if cfg else 0,
+        "files": list_backups(),
+    }
+
+
+@router.post("/backup/files")
+async def backup_run():
+    """立即执行一次数据库备份（SQLite 在线备份 / PG pg_dump）"""
+    from server.core.backup_service import run_backup
+    r = await run_backup("manual")
+    if not r.get("ok"):
+        return JSONResponse(status_code=500, content={"detail": r.get("error", "备份失败")})
+    return r

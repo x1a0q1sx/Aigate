@@ -35,12 +35,12 @@ def get_health_checker() -> HealthChecker:
     return _health_checker
 
 
-# 日志归档用独立调度器（与健康探测器解耦，后者已停用自动探测）
+# 每日维护调度器（归档/备份/周评分同步共用，与健康探测器解耦）
 _archive_scheduler = None
 # 后台智力评分同步任务（启动时不阻塞，关闭时取消）
 _intel_sync_task = None
-def _schedule_log_archive(archive_config):
-    """每日定时归档：每天凌晨 2 点自动归档昨天的日志（独立调度器）"""
+def _schedule_maintenance():
+    """每日维护调度器：日志归档（02:00）+ 数据库备份（config.backup）+ 每周智力评分同步"""
     global _archive_scheduler
     _archive_scheduler = AsyncIOScheduler()
 
@@ -55,15 +55,47 @@ def _schedule_log_archive(archive_config):
         except Exception as e:
             print(f"⚠️ 每日归档失败: {e}")
 
-    _archive_scheduler.add_job(
-        _run_archive,
-        "cron",
-        hour=2,
-        minute=0,
-        id="log_archive_daily",
-    )
+    _archive_scheduler.add_job(_run_archive, "cron", hour=2, minute=0, id="log_archive_daily")
+
+    ac = config.log_archive
+    if ac.enabled:
+        print(f"✓ 每日归档已排程（每天 02:00 归档昨日日志）")
+
+    # C3: 数据库定时备份
+    bc = getattr(config, "backup", None)
+    if bc and bc.enabled:
+        async def _run_backup():
+            try:
+                from .core.backup_service import run_backup
+                r = await run_backup("scheduled")
+                if r.get("ok"):
+                    print(f"✓ 每日备份: {r['file']} ({r['size'] // 1024} KB)"
+                          + (f"，清理 {len(r['pruned'])} 份旧备份" if r.get("pruned") else ""))
+                else:
+                    print(f"⚠️ 每日备份失败: {r.get('error')}")
+            except Exception as e:
+                print(f"⚠️ 每日备份失败: {e}")
+        _archive_scheduler.add_job(
+            _run_backup, "cron", hour=bc.hour, minute=bc.minute, id="db_backup_daily",
+        )
+        print(f"✓ 数据库每日备份已排程（每天 {bc.hour:02d}:{bc.minute:02d}，保留 {bc.keep} 份）")
+
+    # E3: 每周智力评分自动同步（周一凌晨 5 点）
+    if getattr(config.arena, "sync_weekly", False):
+        async def _run_intel_sync():
+            try:
+                from server.core.intelligence_sync import sync_intelligence
+                async with AsyncSessionLocal() as db:
+                    n = await sync_intelligence(db)
+                print(f"✓ 每周智力评分同步完成: {n} 条")
+            except Exception as e:
+                print(f"⚠️ 每周智力评分同步失败: {e}")
+        _archive_scheduler.add_job(
+            _run_intel_sync, "cron", day_of_week="mon", hour=5, minute=0, id="intel_sync_weekly",
+        )
+        print("✓ 智力评分每周自动同步已排程（周一 05:00）")
+
     _archive_scheduler.start()
-    print(f"✓ 每日归档调度器已启动（每天 02:00 归档昨日日志）")
 # 内置服务商模板，首次启动（空数据库）自动创建。
 # 仅保留 3 个开箱即用的免费/直连渠道，其余由用户自行添加。
 BUILTIN_PROVIDERS = [
@@ -125,10 +157,8 @@ async def lifespan(app: FastAPI):
     global _health_checker
     _health_checker = HealthChecker()
     print("✓ 健康检查器已初始化（自动探测已关闭，速度/健康数据来自真实调用日志）")
-    # 启动日志归档调度器
-    ac = config.log_archive
-    if ac.enabled:
-        _schedule_log_archive(ac)
+    # 每日维护调度器（日志归档 / 数据库备份 / 每周智力评分同步）
+    _schedule_maintenance()
     # 启动 OAuth token 主动刷新调度器
     from server.api.oauth_router import start_oauth_refresh_scheduler
     start_oauth_refresh_scheduler()
@@ -148,6 +178,18 @@ async def lifespan(app: FastAPI):
             logger.warning("智力评分后台同步启动失败: %s", e)
     else:
         print("⏭️ 已跳过 Arena 智力评分同步（arena.sync_on_startup=false）")
+    # C4: 启动自检（版本 + 关键资源盘点，异常项醒目提示）
+    try:
+        from .core.selfcheck import get_version_info, run_selfcheck
+        sc = await run_selfcheck()
+        vi = get_version_info()
+        summary = " ".join(f"{i['name']}={i['detail']}" for i in sc["items"])
+        print(f"✓ 自检 v{vi['version']} ({vi['database']}): {summary}")
+        bad = [i["name"] for i in sc["items"] if not i["ok"]]
+        if bad:
+            print(f"⚠️ 自检异常项: {', '.join(bad)}")
+    except Exception as e:
+        print(f"⚠️ 启动自检失败: {e}")
     print(f"✓ AIGate 就绪")
     yield
     # 关闭
@@ -197,6 +239,14 @@ app.include_router(media_router)   # 配额追踪 + 代理池 + 媒体生成
 app.include_router(oauth_router)   # OAuth 接入：/admin/oauth/*
 app.include_router(update_router)  # 一键更新：检查/执行/状态
 app.include_router(route_decisions_router)  # 路由决策中心：候选评分与 fallback 链
+from .api.admin_ext_router import router as admin_ext_router
+app.include_router(admin_ext_router)   # D1 网关密钥 / E1 别名 / A4 缓存管理
+from .api.passthrough_router import router as passthrough_router
+app.include_router(passthrough_router)  # A3: /v1/embeddings、/v1/images/generations
+from .api.gemini_router import router as gemini_router
+app.include_router(gemini_router)      # A1: /v1beta/* Gemini 原生协议
+from .api.admin_ops_router import router as admin_ops_router
+app.include_router(admin_ops_router)   # B1/B2/B4/B5/D3/D4: 诊断/导出/失败看板/实时监控/通知/价格健康
 # ============================================================
 # 挂载前端静态文件 & SPA 路由回退
 # ============================================================
@@ -214,7 +264,7 @@ if _client_dist.exists():
         return FileResponse(str(_client_dist / "vite.svg"))
     # SPA 路由回退：为每个前端路由注册处理器
     # 前端 Vue Router 路由: /dashboard, /providers, /models, /health, /auto, /analytics, /playground
-    SPA_PATHS = ["/dashboard", "/providers", "/models", "/health", "/auto", "/route-decisions", "/combos", "/oauth", "/proxies", "/media", "/analytics", "/playground", "/token-saver", "/settings", "/admin", "/login"]
+    SPA_PATHS = ["/dashboard", "/providers", "/models", "/health", "/monitor", "/auto", "/route-decisions", "/combos", "/oauth", "/proxies", "/media", "/analytics", "/playground", "/token-saver", "/settings", "/keys", "/aliases", "/admin", "/login"]
     for spa_path in SPA_PATHS:
         # 精确匹配
         def _make_handler():
