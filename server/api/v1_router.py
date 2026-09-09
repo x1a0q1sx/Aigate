@@ -1225,6 +1225,19 @@ async def _chat_completions_impl(
         except Exception:
             pass
         raise auth_err
+    # 请求开始即预落一条「待响应」日志：等上游响应期间日志页即可见（500ms 内出现），
+    # 完成时日志队列按 conversation_id 原位更新为最终状态（success/error，单行不补插）。
+    try:
+        from server.core.log_queue import enqueue_log as _enqueue_pending
+        await _enqueue_pending(
+            conversation_id=conversation_id,
+            requested_model=request.model,
+            status="pending",
+            user_ip=raw_request.client.host if raw_request.client else None,
+            is_health_check=conversation_id.startswith("hc-"),
+        )
+    except Exception:
+        pass
     _diag(conversation_id, "router_get_start", _diag_start)
     ar = get_auto_router()
     _diag(conversation_id, "router_get_done", _diag_start)

@@ -15,6 +15,7 @@
       <div class="stat-card"><span class="dim">输入 Token</span><strong>{{ fmtNum(d.prompt_tokens) }}</strong></div>
       <div class="stat-card"><span class="dim">输出 Token</span><strong>{{ fmtNum(d.completion_tokens) }}</strong></div>
       <div class="stat-card"><span class="dim">今日成本</span><strong>${{ (d.cost_usd || 0).toFixed(4) }}</strong></div>
+      <div class="stat-card"><span class="dim">进行中</span><strong>{{ fmtNum(d.pending) }}</strong></div>
       <div class="stat-card"><span class="dim">冷却中模型</span><strong>{{ cooling.length }}</strong></div>
       <div class="stat-card"><span class="dim">缓存命中</span><strong>{{ fmtNum(cache.hits) }}</strong></div>
     </div>

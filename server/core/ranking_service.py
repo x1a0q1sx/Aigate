@@ -271,7 +271,7 @@ class RankingService:
                 RequestLog.routed_model == needle,
             ).order_by(RequestLog.created_at.desc()).limit(200)
         )).fetchall()
-        all_statuses = [r[0] for r in rows]
+        all_statuses = [r[0] for r in rows if r[0] != "pending"]  # 待响应行不计入成功率
         if not all_statuses:
             return 70.0  # baseline stability; unknown models enter Auto
         total = len(all_statuses)

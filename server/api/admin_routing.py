@@ -517,7 +517,7 @@ async def analytics_summary(db: AsyncSession = Depends(get_db)):
             func.count(RequestLog.id).filter(RequestLog.requested_model == "auto"),
             func.coalesce(func.sum(RequestLog.ttft_ms).filter(RequestLog.ttft_ms.isnot(None)), 0),
             func.count(RequestLog.id).filter(RequestLog.ttft_ms.isnot(None)),
-        ).where(RequestLog.is_health_check.is_(False))
+        ).where(RequestLog.is_health_check.is_(False), RequestLog.status.isnot("pending"))
     )).one()
     total, success_count, total_input, total_output, lat_sum, lat_cnt, auto_count, ttft_sum, ttft_cnt = row
 

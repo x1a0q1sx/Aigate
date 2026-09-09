@@ -61,6 +61,7 @@
         <div style="display: flex; gap: 8px;">
           <select v-model="filterStatus" @change="loadPage(1)" style="width: auto;">
             <option value="">全部状态</option>
+            <option value="pending">⏳ 待响应</option>
             <option value="success">成功</option>
             <option value="error">失败</option>
           </select>
@@ -96,7 +97,7 @@
               <span v-else style="color: var(--text-muted);">-</span>
             </td>
             <td>
-              <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 11px;">{{ r.status === 'success' ? '成功' : '失败' }}</span>
+              <span :class="['badge', r.status === 'pending' ? 'badge-info' : (r.status === 'success' ? 'badge-success' : 'badge-danger')]" style="font-size: 11px;">{{ r.status === 'pending' ? '⏳ 待响应' : (r.status === 'success' ? '成功' : '失败') }}</span>
               <span v-if="r.archived" title="详细内容已归档瘦身，可从归档列表恢复" style="font-size: 11px;">📦</span>
             </td>
             <td style="font-family: monospace;">{{ fmtLatency(r.ttft_ms, r.latency_ms) }}</td>
@@ -575,6 +576,15 @@ export default {
   },
     mounted() {
     this.loadAll()
+    // 有「待响应」行时自动轮询当前页（3s），全部落定后自动停
+    this._pollTimer = setInterval(async () => {
+      if (document.hidden) return
+      if (!(this.items || []).some((i) => i.status === 'pending')) return
+      try { await this.loadPage(this.page) } catch (e) { /* 静默 */ }
+    }, 3000)
+  },
+  beforeUnmount() {
+    if (this._pollTimer) clearInterval(this._pollTimer)
   },
   computed: {
     providerTotal() {

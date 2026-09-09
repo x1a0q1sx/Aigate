@@ -190,3 +190,62 @@ async def test_responses_stream_translates_object_error():
     assert "response.failed" in text
     assert "503 Service Unavailable" in text
     assert "response.completed" not in text
+
+
+@pytest.mark.asyncio
+async def test_write_batch_updates_pending_row_inplace(monkeypatch, tmp_path):
+    """待响应行：完成态日志按 conversation_id 原位更新（单行），而非补插第二行。"""
+    import asyncio
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from server.models.base import Base
+    from server.models.request_log import RequestLog
+
+    db_file = tmp_path / "t.db"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_file}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    SessionMaker = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr("server.db.AsyncSessionLocal", SessionMaker)
+
+    cid = "conv-test-1"
+    async with SessionMaker() as db:
+        db.add(RequestLog(conversation_id=cid, requested_model="m1", status="pending"))
+        await db.commit()
+
+    from server.core.log_queue import _write_batch
+    await _write_batch([{
+        "conversation_id": cid,
+        "requested_model": "m1",
+        "routed_provider": "p1", "routed_model": "m1",
+        "status": "success",
+        "latency_ms": 1234,
+        "prompt_tokens": 10, "completion_tokens": 5,
+    }])
+    await asyncio.sleep(0)
+
+    async with SessionMaker() as db:
+        from sqlalchemy import select
+        rows = (await db.execute(select(RequestLog).where(RequestLog.conversation_id == cid))).scalars().all()
+    assert len(rows) == 1, "应原位更新为单行，而不是补插"
+    r = rows[0]
+    assert r.status == "success" and r.latency_ms == 1234 and r.prompt_tokens == 10
+
+    # 无 pending 行时照常插入（管理页直发等场景）
+    await _write_batch([{"conversation_id": "conv-test-2", "status": "success"}])
+    async with SessionMaker() as db:
+        from sqlalchemy import select, func
+        n2 = (await db.execute(select(func.count(RequestLog.id)).where(RequestLog.conversation_id == "conv-test-2"))).scalar()
+    assert n2 == 1
+
+    # 陈旧清扫：pending 行强制收尾为 error
+    from server.core.log_queue import _sweep_stale_pending
+    async with SessionMaker() as db:
+        db.add(RequestLog(conversation_id="conv-test-3", status="pending"))
+        await db.commit()
+    swept = await _sweep_stale_pending(force=True)
+    assert swept >= 1
+    async with SessionMaker() as db:
+        from sqlalchemy import select
+        r3 = (await db.execute(select(RequestLog).where(RequestLog.conversation_id == "conv-test-3"))).scalar_one()
+    assert r3.status == "error" and r3.error_type == "interrupted"
+    await engine.dispose()

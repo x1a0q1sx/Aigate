@@ -154,12 +154,13 @@ async def live_summary(db: AsyncSession = Depends(get_db)):
     row = (await db.execute(
         select(func.count(RequestLog.id),
                func.coalesce(func.sum(case((RequestLog.status == "success", 1), else_=0)), 0),
+               func.coalesce(func.sum(case((RequestLog.status == "pending", 1), else_=0)), 0),
                func.coalesce(func.sum(RequestLog.prompt_tokens), 0),
                func.coalesce(func.sum(RequestLog.completion_tokens), 0),
                func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0))
         .where(RequestLog.created_at >= day_start, RequestLog.is_health_check.is_(False))
     )).first()
-    total, success, pt, ct, cost = row
+    total, success, pending, pt, ct, cost = row
 
     # 冷却中模型
     cooling = []
@@ -201,7 +202,8 @@ async def live_summary(db: AsyncSession = Depends(get_db)):
         "today": {
             "requests": int(total or 0),
             "success": int(success or 0),
-            "errors": int(total or 0) - int(success or 0),
+            "pending": int(pending or 0),
+            "errors": int(total or 0) - int(success or 0) - int(pending or 0),
             "prompt_tokens": int(pt or 0),
             "completion_tokens": int(ct or 0),
             "cost_usd": round(float(cost or 0), 4),

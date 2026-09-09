@@ -72,8 +72,43 @@ def is_running() -> bool:
     return not stopped and _worker_task is not None and not _worker_task.done()
 
 
+# 待响应行的过期阈值：超过该时长仍未完成的行视为卡死（网关重启/请求丢失）
+_PENDING_STALE_SECONDS = 1800
+_pending_last_sweep = 0.0
+
+
+async def _sweep_stale_pending(force: bool = False) -> int:
+    """把未能完成的「待响应」行标记为错误。
+
+    force=True（启动时）：上一进程遗留的 pending 行不可能再完成，全部收尾；
+    常规清扫：只处理超过 _PENDING_STALE_SECONDS 的行（超长流式请求不受影响）。"""
+    from datetime import datetime, timedelta
+    from sqlalchemy import update as _sa_update
+    from server.db import AsyncSessionLocal
+    from server.models.request_log import RequestLog
+    try:
+        async with AsyncSessionLocal() as db:
+            stmt = _sa_update(RequestLog).where(RequestLog.status == "pending").values(
+                status="error", error_type="interrupted",
+                error_msg="request did not complete (gateway restarted or log lost)",
+            )
+            if not force:
+                stmt = stmt.where(
+                    RequestLog.created_at < datetime.utcnow() - timedelta(seconds=_PENDING_STALE_SECONDS))
+            res = await db.execute(stmt)
+            await db.commit()
+            return res.rowcount or 0
+    except Exception:
+        return 0
+
+
 async def _write_batch(batch: list) -> None:
-    """一批日志（≤50 条）单事务落库；整批失败降级为逐条重试一次，仍失败丢弃计数。"""
+    """一批日志（≤50 条）单事务落库；整批失败降级为逐条重试一次，仍失败丢弃计数。
+
+    请求开始时会预落一条 status='pending'（待响应）行；完成态日志按
+    conversation_id 找到该行后「原位更新」为最终状态（单行，不补插）。
+    找不到 pending 行（如管理页直发、独立进程调用）则照常插入。"""
+    from sqlalchemy import update as _sa_update
     from server.db import AsyncSessionLocal
     from server.models.request_log import RequestLog
     from server.core.request_logger import dedup_log_row
@@ -85,6 +120,17 @@ async def _write_batch(batch: list) -> None:
             try:
                 rec = RequestLog(**kwargs)
                 await dedup_log_row(db, rec)
+                if kwargs.get("status") not in (None, "pending") and kwargs.get("conversation_id"):
+                    vals = {c.name: getattr(rec, c.name) for c in RequestLog.__table__.columns
+                            if c.name not in ("id", "created_at")
+                            and getattr(rec, c.name, None) is not None}
+                    res = await db.execute(
+                        _sa_update(RequestLog)
+                        .where(RequestLog.conversation_id == kwargs["conversation_id"],
+                               RequestLog.status == "pending")
+                        .values(**vals))
+                    if res.rowcount:
+                        continue  # 原位更新完成，不再插入
                 db.add(rec)
                 recs.append(rec)
             except Exception as e:
@@ -115,25 +161,46 @@ async def _write_batch(batch: list) -> None:
 
 
 async def _worker():
+    global _pending_last_sweep
     q = _get_queue()
+    first_iteration = True
     while not stopped:
         try:
             first = await asyncio.wait_for(q.get(), timeout=1.0)
         except asyncio.TimeoutError:
-            continue
-        batch = [first]
-        deadline = time.time() + _BATCH_WAIT
-        while len(batch) < _BATCH_MAX and time.time() < deadline:
+            pass
+        else:
+            batch = [first]
+            deadline = time.time() + _BATCH_WAIT
+            while len(batch) < _BATCH_MAX and time.time() < deadline:
+                try:
+                    batch.append(q.get_nowait())
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0.02)
             try:
-                batch.append(q.get_nowait())
-            except asyncio.QueueEmpty:
-                await asyncio.sleep(0.02)
-        try:
-            await _write_batch(batch)
-        except Exception as e:
-            stats["errors"] += 1
-            stats["last_error"] = str(e)[:200]
-            logger.warning("log batch write failed: %s", e)
+                await _write_batch(batch)
+            except Exception as e:
+                stats["errors"] += 1
+                stats["last_error"] = str(e)[:200]
+                logger.warning("log batch write failed: %s", e)
+        # 待响应行清扫：启动时收尾上一进程遗留；之后每 60s 扫一次卡死行
+        if first_iteration:
+            first_iteration = False
+            _pending_last_sweep = time.time()
+            swept = await _sweep_stale_pending(force=True)
+            if swept:
+                stats["pending_swept"] = stats.get("pending_swept", 0) + swept
+                logger.info("startup sweep: %d stale pending log rows -> error", swept)
+        elif time.time() - _pending_last_sweep > 60:
+            _pending_last_sweep = time.time()
+            swept = await _sweep_stale_pending()
+            if swept:
+                stats["pending_swept"] = stats.get("pending_swept", 0) + swept
+        continue
+
+
+def _worker_unused_placeholder():
+    pass
 
 
 async def _wal_checkpoint_loop():
