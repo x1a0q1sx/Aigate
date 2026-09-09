@@ -1122,7 +1122,9 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                     _diag(conversation_id, "stream_log_done", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
         except Exception as e:
             # 不再静默：日志写入失败的根因必须可见（否则待响应行永远无法收尾）
+            import traceback as _tb
             print(f"⚠️ 请求日志写入失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            _tb.print_exc()
             if diag_start_ts:
                 _diag(conversation_id, "stream_log_error", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
     try:
