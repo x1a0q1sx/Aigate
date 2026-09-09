@@ -2297,63 +2297,79 @@ async def _chat_completions_impl(
                     _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
                     # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
                     pt, ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(_stream_chunks_log))
+                    # ORM 属性在长请求 + session churn 后可能过期（MissingGreenlet/Detached）——
+                    # 先做安全快照，参数求值绝不能在 write_log 之前炸掉（否则日志静默丢失）
+                    def _snap_attr(obj, name, default=None):
+                        try:
+                            return getattr(obj, name, default)
+                        except Exception:
+                            return default
+                    _prov_name = _snap_attr(route_result.provider, "name") if route_result else None
+                    _mdl_name = _snap_attr(route_result.model, "model_id") if route_result else None
+                    _in_price = _snap_attr(route_result.model, "input_price", 0) if route_result else 0
+                    _out_price = _snap_attr(route_result.model, "output_price", 0) if route_result else 0
+                    _cr_price = _snap_attr(route_result.model, "cache_read_input_price", 0) if route_result else 0
+                    _cw_price = _snap_attr(route_result.model, "cache_write_input_price", 0) if route_result else 0
+                    _fb_count = _snap_attr(route_result, "fallback_count", 0) if route_result else 0
+                    _upstream_body = None
+                    try:
+                        _upstream_body = _j.dumps(upstream_request.model_dump(), ensure_ascii=False) if upstream_request else None
+                    except Exception:
+                        _upstream_body = None
                     try:
                         _decision_attempt(
                             conversation_id,
-                            provider=route_result.provider.name,
-                            model=route_result.model.model_id,
+                            provider=_prov_name,
+                            model=_mdl_name,
                             status="failed" if _stream_err else "success",
                             attempt=0,
                             latency_ms=int((time.time() - _send_time) * 1000),
                             ttft_ms=_stream_ttft_ms,
                             error=_stream_err,
                         )
-                        _diag(conversation_id, "stream_log_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
-                        from server.db import AsyncSessionLocal as _LS
-                        from server.models.request_log import RequestLog as _RL
+                    except Exception as e:
+                        print(f"⚠️ 路由决策记录失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                    # 决策收尾已移到独立的 shielded 调用（原来混在本 try 里，决策一挂日志就丢）
+                    _diag(conversation_id, "stream_log_start", _diag_start, provider=_prov_name, model=_mdl_name, status="error" if _stream_err else "success")
+                    from server.db import AsyncSessionLocal as _LS
+                    from server.models.request_log import RequestLog as _RL
+                    try:
                         async with _LS() as _ldb:
                             await write_log(_ldb,
                                 conversation_id=conversation_id,
                                 requested_model=request.model,
-                                routed_provider=route_result.provider.name,
-                                routed_model=route_result.model.model_id,
+                                routed_provider=_prov_name,
+                                routed_model=_mdl_name,
                                 status="error" if _stream_err else "success",
                                 prompt_tokens=pt,
                                 completion_tokens=ct,
-                cache_read_tokens=_crd or None,
-                cache_write_tokens=_cwt or None,
-                estimated_cost_usd=(
-                    _segmented_cost({
-                        "input_price": float(route_result.model.input_price or 0),
-                        "output_price": float(route_result.model.output_price or 0),
-                        "cache_read_input_price": float(getattr(route_result.model, "cache_read_input_price", 0) or 0),
-                        "cache_write_input_price": float(getattr(route_result.model, "cache_write_input_price", 0) or 0),
-                    }, pt, ct, _crd, _cwt)
-                    if (not _stream_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
-                ),
-                fallback_count=route_result.fallback_count if route_result else 0,
-                latency_ms=int((time.time() - _send_time) * 1000),
-                ttft_ms=_stream_ttft_ms,
-                error_type="upstream_error" if _stream_err else None,
-                error_msg=(_stream_err or ""),
-                request_body=_j.dumps(upstream_request.model_dump(), ensure_ascii=False) if upstream_request else None,
-                response_body=resp_snapshot,
-                **_proxy_log_fields(),
+                                cache_read_tokens=_crd or None,
+                                cache_write_tokens=_cwt or None,
+                                estimated_cost_usd=(
+                                    _segmented_cost({
+                                        "input_price": float(_in_price or 0),
+                                        "output_price": float(_out_price or 0),
+                                        "cache_read_input_price": float(_cr_price or 0),
+                                        "cache_write_input_price": float(_cw_price or 0),
+                                    }, pt, ct, _crd, _cwt)
+                                    if (not _stream_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
+                                ),
+                                fallback_count=_fb_count,
+                                latency_ms=int((time.time() - _send_time) * 1000),
+                                ttft_ms=_stream_ttft_ms,
+                                error_type="upstream_error" if _stream_err else None,
+                                error_msg=(_stream_err or ""),
+                                request_body=_upstream_body,
+                                response_body=resp_snapshot,
+                                **_proxy_log_fields(),
                             )
-                            _diag(conversation_id, "stream_log_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
-                        await _decision_finish(
-                            conversation_id,
-                            status="error" if _stream_err else "success",
-                            provider=route_result.provider.name,
-                            model=route_result.model.model_id,
-                            fallback_count=route_result.fallback_count if route_result else 0,
-                            total_latency_ms=int((time.time() - _send_time) * 1000),
-                            ttft_ms=_stream_ttft_ms,
-                            failure_reason=_stream_err,
-                        )
-                    except Exception:
-                        _diag(conversation_id, "stream_log_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, status="error" if _stream_err else "success")
-                        pass
+                        _diag(conversation_id, "stream_log_done", _diag_start, provider=_prov_name, model=_mdl_name, status="error" if _stream_err else "success")
+                    except Exception as e:
+                        # 失败原因必须可见（否则待响应行永远无法收尾）
+                        import traceback as _tb
+                        print(f"⚠️ 直连流式日志写入失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:300]}", flush=True)
+                        _tb.print_exc()
+                        _diag(conversation_id, "stream_log_error", _diag_start, provider=_prov_name, model=_mdl_name, status="error" if _stream_err else "success")
                     try:
                         await asyncio.shield(_decision_finish(
                             conversation_id,
