@@ -2331,15 +2331,20 @@ async def _chat_completions_impl(
                 _done = False
                 _last_err = None
                 result = None
+                _same_key_retried = False   # 瞬态故障（429/5xx/断连）允许同一把 key 原样重试一次
+                _force_same_key = False
                 _cur_kid, _cur_key = route_result.key_id, route_result.api_key
                 for _attempt in range(8):
                     _direct_attempt_started = time.time()
                     if _attempt > 0:
-                        _nk = await _rot.next_key_for_model(db, route_result.model, _tried)
-                        if not _nk or _nk[0] is None:
-                            break  # 同模型 key 集合内已无可用 key
-                        _cur_kid, _cur_key = _nk
-                        _tried.add(_cur_kid)
+                        if _force_same_key:
+                            _force_same_key = False  # 同 key 原样重试（不动 key 池）
+                        else:
+                            _nk = await _rot.next_key_for_model(db, route_result.model, _tried)
+                            if not _nk or _nk[0] is None:
+                                break  # 同模型 key 集合内已无可用 key
+                            _cur_kid, _cur_key = _nk
+                            _tried.add(_cur_kid)
                     _diag(conversation_id, "upstream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False)
                     try:
                         result = await route_result.adapter.chat_completion(
@@ -2374,6 +2379,10 @@ async def _chat_completions_impl(
                         )
                         _rot.mark_failure(_cur_kid, getattr(e, "status_code", None))
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
+                        if not _same_key_retried and _is_transient_upstream_error(f"{type(e).__name__}: {str(e)[:200]}"):
+                            _same_key_retried = True
+                            _force_same_key = True
+                            await asyncio.sleep(1.0)  # 瞬态故障稍候原样重试
                         continue
                 if not _done:
                     if _last_err:
@@ -2385,7 +2394,8 @@ async def _chat_completions_impl(
                 _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                 http_status_code = 503
                 raw_err = _extract_error_body(e) or f"{type(e).__name__}: {str(e)[:200]}"
-                response = {"error": f"upstream_call_failed: {type(e).__name__}: {str(e)[:200]}", "_raw_response": raw_err}
+                response = _api_error(f"upstream_call_failed: {type(e).__name__}: {str(e)[:200]}", status=503)
+                response["_raw_response"] = raw_err
     else:
         # 级联回退已完成实际调用，用返回的 model 信息构建标识
         if route_result and route_result.success:
