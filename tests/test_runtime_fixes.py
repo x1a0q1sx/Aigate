@@ -900,7 +900,7 @@ def test_estimate_factor_clamp():
 def test_redact_text_masks_secrets():
     from server.core.request_logger import redact_text
 
-    s = 'Authorization: Bearer ak-TESTFAKEKEY0000000000000000000000000aaa and key=sk-TESTFAKEKEY0000000000000000000000000bbb'
+    s = 'Authorization: Bearer ak-TESTFAKEKEY0000000000000000000000000aaa and key=sk-TESTFAKE-KEY0000000000000000000000bbb'
     out = redact_text(s)
     assert "ak-pTSFhq" not in out and "sk-LYqYo" not in out
     assert "Bearer ***" in out
