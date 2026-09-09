@@ -308,6 +308,24 @@ def _api_error(message, *, status=None, type_=None, **extra) -> dict:
     return {"error": err}
 
 
+async def _early_error_log(conversation_id, request, raw_request, message, *, err_type="route_error"):
+    """路由阶段的提前失败（404/503 等）：落一条终态错误日志，让预落的
+    待响应行原位收尾，而不是挂 30 分钟等清扫。"""
+    try:
+        from server.core.log_queue import enqueue_log as _el
+        await _el(
+            conversation_id=conversation_id,
+            requested_model=request.model,
+            status="error",
+            error_type=err_type,
+            error_msg=str(message)[:500],
+            user_ip=raw_request.client.host if raw_request.client else None,
+            is_health_check=conversation_id.startswith("hc-"),
+        )
+    except Exception:
+        pass
+
+
 async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
     """Yield an upstream stream, failing quickly when it never produces a chunk."""
     try:
@@ -1293,6 +1311,7 @@ async def _chat_completions_impl(
             combo = await find_combo_by_name(db, combo_name)
             if not combo:
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Combo '{combo_name}' not found")
+                await _early_error_log(conversation_id, request, raw_request, f"Combo '{combo_name}' not found")
                 return JSONResponse(status_code=404, content=_api_error(f"Combo '{combo_name}' not found", status=404))
             targets = await resolve_combo_targets(db, combo)
             combo_strategy = getattr(combo, "strategy", None) or "fallback"
@@ -1315,6 +1334,7 @@ async def _chat_completions_impl(
                     status="error",
                     failure_reason=f"Combo '{combo_name}' no available targets",
                 )
+                await _early_error_log(conversation_id, request, raw_request, f"Combo '{combo_name}' no available targets")
                 return JSONResponse(status_code=503, content=_api_error(f"Combo '{combo_name}' no available targets", status=503))
             _diag(conversation_id, "combo_targets", _diag_start, count=len(targets))
             _combo_start = pick_start_index(targets, combo.id, combo_strategy)  # E2: weighted 按权重抽签
@@ -1675,12 +1695,14 @@ async def _chat_completions_impl(
             if not model:
                 _diag(conversation_id, "direct_route_not_found", _diag_start, model=request.model)
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Model {request.model} not found")
+                await _early_error_log(conversation_id, request, raw_request, f"Model {request.model} not found")
                 return JSONResponse(status_code=404, content=_api_error(f"Model {request.model} not found", status=404))
             _diag(conversation_id, "direct_model_done", _diag_start, routed_model=model.model_id)
             provider = await db.get(Provider, model.provider_id)
             # v4.0: 服务商被禁用 → 直连同样不可用
             if provider is None or not getattr(provider, "enabled", True):
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Provider for model {request.model} is disabled")
+                await _early_error_log(conversation_id, request, raw_request, f"Provider for model {request.model} is disabled")
                 return JSONResponse(status_code=404, content=_api_error(f"Provider for model {request.model} is disabled", status=404))
             # Free Tier / OAuth providers — key 可空（无需密钥直发 / OAuth token 走 OAuth client）
             api_key = None
@@ -1699,6 +1721,7 @@ async def _chat_completions_impl(
                         api_key = await get_oauth_client().pick_access_token(oauth_code, db)
                     if not api_key:
                         await _decision_finish(conversation_id, status="error", failure_reason=f"OAuth provider '{oauth_code}' not connected")
+                        await _early_error_log(conversation_id, request, raw_request, f"OAuth provider '{oauth_code}' not connected")
                         return JSONResponse(status_code=503, content=_api_error(f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)", status=503))
                 else:
                     api_key = ""   # free_tier：decoder 时 adapter 用空字符串鉴权头
@@ -1721,6 +1744,7 @@ async def _chat_completions_impl(
                     if not key:
                         _diag(conversation_id, "direct_key_missing", _diag_start, provider=provider.name)
                         await _decision_finish(conversation_id, status="error", failure_reason=f"No active API key for provider {provider.name}")
+                        await _early_error_log(conversation_id, request, raw_request, f"No active API key for provider {provider.name}")
                         return JSONResponse(status_code=503, content=_api_error(f"No active API key for provider {provider.name}", status=503))
                     _diag(conversation_id, "direct_key_done", _diag_start, provider=provider.name)
                     _kid, api_key = key.id, get_crypto_service().decrypt(key.key_encrypted)
@@ -1809,6 +1833,7 @@ async def _chat_completions_impl(
                             _free_err = f"{type(e).__name__}: {str(e)[:200]}"
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
                             await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
+                            await _early_error_log(conversation_id, request, raw_request, f"free_provider_failed: {e}", err_type="upstream_error")
                             return JSONResponse(status_code=502, content=_api_error(f"free_provider_failed: {e}", status=502))
                         finally:
                             _FORCE_PROXY.reset(_proxy_token)
