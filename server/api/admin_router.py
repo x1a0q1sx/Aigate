@@ -1787,7 +1787,8 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 ):
                     yield _format_sse_chunk(chunk, model_id_full)
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
-                yield _format_sse_chunk({"error": f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"}, model_id_full)
+                from server.api.v1_router import _api_error as _api_error_fn
+                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), str(e)[:500])
             yield b"data: [DONE]\n\n"
         return StreamingResponse(wrap_stream(), media_type="text/event-stream")

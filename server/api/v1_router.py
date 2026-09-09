@@ -3,6 +3,7 @@
 """
 import asyncio
 import json
+import re
 import time
 from typing import Optional
 import urllib.parse
@@ -271,6 +272,42 @@ def _is_stream_content_validation_error(text) -> bool:
     return any(marker in lowered for marker in _STREAM_CONTENT_VALIDATION_MARKERS)
 
 
+# 瞬态上游故障：429/5xx、网络超时/断连、站点过载（如 cache-only admission 的 503）。
+# 这类故障在尚未吐出实质内容时值得原样重试一次（同会话重试常因缓存变暖而成功）。
+_TRANSIENT_UPSTREAM_RE = re.compile(
+    r"\b(429|500|502|503|504)\b"
+    r"|service unavailable|bad gateway|gateway timeout"
+    r"|temporarily unavailable|overloaded|too many requests"
+    r"|cache-only|admission rejected"
+    r"|(?:connect|read|send)[a-z]*\s*(?:error|timeout|timed out|reset|closed)"
+    r"|timed?\s?out",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_upstream_error(text) -> bool:
+    """识别可自动重试的瞬态上游故障（区别于 4xx 参数错误 / 鉴权失败等不可重试故障）。"""
+    if not text:
+        return False
+    return bool(_TRANSIENT_UPSTREAM_RE.search(str(text)))
+
+
+def _api_error(message, *, status=None, type_=None, **extra) -> dict:
+    """OpenAI 规范的 error 对象。
+
+    error 必须是对象（{message,type,code}）而非字符串 —— Codex 等客户端按
+    schema 校验响应，字符串会触发 'Invalid input: expected object' 的类型
+    校验错误，把真实原因埋掉。status 用于推断默认 type。"""
+    if type_ is None:
+        t = status or 0
+        type_ = ("rate_limit_error" if t == 429
+                 else "server_error" if t >= 500 else "invalid_request_error")
+    err = {"message": str(message)[:800], "type": type_, "code": None}
+    if extra:
+        err.update(extra)
+    return {"error": err}
+
+
 async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
     """Yield an upstream stream, failing quickly when it never produces a chunk."""
     try:
@@ -310,10 +347,10 @@ async def compress_context(raw_request: Request):
     try:
         body = await raw_request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": "invalid_json"})
+        return JSONResponse(status_code=400, content=_api_error("invalid_json", status=400))
     messages = body.get("messages") or []
     if not isinstance(messages, list):
-        return JSONResponse(status_code=400, content={"error": "messages must be a list"})
+        return JSONResponse(status_code=400, content=_api_error("messages must be a list", status=400))
     from server.core.compress_service import compress_messages
     result = compress_messages(
         messages,
@@ -1243,7 +1280,7 @@ async def _chat_completions_impl(
             combo = await find_combo_by_name(db, combo_name)
             if not combo:
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Combo '{combo_name}' not found")
-                return JSONResponse(status_code=404, content={"error": f"Combo '{combo_name}' not found"})
+                return JSONResponse(status_code=404, content=_api_error(f"Combo '{combo_name}' not found", status=404))
             targets = await resolve_combo_targets(db, combo)
             combo_strategy = getattr(combo, "strategy", None) or "fallback"
             _decision_configure(
@@ -1265,7 +1302,7 @@ async def _chat_completions_impl(
                     status="error",
                     failure_reason=f"Combo '{combo_name}' no available targets",
                 )
-                return JSONResponse(status_code=503, content={"error": f"Combo '{combo_name}' no available targets"})
+                return JSONResponse(status_code=503, content=_api_error(f"Combo '{combo_name}' no available targets", status=503))
             _diag(conversation_id, "combo_targets", _diag_start, count=len(targets))
             _combo_start = pick_start_index(targets, combo.id, combo_strategy)  # E2: weighted 按权重抽签
             ordered_targets = targets[_combo_start:] + targets[:_combo_start]
@@ -1452,7 +1489,7 @@ async def _chat_completions_impl(
                             _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（流式，{st_attempt} 次尝试）")
                         except Exception:
                             pass
-                        yield _format_sse_chunk({"error": "combo all targets failed", "attempts": stream_errs}, "unknown")
+                        yield _format_sse_chunk(_api_error("combo all targets failed", status=503, attempts=stream_errs), "unknown")
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             None, None, "combo all targets failed", 0, stream_errs, diag_start_ts=_diag_start)
@@ -1611,7 +1648,7 @@ async def _chat_completions_impl(
                 pass
             return JSONResponse(
                 status_code=503,
-                content={"error": f"Combo '{combo_name}' all targets failed", "attempts": combo_attempts},
+                content=_api_error(f"Combo '{combo_name}' all targets failed", status=503, attempts=combo_attempts),
             )
         else:
             # 直接路由：解析 model + provider
@@ -1625,13 +1662,13 @@ async def _chat_completions_impl(
             if not model:
                 _diag(conversation_id, "direct_route_not_found", _diag_start, model=request.model)
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Model {request.model} not found")
-                return JSONResponse(status_code=404, content={"error": f"Model {request.model} not found"})
+                return JSONResponse(status_code=404, content=_api_error(f"Model {request.model} not found", status=404))
             _diag(conversation_id, "direct_model_done", _diag_start, routed_model=model.model_id)
             provider = await db.get(Provider, model.provider_id)
             # v4.0: 服务商被禁用 → 直连同样不可用
             if provider is None or not getattr(provider, "enabled", True):
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Provider for model {request.model} is disabled")
-                return JSONResponse(status_code=404, content={"error": f"Provider for model {request.model} is disabled"})
+                return JSONResponse(status_code=404, content=_api_error(f"Provider for model {request.model} is disabled", status=404))
             # Free Tier / OAuth providers — key 可空（无需密钥直发 / OAuth token 走 OAuth client）
             api_key = None
             _kid = None
@@ -1649,7 +1686,7 @@ async def _chat_completions_impl(
                         api_key = await get_oauth_client().pick_access_token(oauth_code, db)
                     if not api_key:
                         await _decision_finish(conversation_id, status="error", failure_reason=f"OAuth provider '{oauth_code}' not connected")
-                        return JSONResponse(status_code=503, content={"error": f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)"})
+                        return JSONResponse(status_code=503, content=_api_error(f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)", status=503))
                 else:
                     api_key = ""   # free_tier：decoder 时 adapter 用空字符串鉴权头
             else:
@@ -1671,7 +1708,7 @@ async def _chat_completions_impl(
                     if not key:
                         _diag(conversation_id, "direct_key_missing", _diag_start, provider=provider.name)
                         await _decision_finish(conversation_id, status="error", failure_reason=f"No active API key for provider {provider.name}")
-                        return JSONResponse(status_code=503, content={"error": f"No active API key for provider {provider.name}"})
+                        return JSONResponse(status_code=503, content=_api_error(f"No active API key for provider {provider.name}", status=503))
                     _diag(conversation_id, "direct_key_done", _diag_start, provider=provider.name)
                     _kid, api_key = key.id, get_crypto_service().decrypt(key.key_encrypted)
             from server.core.model_catalog import create_adapter_for_provider
@@ -1719,7 +1756,7 @@ async def _chat_completions_impl(
                                 yield b"data: [DONE]\n\n"
                             except Exception as e:
                                 _free_err = f"{type(e).__name__}: {str(e)[:200]}"
-                                err_data = {"error": f"free_provider_stream_failed: {e}"}
+                                err_data = _api_error(f"free_provider_stream_failed: {e}")
                                 yield _format_sse_chunk(err_data, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             finally:
@@ -1759,7 +1796,7 @@ async def _chat_completions_impl(
                             _free_err = f"{type(e).__name__}: {str(e)[:200]}"
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
                             await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
-                            return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {e}"})
+                            return JSONResponse(status_code=502, content=_api_error(f"free_provider_failed: {e}", status=502))
                         finally:
                             _FORCE_PROXY.reset(_proxy_token)
                 else:
@@ -1809,7 +1846,7 @@ async def _chat_completions_impl(
                         # combo 路径：按池子顺序取下一个未试目标
                         if st_attempt >= len(combo_pool):
                             _diag(conversation_id, "combo_stream_exhausted", _diag_start, attempted=st_attempt)
-                            err_data = {"error": "combo pool exhausted", "attempts": stream_errs}
+                            err_data = _api_error("combo pool exhausted", status=503, attempts=stream_errs)
                             yield _format_sse_chunk(err_data, "unknown")
                             yield b"data: [DONE]\n\n"
                             await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -1843,7 +1880,7 @@ async def _chat_completions_impl(
                     _diag(conversation_id, "auto_stream_candidate_done", _diag_start, attempt=st_attempt, success=cand.success if cand else None)
                     if not cand.success or (cand.model and cand.model.id in tried_sids):
                         print(f"[CASCADE] exhausted at attempt {st_attempt}: {cand.error if cand else 'no cand'} tried={tried_sids}", flush=True)
-                        err_data = {"error": cand.error or "no more candidates", "attempts": stream_errs}
+                        err_data = _api_error(str(cand.error or "no more candidates"), status=503, attempts=stream_errs)
                         yield _format_sse_chunk(err_data, "unknown")
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -2069,7 +2106,7 @@ async def _chat_completions_impl(
             )
             return JSONResponse(
                 status_code=503,
-                content={"error": response.get("error", "all_candidates_failed"), "attempts": _attempt_errors},
+                content=_api_error(str(response.get("error") or "all_candidates_failed"), status=503, attempts=_attempt_errors),
             )
         made_by_cascade = True
         # response 已经是上游返回的完整 dict，携带 usage/choices/model
@@ -2146,11 +2183,15 @@ async def _chat_completions_impl(
                                     _stream_chunks_log.append(chunk)
                                 yield _format_sse_chunk(chunk, model_id_full)
                             if stream_has_error:
-                                if (
+                                _retry_now = (
                                     _attempt_no == 0
                                     and _stream_content_is_empty(_stream_chunks_log)
-                                    and _is_stream_content_validation_error(stream_err_detail)
-                                ):
+                                    and (_is_stream_content_validation_error(stream_err_detail)
+                                         or _is_transient_upstream_error(stream_err_detail))
+                                )
+                                if _retry_now:
+                                    if _is_transient_upstream_error(stream_err_detail):
+                                        await asyncio.sleep(1.0)  # 429/503 类瞬态故障稍候再试
                                     continue
                                 raise RuntimeError(f"upstream_stream_error: {stream_err_detail}")
                             _diag(conversation_id, "upstream_stream_done", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, chunks=len(_stream_chunks_log))
@@ -2159,15 +2200,19 @@ async def _chat_completions_impl(
                         except Exception as e:
                             _diag(conversation_id, "upstream_stream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, error=type(e).__name__)
                             _err_text = f"{type(e).__name__}: {str(e)[:200]}"
-                            if (
+                            _retry_now = (
                                 _attempt_no == 0
                                 and _stream_content_is_empty(_stream_chunks_log)
-                                and _is_stream_content_validation_error(_err_text)
-                            ):
+                                and (_is_stream_content_validation_error(_err_text)
+                                     or _is_transient_upstream_error(_err_text))
+                            )
+                            if _retry_now:
+                                if _is_transient_upstream_error(_err_text):
+                                    await asyncio.sleep(1.0)  # 429/503 类瞬态故障稍候再试
                                 continue
                             _stream_err = _err_text
-                            error_chunk = {"error": f"upstream_stream_failed: {_stream_err}"}
-                            yield _format_sse_chunk(error_chunk, model_id_full)
+                            yield _format_sse_chunk(
+                                _api_error(f"upstream_stream_failed: {_stream_err}"), model_id_full)
                             yield b"data: [DONE]\n\n"
                             return
                         finally:

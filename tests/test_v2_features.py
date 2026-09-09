@@ -136,3 +136,57 @@ def test_gateway_key_hash_and_generate():
     _check_rpm(row)
     with pytest.raises(Exception):
         _check_rpm(row)                  # 第 3 次超 2/min
+
+
+# ─────────────── 瞬态上游故障重试 + 规范错误对象 ───────────────
+
+def test_transient_upstream_error_predicate():
+    from server.api.v1_router import _is_transient_upstream_error
+    # 可重试：5xx / 429 / 网络超时断连 / 站点准入拒绝
+    assert _is_transient_upstream_error("HTTPStatusError: Client error '503 Service Unavailable' for url ...")
+    assert _is_transient_upstream_error("HTTPStatusError: Client error '429 Too Many Requests'")
+    assert _is_transient_upstream_error("upstream_stream_failed: cache-only admission rejected a cold request")
+    assert _is_transient_upstream_error("httpx.ConnectError: connection reset")
+    assert _is_transient_upstream_error("Request timed out after 30s")
+    # 不可重试：参数错误 / 鉴权失败
+    assert not _is_transient_upstream_error("HTTPStatusError: Client error '400 Bad Request'")
+    assert not _is_transient_upstream_error("Invalid API key")
+    assert not _is_transient_upstream_error("Model not found")
+    assert not _is_transient_upstream_error("")
+
+
+def test_api_error_object_shape():
+    from server.api.v1_router import _api_error
+    out = _api_error("upstream_stream_failed: 503", status=503)
+    assert isinstance(out["error"], dict)                 # error 必须是对象
+    assert out["error"]["type"] == "server_error"
+    assert "503" in out["error"]["message"]
+    out2 = _api_error("too many requests", status=429)
+    assert out2["error"]["type"] == "rate_limit_error"
+    out3 = _api_error("Model m not found", status=404)
+    assert out3["error"]["type"] == "invalid_request_error"
+    out4 = _api_error("combo exhausted", status=503, attempts=[{"error": "x"}])
+    assert out4["error"]["attempts"] == [{"error": "x"}]  # 附加字段在 error 对象内
+
+
+@pytest.mark.asyncio
+async def test_responses_stream_translates_object_error():
+    """对象格式的终态 error chunk（新格式）同样翻译为 response.failed。"""
+    import json as _json
+    from server.api.responses_router import _chat_to_responses_stream
+    from fastapi.responses import StreamingResponse
+
+    payload = _json.dumps({"error": {"message": "upstream_stream_failed: 503 Service Unavailable",
+                                     "type": "server_error", "code": None}})
+    async def gen():
+        yield f"data: {payload}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+
+    sr = _chat_to_responses_stream(StreamingResponse(gen(), media_type="text/event-stream"), "m1")
+    body = b""
+    async for piece in sr.body_iterator:
+        body += piece if isinstance(piece, bytes) else piece.encode()
+    text = body.decode("utf-8", "replace")
+    assert "response.failed" in text
+    assert "503 Service Unavailable" in text
+    assert "response.completed" not in text
