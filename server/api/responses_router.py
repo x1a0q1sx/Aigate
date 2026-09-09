@@ -548,6 +548,15 @@ def _chat_to_responses_stream(openai_stream: StreamingResponse, model: str) -> S
                     "output": [],
                 },
             })
+        finally:
+            # 终态错误 / 提前返回时必须关闭底层 v1 流生成器，否则其 finally
+            # （请求日志落库、路由决策收尾）不会执行 —— 失败请求会从日志里消失
+            _src_close = getattr(_iterator, "aclose", None)
+            if _src_close:
+                try:
+                    await _src_close()
+                except Exception:
+                    pass
 
     return StreamingResponse(responses_stream(), media_type="text/event-stream")
 

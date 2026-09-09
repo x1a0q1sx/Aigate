@@ -228,6 +228,15 @@ def _convert_streaming_response(openai_response: StreamingResponse, openai_req: 
                 }
             }, ensure_ascii=False)
             yield f"event: error\ndata: {err_data}\n\n".encode("utf-8")
+        finally:
+            # 终态错误 / 提前返回时必须关闭底层 v1 流生成器，否则其 finally
+            # （请求日志落库、路由决策收尾）不会执行 —— 失败请求会从日志里消失
+            _src_close = getattr(openai_response.body_iterator, "aclose", None)
+            if _src_close:
+                try:
+                    await _src_close()
+                except Exception:
+                    pass
 
     # 注：不要再 del openai_response —— anthropic_stream 闭包引用它读取 body_iterator，
     # del 会让流式迭代抛 NameError（引用释放交给响应结束后 GC 即可）

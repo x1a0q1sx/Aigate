@@ -249,3 +249,28 @@ async def test_write_batch_updates_pending_row_inplace(monkeypatch, tmp_path):
         r3 = (await db.execute(select(RequestLog).where(RequestLog.conversation_id == "conv-test-3"))).scalar_one()
     assert r3.status == "error" and r3.error_type == "interrupted"
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_responses_translator_closes_source_on_terminal_error():
+    """终态错误提前返回时必须关闭底层 v1 流——其 finally 负责把失败请求写入日志。"""
+    import asyncio
+    from fastapi.responses import StreamingResponse
+    from server.api.responses_router import _chat_to_responses_stream
+
+    closed = {"v": False}
+
+    async def source():
+        try:
+            yield b'data: {"error": {"message": "upstream 503", "type": "server_error", "code": null}}\n\n'
+            yield b"data: [DONE]\n\n"
+        finally:
+            closed["v"] = True
+
+    sr = _chat_to_responses_stream(StreamingResponse(source(), media_type="text/event-stream"), "m1")
+    async for piece in sr.body_iterator:
+        blob = piece if isinstance(piece, bytes) else piece.encode()
+        if b"response.failed" in blob:
+            break  # 模拟客户端在失败事件后停止消费
+    await sr.body_iterator.aclose()  # StreamingResponse 收尾时关闭翻译器
+    assert closed["v"], "底层流应被关闭（其 finally 负责落日志）"
