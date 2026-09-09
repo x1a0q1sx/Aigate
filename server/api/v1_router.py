@@ -1025,92 +1025,113 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
 
     方案A：request_logs 作为唯一用量数据源，直接在此写入
     routed_provider_id 与 estimated_cost_usd，不再写入平行的 quota_usage 表。
+
+    2026-09 加固：
+    - 决策收尾与日志写入拆成两个独立守卫阶段，决策失败不再连累日志落库
+      （此前二者同 try，决策一挂待响应行就永远无法收尾）
+    - 异常不再静默吞掉，失败原因必须出现在服务端日志
+    - 整体 shield：客户端断开触发任务取消时，收尾日志仍会补完
+      （实测 254s 长流式失败后日志写入被吞、行卡 pending 的根因）
     """
-    try:
-        _decision_ingest_attempts(conversation_id, attempt_errors)
-        if routed_provider and routed_model:
-            _decision_select(
-                conversation_id,
-                provider=routed_provider,
-                model=routed_model,
-                reason="completed upstream attempt",
-            )
-        terminal_decision = status == "success" or attempt_errors is not None or not routed_provider
-        if terminal_decision:
-            decision_total_ms = int((time.time() - diag_start_ts) * 1000) if diag_start_ts else latency_ms
-            decision_fallback_count = int(fallback_count or 0)
-            if attempt_errors:
-                decision_fallback_count = max(decision_fallback_count, len(attempt_errors) - 1)
-            await _decision_finish(
-                conversation_id,
-                status=status,
-                provider=routed_provider,
-                model=routed_model,
-                fallback_count=decision_fallback_count,
-                total_latency_ms=decision_total_ms,
-                ttft_ms=ttft_ms,
-                failure_reason=error_msg,
-                attempts=attempt_errors,
-            )
-        if diag_start_ts:
-            _diag(conversation_id, "stream_log_start", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
-        import json as _json_mod
-        from sqlalchemy import select as _sa_sel
-        from server.db import AsyncSessionLocal as _LogSession
-        from server.models.request_log import RequestLog as _RL
-        from server.models.provider import Provider as _QP
-        from server.models.model import Model as _QM
-        req_s = _json_mod.dumps(request.model_dump(), ensure_ascii=False) if request else None
-        pt = int(prompt_tokens) if prompt_tokens else 0
-        ct = int(completion_tokens) if completion_tokens else 0
-        async with _LogSession() as _ldb:
-            # 解析服务商/模型 id 与单价，写入成本
-            _prov_id = None
-            _model_id = None
-            _cost = 0.0
-            if routed_provider:
-                prov_row = (await _ldb.execute(_sa_sel(_QP).where(_QP.name == routed_provider).limit(1))).scalar_one_or_none()
-                _prov_id = prov_row.id if prov_row else None
-            if _prov_id and routed_model:
-                md_row = (await _ldb.execute(_sa_sel(_QM).where(_QM.provider_id == _prov_id, _QM.model_id == routed_model).limit(1))).scalar_one_or_none()
-                _model_id = md_row.id if md_row else None
-                if md_row is not None and (pt or ct or cache_read_tokens or cache_write_tokens):
-                    _md_prices = {
-                        "input_price": float(getattr(md_row, "input_price", 0) or 0),
-                        "output_price": float(getattr(md_row, "output_price", 0) or 0),
-                        "cache_read_input_price": getattr(md_row, "cache_read_input_price", 0) or 0,
-                        "cache_write_input_price": getattr(md_row, "cache_write_input_price", 0) or 0,
-                    }
-                    _cost = _segmented_cost(_md_prices, pt, ct, cache_read_tokens, cache_write_tokens)
-            await write_log(_ldb,
-                conversation_id=conversation_id,
-                requested_model=request.model if request else "unknown",
-                routed_provider=routed_provider,
-                routed_provider_id=_prov_id,
-                routed_model=routed_model,
-                status=status,
-                prompt_tokens=pt,
-                completion_tokens=ct,
-                cache_read_tokens=cache_read_tokens or None,
-                cache_write_tokens=cache_write_tokens or None,
-                estimated_cost_usd=_cost,
-                error_type="upstream_error" if error_msg else None,
-                error_msg=(error_msg or ""),
-                fallback_count=fallback_count or 0,
-                latency_ms=latency_ms,
-                ttft_ms=ttft_ms,
-                est_prompt_tokens=est_prompt_tokens,
-                user_ip=raw_request.client.host if raw_request.client else None,
-                **_proxy_log_fields(),
-                request_body=req_s,
-                response_body=stream_body or (_json_mod.dumps(attempt_errors, ensure_ascii=False) if attempt_errors else "[stream]"),
-            )
+    async def _impl():
+        # ── 阶段一：路由决策收尾（失败仅告警，不连累日志） ──
+        try:
+            _decision_ingest_attempts(conversation_id, attempt_errors)
+            if routed_provider and routed_model:
+                _decision_select(
+                    conversation_id,
+                    provider=routed_provider,
+                    model=routed_model,
+                    reason="completed upstream attempt",
+                )
+            terminal_decision = status == "success" or attempt_errors is not None or not routed_provider
+            if terminal_decision:
+                decision_total_ms = int((time.time() - diag_start_ts) * 1000) if diag_start_ts else latency_ms
+                decision_fallback_count = int(fallback_count or 0)
+                if attempt_errors:
+                    decision_fallback_count = max(decision_fallback_count, len(attempt_errors) - 1)
+                await _decision_finish(
+                    conversation_id,
+                    status=status,
+                    provider=routed_provider,
+                    model=routed_model,
+                    fallback_count=decision_fallback_count,
+                    total_latency_ms=decision_total_ms,
+                    ttft_ms=ttft_ms,
+                    failure_reason=error_msg,
+                    attempts=attempt_errors,
+                )
+        except Exception as e:
+            print(f"⚠️ 路由决策收尾失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:200]}", flush=True)
+        # ── 阶段二：请求日志写入 ──
+        try:
             if diag_start_ts:
-                _diag(conversation_id, "stream_log_done", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
-    except Exception:
-        if diag_start_ts:
-            _diag(conversation_id, "stream_log_error", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
-        pass
+                _diag(conversation_id, "stream_log_start", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
+            import json as _json_mod
+            from sqlalchemy import select as _sa_sel
+            from server.db import AsyncSessionLocal as _LogSession
+            from server.models.request_log import RequestLog as _RL
+            from server.models.provider import Provider as _QP
+            from server.models.model import Model as _QM
+            req_s = _json_mod.dumps(request.model_dump(), ensure_ascii=False) if request else None
+            pt = int(prompt_tokens) if prompt_tokens else 0
+            ct = int(completion_tokens) if completion_tokens else 0
+            async with _LogSession() as _ldb:
+                # 解析服务商/模型 id 与单价，写入成本
+                _prov_id = None
+                _model_id = None
+                _cost = 0.0
+                if routed_provider:
+                    prov_row = (await _ldb.execute(_sa_sel(_QP).where(_QP.name == routed_provider).limit(1))).scalar_one_or_none()
+                    _prov_id = prov_row.id if prov_row else None
+                if _prov_id and routed_model:
+                    md_row = (await _ldb.execute(_sa_sel(_QM).where(_QM.provider_id == _prov_id, _QM.model_id == routed_model).limit(1))).scalar_one_or_none()
+                    _model_id = md_row.id if md_row else None
+                    if md_row is not None and (pt or ct or cache_read_tokens or cache_write_tokens):
+                        _md_prices = {
+                            "input_price": float(getattr(md_row, "input_price", 0) or 0),
+                            "output_price": float(getattr(md_row, "output_price", 0) or 0),
+                            "cache_read_input_price": getattr(md_row, "cache_read_input_price", 0) or 0,
+                            "cache_write_input_price": getattr(md_row, "cache_write_input_price", 0) or 0,
+                        }
+                        _cost = _segmented_cost(_md_prices, pt, ct, cache_read_tokens, cache_write_tokens)
+                await write_log(_ldb,
+                    conversation_id=conversation_id,
+                    requested_model=request.model if request else "unknown",
+                    routed_provider=routed_provider,
+                    routed_provider_id=_prov_id,
+                    routed_model=routed_model,
+                    status=status,
+                    prompt_tokens=pt,
+                    completion_tokens=ct,
+                    cache_read_tokens=cache_read_tokens or None,
+                    cache_write_tokens=cache_write_tokens or None,
+                    estimated_cost_usd=_cost,
+                    error_type="upstream_error" if error_msg else None,
+                    error_msg=(error_msg or ""),
+                    fallback_count=fallback_count or 0,
+                    latency_ms=latency_ms,
+                    ttft_ms=ttft_ms,
+                    est_prompt_tokens=est_prompt_tokens,
+                    user_ip=raw_request.client.host if raw_request.client else None,
+                    **_proxy_log_fields(),
+                    request_body=req_s,
+                    response_body=stream_body or (_json_mod.dumps(attempt_errors, ensure_ascii=False) if attempt_errors else "[stream]"),
+                )
+                if diag_start_ts:
+                    _diag(conversation_id, "stream_log_done", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
+        except Exception as e:
+            # 不再静默：日志写入失败的根因必须可见（否则待响应行永远无法收尾）
+            print(f"⚠️ 请求日志写入失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:300]}", flush=True)
+            if diag_start_ts:
+                _diag(conversation_id, "stream_log_error", diag_start_ts, provider=routed_provider, model=routed_model, status=status)
+    try:
+        await asyncio.shield(_impl())
+    except asyncio.CancelledError:
+        pass  # 外层任务被取消（客户端断开）：_impl 已脱离取消继续执行，日志不丢
+    except Exception as e:
+        print(f"⚠️ 请求日志收尾异常 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:200]}", flush=True)
+
 
 def get_auto_router() -> AutoRouter:
     global _auto_router
