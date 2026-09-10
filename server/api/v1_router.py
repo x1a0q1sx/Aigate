@@ -2185,6 +2185,18 @@ async def _chat_completions_impl(
         if not extra_headers:
             extra_headers = None
         # ??? per-model request overrides (v3.4) ???
+        # 路由完成即刻快照身份与价格（纯标量）：流式收尾时 ORM 对象可能已过期，
+        # 届时再读会拿不到服务商/模型身份（日志行 routed_provider 变空）
+        try:
+            _rt_prov_name = route_result.provider.name
+            _rt_model_id = route_result.model.model_id
+            _rt_in_price = float(getattr(route_result.model, "input_price", 0) or 0)
+            _rt_out_price = float(getattr(route_result.model, "output_price", 0) or 0)
+            _rt_cr_price = float(getattr(route_result.model, "cache_read_input_price", 0) or 0)
+            _rt_cw_price = float(getattr(route_result.model, "cache_write_input_price", 0) or 0)
+        except Exception:
+            _rt_prov_name = _rt_model_id = None
+            _rt_in_price = _rt_out_price = _rt_cr_price = _rt_cw_price = 0.0
         model_overrides_direct = getattr(route_result.model, "request_overrides", None) or {}
         if isinstance(model_overrides_direct, dict):
             ov_headers = model_overrides_direct.get("headers") or {}
@@ -2304,12 +2316,12 @@ async def _chat_completions_impl(
                             return getattr(obj, name, default)
                         except Exception:
                             return default
-                    _prov_name = _snap_attr(route_result.provider, "name") if route_result else None
-                    _mdl_name = _snap_attr(route_result.model, "model_id") if route_result else None
-                    _in_price = _snap_attr(route_result.model, "input_price", 0) if route_result else 0
-                    _out_price = _snap_attr(route_result.model, "output_price", 0) if route_result else 0
-                    _cr_price = _snap_attr(route_result.model, "cache_read_input_price", 0) if route_result else 0
-                    _cw_price = _snap_attr(route_result.model, "cache_write_input_price", 0) if route_result else 0
+                    _prov_name = _rt_prov_name or (_snap_attr(route_result.provider, "name") if route_result else None)
+                    _mdl_name = _rt_model_id or (_snap_attr(route_result.model, "model_id") if route_result else None)
+                    _in_price = _rt_in_price or (_snap_attr(route_result.model, "input_price", 0) if route_result else 0)
+                    _out_price = _rt_out_price or (_snap_attr(route_result.model, "output_price", 0) if route_result else 0)
+                    _cr_price = _rt_cr_price or (_snap_attr(route_result.model, "cache_read_input_price", 0) if route_result else 0)
+                    _cw_price = _rt_cw_price or (_snap_attr(route_result.model, "cache_write_input_price", 0) if route_result else 0)
                     _fb_count = _snap_attr(route_result, "fallback_count", 0) if route_result else 0
                     _upstream_body = None
                     try:
