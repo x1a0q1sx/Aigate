@@ -25,18 +25,18 @@ function _handle401(res) {
   return false
 }
 
-async function apiGet(path) {
-  const res = await fetch(`${BASE_URL}${path}`, { headers: _addAuthHeader() })
+async function apiGet(path, extraHeaders = {}) {
+  const res = await fetch(`${BASE_URL}${path}`, { headers: { ..._addAuthHeader(), ...extraHeaders } })
   if (_handle401(res)) throw new Error('未登录或 session 已过期')
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}: ${await res.text()}`)
   }
   return res.json()
 }
-async function apiPost(path, data) {
+async function apiPost(path, data, extraHeaders = {}) {
   const res = await fetch(`${BASE_URL}${path}`, {
     method: 'POST',
-    headers: _addAuthHeader({ 'Content-Type': 'application/json' }),
+    headers: { ..._addAuthHeader({ 'Content-Type': 'application/json' }), ...extraHeaders },
     body: JSON.stringify(data)
   })
   if (_handle401(res)) throw new Error('未登录或 session 已过期')
@@ -121,8 +121,8 @@ export default {
   updateProvider: (id, data) => apiPut(`/admin/api/providers/${id}`, data),
   deleteProvider: (id) => apiDelete(`/admin/api/providers/${id}`),
   // 一键备份 / 恢复（全系统）
-  fullBackup: () => apiGet('/admin/api/backup'),
-  fullRestore: (data) => apiPost('/admin/api/restore', data),
+  fullBackup: (adminPassword) => apiGet('/admin/api/backup', { 'X-Admin-Password': adminPassword || '' }),
+  fullRestore: (data, adminPassword) => apiPost('/admin/api/restore', data, { 'X-Admin-Password': adminPassword || '' }),
   // 服务商配置导入 / 导出
   exportProviders: (params = {}) => {
     const qs = new URLSearchParams()

@@ -32,6 +32,7 @@ from server.core.route_decision import (
     mark_selected as _decision_select,
 )
 from server.core.usage_normalize import normalize_usage as _normalize_usage
+from server.core.client_ip import real_client_ip as _real_client_ip
 from server.core.context_guard import (
     estimate_request_tokens,
     is_context_error,
@@ -319,7 +320,7 @@ async def _early_error_log(conversation_id, request, raw_request, message, *, er
             status="error",
             error_type=err_type,
             error_msg=str(message)[:500],
-            user_ip=raw_request.client.host if raw_request.client else None,
+            user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
             is_health_check=conversation_id.startswith("hc-"),
         )
     except Exception:
@@ -633,7 +634,7 @@ def _proxy_log_fields() -> dict:
     u = CURRENT_PROXY_URL.get()
     return {"used_proxy": bool(u), "proxy_url": u}
 
-def _preprocess_request(req):
+def _preprocess_request(req, savers_off: bool = False):
     """轻量截断超长 system message（保底）+ RTK Token Saver 注入式压缩
     + Caveman / Ponytail（默认关，config.token_saver_extra 开启时生效）"""
     msgs = getattr(req, 'messages', None) or []
@@ -646,7 +647,7 @@ def _preprocess_request(req):
     try:
         from server.core.token_saver import apply_rtk
         ts_cfg = getattr(config, 'token_saver', None)
-        ts_enabled = getattr(ts_cfg, 'enabled', True) if ts_cfg else True
+        ts_enabled = (getattr(ts_cfg, 'enabled', True) if ts_cfg else True) and not savers_off
         new_msgs, stats = apply_rtk(msgs, enabled=ts_enabled)
         if stats.get("applied"):
             _diag("", "rtk_applied", time.time(),
@@ -666,7 +667,7 @@ def _preprocess_request(req):
     try:
         from server.core.caveman_saver import apply_caveman
         extra = getattr(config, 'token_saver_extra', None)
-        if extra and getattr(extra, 'caveman_enabled', False):
+        if extra and getattr(extra, 'caveman_enabled', False) and not savers_off:
             cur_msgs = getattr(req, 'messages', None) or []
             new_msgs_c, stats_c = apply_caveman(cur_msgs, enabled=True)
             if stats_c.get("applied"):
@@ -684,7 +685,7 @@ def _preprocess_request(req):
     try:
         from server.core.ponytail_saver import apply_ponytail
         extra = getattr(config, 'token_saver_extra', None)
-        if extra and getattr(extra, 'ponytail_enabled', False):
+        if extra and getattr(extra, 'ponytail_enabled', False) and not savers_off:
             cur_msgs = getattr(req, 'messages', None) or []
             new_msgs_p, stats_p = apply_ponytail(cur_msgs, enabled=True)
             if stats_p.get("applied"):
@@ -1113,7 +1114,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                     latency_ms=latency_ms,
                     ttft_ms=ttft_ms,
                     est_prompt_tokens=est_prompt_tokens,
-                    user_ip=raw_request.client.host if raw_request.client else None,
+                    user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
                     **_proxy_log_fields(),
                     request_body=req_s,
                     response_body=stream_body or (_json_mod.dumps(attempt_errors, ensure_ascii=False) if attempt_errors else "[stream]"),
@@ -1241,7 +1242,7 @@ async def _chat_completions_impl(
     _diag_start = time.time()
     import uuid
     conversation_id = str(uuid.uuid4())
-    _diag(conversation_id, "request_enter", _diag_start, model=getattr(request, "model", None), stream=getattr(request, "stream", None), client=raw_request.client.host if raw_request.client else None)
+    _diag(conversation_id, "request_enter", _diag_start, model=getattr(request, "model", None), stream=getattr(request, "stream", None), client=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)))
     try:
         _diag(conversation_id, "auth_start", _diag_start)
         await verify_aigate_api_key(raw_request)
@@ -1260,7 +1261,7 @@ async def _chat_completions_impl(
                     error_type="auth_failed",
                     error_msg=str(auth_err.detail),
                     **_proxy_log_fields(),
-                    user_ip=raw_request.client.host if raw_request.client else None,
+                    user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
                     request_body=_json_mod.dumps(request.model_dump(), ensure_ascii=False) if request else None,
                 )
         except Exception:
@@ -1274,7 +1275,7 @@ async def _chat_completions_impl(
             conversation_id=conversation_id,
             requested_model=request.model,
             status="pending",
-            user_ip=raw_request.client.host if raw_request.client else None,
+            user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
             is_health_check=conversation_id.startswith("hc-"),
         )
     except Exception:
@@ -1282,7 +1283,11 @@ async def _chat_completions_impl(
     _diag(conversation_id, "router_get_start", _diag_start)
     ar = get_auto_router()
     _diag(conversation_id, "router_get_done", _diag_start)
-    request = _preprocess_request(request)
+    # X-AIGate-Token-Saver: off —— 单请求旁路所有 token saver
+    # （长上下文客户端如 Codex 偶尔不希望历史被压缩改写）
+    _savers_off = (raw_request.headers.get("x-aigate-token-saver", "").strip().lower()
+                    in ("off", "0", "none", "skip"))
+    request = _preprocess_request(request, savers_off=_savers_off)
     _diag(conversation_id, "preprocess_done", _diag_start)
     # ─── 思考强度后缀：combo:xxx-high / 模型-high ───
     # 仅当原名解析不到、剥后缀后能解析时才剥离（避免误伤以 -high 结尾的真实模型名）；
@@ -2148,7 +2153,7 @@ async def _chat_completions_impl(
                         error_type="upstream_error",
                         error_msg=response.get("error", "all_candidates_failed"),
                         fallback_count=len(_attempt_errors),
-                        user_ip=raw_request.client.host if raw_request.client else None,
+                        user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
                         request_body=_j.dumps(request.model_dump(), ensure_ascii=False),
                         response_body=_j.dumps(response, ensure_ascii=False),
                         **_proxy_log_fields(),
@@ -2532,7 +2537,7 @@ async def _chat_completions_impl(
                     if (not is_err and route_result and route_result.success and (pt or ct or _crd or _cwt)) else 0.0
                 ),
                 fallback_count=route_result.fallback_count if route_result else 0,
-                user_ip=raw_request.client.host if raw_request.client else None,
+                user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
                 error_type="upstream_error" if is_err else None,
                 error_msg=str(response.get("error", "")) if is_err else None,
                 est_prompt_tokens=est_req_tokens,

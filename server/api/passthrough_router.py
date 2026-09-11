@@ -18,6 +18,7 @@ from server.db import AsyncSessionLocal
 from server.models.model import Model
 from server.models.provider import Provider
 from server.api.v1_router import verify_aigate_api_key
+from server.core.client_ip import real_client_ip
 from server.core.alias_service import resolve_alias
 from server.core.credential_resolver import resolve_credential_async
 from server.core.request_logger import write_log
@@ -119,6 +120,7 @@ async def _passthrough(
                         routed_model=model.model_id, status="error",
                         media_type=media_type, error_type="upstream_error",
                         error_msg=str(e)[:500], latency_ms=int((time.time() - _t0) * 1000),
+                        user_ip=real_client_ip(raw_request),
                         used_proxy=bool(_proxy_kwargs(provider)))
         return JSONResponse(status_code=502, content={"error": {"message": f"上游请求失败: {str(e)[:200]}"}})
     latency_ms = int((time.time() - _t0) * 1000)
@@ -137,7 +139,8 @@ async def _passthrough(
                     completion_tokens=usage.get("completion_tokens"),
                     error_type=None if resp.status_code == 200 else "upstream_error",
                     error_msg=None if resp.status_code == 200 else str(payload)[:500],
-                    latency_ms=latency_ms, used_proxy=bool(_proxy_kwargs(provider)))
+                    latency_ms=latency_ms, user_ip=real_client_ip(raw_request),
+                    used_proxy=bool(_proxy_kwargs(provider)))
     return JSONResponse(status_code=resp.status_code, content=payload)
 
 

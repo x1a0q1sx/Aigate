@@ -17,6 +17,9 @@ class DatabaseConfig(BaseModel):
 class SecurityConfig(BaseModel):
     encryption_key: str = ""
     aigate_api_key: str = ""
+    # 反代（nginx 等）后启用：日志/限速取 X-Forwarded-For 最左值。
+    # 默认关闭——直连场景开 XFF 会被客户端伪造头。
+    trust_proxy_headers: bool = False
 class HealthCheckConfig(BaseModel):
     interval_minutes: int = 5
     ping_timeout_seconds: int = 10

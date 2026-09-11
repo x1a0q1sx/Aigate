@@ -60,6 +60,35 @@ def _extract_anthropic_error_message(e: Exception) -> str:
     return s[:500]
 
 
+@router.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(raw_request: Request):
+    """Anthropic count_tokens 兼容端点（Claude Code 做上下文预算/压缩决策会调用）。
+
+    用现有 anthropic→openai 转换器 + context_guard 估算给出 input_tokens，
+    避免客户端把该端点当 404 报错。"""
+    try:
+        await _verify_aigate_api_key(raw_request)
+    except HTTPException as auth_err:
+        raise auth_err
+    try:
+        body = await raw_request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "invalid_json"}})
+    try:
+        from server.core.context_guard import estimate_request_tokens
+        oa = anthropic_to_openai_request(body if isinstance(body, dict) else {})
+        oa["stream"] = False
+        chat_req = ChatCompletionRequest(**oa)
+        n = int(estimate_request_tokens(chat_req))
+    except Exception as e:
+        return JSONResponse(status_code=400, content={
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": str(e)[:200]}})
+    return {"input_tokens": n}
+
+
 @router.post("/v1/messages")
 async def anthropic_messages(
     raw_request: Request,

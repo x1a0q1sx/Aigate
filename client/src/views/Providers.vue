@@ -1368,7 +1368,9 @@ export default {
     async doBackup() {
       this.backingUp = true
       try {
-        const bundle = await api.fullBackup()
+        const adminPwd = prompt('导出包含全部明文密钥与 OAuth token，请输入管理员密码确认：')
+        if (adminPwd === null) return
+        const bundle = await api.fullBackup(adminPwd)
         const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' })
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
@@ -1395,12 +1397,14 @@ export default {
       if (!confirm('确认恢复？将按所选策略写入当前系统配置，建议先做一次备份。')) return
       this.restoring = true
       this.restoreResult = null
+      const adminPwd = prompt('恢复会覆盖当前配置（含密钥），请输入管理员密码确认：')
+      if (adminPwd === null) return
       try {
         const result = await api.fullRestore({
           data: this.restoreData,
           conflict: this.restoreConflict,
           ...this.restoreOptions,
-        })
+        }, adminPwd)
         this.restoreResult = result
         await this.load()
         if (result.ok) {

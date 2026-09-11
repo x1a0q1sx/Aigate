@@ -152,6 +152,27 @@ from server.models.combo import Combo
 from server.models.routing_config import RoutingWeights
 from server.models.oauth_token import OAuthToken
 
+def _require_admin_reauth(raw_request: Request) -> None:
+    """全量备份导出/恢复需要二次校验管理员密码（9router 同类安全加固）。
+
+    bundle 内含明文密钥与 OAuth token，会话 Cookie 被盗即可整库拖走——
+    破坏性/敏感操作强制重新输入密码。auth 未启用或未设密码时跳过。"""
+    auth_cfg = getattr(get_config(), "auth", None)
+    if not (auth_cfg and auth_cfg.enabled and auth_cfg.password_hash):
+        return
+    pwd = raw_request.headers.get("x-admin-password", "")
+    if not pwd:
+        raise HTTPException(status_code=403,
+                            detail="导出/恢复备份需要管理员密码（X-Admin-Password 头）")
+    try:
+        import bcrypt
+        ok = bcrypt.checkpw(pwd.encode("utf-8"), auth_cfg.password_hash.encode("utf-8"))
+    except Exception:
+        ok = False
+    if not ok:
+        raise HTTPException(status_code=403, detail="管理员密码不正确")
+
+
 BACKUP_KIND = "aigate.backup"
 BACKUP_VERSION = 1
 
@@ -160,7 +181,8 @@ _CONFIG_SKIP_SECTIONS = {"server", "database"}
 
 
 @router.get("/backup")
-async def full_backup(db: AsyncSession = Depends(get_db)):
+async def full_backup(raw_request: Request, db: AsyncSession = Depends(get_db)):
+    _require_admin_reauth(raw_request)
     """一键导出全系统配置：服务商+模型+密钥+OAuth+组合+路由权重+config.yaml 设置。
 
     密钥和 OAuth token 以明文导出（用于换机迁移）。
@@ -293,7 +315,8 @@ class BackupRestoreRequest(BaseModel):
 
 
 @router.post("/restore")
-async def full_restore(payload: BackupRestoreRequest, db: AsyncSession = Depends(get_db)):
+async def full_restore(raw_request: Request, payload: BackupRestoreRequest, db: AsyncSession = Depends(get_db)):
+    _require_admin_reauth(raw_request)
     """一键恢复全系统配置。接受 /backup 导出的 JSON bundle。"""
     import json as _json
     from server.core.crypto_service import get_crypto_service
