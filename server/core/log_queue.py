@@ -75,6 +75,19 @@ def is_running() -> bool:
 # 待响应行的过期阈值：超过该时长仍未完成的行视为卡死（网关重启/请求丢失）
 _PENDING_STALE_SECONDS = 1800
 _pending_last_sweep = 0.0
+# 本进程启动时间：启动清扫只收尾「早于本进程启动」的遗留 pending，绝不动在途请求
+_PROCESS_STARTED_AT = None  # 惰性取（避免导入顺序问题），见 _process_started_at()
+
+
+_process_started_dt = None
+
+
+def _process_started():
+    global _process_started_dt
+    if _process_started_dt is None:
+        from datetime import datetime
+        _process_started_dt = datetime.utcnow()
+    return _process_started_dt
 
 
 async def _sweep_stale_pending(force: bool = False) -> int:
@@ -92,7 +105,12 @@ async def _sweep_stale_pending(force: bool = False) -> int:
                 status="error", error_type="interrupted",
                 error_msg="request did not complete (gateway restarted or log lost)",
             )
-            if not force:
+            # 关键不变式：无论如何都不翻新于本进程启动后的行（那一定是正在处理的在途请求）。
+            # force=True（启动收尾）：只清早于进程启动≥5s 的遗留；force=False（周期）：清超过 30min 的。
+            _started = _process_started()
+            if force:
+                stmt = stmt.where(RequestLog.created_at < _started - timedelta(seconds=5))
+            else:
                 stmt = stmt.where(
                     RequestLog.created_at < datetime.utcnow() - timedelta(seconds=_PENDING_STALE_SECONDS))
             res = await db.execute(stmt)

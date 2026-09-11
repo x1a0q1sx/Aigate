@@ -237,17 +237,25 @@ async def test_write_batch_updates_pending_row_inplace(monkeypatch, tmp_path):
         n2 = (await db.execute(select(func.count(RequestLog.id)).where(RequestLog.conversation_id == "conv-test-2"))).scalar()
     assert n2 == 1
 
-    # 陈旧清扫：pending 行强制收尾为 error
-    from server.core.log_queue import _sweep_stale_pending
+    # 启动收尾：只清「早于本进程启动」的遗留 pending；在途新行不动
+    from datetime import datetime, timedelta
+    from server.core.log_queue import _sweep_stale_pending, _process_started
+    # 遗留行：created_at 早于进程启动 60s → 应被收尾
     async with SessionMaker() as db:
-        db.add(RequestLog(conversation_id="conv-test-3", status="pending"))
+        db.add(RequestLog(conversation_id="conv-test-3", status="pending",
+                          created_at=_process_started() - timedelta(seconds=60)))
+        # 在途行：created_at 晚于进程启动（刚插入）→ 不应被动
+        db.add(RequestLog(conversation_id="conv-test-inflight", status="pending",
+                          created_at=datetime.utcnow()))
         await db.commit()
     swept = await _sweep_stale_pending(force=True)
     assert swept >= 1
     async with SessionMaker() as db:
         from sqlalchemy import select
         r3 = (await db.execute(select(RequestLog).where(RequestLog.conversation_id == "conv-test-3"))).scalar_one()
+        r_in = (await db.execute(select(RequestLog).where(RequestLog.conversation_id == "conv-test-inflight"))).scalar_one()
     assert r3.status == "error" and r3.error_type == "interrupted"
+    assert r_in.status == "pending", "在途请求的 pending 行绝不应被启动收尾误杀"
     await engine.dispose()
 
 
