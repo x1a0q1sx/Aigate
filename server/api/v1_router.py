@@ -1412,11 +1412,13 @@ async def _chat_completions_impl(
                 async def _fusion_log_done(fresp, fmeta):
                     jp, jm = (fmeta.get("judge") or (None, None))
                     fb = max(0, len(fmeta.get("attempts") or []) - 1)
+                    _fl = int((time.time() - _send_time) * 1000)
                     try:
                         await _write_stream_log(
                             conversation_id, request, raw_request, "success",
                             jp, jm, None, fb, fmeta.get("attempts"),
                             stream_body=_fj.dumps(fresp, ensure_ascii=False),
+                            latency_ms=_fl, ttft_ms=_fl,
                             diag_start_ts=_diag_start,
                         )
                     except Exception:
@@ -1434,7 +1436,9 @@ async def _chat_completions_impl(
                         await _write_stream_log(
                             conversation_id, request, raw_request, "error",
                             None, None, "fusion all candidates failed",
-                            max(0, len(attempts) - 1), attempts, diag_start_ts=_diag_start,
+                            max(0, len(attempts) - 1), attempts,
+                            latency_ms=int((time.time() - _send_time) * 1000),
+                            diag_start_ts=_diag_start,
                         )
                     except Exception:
                         pass
