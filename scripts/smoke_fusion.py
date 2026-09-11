@@ -2,7 +2,13 @@
 """fusion 真实冒烟：取最近成功的两个模型建 fusion 组合 → 请求 → 验证日志（临时）"""
 import asyncio
 import json
+import os
+import sys
 import urllib.request
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO)
+os.chdir(_REPO)
 
 async def main():
     from sqlalchemy import text
