@@ -1377,6 +1377,126 @@ async def _chat_completions_impl(
                 }
                 for index, full_id in enumerate(combo_full_ids, start=1)
             ])
+            # ─── Fusion 策略：并行 fan-out + judge 合成 ───
+            # 自闭环：本分支自行落日志/决策并 return，不走下方共享级联收尾。
+            # 设计：docs/superpowers/specs/2026-09-11-fusion-strategy-design.md
+            if combo_strategy == "fusion":
+                from server.core.fusion import run_fusion, FusionAllFailed
+                import json as _fj
+
+                async def _f_precheck(_p, _m):
+                    _pf = await get_estimate_factor(db, _p.id, _m.model_id)
+                    _obs = int(getattr(_m, "observed_context_limit", 0) or 0)
+                    if context_overflows(_m, int(est_req_tokens * _pf), observed_limit=_obs):
+                        return f"context window {_m.context_length} < est ~{int(est_req_tokens * _pf)}"
+                    if ar.health_checker and ar.health_checker.is_cooling(_m.id):
+                        return "model is cooling down"
+                    return None
+
+                def _f_attempt(_t, _ok, _err):
+                    try:
+                        _decision_attempt(
+                            conversation_id,
+                            provider=_t["provider"].name, model=_t["model"].model_id,
+                            status="success" if _ok else "failed", attempt=0, error=_err,
+                        )
+                    except Exception:
+                        pass
+
+                async def _fusion_job():
+                    return await run_fusion(
+                        db, ordered_targets, request, combo=combo,
+                        precheck=_f_precheck, on_attempt=_f_attempt,
+                    )
+
+                async def _fusion_log_done(fresp, fmeta):
+                    jp, jm = (fmeta.get("judge") or (None, None))
+                    fb = max(0, len(fmeta.get("attempts") or []) - 1)
+                    try:
+                        await _write_stream_log(
+                            conversation_id, request, raw_request, "success",
+                            jp, jm, None, fb, fmeta.get("attempts"),
+                            stream_body=_fj.dumps(fresp, ensure_ascii=False),
+                            diag_start_ts=_diag_start,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await _decision_finish(
+                            conversation_id, status="success", provider=jp, model=jm,
+                            total_latency_ms=int((time.time() - _send_time) * 1000),
+                        )
+                    except Exception:
+                        pass
+
+                async def _fusion_log_fail(attempts):
+                    try:
+                        await _write_stream_log(
+                            conversation_id, request, raw_request, "error",
+                            None, None, "fusion all candidates failed",
+                            max(0, len(attempts) - 1), attempts, diag_start_ts=_diag_start,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await _decision_finish(
+                            conversation_id, status="error",
+                            failure_reason="fusion all candidates failed", attempts=attempts,
+                        )
+                    except Exception:
+                        pass
+
+                if request.stream:
+                    _fusion_task = asyncio.create_task(_fusion_job())
+
+                    async def _fusion_sse():
+                        yield b": keepalive\n\n"
+                        while not _fusion_task.done():
+                            try:
+                                await asyncio.wait_for(asyncio.shield(_fusion_task), 5)
+                            except asyncio.TimeoutError:
+                                yield b": fusion-collecting\n\n"
+                        try:
+                            fresp, fmeta = _fusion_task.result()
+                        except FusionAllFailed as fe:
+                            yield _format_sse_chunk(
+                                _api_error("fusion: all candidates failed", status=502,
+                                           attempts=fe.attempts), request.model)
+                            yield b"data: [DONE]\n\n"
+                            await _fusion_log_fail(fe.attempts)
+                            return
+                        except Exception as fe:
+                            yield _format_sse_chunk(
+                                _api_error(f"fusion failed: {type(fe).__name__}: {str(fe)[:200]}",
+                                           status=502), request.model)
+                            yield b"data: [DONE]\n\n"
+                            await _fusion_log_fail([{"attempt": 0, "error": str(fe)[:200]}])
+                            return
+                        _ctext = ((fresp.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                        _chunk = {
+                            "id": f"chatcmpl-{conversation_id[:12]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()), "model": request.model,
+                            "choices": [{"index": 0,
+                                         "delta": {"role": "assistant", "content": _ctext},
+                                         "finish_reason": "stop"}],
+                        }
+                        yield _format_sse_chunk(_chunk, request.model)
+                        yield b"data: [DONE]\n\n"
+                        await _fusion_log_done(fresp, fmeta)
+
+                    return StreamingResponse(_fusion_sse(), media_type="text/event-stream",
+                                             headers={"Cache-Control": "no-cache",
+                                                      "X-Accel-Buffering": "no"})
+                try:
+                    fresp, fmeta = await _fusion_job()
+                except FusionAllFailed as fe:
+                    await _fusion_log_fail(fe.attempts)
+                    return JSONResponse(status_code=502, content=_api_error(
+                        "fusion: all candidates failed", status=502, attempts=fe.attempts))
+                await _fusion_log_done(fresp, fmeta)
+                return JSONResponse(fresp)
+
             # ─── 流式 combo：统一级联回退（带冷却），与 auto 流式行为一致 ───
             if request.stream:
                 _diag(conversation_id, "combo_stream_start", _diag_start, count=len(combo_full_ids))

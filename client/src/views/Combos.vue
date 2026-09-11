@@ -53,8 +53,29 @@
             <option value="fallback">fallback 顺序兜底（第一个失败 → 下一个）</option>
             <option value="round_robin">round_robin 轮询（每次请求轮到下一个）</option>
             <option value="weighted">weighted 加权随机（按候选权重分配流量）</option>
-            <option value="fusion" disabled>fusion 扇出合并（实验中：当前按 fallback 顺序处理）</option>
+            <option value="fusion">fusion 并行咨询 + 评审合成（质量优先，N+1 倍成本与延迟）</option>
           </select>
+        </div>
+
+        <div class="form-group" v-if="form.strategy === 'fusion'">
+          <label>Fusion 配置
+            <span class="cfg-hint">并行问所有候选模型，再由评审模型（judge）综合成一份最终答案。
+            更准更稳，但按候选数付费，且流式下答案在全部候选完成后一次性给出。</span>
+          </label>
+          <div class="fusion-grid">
+            <label>评审模型
+              <select v-model="fusionJudge">
+                <option value="">自动：候选中智力评分最高</option>
+                <option v-for="m in fusionCandidateOptions" :key="m.value" :value="m.value">{{ m.label }}</option>
+              </select>
+            </label>
+            <label>并行上限
+              <input type="number" min="1" max="12" v-model.number="fusionMaxTargets" />
+            </label>
+            <label>单候选超时（秒）
+              <input type="number" min="5" max="180" v-model.number="fusionTimeout" />
+            </label>
+          </div>
         </div>
 
         <div class="form-group">
@@ -206,7 +227,8 @@ export default {
         name: '',
         description: '',
         strategy: 'fallback',
-        model_ids: []
+        model_ids: [],
+        fusion_config: { judge: null, max_targets: 6, timeout_seconds: 30 }
       }
     }
   },
@@ -215,6 +237,23 @@ export default {
     await this.loadAll()
   },
   computed: {
+    fusionJudge: {
+      get() { return (this.form.fusion_config && this.form.fusion_config.judge) || '' },
+      set(v) { this.$set(this.form, 'fusion_config', { ...(this.form.fusion_config || {}), judge: v || null }) },
+    },
+    fusionMaxTargets: {
+      get() { return (this.form.fusion_config && this.form.fusion_config.max_targets) || 6 },
+      set(v) { this.$set(this.form, 'fusion_config', { ...(this.form.fusion_config || {}), max_targets: v }) },
+    },
+    fusionTimeout: {
+      get() { return (this.form.fusion_config && this.form.fusion_config.timeout_seconds) || 30 },
+      set(v) { this.$set(this.form, 'fusion_config', { ...(this.form.fusion_config || {}), timeout_seconds: v }) },
+    },
+    fusionCandidateOptions() {
+      return (this.form.model_ids || [])
+        .filter(m => m.provider && m.model_id)
+        .map(m => ({ value: `${m.provider}/${m.model_id}`, label: `${m.provider}/${m.model_id}` }))
+    },
     // 按 provider 分组 + 搜索过滤后的模型池
     groupedPool() {
       const q = (this.searchQuery || '').trim().toLowerCase()
@@ -547,7 +586,7 @@ export default {
       this.isEditing = false
       this.editingId = null
       this.searchQuery = ''
-      this.form = { name: '', description: '', strategy: 'fallback', model_ids: [] }
+      this.form = { name: '', description: '', strategy: 'fallback', model_ids: [], fusion_config: { judge: null, max_targets: 6, timeout_seconds: 30 } }
       this.showModal = true
     },
     editCombo(c) {
@@ -558,6 +597,12 @@ export default {
         name: c.name,
         description: c.description || '',
         strategy: c.strategy,
+        fusion_config: {
+          judge: (c.fusion_config && c.fusion_config.judge)
+            ? (c.fusion_config.judge.provider + '/' + c.fusion_config.judge.model_id) : '',
+          max_targets: (c.fusion_config && c.fusion_config.max_targets) || 6,
+          timeout_seconds: (c.fusion_config && c.fusion_config.timeout_seconds) || 30,
+        },
         model_ids: (c.model_ids || []).map(m => ({
           provider: m.provider || (m.full_id ? m.full_id.split('/')[0] : ''),
           model_id: m.model_id || (m.full_id ? m.full_id.split('/')[1] : ''),
@@ -576,10 +621,25 @@ export default {
       if (cleaned.length === 0) { toast.error('至少添加一个候选模型'); return }
       this.saving = true
       try {
+        let fusionConfig = null
+        if (this.form.strategy === 'fusion') {
+          let judge = null
+          const jv = this.fusionJudge
+          if (jv && jv.includes('/')) {
+            const i = jv.indexOf('/')
+            judge = { provider: jv.slice(0, i), model_id: jv.slice(i + 1) }
+          }
+          fusionConfig = {
+            judge,
+            max_targets: Number(this.fusionMaxTargets) > 0 ? Number(this.fusionMaxTargets) : 6,
+            timeout_seconds: Number(this.fusionTimeout) > 0 ? Number(this.fusionTimeout) : 30,
+          }
+        }
         const payload = {
           name: this.form.name.trim(),
           description: this.form.description.trim(),
           strategy: this.form.strategy,
+          fusion_config: fusionConfig,
           model_ids: cleaned,
           priority: 0,
           enabled: true
@@ -680,6 +740,10 @@ export default {
   color: var(--badge-paid-fg);
   border-color: var(--badge-paid-fg);
 }
+.cfg-hint { display: block; font-weight: 400; color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.fusion-grid { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: var(--space-3); margin-top: 8px; }
+.fusion-grid label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-muted); }
+.fusion-grid input, .fusion-grid select { background: var(--surface-1); border: 1px solid var(--border-base); border-radius: 6px; padding: 6px 8px; color: var(--text-primary); font-size: 13px; }
 .weight-input {
   width: 56px;
   padding: 2px 6px;

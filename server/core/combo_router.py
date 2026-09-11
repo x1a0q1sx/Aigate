@@ -3,7 +3,9 @@ Combos 组合路由器
 策略:
   - fallback:   从候选顺序尝试第一个可用，失败则取下一个，最多 max_fallbacks 次
   - round_robin: 每次按内存中维护的下标轮到下一个候选，失败同 fallback 跳下一个
-  - fusion:     未实现（strategy=fusion 当前按 fallback 顺序处理；扇出+judge 合并待后续设计）
+  - weighted:   E2 加权随机（combo.model_ids 条目可带 weight，缺省 1）
+  - fusion:     并行 fan-out 全部候选 + judge 合成（执行在 core/fusion.run_fusion，
+                由 v1_router combo 分支分派；配置见 combo.fusion_config）
 
 调用入口：
   - 模型名以 "combo:" 前缀（例如 "combo:my-fast"）

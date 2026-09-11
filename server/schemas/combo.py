@@ -16,8 +16,9 @@ class ComboItem(BaseModel):
 class ComboCreate(BaseModel):
     name: str
     description: Optional[str] = None
-    strategy: str = "fallback"     # fallback / round_robin / fusion
-    model_ids: List[Dict[str, Any]] = []   # [{"provider":..., "model_id":...}]
+    strategy: str = "fallback"     # fallback / round_robin / weighted / fusion
+    model_ids: List[Dict[str, Any]] = []   # [{"provider":..., "model_id":..., "weight"?:n}]
+    fusion_config: Optional[Dict[str, Any]] = None
     priority: int = 0
     enabled: bool = True
 
@@ -25,7 +26,7 @@ class ComboCreate(BaseModel):
     @classmethod
     def _validate_strategy(cls, v: str) -> str:
         v = (v or "fallback").lower()
-        if v not in ("fallback", "round_robin", "fusion"):
+        if v not in ("fallback", "round_robin", "weighted", "fusion"):
             raise ValueError("strategy must be one of fallback/round_robin/fusion")
         return v
 
@@ -45,6 +46,7 @@ class ComboUpdate(BaseModel):
     description: Optional[str] = None
     strategy: Optional[str] = None
     model_ids: Optional[List[Dict[str, Any]]] = None
+    fusion_config: Optional[Dict[str, Any]] = None
     priority: Optional[int] = None
     enabled: Optional[bool] = None
 
@@ -55,6 +57,7 @@ class ComboResponse(BaseModel):
     description: Optional[str]
     strategy: str
     model_ids: List[Any]
+    fusion_config: Optional[Dict[str, Any]] = None
     priority: int
     enabled: bool
     created_at: Optional[datetime]

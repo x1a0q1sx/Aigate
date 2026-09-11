@@ -42,6 +42,7 @@ async def create_combo(data: ComboCreate, db: AsyncSession = Depends(get_db)):
         description=data.description or "",
         strategy=data.strategy,
         model_ids=data.model_ids or [],
+        fusion_config=data.fusion_config,
         priority=data.priority,
         enabled=data.enabled,
     )
@@ -75,9 +76,11 @@ async def update_combo(combo_id: int, data: ComboUpdate, db: AsyncSession = Depe
         combo.description = data.description
     if data.strategy is not None:
         s = data.strategy.lower()
-        if s not in ("fallback", "round_robin", "fusion"):
+        if s not in ("fallback", "round_robin", "weighted", "fusion"):
             raise HTTPException(status_code=400, detail="strategy 校验失败")
         combo.strategy = s
+    if data.fusion_config is not None:
+        combo.fusion_config = data.fusion_config or None
     if data.model_ids is not None:
         combo.model_ids = data.model_ids or []
     if data.priority is not None:

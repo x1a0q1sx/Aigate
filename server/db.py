@@ -143,6 +143,8 @@ async def init_db():
         "ALTER TABLE request_logs ADD COLUMN response_body_hash VARCHAR(64) DEFAULT NULL",
         # D1: 下游网关密钥关联（哪个客户端 key 发起的请求）
         "ALTER TABLE request_logs ADD COLUMN downstream_key_id INTEGER DEFAULT NULL",
+        # v16: combos 表 fusion 配置（JSON；SQLite 动态类型直接存文本）
+        "ALTER TABLE combos ADD COLUMN fusion_config JSON",
     ]
     for sql in _migrations:
         try:

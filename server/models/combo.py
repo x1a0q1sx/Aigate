@@ -11,11 +11,13 @@ class Combo(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), nullable=False, unique=True)
     description = Column(Text, nullable=True, default="")
-    # 策略：fallback（顺序兜底）/ round_robin（轮询）/ fusion（扇出合并，暂未实现）
+    # 策略：fallback（顺序兜底）/ round_robin（轮询）/ weighted（加权随机）/ fusion（并行+judge合成）
     strategy = Column(String(20), nullable=False, default="fallback")
     # JSON 数组：[{"provider": "...", "model_id": "..."}, ...]
     # 存储的是完整路由键（provider_name/model_id 形式），调用时解析
     model_ids = Column(JSON, nullable=False, default=list)
+    # Fusion 策略配置：{"judge": {provider, model_id}|null, "max_targets": 6, "timeout_seconds": 30}
+    fusion_config = Column(JSON, nullable=True, default=None)
     priority = Column(Integer, nullable=False, default=0)
     enabled = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
