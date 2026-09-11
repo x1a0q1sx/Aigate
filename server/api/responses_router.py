@@ -164,7 +164,9 @@ def _tools_to_chat(tools: Optional[List[dict]]) -> Optional[List[dict]]:
         if not isinstance(t, dict):
             continue
         if t.get("type") == "function":
-            fn = t.get("function", {})
+            # Responses API 的工具是扁平格式（name/description 在顶层）；
+            # chat 风格是嵌套在 function 下。两种都要认，否则 name 转空串被上游 400。
+            fn = t.get("function") or t
             out.append({
                 "type": "function",
                 "function": {
@@ -173,11 +175,10 @@ def _tools_to_chat(tools: Optional[List[dict]]) -> Optional[List[dict]]:
                     "parameters": fn.get("parameters") or fn.get("input_schema") or {"type": "object", "properties": {}},
                 },
             })
-        elif t.get("type") == "code_interpreter" or t.get("type") == "web_search":
-            # codex 主要用 function tools；其余忽略
-            continue
         else:
-            out.append(t)
+            # 非 function 工具（web_search/code_interpreter/apply_patch/自定义 type）
+            # 一律丢弃：多数上游 chat 端点只认 function 类型，透传会 400。
+            continue
     return out or None
 
 
