@@ -19,6 +19,7 @@
 - 模型管理/Playground/日志详情性能优化（N+1 消除、懒加载、截断）
 
 ### Fixed
+- 日志「一成功一失败」双行：systemd `aigate.service` 与 pm2 双守护冲突（每 5s 崩溃重拉，累计 48934 次），每次启动清扫把在途 pending 行误翻为 interrupted；启动收尾现只处理早于本进程启动（留 5s 余量）的遗留行
 - Anthropic 流式缺 await 导致 /v1/messages 全坏、message_start 被 ping 抢首、非流式块序错误
 - 终态错误被包装成"正常完成"的空响应（Responses/Anthropic SSE）
 - 请求日志 token 全 0、PG 布尔比较、种子 NOT NULL 等方言问题
