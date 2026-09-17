@@ -11,6 +11,9 @@ from typing import AsyncGenerator, List
 from dataclasses import dataclass
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.core.model_capabilities import infer_reasoning_effort_support
+from server.core.provider_quirks import (
+    quirks_for, transform_payload, unwrap_response, auth_token_for,
+)
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
 logger = logging.getLogger(__name__)
@@ -131,20 +134,29 @@ class OpenAICompatAdapter(BaseAdapter):
         if not base.endswith('/v1'):
             base += '/v1'
         return f"{base}/models"
-    def _get_headers(self, api_key: str, extra_headers: dict = None) -> dict:
+    def _get_headers(self, api_key: str, extra_headers: dict = None, base_url: str = None) -> dict:
+        q = quirks_for(base_url) if base_url else None
+        token = auth_token_for(q, api_key) if q else str(api_key or "").strip()
         # v3.1：free_tier / OAuth 路径可能给空字符串 — 不带 Authorization 头
         # httpx 会因 "Bearer " 尾随空格抛 LocalProtocolError
-        if api_key and str(api_key).strip():
+        if token:
             headers = {
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
         else:
             # 无密钥请求（部分本地/免费端点接受匿名调用）
             headers = {"Content-Type": "application/json"}
-        # Proxy metadata is routing state and must never become an upstream header.
+        # 域名方言的专属头（CodeBuddy X-Product / Cline Referer 等）先垫底，
+        # provider 级自定义头优先覆盖
+        if q and q.default_headers:
+            headers.update(q.default_headers)
+        # 网关内部路由标记（__proxy_* / __oauth）不是上游协议的一部分，绝不出站；
+        # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
+            headers.update({k: v for k, v in extra_headers.items()
+                            if k not in ("__proxy_force", "__proxy_url", "__oauth")})
+        headers["Content-Type"] = "application/json"
         return headers
     async def chat_completion(
         self,
@@ -153,14 +165,19 @@ class OpenAICompatAdapter(BaseAdapter):
         base_url: str,
         extra_headers: dict = None
     ) -> ChatCompletionResponse:
+        q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers)
+        headers = self._get_headers(api_key, extra_headers, base_url)
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         # reasoning dict 是网关内部思考控制提示（anthropic 出站方言）；OpenAI 兼容上游
         # 只认 reasoning_effort，透传非标字段有被严格上游 400 的风险
         payload.pop("reasoning", None)
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
+        payload = transform_payload(payload, q)
+        if q and q.force_stream:
+            # 流式专属上游（CodeBuddy 拒绝非流式，11101）：走 SSE 聚合成 JSON 回包
+            return await self._collect_stream(payload, url, headers, force_proxy)
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
@@ -170,6 +187,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     request=resp.request, response=resp
                 )
             data = resp.json()
+            data = unwrap_response(data, q)  # Cline 信封 {"success":true,"data":{...}}
             try:
                 from server.config import get_config
                 if get_config().adapters.openai_compat.reasoning == "drop":
@@ -178,6 +196,90 @@ class OpenAICompatAdapter(BaseAdapter):
             except Exception:
                 pass
             return data
+
+    async def _collect_stream(self, payload: dict, url: str, headers: dict,
+                              force_proxy: bool, timeout: int = None) -> dict:
+        """流式专属上游 + 非流式客户端：消费 SSE 并聚合为标准 OpenAI 响应 dict。
+
+        对齐 9router「forceStream + 网关侧重新聚合」的做法：content/reasoning/
+        tool_calls 按 delta 拼接，finish_reason/usage 取最后出现值。"""
+        acc = {"id": None, "object": "chat.completion", "created": None, "model": None,
+               "usage": None}
+        content, reasoning = [], []
+        tool_calls = {}   # index -> {"id","type","function":{"name","arguments"}}
+        finish = None
+        async with httpx.AsyncClient(timeout=timeout or self.timeout, **self._proxy(url, force_proxy)) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    raise httpx.HTTPStatusError(
+                        f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:500]}",
+                        request=resp.request, response=resp
+                    )
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("data:"):
+                        line = line[5:].strip()
+                    if line == "[DONE]":
+                        break
+                    try:
+                        c = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("error"):
+                        raise RuntimeError(f"upstream stream error: {json.dumps(c['error'], ensure_ascii=False)[:200]}")
+                    for k in ("id", "created", "model"):
+                        if c.get(k) is not None:
+                            acc[k] = c[k]
+                    if c.get("usage"):
+                        acc["usage"] = c["usage"]
+                    for ch in (c.get("choices") or []):
+                        if not isinstance(ch, dict):
+                            continue
+                        delta = ch.get("delta") or {}
+                        if delta.get("content"):
+                            content.append(delta["content"])
+                        if delta.get("reasoning_content"):
+                            reasoning.append(delta["reasoning_content"])
+                        for tc in (delta.get("tool_calls") or []):
+                            if not isinstance(tc, dict):
+                                continue
+                            idx = tc.get("index") if tc.get("index") is not None else 0
+                            slot = tool_calls.setdefault(idx, {
+                                "id": "", "type": "function",
+                                "function": {"name": "", "arguments": ""}})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                slot["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                slot["function"]["arguments"] += fn["arguments"]
+                        if ch.get("finish_reason"):
+                            finish = ch["finish_reason"]
+        message = {"role": "assistant", "content": "".join(content) or ""}
+        if reasoning:
+            message["reasoning_content"] = "".join(reasoning)
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[i] for i in sorted(tool_calls)]
+        try:
+            from server.config import get_config
+            if get_config().adapters.openai_compat.reasoning == "drop":
+                message.pop("reasoning_content", None)
+        except Exception:
+            pass
+        return {
+            "id": acc["id"] or f"chatcmpl-aggregated",
+            "object": "chat.completion",
+            "created": acc["created"] or int(time.time()),
+            "model": acc["model"] or payload.get("model"),
+            "choices": [{"index": 0, "message": message, "finish_reason": finish or "stop"}],
+            "usage": acc["usage"] or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
     async def stream_chat_completion(
         self,
         request: ChatCompletionRequest,
@@ -185,12 +287,14 @@ class OpenAICompatAdapter(BaseAdapter):
         base_url: str,
         extra_headers: dict = None
     ) -> AsyncGenerator[dict, None]:
+        q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers)
+        headers = self._get_headers(api_key, extra_headers, base_url)
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
+        payload = transform_payload(payload, q)  # 流式专属/请求体形态方言
         timeout_error = None
         try:
             async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
@@ -242,7 +346,7 @@ class OpenAICompatAdapter(BaseAdapter):
         extra_headers: dict = None
     ) -> List[ModelInfo]:
         url = self._build_models_url(base_url)
-        headers = self._get_headers(api_key, extra_headers)
+        headers = self._get_headers(api_key, extra_headers, base_url)
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.get(url, headers=headers)
@@ -273,8 +377,9 @@ class OpenAICompatAdapter(BaseAdapter):
         extra_headers: dict = None,
         timeout: int = 10
     ) -> HealthResult:
+        q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers)
+        headers = self._get_headers(api_key, extra_headers, base_url)
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = {
             "model": model,
@@ -282,7 +387,25 @@ class OpenAICompatAdapter(BaseAdapter):
             "max_tokens": 1,
             "stream": False
         }
+        payload = transform_payload(payload, q)
         start_time = time.time()
+        if q and q.force_stream:
+            # 流式专属上游：聚合探测（非流式会被 11101 直接拒掉，那不是故障）
+            try:
+                await self._collect_stream(payload, url, headers, force_proxy, timeout=timeout)
+                latency_ms = (time.time() - start_time) * 1000
+                from server.config import get_config
+                threshold = get_config().health_check.healthy_latency_threshold_ms
+                return HealthResult(status="healthy" if latency_ms < threshold else "degraded",
+                                    latency_ms=latency_ms, error_message="")
+            except httpx.HTTPStatusError as e:
+                latency_ms = (time.time() - start_time) * 1000
+                return HealthResult(status="unhealthy", latency_ms=latency_ms,
+                                    error_message=f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+            except Exception as e:
+                latency_ms = (time.time() - start_time) * 1000
+                return HealthResult(status="unhealthy", latency_ms=latency_ms,
+                                    error_message=str(e)[:200])
         try:
             async with httpx.AsyncClient(timeout=timeout, **self._proxy(base_url, force_proxy)) as client:
                 resp = await client.post(url, headers=headers, json=payload)

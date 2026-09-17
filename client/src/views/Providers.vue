@@ -783,6 +783,17 @@ export default {
   mounted() {
     this.pinnedIds = JSON.parse(localStorage.getItem(PIN_KEY) || '[]')
     this.load()
+    // OAuth 浏览器回调落地（/providers?oauth=success）：提示并清理地址栏
+    try {
+      const params = new URLSearchParams(window.location.search)
+      if (params.get('oauth') === 'success') {
+        toast.success('OAuth 授权完成，token 已保存（稍后请求即自动使用）')
+        window.history.replaceState({}, '', window.location.pathname)
+      } else if (params.get('oauth')) {
+        toast.error('OAuth 授权失败：' + params.get('oauth'))
+        window.history.replaceState({}, '', window.location.pathname)
+      }
+    } catch (e) { /* 老浏览器忽略 */ }
   },
   methods: {
     async load() {

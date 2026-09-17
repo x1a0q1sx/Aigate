@@ -162,7 +162,12 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         extra_params={"device_code_only": True},
         notes="Qoder 设备流（30 天 token）",
     ),
-    # ── CodeBuddy CN（腾讯） ──
+    # ── CodeBuddy CN（腾讯 copilot.tencent.com） ──
+    # 流程（对齐 9router codebuddy-cn provider 实测）：
+    #   1) POST {state_url}?platform=CLI body={}（带 X-No-* 匿名头）→ {code:0,data:{state,authUrl}}
+    #   2) 浏览器打开 authUrl 登录
+    #   3) GET {token_url}?state=... 轮询，code 11217=pending，code 0 带 accessToken/refreshToken
+    #   4) 刷新 POST {refresh_url} 头 X-Refresh-Token + 空 JSON body
     "codebuddy_cn": OAuthProviderConfig(
         code="codebuddy_cn",
         name="CodeBuddy CN (腾讯)",
@@ -177,7 +182,9 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         refresh_lead_seconds=300,
         extra_params={
             "auth_mode": "device_poll",
+            "refresh_style": "codebuddy",
             "state_url": "https://copilot.tencent.com/v2/plugin/auth/state",
+            "platform": "CLI",
             "user_agent": "CLI/2.63.2 CodeBuddy/2.63.2",
             "x_domain": "copilot.tencent.com",
             "x_product": "SaaS",
@@ -185,6 +192,59 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         },
         api_base_url="https://copilot.tencent.com/v2/chat/completions",
         notes="腾讯 CodeBuddy — state 轮询登录 + X-Refresh-Token 头刷新",
+    ),
+    # ── CodeBuddy International（www.codebuddy.ai）──
+    # 与 CN 同构，仅域名 / X-Domain / platform=ide（CN 用 CLI）不同。
+    "codebuddy_intl": OAuthProviderConfig(
+        code="codebuddy_intl",
+        name="CodeBuddy (International)",
+        client_id="",
+        client_secret="",
+        authorize_url="",
+        token_url="https://www.codebuddy.ai/v2/plugin/auth/token",
+        refresh_url="https://www.codebuddy.ai/v2/plugin/auth/token/refresh",
+        redirect_uri="",
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=300,
+        extra_params={
+            "auth_mode": "device_poll",
+            "refresh_style": "codebuddy",
+            "state_url": "https://www.codebuddy.ai/v2/plugin/auth/state",
+            "platform": "ide",
+            "user_agent": "IDE/2.63.2 CodeBuddy/2.63.2",
+            "x_domain": "www.codebuddy.ai",
+            "x_product": "SaaS",
+            "poll_interval_ms": 5000,
+        },
+        api_base_url="https://www.codebuddy.ai/v2/chat/completions",
+        notes="CodeBuddy 国际服 — 与 CN 同协议（state 轮询 + X-Refresh-Token 刷新）",
+    ),
+    # ── Cline（api.cline.bot 订阅网关）──
+    # authorization_code 变体：/auth/authorize?client_type=extension&callback_url=&redirect_uri=
+    #   回调的 code 本身是 base64(JSON token)，直接解码即得 token（解析失败回退
+    #   POST token_url 标准交换）。刷新为 JSON {refreshToken,grantType,clientType}。
+    #   注意：ClinePass（clp_ API key）共用域名但只认 API key，OAuth token 会被 401。
+    "cline": OAuthProviderConfig(
+        code="cline",
+        name="Cline (cline.bot)",
+        client_id="",                                # authorize 无 client_id
+        client_secret="",
+        authorize_url="https://api.cline.bot/api/v1/auth/authorize",
+        token_url="https://api.cline.bot/api/v1/auth/token",
+        refresh_url="https://api.cline.bot/api/v1/auth/refresh",
+        redirect_uri=_DEFAULT_REDIRECT,
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=300,
+        extra_params={
+            "auth_mode": "cline",
+            "refresh_style": "cline",
+            "token_in_code": True,
+            "client_type": "extension",
+        },
+        api_base_url="https://api.cline.bot/api/v1/chat/completions",
+        notes="Cline 订阅 — code 即 base64 token（自解码）+ JSON 刷新 + workos: 前缀",
     ),
     # ── Kimchi ──
     "kimchi": OAuthProviderConfig(

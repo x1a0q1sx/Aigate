@@ -49,6 +49,57 @@ def gen_state() -> str:
     return secrets.token_urlsafe(32)
 
 
+def _expires_in_from(iso_exp, fallback) -> int:
+    """expiresAt ISO 字符串 → 剩余秒数；无则用 fallback 秒数（下限 60s）。"""
+    try:
+        if iso_exp:
+            dt = datetime.fromisoformat(str(iso_exp).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(60, int((dt - datetime.now(timezone.utc)).total_seconds()))
+    except Exception:
+        pass
+    try:
+        return max(60, int(fallback or 3600))
+    except Exception:
+        return 3600
+
+
+def decode_cline_code(code: str) -> Optional[dict]:
+    """Cline 登录回调的 code = base64(JSON token)。
+
+    官方扩展实现：授权跳转回来的 code 参数直接编码了 token 数据（补 = 填充、
+    容忍尾部垃圾字符，取首个 { 到最后一个 } 的 JSON）。返回 _save_token 可用的
+    标准 tok dict；任何解析失败返回 None（调用方走 POST 换票兜底）。
+    """
+    import json
+    import base64
+    try:
+        b64 = (code or "").strip()
+        if not b64:
+            return None
+        pad = 4 - len(b64) % 4
+        if pad != 4:
+            b64 += "=" * pad
+        decoded = base64.b64decode(b64).decode("utf-8", errors="replace")
+        start, end = decoded.find("{"), decoded.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        t = json.loads(decoded[start:end + 1])
+        access = t.get("accessToken")
+        if not access:
+            return None
+        return {
+            "access_token": access,
+            "refresh_token": t.get("refreshToken") or "",
+            "expires_in": _expires_in_from(t.get("expiresAt"), 3600),
+            "token_type": "Bearer",
+            "scope": ("email:%s" % t["email"]) if t.get("email") else "cline",
+        }
+    except Exception:
+        return None
+
+
 class OAuthClient:
     """OAuth 客户端 + 主动刷新 + 持久化"""
 
@@ -57,6 +108,9 @@ class OAuthClient:
         self.redirect_override = redirect_override         # 运行时 host 替换默认 redirect
         self._flight_locks: Dict[str, asyncio.Lock] = {}    # Single Flight per (provider+owner)
         self._inflight: Dict[str, asyncio.Future] = {}       # 进行中 refresh 的 future
+        # cline 类「回调不带 state」的 provider：记住 authorize 时下发的 redirect_uri / 会话
+        self._pending_redirect: Dict[str, str] = {}
+        self._pending_sessions: Dict[str, str] = {}          # provider_code → packed_state
 
     # ── 唯一性 ──
     def _key(self, provider_code: str, owner: str = "__default") -> str:
@@ -75,6 +129,18 @@ class OAuthClient:
         state = gen_state()
         # 在 state 中编码 provider_code 和 owner，回调时反查 — HMAC-style 不验签，省事
         packed_state = f"{provider.code}|{owner}|{state}"
+        # ── Cline 定制授权 URL：无 client_id/scope，参数为 client_type + callback_url/redirect_uri ──
+        # （9router cline provider 同构；另带 state 以便回调透传，不带也不影响 token 解码）
+        if (provider.extra_params or {}).get("auth_mode") == "cline":
+            from urllib.parse import quote
+            ep = provider.extra_params or {}
+            ct = quote(ep.get("client_type", "extension"), safe="")
+            ru = quote(redirect_uri, safe="")
+            url = (f"{provider.authorize_url}?client_type={ct}"
+                   f"&callback_url={ru}&redirect_uri={ru}&state={quote(packed_state, safe='')}")
+            self._pending_redirect[provider.code] = redirect_uri
+            self._pending_sessions[provider.code] = packed_state
+            return url, packed_state, None
         query_pairs = {
             "client_id": provider.client_id,
             "redirect_uri": redirect_uri,
@@ -121,6 +187,9 @@ class OAuthClient:
         provider = get_oauth_provider(provider_code)
         if not provider:
             return False, f"unknown provider {provider_code}", None
+        # ── Cline：回调 code 本身就是 base64(JSON) token，无需服务端换票 ──
+        if (provider.extra_params or {}).get("token_in_code"):
+            return await self._complete_token_in_code(provider, owner, code, db)
         verifier = self._state_verifier_map.pop(state, None)
         if provider.use_pkce and not verifier:
             return False, "missing PKCE verifier (state expired)", None
@@ -150,6 +219,61 @@ class OAuthClient:
         saved = await self._save_token(db, provider_code, owner, tok)
         # 清掉所有者的 state verifier（成功路径）
         return True, "ok", saved
+
+    async def _complete_token_in_code(
+        self, provider: OAuthProviderConfig, owner: str, code: str, db: AsyncSession,
+    ) -> Tuple[bool, str, Optional[OAuthToken]]:
+        """Cline 收尾：先直接解码 code（其本质是 base64 token），失败再走 POST 换票兜底。"""
+        tok = decode_cline_code(code)
+        if tok is None:
+            ep = provider.extra_params or {}
+            redirect_uri = self._pending_redirect.get(provider.code) or provider.redirect_uri
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(provider.token_url, json={
+                        "grant_type": "authorization_code",
+                        "code": code,
+                        "client_type": ep.get("client_type", "extension"),
+                        "redirect_uri": redirect_uri,
+                    }, headers={"Content-Type": "application/json", "Accept": "application/json"})
+            except Exception as e:
+                return False, f"cline exchange request failed: {e}", None
+            if resp.status_code >= 400:
+                return False, f"cline exchange HTTP {resp.status_code}: {resp.text[:200]}", None
+            try:
+                body = resp.json()
+            except Exception:
+                return False, "cline exchange invalid JSON", None
+            inner = body.get("data") if isinstance(body.get("data"), dict) else body
+            access = inner.get("accessToken") or inner.get("access_token")
+            if not access:
+                return False, "cline exchange missing accessToken", None
+            tok = {
+                "access_token": access,
+                "refresh_token": inner.get("refreshToken") or inner.get("refresh_token") or "",
+                "expires_in": _expires_in_from(
+                    inner.get("expiresAt") or inner.get("expires_at"),
+                    inner.get("expiresIn") or 3600),
+                "token_type": "Bearer",
+                "scope": "cline",
+            }
+        saved = await self._save_token(db, provider.code, owner, tok)
+        self._pending_sessions.pop(provider.code, None)
+        return True, "ok", saved
+
+    async def complete_pending(
+        self, code: str, db: AsyncSession,
+    ) -> Tuple[bool, str, Optional[OAuthToken]]:
+        """回调未带回 state 时（Cline authorize 不保证回显）按 authorize 时的挂起会话收尾。"""
+        for provider_code, packed in list(self._pending_sessions.items()):
+            provider = get_oauth_provider(provider_code)
+            if not provider or not (provider.extra_params or {}).get("token_in_code"):
+                continue
+            owner = packed.split("|", 2)[1] if "|" in packed else "__default"
+            ok, msg, saved = await self._complete_token_in_code(provider, owner, code, db)
+            if ok:
+                return True, msg, saved
+        return False, "no pending authorize session matches this code", None
 
     # ── refresh 主动刷新 ──
     async def refresh_token(
@@ -191,9 +315,14 @@ class OAuthClient:
         if not existing or not existing.refresh_token_enc:
             return False, "no refresh_token stored"
         refresh_plain = self._crypto.decrypt(existing.refresh_token_enc)
-        # ── CodeBuddy CN 非标准协议：X-Refresh-Token 头 + 空 JSON body ──
-        if provider_code == "codebuddy_cn":
+        # ── 非标准刷新协议按 extra_params.refresh_style 分发 ──
+        _style = (provider.extra_params or {}).get("refresh_style")
+        if _style == "codebuddy" or provider_code == "codebuddy_cn":
+            # 腾讯系（CN/国际服同构）：X-Refresh-Token 头 + 空 JSON body
             return await self._refresh_codebuddy(db, provider, existing, refresh_plain)
+        if _style == "cline":
+            # Cline：JSON body {refreshToken,grantType,clientType} → {data:{accessToken,expiresAt}}
+            return await self._refresh_cline(db, provider, existing, refresh_plain)
         # ── Qoder device_token ──
         if provider_code == "qoder" and (provider.extra_params or {}).get("device_code_only"):
             return await self._refresh_device_token(db, provider, existing, refresh_plain)
@@ -269,6 +398,46 @@ class OAuthClient:
         except Exception as e:
             return False, f"refresh_codebuddy exception: {e}"
 
+    # ── Cline 专属 refresh（JSON body + data 包裹响应） ──
+    async def _refresh_cline(
+        self, db: AsyncSession, provider: OAuthProviderConfig,
+        existing: OAuthToken, refresh_plain: str,
+    ) -> Tuple[bool, str]:
+        ep = provider.extra_params or {}
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(provider.refresh_url, json={
+                    "refreshToken": refresh_plain,
+                    "grantType": "refresh_token",
+                    "clientType": ep.get("client_type", "extension"),
+                }, headers={"Content-Type": "application/json", "Accept": "application/json"})
+            if resp.status_code >= 400:
+                err = resp.text[:300]
+                existing.last_error = err
+                existing.is_active = False
+                await db.commit()
+                return False, f"http {resp.status_code}: {err}"
+            body = resp.json()
+            inner = body.get("data") if isinstance(body.get("data"), dict) else body
+            access = inner.get("accessToken")
+            if not access:
+                err = body.get("message") or body.get("error") or "no accessToken in response"
+                existing.last_error = str(err)
+                existing.is_active = False
+                await db.commit()
+                return False, f"cline refresh: {err}"
+            tok = {
+                "access_token": access,
+                "refresh_token": inner.get("refreshToken") or refresh_plain,
+                "expires_in": _expires_in_from(
+                    inner.get("expiresAt"), inner.get("expiresIn") or 3600),
+                "token_type": "Bearer",
+            }
+            await self._save_token(db, provider.code, existing.owner, tok, update_existing=existing)
+            return True, "ok"
+        except Exception as e:
+            return False, f"refresh_cline exception: {e}"
+
     # ── CodeBuddy CN 专属 device_poll 流程：首次登录 ──
     async def start_device_poll(
         self,
@@ -277,14 +446,13 @@ class OAuthClient:
         owner: str = "__default",
     ) -> dict:
         """
-        CodeBuddy CN / 类似的 device poll provider：
-        1) POST state_url 拿一个 state
-        2) 返回 state + login_url 给前端弹窗
+        CodeBuddy CN / 国际服 device poll（协议对齐 9router）：
+        1) POST {state_url}?platform={platform} body={} → {code:0, data:{state, authUrl}}
+        2) 返回 state + login_url（authUrl）给前端弹窗
         3) 同时启动后台轮询，每 poll_interval_ms 拿 token_url?state=xxx
         4) 拿到 token 后持久化
-        返回 {"state": "...", "login_url": "https://copilot.tencent.com/...?state=xxx",
-              "poll_interval_ms": 5000, "owner": "..."
-        }
+        返回 {"state": "...", "login_url": "https://...authUrl...", "poll_interval_ms": ...,
+              "owner": "..."}
         """
         provider = get_oauth_provider(provider_code)
         if not provider:
@@ -294,25 +462,31 @@ class OAuthClient:
             return {"error": "provider not device_poll mode"}
         state_url = ep.get("state_url") or provider.token_url
         ua = ep.get("user_agent", "CLI/2.63.2 CodeBuddy/2.63.2")
+        platform = ep.get("platform", "CLI")
         headers = {
+            "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": ua,
             "X-Requested-With": "XMLHttpRequest",
+            "X-Domain": ep.get("x_domain", "copilot.tencent.com"),
+            "X-No-Authorization": "true",
+            "X-No-User-Id": "true",
             "X-Product": ep.get("x_product", "SaaS"),
         }
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(state_url, headers=headers)
+                resp = await client.post(f"{state_url}?platform={platform}",
+                                         headers=headers, content="{}")
             if resp.status_code >= 400:
                 return {"error": f"state URL HTTP {resp.status_code}: {resp.text[:200]}"}
             data = resp.json()
-            # 期望返回：{ "code": 0, "data": { "state": "xxxx", "loginUrl": "https://..." } }
-            inner = data.get("data") if data.get("code") == 0 else data
-            state = inner.get("state") if isinstance(inner, dict) else None
-            login_url = (inner.get("loginUrl") if isinstance(inner, dict) else None) or \
+            if data.get("code") != 0 or not (data.get("data") or {}).get("state"):
+                return {"error": f"state error: {data.get('msg') or 'missing state/authUrl'}"}
+            inner = data["data"]
+            state = inner["state"]
+            # authUrl = 官方协议字段（9router 实测）；loginUrl 兜底兼容
+            login_url = inner.get("authUrl") or inner.get("loginUrl") or \
                         (state_url + ("?state=" + state if state else ""))
-            if not state:
-                return {"error": f"missing state in response: {resp.text[:200]}"}
             # 启动后台轮询任务（不 awaited，独立协程）
             poll_interval_ms = ep.get("poll_interval_ms", 5000)
             asyncio.create_task(self._poll_codebuddy_token(
@@ -337,7 +511,8 @@ class OAuthClient:
     ):
         """
         每 poll_interval_ms 轮询 token_url?state=xxx，最多 max_attempts 次（默认 ~10 分钟）。
-        拿到 token 后持久化到 DB。
+        腾讯协议：code 0 带 accessToken=成功；code 11217=等待用户登录（pending）；
+        其余 code 视为本次失败继续重试（可能瞬时）。拿到 token 后持久化到 DB。
         """
         provider = get_oauth_provider(provider_code)
         if not provider:
@@ -348,6 +523,11 @@ class OAuthClient:
             "Accept": "application/json",
             "User-Agent": ua,
             "X-Requested-With": "XMLHttpRequest",
+            "X-Domain": ep.get("x_domain", "copilot.tencent.com"),
+            "X-No-Authorization": "true",
+            "X-No-User-Id": "true",
+            "X-No-Enterprise-Id": "true",
+            "X-No-Department-Info": "true",
             "X-Product": ep.get("x_product", "SaaS"),
         }
         token_url = provider.token_url
@@ -362,9 +542,9 @@ class OAuthClient:
                         # 状态码错误，继续等
                         continue
                     data = resp.json()
-                    inner = data.get("data") if data.get("code") == 0 else data
-                    if not isinstance(inner, dict):
-                        continue
+                    if data.get("code") != 0:
+                        continue  # 11217 pending 或其他瞬时错误，继续轮询
+                    inner = data.get("data") or {}
                     access = inner.get("accessToken")
                     if not access:
                         # 还在等待用户登录，继续轮询
@@ -374,7 +554,7 @@ class OAuthClient:
                         "access_token": access,
                         "refresh_token": inner.get("refreshToken", ""),
                         "expires_in": inner.get("expiresIn") or 3600,
-                        "token_type": "Bearer",
+                        "token_type": inner.get("tokenType") or "Bearer",
                         "scope": "codebuddy",
                     }
                     await self._save_token(db, provider_code, owner, tok)

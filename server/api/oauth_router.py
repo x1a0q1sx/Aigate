@@ -142,17 +142,24 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
 # ── 回调 ──────────────────────────────────────────
 
 @router.get("/callback")
-async def oauth_callback(code: str, state: str, db: AsyncSession = Depends(get_db)):
-    """OAuth 回调：用 code 换 token 并持久化"""
-    if not code or not state:
-        return JSONResponse(status_code=400, content={"error": "missing code or state"})
-    ok, msg, token = await get_oauth_client().exchange_code_for_token(
-        provider_code="", code=code, state=state, db=db
-    )
+async def oauth_callback(code: str, state: str = "", db: AsyncSession = Depends(get_db)):
+    """OAuth 回调：用 code 换 token 并持久化。
+
+    state 可选：Cline 类 authorize 端点不保证回显 state，此时按
+    start_oauth_authorize 时登记的挂起会话（provider+owner+redirect）收尾。"""
+    if not code:
+        return JSONResponse(status_code=400, content={"error": "missing code"})
+    client = get_oauth_client()
+    if state and "|" in state:
+        ok, msg, token = await client.exchange_code_for_token(
+            provider_code="", code=code, state=state, db=db
+        )
+    else:
+        ok, msg, token = await client.complete_pending(code, db)
     if not ok:
         return JSONResponse(status_code=400, content={"error": msg})
-    # 重定向回前端的 OAuth 连接页
-    return RedirectResponse(url="/oauth?auth=success", status_code=302)
+    # 重定向回前端的 OAuth 连接页（Providers 目录的 oauth tab，?oauth=success 触发提示）
+    return RedirectResponse(url="/providers?oauth=success", status_code=302)
 
 
 # ── 手动刷新 ──────────────────────────────────────────
