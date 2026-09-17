@@ -5,6 +5,9 @@
 ## [Unreleased]
 
 ### Added
+- Cline (api.cline.bot) OAuth 接入：code 即 base64 token 直解、JSON 刷新、回调无 state 收尾、workos: JWT 前缀与 success/data 信封解包
+- CodeBuddy 国际服 (www.codebuddy.ai) OAuth 注册（与 CN 同 device_poll 协议，platform=ide）
+- `server/core/provider_quirks.py` 上游请求方言档案：CodeBuddy 流式专属（网关侧 SSE 聚合）、CN agent system prompt 中性化、国际服 typed-blocks 形态、reasoning_summary 镜像
 - PostgreSQL 支持：`AIGATE_DATABASE_URL` 环境变量切换（默认 SQLite 不变），方言全兼容，服务器 PG16 全链路实测
 - 跨库迁移工具 `scripts/migrate_to_pg.py`：SQLite → PostgreSQL 全量数据迁移（幂等、孤儿行预分类、序列对齐）
 - 数据库每日定时备份 + 保留策略（SQLite 在线备份 / PG pg_dump），管理页可查看与手动触发
@@ -19,6 +22,7 @@
 - 模型管理/Playground/日志详情性能优化（N+1 消除、懒加载、截断）
 
 ### Fixed
+- CodeBuddy CN device_poll 协议纠正：state 请求从 GET 改为 POST ?platform=，解析字段对齐真实协议的 authUrl（旧实现按 loginUrl 解析，实际拿不到登录链接）
 - 日志「一成功一失败」双行：systemd `aigate.service` 与 pm2 双守护冲突（每 5s 崩溃重拉，累计 48934 次），每次启动清扫把在途 pending 行误翻为 interrupted；启动收尾现只处理早于本进程启动（留 5s 余量）的遗留行
 - Anthropic 流式缺 await 导致 /v1/messages 全坏、message_start 被 ping 抢首、非流式块序错误
 - 终态错误被包装成"正常完成"的空响应（Responses/Anthropic SSE）
