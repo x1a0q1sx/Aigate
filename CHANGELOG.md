@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### Added
+- Combo 前缀路由（组合即端点）：`http://host:8000/combo:<名称或id>/v1` 直接把 Base URL 锁进某个组合——`/combo:918/v1/chat/completions`、`/v1/messages`、`/v1/responses` 的请求被强制改写为该组合级联路由（思考强度后缀保留），`/combo:918/v1/models`（简写 `/combo:918/models`）只列该组合候选模型；实现为路径改写中间件 + v1 入口注入，三协议零重复逻辑；Combos 页每条组合展示可复制的访问端点
+- 登录会话持久化：session 落库 `admin_sessions`（此前纯内存，服务每次重启全员掉线=「一会儿就过期」的根因），重启不丢登录态；活跃会话剩余不足一半时长自动滑动续期；过期时长调整为 2 小时（`auth.session_timeout_hours`）
 - OAuth 连接即自动登记服务商（credential_type=oauth，幂等；同名手工服务商只补 oauth 指向）；模型刷新支持 OAuth 服务商：在线 list_models，失败/无端点回退注册表静态种子（claude_code/codex/github_copilot/antigravity/cursor/codebuddy 国服国际服/cline/qoder 已配种子）
 - 额度/余额查询 `GET /admin/oauth/connections/{id}/usage`（5 分钟缓存 + 并发合流 + Claude 429 冷却）：claude_code 5h/7d/模型级周窗、codex 会话/周/review/spark+重置券、github_copilot 付费/免费双形态、antigravity 按模型分数+周额度、codebuddy 续包/赠包分列、qoder 用户/组织配额（PAT 先换 job token）、u1s1 永久余额+今日免费（USD/token 双口径）——覆盖范围与 9router usage 一致；隐藏页内「查询余额」进度条面板
 - Qoder 推理代理（端口自 9router qoder 全栈）：`QoderAdapter` COSY 签名（RSA+AES-CBC+MD5、17 指纹头）+ WAF 绕过编码（&Encode=1）+ `{statusCodeValue,body}` SSE 信封解包与 finish/usage 合流 + 服务端下发的 per-model model_config（缺键硬错、1h 目录缓存）+ 上下文档位自动升档 + 首帧计费拦截转回退；设备流登录一键连接（本地 PKCE/nonce → 轮询 deviceToken/poll 收 dt- token，签名元数据存连接 scope）；PAT(pt-) 自动换 job token(jt-，api2 路由)

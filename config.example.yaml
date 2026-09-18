@@ -15,7 +15,7 @@ arena:
 auth:
   enabled: true
   username: admin
-  session_timeout_hours: 24
+  session_timeout_hours: 2
   # password_hash 留空 → 首次启动用默认密码 aigate123 生成
 
 auto_router:

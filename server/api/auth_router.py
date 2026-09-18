@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from typing import Optional
 from server.core.auth import (
     verify_password, create_session, destroy_session, validate_session,
-    extract_token, config,
+    clear_all_sessions, extract_token, config,
 )
 
 router = APIRouter(prefix="/admin/api/auth", tags=["auth"])
@@ -35,7 +35,7 @@ async def login(payload: LoginPayload):
         return JSONResponse(status_code=401, content={"detail": "用户名或密码错误"})
     if not verify_password(payload.password, config.auth.password_hash):
         return JSONResponse(status_code=401, content={"detail": "用户名或密码错误"})
-    token = create_session(payload.username)
+    token = await create_session(payload.username)
     return {"ok": True, "token": token, "username": payload.username}
 
 
@@ -43,7 +43,7 @@ async def login(payload: LoginPayload):
 async def logout(request: Request):
     token = extract_token(request)
     if token:
-        destroy_session(token)
+        await destroy_session(token)
     return {"ok": True}
 
 
@@ -52,7 +52,7 @@ async def check_session(request: Request):
     if not config.auth.enabled:
         return {"authenticated": True, "auth_enabled": False}
     token = extract_token(request)
-    if token and validate_session(token):
+    if token and await validate_session(token):
         return {"authenticated": True, "auth_enabled": True, "username": config.auth.username}
     return {"authenticated": False, "auth_enabled": True}
 
@@ -62,7 +62,7 @@ async def change_password(payload: PasswordChangePayload, request: Request):
     if not config.auth.enabled:
         return JSONResponse(status_code=400, content={"detail": "认证未开启"})
     token = extract_token(request)
-    if not token or not validate_session(token):
+    if not token or not await validate_session(token):
         return JSONResponse(status_code=401, content={"detail": "未登录"})
     if not verify_password(payload.old_password, config.auth.password_hash):
         return JSONResponse(status_code=400, content={"detail": "旧密码错误"})
@@ -73,7 +73,6 @@ async def change_password(payload: PasswordChangePayload, request: Request):
     # 持久化到 config.yaml
     from server.config import save_config
     save_config()
-    # 清除所有 session，强制重新登录
-    from server.core.auth import _sessions
-    _sessions.clear()
+    # 清除所有 session（含落库的），强制重新登录
+    await clear_all_sessions()
     return {"ok": True, "message": "密码已修改，请重新登录"}

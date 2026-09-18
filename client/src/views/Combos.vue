@@ -34,6 +34,10 @@
             {{ m.provider }}/{{ m.model_id }}
           </span>
         </div>
+        <div class="combo-endpoint">
+          访问端点：<code :title="'把客户端 Base URL 设为它；GET /v1/models 列本组合全部模型'">{{ origin }}/combo:{{ c.id }}/v1</code>
+          <button class="btn btn-ghost btn-xs" @click="copyEndpoint(c)">复制</button>
+        </div>
       </div>
     </div>
 
@@ -237,6 +241,7 @@ export default {
     await this.loadAll()
   },
   computed: {
+    origin() { return window.location.origin },
     fusionJudge: {
       get() { return (this.form.fusion_config && this.form.fusion_config.judge) || '' },
       set(v) { this.$set(this.form, 'fusion_config', { ...(this.form.fusion_config || {}), judge: v || null }) },
@@ -665,6 +670,15 @@ export default {
       } catch (e) {
         toast.error('删除失败: ' + e.message)
       }
+    },
+    async copyEndpoint(c) {
+      const url = `${this.origin}/combo:${encodeURIComponent(c.id)}/v1`
+      try {
+        await navigator.clipboard.writeText(url)
+        toast.success(`已复制 Base URL：${url}`)
+      } catch (e) {
+        window.prompt('浏览器拒绝了剪贴板，请手动复制：', url)
+      }
     }
   }
 }
@@ -711,6 +725,23 @@ export default {
   border-radius: 4px;
   background: var(--bg-code);
   border: 1px solid var(--border-soft);
+}
+.combo-endpoint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.combo-endpoint code {
+  font-family: ui-monospace, monospace;
+  background: var(--bg-code);
+  border: 1px dashed var(--border-soft);
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: help;
+  user-select: all;
 }
 .cred-badge {
   display: inline-block;

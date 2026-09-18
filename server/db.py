@@ -39,6 +39,7 @@ from .models.oauth_token import OAuthToken
 from .models.route_decision import RouteDecision
 from .models.gateway_key import GatewayKey   # D1 下游网关密钥
 from .models.model_alias import ModelAlias   # E1 模型别名
+from .models.admin_session import AdminSession  # 登录会话持久化（重启不掉线）
 from .config import get_config
 config = get_config()
 # P2-11: DATABASE_URL 环境变量优先（postgresql+asyncpg://...），未设置时用 SQLite 单机默认

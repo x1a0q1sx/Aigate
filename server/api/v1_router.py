@@ -1211,6 +1211,30 @@ async def _model_name_resolves(db: AsyncSession, name: str) -> bool:
         return False
 
 
+async def _apply_combo_scope(db: AsyncSession, raw_request: Request,
+                             request: ChatCompletionRequest):
+    """combo 前缀路由注入：/combo:<ref>/... 下把 model 改写为 "combo:<名称>"。
+
+    ref 支持组合名称或数字 id；原模型名尾部的思考强度后缀（-high 等）
+    保留拼到组合名后，由下游既有的后缀解析逻辑处理。前缀是访问边界：
+    即使请求体显式写了别的 combo 也以前缀为准。
+
+    返回 (改写后的 request, 错误响应|None)。无 combo_scope 时原样返回。
+    """
+    ref = getattr(getattr(raw_request, "state", None), "combo_scope", None)
+    if not ref:
+        return request, None
+    from server.core.combo_router import find_combo_by_ref
+    combo = await find_combo_by_ref(db, ref)
+    if combo is None:
+        return request, JSONResponse(
+            status_code=404,
+            content=_api_error(f"Combo '{ref}' not found", status=404))
+    _base, _sfx = _split_effort_suffix(request.model or "")
+    new_model = f"combo:{combo.name}" + (f"-{_sfx}" if _sfx else "")
+    return request.model_copy(update={"model": new_model}), None
+
+
 @router.post("/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -1221,6 +1245,10 @@ async def chat_completions(
 
     A4: config.response_cache.enabled 开启时，相同请求指纹（模型+参数）的
     非流式成功响应在 TTL 内直接复用，不走路由与上游。"""
+    # combo 前缀路由：改写先于缓存指纹，避免不同组合与直连互相污染缓存
+    request, _combo_err = await _apply_combo_scope(db, raw_request, request)
+    if _combo_err is not None:
+        return _combo_err
     from server.core.response_cache import response_cache
     _cached = response_cache.get(request)
     if _cached is not None:
@@ -2704,13 +2732,52 @@ async def _chat_completions_impl(
     return response
 @router.get("/models")
 async def list_models(
+    raw_request: Request = None,
     db: AsyncSession = Depends(get_db),
     include_effort: bool = False,
 ):
     """OpenAI 兼容 models 端点。
     A2: 组合路由作为伪模型（id=combo:名称）一并列出，客户端下拉框可直接选用；
     include_effort=true 时为支持思考强度的模型追加 -minimal/-low/-medium/-high/-xhigh
-    后缀变体（后缀语义与请求入口的思考强度后缀一致）。"""
+    后缀变体（后缀语义与请求入口的思考强度后缀一致）。
+
+    combo 前缀路由（/combo:<名称或id>/v1/models）：只列该组合的全部候选模型。"""
+    _scope_ref = getattr(getattr(raw_request, "state", None), "combo_scope", None)
+    if _scope_ref:
+        from server.core.combo_router import find_combo_by_ref, resolve_combo_targets
+        _combo = await find_combo_by_ref(db, _scope_ref)
+        if _combo is None:
+            return JSONResponse(status_code=404,
+                                content=_api_error(f"Combo '{_scope_ref}' not found", status=404))
+        _targets = await resolve_combo_targets(db, _combo)
+        _now = int(time.time())
+        _data = []
+        for t in _targets:
+            _m = t["model"]
+            _p = t["provider"]
+            _data.append({
+                "id": t["full_id"],
+                "object": "model",
+                "created": int(_m.created_at.timestamp()) if _m.created_at else _now,
+                "owned_by": _p.name,
+                "pricing": {
+                    "input": _m.input_price,
+                    "output": _m.output_price,
+                    "cache_read_input": getattr(_m, "cache_read_input_price", 0) or 0,
+                    "cache_write_input": getattr(_m, "cache_write_input_price", 0) or 0,
+                    "unit": "per_1M_tokens", "currency": "USD",
+                },
+                "is_free": _m.is_free,
+                "auto_enabled": _m.auto_enabled,
+                "aigate_combo": _combo.name,
+                "capabilities": {
+                    "streaming": _m.supports_streaming,
+                    "vision": _m.supports_vision,
+                    "reasoning_effort": getattr(_m, "supports_reasoning_effort", None),
+                    "context_length": _m.context_length,
+                },
+            })
+        return {"object": "list", "data": _data}
     mc = ModelCatalog()
     models = await mc.list_models(db, enabled_only=True)
     data = []

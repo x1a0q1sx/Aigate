@@ -246,6 +246,10 @@ if config.server.cors_origins:
     )
 # 认证中间件（/admin/* 需要登录，/v1/* 保持开放）
 app.add_middleware(AuthMiddleware)
+# Combo 前缀路由（最后添加 = 最外层）：/combo:<名称或id>/v1/... → 剥前缀
+# 转发进既有 /v1 端点，请求强制走该组合；详见 server/core/combo_prefix.py
+from server.core.combo_prefix import ComboPrefixMiddleware
+app.add_middleware(ComboPrefixMiddleware)
 # ============================================================
 # 注册 API 路由（必须在 SPA 回退之前注册，确保 API 优先匹配）
 # ============================================================

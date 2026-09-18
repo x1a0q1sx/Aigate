@@ -40,6 +40,20 @@ async def find_combo_by_name(db: AsyncSession, name: str) -> Optional[Combo]:
         return None
 
 
+async def find_combo_by_ref(db: AsyncSession, ref: str) -> Optional[Combo]:
+    """按引用查组合：优先名称，纯数字时回退按 id（combo 前缀路由用 id 寻址）。"""
+    combo = await find_combo_by_name(db, ref)
+    if combo is None and (ref or "").strip().isdigit():
+        try:
+            result = await db.execute(
+                select(Combo).where(Combo.id == int(ref.strip()), Combo.enabled == True).limit(1)
+            )
+            combo = result.scalar_one_or_none()
+        except SQLAlchemyError as e:
+            logger.warning("find_combo_by_ref(%s) by-id failed: %s", ref, e)
+    return combo
+
+
 def is_combo_request(model_name: str) -> Tuple[bool, Optional[str]]:
     """
     判断请求是否是 combo 路由。
