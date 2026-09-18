@@ -372,7 +372,8 @@ export default {
 .oauth-card {
   border: 1px solid var(--border-color, #1c2839);
   border-radius: 10px;
-  background: var(--card-color, #0f1623);
+  /* --card-color 并不存在，旧代码命中深色 fallback 导致白天模式卡片恒为黑底 */
+  background: var(--bg-card, var(--bg-surface, #0f1623));
   padding: 14px;
   display: flex;
   flex-direction: column;
