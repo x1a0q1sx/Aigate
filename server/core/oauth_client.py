@@ -565,7 +565,7 @@ class OAuthClient:
                         ur = await client.get(ep.get("userinfo_url"), headers={
                             "Authorization": f"Bearer {access}",
                             "Accept": "application/json", "User-Agent": "Go-http-client/2.0"})
-                    if ur.ok:
+                    if ur.is_success:
                         ud = ur.json() or {}
                         meta["email"] = str(ud.get("email") or "").strip()
                         meta["name"] = str(ud.get("name") or ud.get("username") or "").strip()

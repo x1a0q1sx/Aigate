@@ -98,7 +98,7 @@ async def _claude_code_usage(token: str) -> dict:
     )
     if r.status_code == 429:
         raise _RateLimited("claude usage endpoint 429")
-    if not r.ok:
+    if not r.is_success:
         return {"plan": "Claude Code", "quotas": {},
                 "message": f"Usage API 返回 {r.status_code}（chat 不受影响）"}
     data = r.json()
@@ -141,7 +141,7 @@ async def _codex_usage(token: str) -> dict:
         "https://chatgpt.com/backend-api/wham/usage",
         {"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    if not r.ok:
+    if not r.is_success:
         return {"quotas": {}, "message": f"Codex Usage API 暂不可用（{r.status_code}）"}
     data = r.json() if r.content else {}
     normal = data.get("rate_limit") or data.get("rate_limits") or \
@@ -208,7 +208,7 @@ async def _github_usage(token: str) -> dict:
             "Editor-Plugin-Version": "copilot-chat/0.26.7",
         },
     )
-    if not r.ok:
+    if not r.is_success:
         return {"quotas": {}, "message": f"GitHub 额度接口返回 {r.status_code}"}
     data = r.json()
 
@@ -259,7 +259,7 @@ async def _antigravity_usage(token: str) -> dict:
         sub = await _post_json(f"{ide_base}/v1internal:loadCodeAssist",
                                {k: v for k, v in headers.items() if k != "X-Client-Name"},
                                {"metadata": {"ideversion": "antigravity/ide/2.11.0"}, "mode": 1})
-        if sub.ok:
+        if sub.is_success:
             sd = sub.json()
             project_id = sd.get("cloudaicompanionProject")
             plan = (sd.get("paidTier") or {}).get("id") or (sd.get("currentTier") or {}).get("id") or "free-tier"
@@ -270,7 +270,7 @@ async def _antigravity_usage(token: str) -> dict:
     body = {"project": project_id} if project_id else {}
     models_r = await _post_json(f"{ide_base}/v1internal:fetchAvailableModels", headers, body)
     is_free = not plan or "free" in str(plan)
-    if models_r.ok:
+    if models_r.is_success:
         for model_key, info in (models_r.json().get("models") or {}).items():
             try:
                 qi = (info or {}).get("quotaInfo") or {}
@@ -292,7 +292,7 @@ async def _antigravity_usage(token: str) -> dict:
 
     try:
         weekly_r = await _post_json(f"{ide_base}/v1internal:retrieveUserQuotaSummary", headers, body)
-        if weekly_r.ok:
+        if weekly_r.is_success:
             wd = weekly_r.json()
             groups = wd.get("groups") or (wd.get("quotaSummary") or {}).get("groups") or []
             for group in groups:
@@ -343,7 +343,7 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
     r = await _post_json(billing_url, headers, None, content=b"{}")
     if r.status_code in (401, 403):
         return {"quotas": {}, "message": "CodeBuddy 凭证无效或已过期"}
-    if not r.ok:
+    if not r.is_success:
         return {"quotas": {}, "message": f"CodeBuddy 额度接口错误（{r.status_code}）"}
     try:
         j = r.json()
@@ -422,14 +422,14 @@ async def _qoder_usage(token: str) -> dict:
              "User-Agent": "qodercli/1.0.0"},
             {"personal_token": token},
         )
-        if not ex.ok:
+        if not ex.is_success:
             return {"quotas": {}, "message": f"Qoder PAT 兑换失败（{ex.status_code}）"}
         token = (ex.json() or {}).get("token") or ""
     if not token:
         return {"quotas": {}, "message": "Qoder 无可用于额度查询的凭证"}
     r = await _get_json("https://openapi.qoder.sh/api/v2/quota/usage",
                         {"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    if not r.ok:
+    if not r.is_success:
         return {"quotas": {}, "message": f"Qoder 已连接，额度接口返回 {r.status_code}"}
     body = r.json() if r.content else {}
     uq = body.get("userQuota") or {}
@@ -460,7 +460,7 @@ async def _u1s1_usage(token: str) -> dict:
     headers = {"Authorization": f"Bearer {token}",
                **dict((q.default_headers if q else None) or {})}
     r = await _get_json("https://api.u1s1.io/v1/me", headers)
-    if not r.ok:
+    if not r.is_success:
         return {"quotas": {}, "message": f"u1s1 额度接口返回 {r.status_code}"}
     me = r.json() if r.content else {}
     tpu = _num(me.get("tokens_per_usd"))

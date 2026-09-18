@@ -23,7 +23,7 @@ def make_httpx(calls, results):
             self.text = json.dumps(self._data)
 
         @property
-        def ok(self):
+        def is_success(self):
             return 200 <= self.status_code < 400
 
         def json(self):

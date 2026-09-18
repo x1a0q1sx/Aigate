@@ -332,7 +332,7 @@ def test_qoder_poll_flow(monkeypatch):
             self.text = json.dumps(data)
 
         @property
-        def ok(self):
+        def is_success(self):
             return 200 <= self.status_code < 400
 
         def json(self):

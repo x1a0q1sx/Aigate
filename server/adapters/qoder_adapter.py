@@ -265,7 +265,7 @@ class QoderAdapter(BaseAdapter):
                     ur = await client.get(QODER_USERINFO_URL, headers={
                         "Authorization": f"Bearer {jt}", "Accept": "application/json",
                         "User-Agent": "Go-http-client/2.0"})
-                if ur.ok:
+                if ur.is_success:
                     ud = ur.json() or {}
                     uid = str(ud.get("id") or ud.get("userId") or ud.get("user_id") or "")
             except httpx.HTTPError:
@@ -306,7 +306,7 @@ class QoderAdapter(BaseAdapter):
             try:
                 async with httpx.AsyncClient(timeout=15.0) as client:
                     r = await client.get(url, headers=headers)
-                if not r.ok:
+                if not r.is_success:
                     logger.warning("qoder catalog http %s", r.status_code)
                     return None
                 body = r.json()
