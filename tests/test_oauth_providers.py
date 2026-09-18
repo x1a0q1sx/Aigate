@@ -292,7 +292,122 @@ def _fake_sessionmaker():
     return _cm
 
 
-# ── provider_quirks ────────────────────────────────────────
+# ── u1s1（有一说一）设备登录 ──────────────────────────────
+
+def test_u1s1_registry_entry():
+    p = get_oauth_provider("u1s1")
+    assert p is not None
+    ep = p.extra_params or {}
+    assert ep.get("auth_mode") == "u1s1_device"
+    assert ep.get("refresh_style") == "none"
+    assert ep["device_start_url"] == "https://api.u1s1.io/auth/device/start"
+    assert ep["device_poll_url"] == "https://api.u1s1.io/auth/device/poll"
+    assert p.api_base_url == "https://api.u1s1.io/v1"
+
+
+@pytest.mark.asyncio
+async def test_start_u1s1_device_sends_valid_p256_jwk(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"verify_url": "https://u1s1.io/d/abc", "poll_secret": "ps-1",
+               "interval": 2, "expires_in": 900}),
+    ]))
+    started = {}
+
+    async def fake_poll(provider_code, poll_secret, owner, interval, expires_in):
+        started["args"] = (provider_code, poll_secret, owner, interval, expires_in)
+
+    c._poll_u1s1_device = fake_poll
+    r = await c.start_u1s1_device("u1s1", None)
+    import asyncio
+    await asyncio.sleep(0.05)
+    assert r["login_url"] == "https://u1s1.io/d/abc"
+    assert r["state"] == "ps-1"
+    body = calls[0]["json"]
+    jwk = body["public_jwk"]
+    assert jwk["kty"] == "EC" and jwk["crv"] == "P-256"
+    # P-256 坐标 = 32 字节 → base64url 43 字符（无填充）
+    assert len(jwk["x"]) == 43 and len(jwk["y"]) == 43
+    assert body["device_name"] == "AIGate Gateway"
+    assert started["args"] == ("u1s1", "ps-1", "__default", 2, 900)
+
+
+@pytest.mark.asyncio
+async def test_u1s1_start_error_bubbles_server_message(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (400, {"error": {"message": "invalid P-256 device public key"}}),
+    ]))
+    r = await c.start_u1s1_device("u1s1", None)
+    assert "error" in r and "P-256" in r["error"]
+
+
+@pytest.mark.asyncio
+async def test_u1s1_poll_ok_saves_api_key(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"status": "ok", "api_key": "u1s1-real-key-abc",
+               "device_token": "u1s1d-dev-1", "device_id": 7}),
+    ]))
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+    saved = {}
+
+    async def fake_save(db, code, owner, tok, update_existing=None):
+        saved.update(code=code, owner=owner, tok=tok)
+
+    c._save_token = fake_save
+    await c._poll_u1s1_device("u1s1", "ps-1", "__default", 1, 30)
+    assert saved["code"] == "u1s1"
+    assert saved["tok"]["access_token"] == "u1s1-real-key-abc"
+    assert saved["tok"]["refresh_token"] == "u1s1d-dev-1"
+    # 长期凭证：30 天过期 + refresh_style none 不会被调度器刷坏
+    assert saved["tok"]["expires_in"] == 30 * 86400
+
+
+@pytest.mark.asyncio
+async def test_u1s1_poll_expired_stops(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"status": "expired"}),
+    ]))
+    saved = []
+
+    async def fake_save(db, code, owner, tok, update_existing=None):
+        saved.append(tok)
+
+    c._save_token = fake_save
+    await c._poll_u1s1_device("u1s1", "ps-1", "__default", 1, 30)
+    assert saved == [] and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_style_none_short_circuits(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+
+    async def fake_get_token(db, code, owner):
+        return SimpleNamespace(refresh_token_enc="enc:RT", owner=owner,
+                               last_error="", is_active=True)
+
+    c._get_token_record = fake_get_token
+
+    class _DB:
+        async def commit(self): pass
+
+    ok, msg = await c._do_refresh(_DB(), "u1s1", "__default")
+    assert ok is True and "long-lived" in msg
+
+
+def test_u1s1_headers_applied_by_adapter():
+    from server.adapters.openai_compat import OpenAICompatAdapter
+    a = OpenAICompatAdapter()
+    h = a._get_headers("u1s1-key-123", {"__oauth": True}, "https://api.u1s1.io/v1")
+    assert h["Authorization"] == "Bearer u1s1-key-123"   # 无前缀变换
+    assert "__oauth" not in h
+    assert h["x-u1s1-client"] == "terminal" and h["x-u1s1-version"]
 
 def test_quirks_domain_matching():
     assert quirks_for("https://copilot.tencent.com/v2/chat/completions").name == "codebuddy_cn"

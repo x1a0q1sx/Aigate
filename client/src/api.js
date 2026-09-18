@@ -144,6 +144,7 @@ export default {
   getAIGateKey: (reveal = false) => apiGet(`/admin/api/aigate-key${reveal ? '?reveal=true' : ''}`),
   createKey: (data) => apiPost('/admin/api/keys', data),
   deleteKey: (id) => apiDelete(`/admin/api/keys/${id}`),
+  toggleKey: (id, isActive) => apiPost(`/admin/api/keys/${id}/toggle`, { is_active: isActive }),
   // 模型
   getModels: (params) => {
     let qs = new URLSearchParams()

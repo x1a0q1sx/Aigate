@@ -370,6 +370,11 @@
               <span class="badge" :class="k.is_active ? 'badge-success' : 'badge-danger'">{{ k.is_active ? '可用' : '停用' }}</span>
             </div>
             <div class="key-actions">
+              <button class="btn btn-outline btn-xs" :disabled="keyTogglingId === k.id"
+                      @click="toggleKeyActive(k)" :title="k.is_active ? '停用后轮转与模型归属都会跳过这把 key' : '重新启用并清除熔断状态'">
+                <AppIcon :name="k.is_active ? 'ban' : 'play'" :size="11" />
+                {{ k.is_active ? '停用' : '启用' }}
+              </button>
               <button class="btn btn-outline btn-xs" @click="toggleReveal(k)" :disabled="revealingId === k.id">
                 <AppIcon :name="revealedKeys[k.id] ? 'eyeOff' : 'eye'" :size="11" />
                 {{ revealedKeys[k.id] ? '隐藏' : '查看' }}
@@ -668,6 +673,7 @@ export default {
       modalKeys: [],
       keyForm: { key: '', label: '' },
       keySaving: false,
+      keyTogglingId: null,
       showKeyInput: false,
       revealedKeys: {},
       revealingId: null,
@@ -1046,6 +1052,24 @@ export default {
     async copyKey(id) {
       await navigator.clipboard?.writeText(this.revealedKeys[id] || '')
       toast.success('已复制到剪贴板')
+    },
+    async toggleKeyActive(k) {
+      this.keyTogglingId = k.id
+      try {
+        const updated = await api.toggleKey(k.id, !k.is_active)
+        const idx = this.modalKeys.findIndex((x) => x.id === k.id)
+        if (idx >= 0) this.modalKeys.splice(idx, 1, updated)
+        // 同步全局缓存（列表页 keyCount 徽标等）
+        const gi = this.allKeys.findIndex((x) => x.id === k.id)
+        if (gi >= 0) this.allKeys.splice(gi, 1, updated)
+        toast.success(updated.is_active
+          ? `密钥「${k.label || k.key_prefix + '***'}」已启用（熔断状态同时清除）`
+          : `密钥「${k.label || k.key_prefix + '***'}」已停用，轮转与请求将跳过`)
+      } catch (e) {
+        toast.error('切换失败: ' + (e.response?.data?.detail || e.message))
+      } finally {
+        this.keyTogglingId = null
+      }
     },
     async deleteKey(k) {
       if (!confirm(`确认删除密钥「${k.label || k.key_prefix + '***'}」？`)) return

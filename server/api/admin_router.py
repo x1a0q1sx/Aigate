@@ -20,7 +20,7 @@ from server.models.health_check import HealthCheck
 from server.models.request_log import RequestLog
 from server.schemas.provider import (
     ProviderCreate, ProviderUpdate, ProviderResponse,
-    ApiKeyCreate, ApiKeyResponse,
+    ApiKeyCreate, ApiKeyResponse, ApiKeyToggle,
     ModelUpdate, ModelInfoResponse, ModelsRefreshResponse,
     PingResult, PingAllResponse, LatencyStatsResponse
 )
@@ -1003,6 +1003,24 @@ async def delete_key(key_id: int, db: AsyncSession = Depends(get_db)):
     if not success:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"ok": True}
+
+@router.post("/keys/{key_id}/toggle")
+async def toggle_key(key_id: int, data: ApiKeyToggle, db: AsyncSession = Depends(get_db)):
+    """启用/停用某服务商的某把密钥。
+
+    停用即从轮转/模型归属选择中摘除（KeyRotator 每次实时查 DB is_active）；
+    重新启用时清除进程内熔断状态（401/403 永久禁用、冷却、失败计数），
+    否则被熔断过的 key 即使 DB 恢复 active 也选不中。"""
+    key = await db.get(ApiKey, key_id)
+    if not key:
+        raise HTTPException(status_code=404, detail="Key not found")
+    key.is_active = (not key.is_active) if data.is_active is None else bool(data.is_active)
+    await db.commit()
+    await db.refresh(key)
+    if key.is_active:
+        from server.core.key_rotator import get_key_rotator
+        get_key_rotator().reactivate(key_id)
+    return ApiKeyResponse.model_validate(key)
 
 @router.get("/providers/model-stats")
 async def get_provider_model_stats(db: AsyncSession = Depends(get_db)):

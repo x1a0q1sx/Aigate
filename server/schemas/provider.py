@@ -45,6 +45,9 @@ class ApiKeyCreate(BaseModel):
     provider_id: int
     key: str
     label: Optional[str] = None
+class ApiKeyToggle(BaseModel):
+    """启用/停用某把服务商密钥；不传 is_active 则按当前状态取反。"""
+    is_active: Optional[bool] = None
 class ApiKeyResponse(BaseModel):
     id: int
     provider_id: int

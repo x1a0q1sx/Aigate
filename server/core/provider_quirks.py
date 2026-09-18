@@ -93,11 +93,24 @@ _CLINE = ProviderQuirks(
     },
 )
 
+# u1s1（有一说一）：OpenAI 兼容 + Bearer api_key（实测 chat/models 均按普通 key 鉴权，
+# DPoP/attestation 只是官方 CLI 的 sender-constrained 增强，非必需）。
+# 归因头对齐官方 CLI 形态（device-auth.js 转发时统一附加），降低被指纹识别的差异。
+_U1S1 = ProviderQuirks(
+    name="u1s1",
+    default_headers={
+        "x-u1s1-client": "terminal",
+        "x-u1s1-version": "1.11.2",
+        "x-u1s1-platform": "linux-x64",
+    },
+)
+
 # 域名 → 档案（子串匹配，大小写不敏感；codebuddy.ai 兜住 www./裸域两形态）
 _DOMAIN_RULES = (
     ("copilot.tencent.com", _CODEBUDDY_CN),
     ("codebuddy.ai", _CODEBUDDY_INTL),
     ("api.cline.bot", _CLINE),
+    ("api.u1s1.io", _U1S1),
 )
 
 

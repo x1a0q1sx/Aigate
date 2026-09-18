@@ -104,6 +104,12 @@ class KeyRotator:
         key_ids = list(rels)
         if not key_ids:
             return await self._fallback_key(db, provider_id)
+        # 管理端启用/停用必须对模型归属路径同样生效：只保留 DB 仍 active 的 key
+        key_ids = list((await db.execute(
+            select(ApiKey.id).where(ApiKey.id.in_(key_ids), ApiKey.is_active == True)  # noqa: E712
+        )).scalars().all())
+        if not key_ids:
+            return await self._fallback_key(db, provider_id)
         avail = [kid for kid in key_ids if self._is_available(kid)]
         if not avail:
             # 归属 key 全冷却/禁用 → 仍用 provider 第一把兜底，避免直接 503
@@ -112,7 +118,7 @@ class KeyRotator:
         chosen = avail[cursor]
         self._model_cursor[model_id] = (cursor + 1) % len(avail)
         key = await db.get(ApiKey, chosen)
-        if not key:
+        if not key or not key.is_active:
             return await self._fallback_key(db, provider_id)
         return key.id, self._crypto.decrypt(key.key_encrypted)
 
@@ -129,6 +135,10 @@ class KeyRotator:
             select(ModelApiKey.api_key_id).where(ModelApiKey.model_id == model_id)
         )).scalars().all()
         key_ids = [kid for kid in rels if kid not in (exclude or set())]
+        # 与 pick_key_for_model 一致：管理端停用的 key 不参与模型归属轮换
+        key_ids = list((await db.execute(
+            select(ApiKey.id).where(ApiKey.id.in_(key_ids), ApiKey.is_active == True)  # noqa: E712
+        )).scalars().all()) if key_ids else []
         avail = [kid for kid in key_ids if self._is_available(kid)]
         if not avail:
             # 同集合内无可用 → 尝试兜底第一把（若不在 exclude 且可用）
@@ -140,7 +150,7 @@ class KeyRotator:
         cursor = self._model_cursor.get(model_id, 0) % len(avail)
         chosen = avail[cursor]
         key = await db.get(ApiKey, chosen)
-        if not key:
+        if not key or not key.is_active:
             return (None, None)
         return key.id, self._crypto.decrypt(key.key_encrypted)
 
@@ -170,6 +180,13 @@ class KeyRotator:
         if api_key_id:
             self._fail_count.pop(api_key_id, None)
             self._cooldown_until.pop(api_key_id, None)
+
+    def reactivate(self, api_key_id: int):
+        """人工重新启用 key：清除进程内熔断状态（hard_disabled / 冷却 / 失败计数）。
+        否则被 401/403 永久熔断过的 key，即使 DB is_active 改回 True 也选不中。"""
+        self._hard_disabled.discard(api_key_id)
+        self._fail_count.pop(api_key_id, None)
+        self._cooldown_until.pop(api_key_id, None)
 
     def mark_failure(self, api_key_id: int, status_code: Optional[int] = None):
         """单次请求失败 → 计数加 1，过阈值则进冷却；401/403 永久禁用"""

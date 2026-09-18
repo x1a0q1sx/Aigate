@@ -246,6 +246,41 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         api_base_url="https://api.cline.bot/api/v1/chat/completions",
         notes="Cline 订阅 — code 即 base64 token（自解码）+ JSON 刷新 + workos: 前缀",
     ),
+    # ── u1s1（有一说一）额度平台 ──
+    # 设备登录流（复刻官方 CLI login.js，免客户端）：
+    #   1) 本地生成 EC P-256 密钥对
+    #   2) POST {origin}/auth/device/start {public_jwk, device_name, client_version}
+    #      → {verify_url, poll_secret, interval, expires_in}
+    #   3) 浏览器打开 verify_url 登录并「批准设备」
+    #   4) POST {origin}/auth/device/poll {poll_secret} → status ok 时带
+    #      {api_key: u1s1-…, device_token: u1s1d-…}
+    # api_key 即可直接 Bearer 调 https://api.u1s1.io/v1/*（OpenAI 兼容，实测
+    # chat/completions 与 models 均按普通 key 鉴权，DPoP 只是官方客户端的
+    # sender-constrained 增强）。api_key 长期有效，无标准 refresh——到期需
+    # 重新登录（refresh_style=none）。
+    "u1s1": OAuthProviderConfig(
+        code="u1s1",
+        name="u1s1 (有一说一)",
+        client_id="",
+        client_secret="",
+        authorize_url="",
+        token_url="",
+        refresh_url="",
+        redirect_uri="",
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=86400,
+        extra_params={
+            "auth_mode": "u1s1_device",
+            "refresh_style": "none",
+            "device_start_url": "https://api.u1s1.io/auth/device/start",
+            "device_poll_url": "https://api.u1s1.io/auth/device/poll",
+            "device_name": "AIGate Gateway",
+            "client_version": "1.11.2",
+        },
+        api_base_url="https://api.u1s1.io/v1",
+        notes="u1s1 额度平台 — 浏览器批准设备后自动收 api_key（OpenAI 兼容直连）",
+    ),
     # ── Kimchi ──
     "kimchi": OAuthProviderConfig(
         code="kimchi",

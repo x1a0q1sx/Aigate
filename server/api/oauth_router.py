@@ -72,7 +72,7 @@ async def start_oauth_authorize(provider_code: str, request: Request, owner: str
     provider = get_oauth_provider(provider_code)
     if not provider:
         raise HTTPException(status_code=404, detail=f"Unknown OAuth provider: {provider_code}")
-    # ── device_poll 流程（如 CodeBuddy CN）────
+    # ── device_poll 流程（如 CodeBuddy CN / 国际服）────
     if (provider.extra_params or {}).get("auth_mode") == "device_poll":
         async with AsyncSessionLocal() as db:
             r = await get_oauth_client().start_device_poll(provider_code, db, owner=owner)
@@ -85,6 +85,19 @@ async def start_oauth_authorize(provider_code: str, request: Request, owner: str
             "login_url": r["login_url"],
             "poll_interval_ms": r["poll_interval_ms"],
             "message": "请在新窗口完成登录，登录成功后系统会自动获取 token",
+        }
+    # ── u1s1 设备登录（浏览器批准 → 轮询收 api_key，免客户端）────
+    if (provider.extra_params or {}).get("auth_mode") == "u1s1_device":
+        async with AsyncSessionLocal() as db:
+            r = await get_oauth_client().start_u1s1_device(provider_code, db, owner=owner)
+        if "error" in r:
+            raise HTTPException(status_code=400, detail=r["error"])
+        return {
+            "device_poll": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "poll_interval_ms": r["poll_interval_ms"],
+            "message": "请在新窗口登录 u1s1 并批准本设备，批准后系统会自动收取 api_key",
         }
     # 运行时 redirect_uri：用本机 incoming host:port 替换默认 localhost:8000
     redirect_override = None

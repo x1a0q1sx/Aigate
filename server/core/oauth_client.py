@@ -317,6 +317,9 @@ class OAuthClient:
         refresh_plain = self._crypto.decrypt(existing.refresh_token_enc)
         # ── 非标准刷新协议按 extra_params.refresh_style 分发 ──
         _style = (provider.extra_params or {}).get("refresh_style")
+        if _style == "none":
+            # 长期凭证（如 u1s1 api_key）：无标准刷新，到期重登录即可
+            return True, "long-lived credential (re-login when it expires)"
         if _style == "codebuddy" or provider_code == "codebuddy_cn":
             # 腾讯系（CN/国际服同构）：X-Refresh-Token 头 + 空 JSON body
             return await self._refresh_codebuddy(db, provider, existing, refresh_plain)
@@ -397,6 +400,98 @@ class OAuthClient:
             return True, "ok"
         except Exception as e:
             return False, f"refresh_codebuddy exception: {e}"
+
+    # ── u1s1（有一说一）设备登录：复刻官方 CLI login.js，免客户端 ──
+    async def start_u1s1_device(self, provider_code: str, db: AsyncSession,
+                                owner: str = "__default") -> dict:
+        """
+        1) 生成 EC P-256 密钥对（服务端本地持有即可，api_key 收票后不再依赖 DPoP）
+        2) POST /auth/device/start {public_jwk, device_name, client_version}
+        3) 返回 verify_url（用户在浏览器登录并批准）+ 后台轮询 /auth/device/poll
+        4) 批准后拿 {api_key: u1s1-…, device_token: u1s1d-…}，api_key 存为 access_token
+        """
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return {"error": f"unknown provider {provider_code}"}
+        ep = provider.extra_params or {}
+        if ep.get("auth_mode") != "u1s1_device":
+            return {"error": "provider not u1s1_device mode"}
+        try:
+            import base64 as _b64
+            from cryptography.hazmat.primitives.asymmetric import ec
+            priv = ec.generate_private_key(ec.SECP256R1())
+            nums = priv.public_key().public_numbers()
+
+            def _coord(n: int) -> str:
+                return _b64.urlsafe_b64encode(n.to_bytes(32, "big")).rstrip(b"=").decode()
+
+            public_jwk = {"kty": "EC", "crv": "P-256",
+                          "x": _coord(nums.x), "y": _coord(nums.y),
+                          "key_ops": ["verify"], "ext": True}
+            body = {"public_jwk": public_jwk,
+                    "device_name": ep.get("device_name", "AIGate Gateway"),
+                    "client_version": ep.get("client_version", "1.11.2")}
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(ep.get("device_start_url"), json=body,
+                                         headers={"content-type": "application/json"})
+            if resp.status_code >= 400:
+                detail = ""
+                try:
+                    detail = str((resp.json().get("error") or {}).get("message", ""))
+                except Exception:
+                    detail = resp.text[:200]
+                return {"error": f"u1s1 device start http {resp.status_code}: {detail[:200]}"}
+            data = resp.json()
+            verify_url = str(data.get("verify_url") or "")
+            poll_secret = str(data.get("poll_secret") or "")
+            if not verify_url.startswith(("http://", "https://")) or not poll_secret:
+                return {"error": "u1s1 device start missing verify_url/poll_secret"}
+            interval = int(data.get("interval") or 2)
+            expires_in = int(data.get("expires_in") or 900)
+            asyncio.create_task(self._poll_u1s1_device(
+                provider_code, poll_secret, owner, interval, expires_in))
+            return {"state": poll_secret, "login_url": verify_url,
+                    "poll_interval_ms": max(1, interval) * 1000, "owner": owner}
+        except Exception as e:
+            return {"error": f"start_u1s1_device exception: {e}"}
+
+    async def _poll_u1s1_device(self, provider_code: str, poll_secret: str,
+                                owner: str, interval: int, expires_in: int):
+        """轮询等浏览器批准（官方 CLI 同协议）；status ok 时收 api_key 落库。"""
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return
+        ep = provider.extra_params or {}
+        poll_url = ep.get("device_poll_url")
+        deadline = time.time() + max(60, expires_in + 30)
+        while time.time() < deadline:
+            await asyncio.sleep(max(1, interval))
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(poll_url, json={"poll_secret": poll_secret},
+                                             headers={"content-type": "application/json"})
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                if data.get("status") == "expired":
+                    logger.info("u1s1 device login expired (user did not approve)")
+                    return
+                api_key = str(data.get("api_key") or "")
+                if data.get("status") == "ok" and api_key.startswith("u1s1-"):
+                    async with AsyncSessionLocal() as db:
+                        await self._save_token(db, provider_code, owner, {
+                            "access_token": api_key,
+                            "refresh_token": str(data.get("device_token") or ""),
+                            # api_key 长期有效（实测无标准刷新）；到期/失效重新登录即可
+                            "expires_in": 30 * 86400,
+                            "token_type": "Bearer",
+                            "scope": "u1s1",
+                        })
+                    logger.info("u1s1 api_key acquired for %s/%s", provider_code, owner)
+                    return
+            except Exception as e:
+                logger.debug("u1s1 poll failed: %s", e)
+                continue
 
     # ── Cline 专属 refresh（JSON body + data 包裹响应） ──
     async def _refresh_cline(

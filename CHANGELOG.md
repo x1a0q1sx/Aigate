@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### Added
+- u1s1（有一说一）额度平台接入：服务端复刻官方 CLI 设备登录（start→浏览器批准→poll 收 api_key），免下载客户端；api_key 为长期 Bearer 凭证，OpenAI 兼容直连 api.u1s1.io/v1
+- 服务商密钥启用/停用：每把密钥可单独停用（轮转与模型归属选择即时跳过），重新启用时自动清除 401/403 熔断与冷却状态；POST /admin/api/keys/{id}/toggle + Providers 页密钥弹窗按钮
 - Cline (api.cline.bot) OAuth 接入：code 即 base64 token 直解、JSON 刷新、回调无 state 收尾、workos: JWT 前缀与 success/data 信封解包
 - CodeBuddy 国际服 (www.codebuddy.ai) OAuth 注册（与 CN 同 device_poll 协议，platform=ide）
 - `server/core/provider_quirks.py` 上游请求方言档案：CodeBuddy 流式专属（网关侧 SSE 聚合）、CN agent system prompt 中性化、国际服 typed-blocks 形态、reasoning_summary 镜像
