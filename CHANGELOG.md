@@ -31,6 +31,8 @@
 - 模型管理/Playground/日志详情性能优化（N+1 消除、懒加载、截断）
 
 ### Fixed
+- OAuth 服务商模型刷新 404（「Cline 免费模型获取不到」根因）：注册表 api_base_url 填到推理端点级别（`…/api/v1/chat/completions`）时，models 列表 URL 又拼了一层 `/v1/models` 成 `…/chat/completions/v1/models`；现剥除 chat/completions、messages、responses、embeddings 等端点后缀再挂 `/models`（已是版本根则直接拼），Cline 实时目录 445 模型（含 `:free` 后缀免费模型）正常入库；`/models` 裸数组响应形态同步兼容（此前只认 `{"data":[...]}`），CodeBuddy 的同类刷新 404 一并治愈
+- 改密码后强制全员重新登录现会同时清除落库会话（此前只清内存，DB 行在重启回填后仍「可复活」）
 - OAuth 浏览器回调 `/admin/oauth/callback` 被 auth 中间件拦成 SPA 页面（回调是浏览器顶层导航，不可能带 Authorization 头），authorization_code 流在默认配置下全断（审计 P0-2）→ 精确豁免该路径（其防线本就是 state/PKCE 而非登录态）；回调结果 redirect 到 /providers/oauth 的 success/error 落地提示，用户拒登的 error 回跳与换票异常不再裸 422/500
 - CodeBuddy CN device_poll 协议纠正：state 请求从 GET 改为 POST ?platform=，解析字段对齐真实协议的 authUrl（旧实现按 loginUrl 解析，实际拿不到登录链接）
 - 日志「一成功一失败」双行：systemd `aigate.service` 与 pm2 双守护冲突（每 5s 崩溃重拉，累计 48934 次），每次启动清扫把在途 pending 行误翻为 interrupted；启动收尾现只处理早于本进程启动（留 5s 余量）的遗留行

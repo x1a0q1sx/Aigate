@@ -127,9 +127,21 @@ class OpenAICompatAdapter(BaseAdapter):
         if not base.endswith('/v1'):
             base += '/v1'
         return f"{base}/chat/completions"
+    # 推理端点后缀：服务商 base_url 直接填到 chat/completions 级别时，
+    # models 列表挂在 API 根（剥掉端点后缀），不能再拼一层（Cline/CodeBuddy 教训）
+    _INFER_ENDPOINT_SUFFIXES = ("/chat/completions", "/completions", "/responses",
+                                "/messages", "/embeddings")
+
     def _build_models_url(self, base_url: str) -> str:
         base = base_url.rstrip('/')
+        for suf in self._INFER_ENDPOINT_SUFFIXES:
+            if base.endswith(suf):
+                base = base[:-len(suf)].rstrip('/')
+                break
         if '/api/paas/' in base:
+            return f"{base}/models"
+        # 已是版本根（…/v1、…/v2、…/api/v1）→ 直接拼 /models
+        if base.endswith(('/v1', '/v2', '/v3', '/v4')):
             return f"{base}/models"
         if not base.endswith('/v1'):
             base += '/v1'
@@ -352,8 +364,12 @@ class OpenAICompatAdapter(BaseAdapter):
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+            # 有的上游返回 {"data":[...]}，有的（如 Cline /api/v1/models）返回裸数组
+            items = data if isinstance(data, list) else (data.get('data') or [])
             models = []
-            for item in data.get('data', []):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
                 model_id = item.get('id', '')
                 if not model_id:
                     continue
