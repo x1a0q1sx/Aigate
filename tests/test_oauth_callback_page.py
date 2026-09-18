@@ -8,8 +8,18 @@ from urllib.parse import unquote
 
 import pytest
 
-from server.core.auth import _PUBLIC_PATHS
+from server.core.auth import _PUBLIC_PATHS, _is_admin_api_path
 from server.api.oauth_router import oauth_callback
+
+
+def test_oauth_admin_endpoints_are_api_not_spa_page():
+    # 未认证时必须返回 401 JSON，而非 200+index.html（否则前端 JSON.parse 炸）
+    assert _is_admin_api_path("/admin/oauth/providers")
+    assert _is_admin_api_path("/admin/oauth/connections")
+    assert _is_admin_api_path("/admin/api/health")
+    assert not _is_admin_api_path("/admin")
+    assert not _is_admin_api_path("/admin/api")  # 精确登录页路径另行豁免
+    assert not _is_admin_api_path("/providers/oauth")
 
 
 class _FakeClient:

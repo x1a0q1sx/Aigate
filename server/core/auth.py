@@ -81,6 +81,15 @@ def extract_token(request: Request) -> Optional[str]:
     return None
 
 
+def _is_admin_api_path(path: str) -> bool:
+    """未认证时应返回 401 JSON 的管理端接口路径。
+
+    除 /admin/api/* 外还有 /admin/oauth/*（OAuth 管理接口）。若按"SPA 页面"
+    处理会返回 200+index.html，前端 res.ok 后 JSON.parse 直接炸。
+    """
+    return path.startswith("/admin/api/") or path.startswith("/admin/oauth/")
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -102,7 +111,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if token and validate_session(token):
                 return await call_next(request)
             # 未认证：API 返回 401 JSON，页面返回 401 让前端跳转登录
-            if path.startswith("/admin/api/"):
+            if _is_admin_api_path(path):
                 return JSONResponse(status_code=401, content={"detail": "未登录或 session 已过期"})
             # SPA 页面：返回 index.html（前端 router 会拦截跳登录页）
             from fastapi.responses import FileResponse
