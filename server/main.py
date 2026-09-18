@@ -163,6 +163,27 @@ async def lifespan(app: FastAPI):
     from server.api.oauth_router import start_oauth_refresh_scheduler
     start_oauth_refresh_scheduler()
     print("✓ OAuth token 主动刷新调度器已启动（60s 扫一次）")
+    # 存量 OAuth 连接回填服务商（自动登记上线前的旧连接补建，幂等）
+    import asyncio as _aio
+
+    async def _backfill_oauth_providers():
+        try:
+            from server.core.oauth_client import get_oauth_client
+            from server.db import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                conns = await get_oauth_client().list_connections(db)
+            codes = {c["provider_code"] for c in conns}
+            for code in codes:
+                try:
+                    async with AsyncSessionLocal() as db:
+                        await get_oauth_client()._ensure_provider_registered(db, code)
+                except Exception as e:
+                    logger.warning("oauth provider backfill %s failed: %s", code, e)
+            if codes:
+                print(f"✓ OAuth 存量连接回填服务商完成（{len(codes)} 家）")
+        except Exception as e:
+            logger.warning("oauth provider backfill failed: %s", e)
+    _backfill_task = _aio.ensure_future(_backfill_oauth_providers())
     # P0-3: 日志写入队列（请求路径零落库，后台批量 commit + WAL 周期 checkpoint）
     from server.core.log_queue import start_log_queue
     start_log_queue()
