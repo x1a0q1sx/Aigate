@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import Dashboard from './views/Dashboard.vue'
 import Providers from './views/Providers.vue'
+import OAuthConnections from './views/OAuthConnections.vue'
 import Models from './views/Models.vue'
 import Health from './views/Health.vue'
 import Auto from './views/Auto.vue'
@@ -21,6 +22,8 @@ const routes = [
   { path: '/login', component: Login, meta: { title: '登录', public: true } },
   { path: '/', redirect: '/dashboard' },
   { path: '/dashboard', component: Dashboard, meta: { title: '仪表盘' } },
+  // 隐藏页面：OAuth 连接管理（无导航入口，直接访问 /providers/oauth）
+  { path: '/providers/oauth', component: OAuthConnections, meta: { title: 'OAuth 连接' } },
   { path: '/providers', component: Providers, meta: { title: '服务商' } },
   { path: '/models', component: Models, meta: { title: '模型' } },
   { path: '/aliases', component: Aliases, meta: { title: '模型别名' } },
@@ -36,7 +39,7 @@ const routes = [
   { path: '/media', component: Media, meta: { title: '媒体中心' } },
   { path: '/token-saver', component: TokenSaver, meta: { title: '省 Token' } },
   { path: '/settings', component: Settings, meta: { title: '设置' } },
-  { path: '/oauth', redirect: '/providers' },
+  { path: '/oauth', redirect: '/providers/oauth' },
   // 兜底：未知路径回仪表盘，避免白屏
   { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
 ]

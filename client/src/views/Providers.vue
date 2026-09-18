@@ -493,35 +493,6 @@
       </template>
     </AppModal>
 
-    <!-- OAuth 导入 token -->
-    <AppModal v-model="importTokenModal.show" :title="'导入 ' + importTokenModal.provider_code + ' token'" icon="shield" size="md">
-      <div class="form-group">
-        <label class="form-label">Access Token *</label>
-        <textarea v-model="importTokenModal.access_token" rows="3"></textarea>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Refresh Token</label>
-        <textarea v-model="importTokenModal.refresh_token" rows="3"></textarea>
-      </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label class="form-label">过期秒数</label>
-          <input type="number" v-model.number="importTokenModal.expires_in" min="60" />
-        </div>
-        <div class="form-group">
-          <label class="form-label">Owner</label>
-          <input v-model="importTokenModal.owner" />
-        </div>
-      </div>
-      <p v-if="importTokenError" class="alert alert-error text-sm">{{ importTokenError }}</p>
-      <template #footer>
-        <button class="btn btn-outline" @click="importTokenModal.show = false">取消</button>
-        <button class="btn btn-primary" @click="submitImportToken" :disabled="importTokenBusy">
-          {{ importTokenBusy ? '导入中...' : '确认导入' }}
-        </button>
-      </template>
-    </AppModal>
-
     <!-- 一键备份 -->
     <AppModal v-model="showBackupModal" title="一键备份" icon="archive" size="md">
       <p class="text-sm text-muted">
@@ -698,12 +669,6 @@ export default {
       atomExeError: '',
       atomExeWarning: '',
 
-      // OAuth 导入 token
-      importTokenModal: { show: false, provider_code: '', access_token: '', refresh_token: '', expires_in: 3600, owner: '__default' },
-      importTokenBusy: false,
-      importTokenError: '',
-      pendingCode: null,
-
       // 导出/导入
       showExportModal: false,
       exportIncludeKeys: false,
@@ -789,17 +754,7 @@ export default {
   mounted() {
     this.pinnedIds = JSON.parse(localStorage.getItem(PIN_KEY) || '[]')
     this.load()
-    // OAuth 浏览器回调落地（/providers?oauth=success）：提示并清理地址栏
-    try {
-      const params = new URLSearchParams(window.location.search)
-      if (params.get('oauth') === 'success') {
-        toast.success('OAuth 授权完成，token 已保存（稍后请求即自动使用）')
-        window.history.replaceState({}, '', window.location.pathname)
-      } else if (params.get('oauth')) {
-        toast.error('OAuth 授权失败：' + params.get('oauth'))
-        window.history.replaceState({}, '', window.location.pathname)
-      }
-    } catch (e) { /* 老浏览器忽略 */ }
+    // OAuth 连接与浏览器回调落地已迁到隐藏页面 /providers/oauth（OAuthConnections.vue）
   },
   methods: {
     async load() {
@@ -1267,70 +1222,6 @@ export default {
       }
     },
 
-    // OAuth 导入 token
-    isImportProvider(code) {
-      return ['codebuddy_cn', 'kimchi', 'qoder', 'kimi_coding'].includes(code)
-    },
-    async startAuthorize(code) {
-      if (this.isImportProvider(code)) return this.openImportTokenModal(code)
-      this.pendingCode = code
-      try {
-        const r = await api.startOAuthAuthorize(code)
-        if (r.login_url) window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
-        else if (r.authorize_url) window.open(r.authorize_url, '_blank', 'noopener,noreferrer,width=720,height=720')
-        setTimeout(() => this.load(), 5000)
-      } catch (e) {
-        toast.error('授权失败: ' + e.message)
-      } finally {
-        this.pendingCode = null
-      }
-    },
-    openImportTokenModal(code) {
-      this.importTokenError = ''
-      this.importTokenModal = { show: true, provider_code: code, access_token: '', refresh_token: '', expires_in: 3600, owner: '__default' }
-    },
-    async submitImportToken() {
-      if (!this.importTokenModal.access_token.trim()) {
-        this.importTokenError = 'access_token 不能为空'
-        return
-      }
-      this.importTokenBusy = true
-      try {
-        await api.importOAuthToken({
-          provider_code: this.importTokenModal.provider_code,
-          access_token: this.importTokenModal.access_token.trim(),
-          refresh_token: this.importTokenModal.refresh_token.trim(),
-          expires_in: this.importTokenModal.expires_in || 3600,
-          owner: this.importTokenModal.owner || '__default',
-        })
-        this.importTokenModal.show = false
-        await this.load()
-        toast.success('导入成功')
-      } catch (e) {
-        this.importTokenError = '导入失败: ' + e.message
-      } finally {
-        this.importTokenBusy = false
-      }
-    },
-    async refreshOAuth(id) {
-      try {
-        await api.refreshOAuthConnection(id)
-        await this.load()
-        toast.success('刷新成功')
-      } catch (e) {
-        toast.error('刷新失败: ' + e.message)
-      }
-    },
-    async removeOAuth(id) {
-      if (!confirm('确认删除该 OAuth 连接？')) return
-      try {
-        await api.deleteOAuthConnection(id)
-        await this.load()
-        toast.success('已删除')
-      } catch (e) {
-        toast.error('删除失败: ' + e.message)
-      }
-    },
     formatTime(t) {
       return t ? String(t).replace('T', ' ').replace('Z', '').slice(0, 19) : '-'
     },

@@ -31,7 +31,10 @@ _PUBLIC_PREFIXES = (
 )
 
 # 不需要认证的精确路径
-_PUBLIC_PATHS = {"/", "/admin/api/auth/login", "/admin/api/auth/check"}
+# OAuth 回调是 provider 在用户浏览器中顶层导航触发的 GET，不可能携带
+# Authorization 头（会话只存 localStorage），必须精确豁免；
+# 该端点自身的安全防线是 state/PKCE 校验，而非登录态。
+_PUBLIC_PATHS = {"/", "/admin/api/auth/login", "/admin/api/auth/check", "/admin/oauth/callback"}
 
 
 def verify_password(plain: str, hashed: str) -> bool:

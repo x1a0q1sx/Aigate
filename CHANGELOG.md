@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### Added
+- OAuth 连接隐藏管理页 `/providers/oauth`：设备流一键连接（自动侦测收取 token）、浏览器授权、手动导入 token，连接列表含到期倒计时/强制刷新/断开；不在导航留入口，浏览器授权完成后自动落回本页
+- 隐藏 bug 猎捕审计落档 `docs/findings-bughunt-2026-09-18.md`（5 路分区审查+逐条复核：P0×5 / P1×23 / P2·P3 若干，含修复顺序与勾选清单）
 - u1s1（有一说一）额度平台接入：服务端复刻官方 CLI 设备登录（start→浏览器批准→poll 收 api_key），免下载客户端；api_key 为长期 Bearer 凭证，OpenAI 兼容直连 api.u1s1.io/v1
 - 服务商密钥启用/停用：每把密钥可单独停用（轮转与模型归属选择即时跳过），重新启用时自动清除 401/403 熔断与冷却状态；POST /admin/api/keys/{id}/toggle + Providers 页密钥弹窗按钮
 - Cline (api.cline.bot) OAuth 接入：code 即 base64 token 直解、JSON 刷新、回调无 state 收尾、workos: JWT 前缀与 success/data 信封解包
@@ -24,6 +26,7 @@
 - 模型管理/Playground/日志详情性能优化（N+1 消除、懒加载、截断）
 
 ### Fixed
+- OAuth 浏览器回调 `/admin/oauth/callback` 被 auth 中间件拦成 SPA 页面（回调是浏览器顶层导航，不可能带 Authorization 头），authorization_code 流在默认配置下全断（审计 P0-2）→ 精确豁免该路径（其防线本就是 state/PKCE 而非登录态）；回调结果 redirect 到 /providers/oauth 的 success/error 落地提示，用户拒登的 error 回跳与换票异常不再裸 422/500
 - CodeBuddy CN device_poll 协议纠正：state 请求从 GET 改为 POST ?platform=，解析字段对齐真实协议的 authUrl（旧实现按 loginUrl 解析，实际拿不到登录链接）
 - 日志「一成功一失败」双行：systemd `aigate.service` 与 pm2 双守护冲突（每 5s 崩溃重拉，累计 48934 次），每次启动清扫把在途 pending 行误翻为 interrupted；启动收尾现只处理早于本进程启动（留 5s 余量）的遗留行
 - Anthropic 流式缺 await 导致 /v1/messages 全坏、message_start 被 ping 抢首、非流式块序错误

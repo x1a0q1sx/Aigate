@@ -155,24 +155,35 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
 # ── 回调 ──────────────────────────────────────────
 
 @router.get("/callback")
-async def oauth_callback(code: str, state: str = "", db: AsyncSession = Depends(get_db)):
-    """OAuth 回调：用 code 换 token 并持久化。
+async def oauth_callback(code: str = "", state: str = "", error: str = "", db: AsyncSession = Depends(get_db)):
+    """OAuth 回调：用 code 换 token 并持久化，结果自动落到 /providers/oauth 页。
 
     state 可选：Cline 类 authorize 端点不保证回显 state，此时按
-    start_oauth_authorize 时登记的挂起会话（provider+owner+redirect）收尾。"""
+    start_oauth_authorize 时登记的挂起会话（provider+owner+redirect）收尾。
+    用户在授权页拒绝时 provider 回跳 ?error=...（无 code），同样落到页面提示。"""
+    from urllib.parse import quote
+
+    def _landing(ok: bool, msg: str = ""):
+        q = "?oauth=success" if ok else "?oauth=error&msg=" + quote(msg or "unknown error")
+        return RedirectResponse(url="/providers/oauth" + q, status_code=302)
+
+    if error:
+        return _landing(False, f"对方拒绝了授权（{error}）")
     if not code:
         return JSONResponse(status_code=400, content={"error": "missing code"})
     client = get_oauth_client()
-    if state and "|" in state:
-        ok, msg, token = await client.exchange_code_for_token(
-            provider_code="", code=code, state=state, db=db
-        )
-    else:
-        ok, msg, token = await client.complete_pending(code, db)
+    try:
+        if state and "|" in state:
+            ok, msg, token = await client.exchange_code_for_token(
+                provider_code="", code=code, state=state, db=db
+            )
+        else:
+            ok, msg, token = await client.complete_pending(code, db)
+    except Exception as e:
+        ok, msg = False, f"{type(e).__name__}: {e}"
     if not ok:
-        return JSONResponse(status_code=400, content={"error": msg})
-    # 重定向回前端的 OAuth 连接页（Providers 目录的 oauth tab，?oauth=success 触发提示）
-    return RedirectResponse(url="/providers?oauth=success", status_code=302)
+        return _landing(False, msg)
+    return _landing(True)
 
 
 # ── 手动刷新 ──────────────────────────────────────────
