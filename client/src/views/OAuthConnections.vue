@@ -34,10 +34,28 @@
           <span class="badge" :class="connStatus(c).cls">{{ connStatus(c).label }}</span>
           <span class="conn-expire text-xs" :title="'到期 ' + (c.expires_at || '未知')">{{ expireText(c) }}</span>
           <span class="conn-actions">
+            <button class="btn btn-ghost btn-xs" @click="loadUsage(c, false)">查询余额</button>
             <button class="btn btn-ghost btn-xs" @click="refreshConn(c)" :disabled="busyConn === c.id">强制刷新</button>
             <button class="btn btn-ghost btn-xs danger-text" @click="removeConn(c)">断开</button>
           </span>
           <div v-if="c.last_error" class="conn-error text-xs" :title="c.last_error">最后错误：{{ c.last_error.slice(0, 120) }}</div>
+          <div v-if="usage[c.id]" class="usage-panel">
+            <div v-if="usage[c.id].loading" class="text-xs muted">额度查询中...</div>
+            <template v-else>
+              <div class="usage-head text-xs">
+                <strong>{{ (usage[c.id].data && usage[c.id].data.plan) || c.provider_code }}</strong>
+                <span v-if="usage[c.id].data && usage[c.id].data.cached" class="muted">（缓存，5 分钟）</span>
+                <button v-if="usage[c.id].data && !usage[c.id].loading" class="btn btn-ghost btn-xs" @click="loadUsage(c, true)">强刷</button>
+              </div>
+              <div v-for="(q, name) in quotaRows(usage[c.id].data)" :key="name" class="quota-row">
+                <span class="quota-name" :title="name">{{ q.display_name && q.display_name !== name ? name + ' · ' + q.display_name : name }}</span>
+                <div class="quota-bar"><i :class="{ warn: quotaPct(q) > 85, hot: quotaPct(q) >= 100 }" :style="{ width: quotaPct(q) + '%' }"></i></div>
+                <span class="quota-val">{{ quotaText(q) }}</span>
+              </div>
+              <div v-if="usageMsg(usage[c.id].data)" class="usage-msg text-xs">{{ usageMsg(usage[c.id].data) }}</div>
+              <div v-if="usage[c.id].error" class="usage-msg text-xs">{{ usage[c.id].error }}</div>
+            </template>
+          </div>
         </div>
 
         <div class="oauth-card-actions">
@@ -50,8 +68,9 @@
     </div>
 
     <p class="foot-tip text-xs">
-      提示：连接成功后，需在「服务商」页新建服务商（credential_type=oauth，通过 API 创建），或直接导入含 OAuth 连接的备份。
-      设备流/导入类服务商的 token 长期有效时页面显示"长效"。
+      提示：连接成功后系统自动登记服务商（服务商列表即可见，credential_type=oauth），在服务商页刷新模型后即可路由流量。
+      「查询余额」覆盖 claude_code / codex / github_copilot / antigravity / codebuddy 国服与国际服 / qoder / u1s1
+      （对齐 9router 的 usage 支持范围；其余服务商上游没有公开额度接口）。
     </p>
 
     <!-- 导入 token -->
@@ -104,6 +123,7 @@ export default {
       busyCode: null,
       busyConn: null,
       importModal: { show: false, provider_code: '', access_token: '', refresh_token: '', expires_in: 3600, owner: '__default', busy: false, error: '' },
+      usage: {},          // connectionId -> { loading, data?, error? }
       _deviceWatcher: null,
     }
   },
@@ -268,11 +288,68 @@ export default {
       if (!confirm(`确认断开 ${c.provider_code}（owner=${c.owner}）的连接？token 将被删除。`)) return
       try {
         await api.deleteOAuthConnection(c.id)
+        delete this.usage[c.id]
         await this.load()
         toast.success('已断开')
       } catch (e) {
         toast.error('断开失败：' + e.message)
       }
+    },
+    // ── 余额/额度面板 ──
+    async loadUsage(c, force) {
+      this.usage = { ...this.usage, [c.id]: { loading: true, data: this.usage[c.id]?.data || null } }
+      try {
+        const data = await api.getOAuthConnectionUsage(c.id, !!force)
+        this.usage = { ...this.usage, [c.id]: { loading: false, data } }
+      } catch (e) {
+        this.usage = { ...this.usage, [c.id]: { loading: false, data: null, error: '查询失败：' + e.message } }
+      }
+    },
+    quotaRows(entry) {
+      return (entry && entry.quotas) || {}
+    },
+    usageMsg(entry) {
+      return (entry && entry.message) || ''
+    },
+    quotaPct(q) {
+      if (q.unlimited) return 0
+      const total = Number(q.total) || 0
+      if (!total) return 0
+      return Math.max(0, Math.min(100, (Number(q.used) || 0) / total * 100))
+    },
+    quotaText(q) {
+      if (q.unlimited) return '不限量'
+      const money = (v) => '$' + (Number(v) || 0).toFixed(2)
+      if (q.unit === 'USD') {
+        const bal = q.remaining != null ? q.remaining : q.total
+        return `剩 ${money(bal)}` + (q.display_name ? `（${q.display_name}）` : '')
+      }
+      const isPct = Math.round(Number(q.total) || 0) === 100 && !q.unit
+      let text
+      if (isPct) text = `已用 ${Math.round(Number(q.used) || 0)}%`
+      else {
+        const u = Math.round(Number(q.used) || 0)
+        const t = Math.round(Number(q.total) || 0)
+        text = `${u.toLocaleString()}/${t.toLocaleString()}` + (q.unit ? ` ${q.unit}` : '')
+        if (q.display_name && !isPct && q.unit !== 'USD') text += `（${q.display_name}）`
+      }
+      if (q.reset_at) {
+        const tl = this._timeLeft(q.reset_at)
+        text += ` · ${q.recurring ? '重置' : '到期'} ${tl}`
+      }
+      return text
+    },
+    _timeLeft(iso) {
+      const ms = new Date(iso).getTime() - Date.now()
+      if (!Number.isFinite(ms)) return iso
+      if (ms <= 0) return '已过'
+      const d = Math.floor(ms / 86400000)
+      const h = Math.floor((ms % 86400000) / 3600000)
+      const m = Math.floor((ms % 3600000) / 60000)
+      if (d >= 7) return d + ' 天后'
+      if (d > 0) return d + ' 天 ' + h + ' 时后'
+      if (h > 0) return h + ' 时 ' + m + ' 分后'
+      return m + ' 分后'
     },
   },
 }
@@ -338,4 +415,45 @@ export default {
 }
 .danger-text { color: #f87171; }
 .foot-tip { margin-top: 18px; color: var(--text-muted, #7e8ea9); line-height: 1.7; }
+.muted { color: var(--text-muted, #7e8ea9); font-weight: 400; }
+.usage-panel {
+  width: 100%;
+  border-top: 1px dashed var(--border-color, #1c2839);
+  margin-top: 4px;
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.usage-head { display: flex; align-items: center; gap: 8px; }
+.quota-row {
+  display: grid;
+  grid-template-columns: minmax(80px, 1.4fr) 1fr minmax(120px, auto);
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.quota-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted, #a9b7cd);
+}
+.quota-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(126, 142, 169, 0.18);
+  overflow: hidden;
+}
+.quota-bar i {
+  display: block;
+  height: 100%;
+  background: var(--primary, #5b8dff);
+  border-radius: 3px;
+  transition: width 0.25s;
+}
+.quota-bar i.warn { background: #fbbf24; }
+.quota-bar i.hot { background: #f87171; }
+.quota-val { text-align: right; white-space: nowrap; }
+.usage-msg { color: var(--text-muted, #7e8ea9); }
 </style>

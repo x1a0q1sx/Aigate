@@ -493,6 +493,121 @@ class OAuthClient:
                 logger.debug("u1s1 poll failed: %s", e)
                 continue
 
+    # ── Qoder 设备流（本地 PKCE+nonce，轮询 deviceToken/poll 收 dt- token） ──
+    async def start_qoder_device(self, provider_code: str, db: AsyncSession,
+                                 owner: str = "__default") -> dict:
+        """对齐 9router QoderService.initiateDeviceFlow：
+        1) 本地生成 PKCE(S256) verifier/challenge + nonce + machine_id
+        2) 用户浏览器打开 qoder.com/device/selectAccounts?challenge&nonce&machine_id
+        3) 后台轮询 openapi.qoder.sh/api/v1/deviceToken/poll（202/404=pending）
+        4) 批准后收 {token: dt-…, user_id, expires_at} → userinfo 补邮箱 → 落库
+           （scope 列存 COSY 签名所需 JSON 元数据）
+        """
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return {"error": f"unknown provider {provider_code}"}
+        ep = provider.extra_params or {}
+        if ep.get("auth_mode") != "qoder_device":
+            return {"error": "provider not qoder_device mode"}
+        try:
+            import uuid as _uuid
+            verifier = secrets.token_urlsafe(32)
+            challenge = base64.urlsafe_b64encode(
+                hashlib.sha256(verifier.encode()).digest()
+            ).rstrip(b"=").decode()
+            nonce = str(_uuid.uuid4())
+            machine_id = str(_uuid.uuid4())
+            login_url = (
+                f"{ep.get('login_url')}?challenge={challenge}"
+                f"&challenge_method=S256&machine_id={machine_id}&nonce={nonce}"
+            )
+            asyncio.create_task(self._poll_qoder_device(
+                provider_code, nonce, verifier, machine_id, owner))
+            return {"state": nonce, "login_url": login_url,
+                    "poll_interval_ms": 2000, "owner": owner}
+        except Exception as e:
+            return {"error": f"start_qoder_device exception: {e}"}
+
+    async def _poll_qoder_device(self, provider_code: str, nonce: str,
+                                 verifier: str, machine_id: str, owner: str):
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return
+        ep = provider.extra_params or {}
+        poll_url = provider.token_url
+        headers = {"Accept": "application/json", "User-Agent": "Go-http-client/2.0"}
+        deadline = time.time() + 5 * 60
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.get(
+                        f"{poll_url}?nonce={nonce}&verifier={verifier}&challenge_method=S256",
+                        headers=headers)
+                if resp.status_code in (202, 404):
+                    continue  # 用户还没批
+                if resp.status_code >= 400:
+                    logger.warning("qoder device poll http %s: %s",
+                                   resp.status_code, resp.text[:160])
+                    continue
+                data = resp.json()
+                access = str(data.get("token") or "")
+                if not access:
+                    continue
+                # 到期时间：expires_at（ms/RFC3339）兜底 30 天
+                expire_ts = self._qoder_parse_expiry(data.get("expires_at"), data.get("expires_in"))
+                expires_in = max(3600, int((expire_ts - time.time())))
+                # 补账号信息（尽力而为）
+                meta = {"uid": str(data.get("user_id") or ""),
+                        "machine_id": machine_id, "email": "", "name": "", "org": ""}
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        ur = await client.get(ep.get("userinfo_url"), headers={
+                            "Authorization": f"Bearer {access}",
+                            "Accept": "application/json", "User-Agent": "Go-http-client/2.0"})
+                    if ur.ok:
+                        ud = ur.json() or {}
+                        meta["email"] = str(ud.get("email") or "").strip()
+                        meta["name"] = str(ud.get("name") or ud.get("username") or "").strip()
+                        meta["org"] = str(ud.get("organization_id") or "").strip()
+                        meta["uid"] = meta["uid"] or str(ud.get("id") or ud.get("user_id") or "")
+                except Exception:
+                    pass
+                import json as _json
+                async with AsyncSessionLocal() as db:
+                    await self._save_token(db, provider_code, owner, {
+                        "access_token": access,
+                        "refresh_token": str(data.get("refresh_token") or ""),
+                        "expires_in": expires_in,
+                        "token_type": "Bearer",
+                        "scope": _json.dumps(meta, ensure_ascii=False)[:480],
+                    })
+                logger.info("qoder device token acquired for %s/%s (uid=%s)",
+                            provider_code, owner, meta["uid"])
+                return
+            except Exception as e:
+                logger.debug("qoder poll failed: %s", e)
+                continue
+        logger.info("qoder device flow timed out (user did not approve)")
+
+    @staticmethod
+    def _qoder_parse_expiry(expires_at, expires_in) -> float:
+        """upstream 到期字段 → unix 秒（ms/秒/RFC3339 容错），兜底 now+30d。"""
+        v = expires_at
+        if isinstance(v, str) and v.strip().isdigit():
+            v = int(v.strip())
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v) / 1000.0 if v > 1e12 else float(v)
+        if isinstance(v, str) and v.strip():
+            try:
+                dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+                return dt.timestamp()
+            except ValueError:
+                pass
+        if isinstance(expires_in, (int, float)) and expires_in >= 0:
+            return time.time() + float(expires_in)
+        return time.time() + 30 * 86400
+
     # ── Cline 专属 refresh（JSON body + data 包裹响应） ──
     async def _refresh_cline(
         self, db: AsyncSession, provider: OAuthProviderConfig,
@@ -744,7 +859,59 @@ class OAuthClient:
             db.add(row)
         await db.commit()
         await db.refresh(row)
+        # 连接落库即自动登记服务商（服务商列表可见，credential_type=oauth）
+        try:
+            await self._ensure_provider_registered(db, provider_code)
+        except Exception as e:
+            logger.warning("auto-register oauth provider %s failed: %s", provider_code, e)
         return row
+
+    async def _ensure_provider_registered(self, db: AsyncSession, provider_code: str):
+        """按注册表把 OAuth provider 幂等地建成服务商行（oauth_code 或同名已存在则跳过）。"""
+        from server.models.provider import Provider
+        provider = (await db.execute(
+            select(Provider).where(Provider.oauth_code == provider_code).limit(1)
+        )).scalar_one_or_none()
+        if provider:
+            return
+        cfg = get_oauth_provider(provider_code)
+        if not cfg:
+            return
+        name = (cfg.name or provider_code).strip() or provider_code
+        dup = (await db.execute(
+            select(Provider).where(Provider.name == name).limit(1)
+        )).scalar_one_or_none()
+        if dup:
+            # 用户已手工建过同名服务商：只补 oauth 指向
+            if not dup.oauth_code:
+                dup.oauth_code = provider_code
+                dup.credential_type = "oauth"
+                await db.commit()
+            return
+        db.add(Provider(
+            name=name,
+            base_url=cfg.api_base_url or "",
+            api_type=cfg.adapter_api_type or "openai_compat",
+            credential_type="oauth",
+            oauth_code=provider_code,
+            enabled=True,
+            description=f"由 OAuth 连接自动登记（{provider_code}）",
+        ))
+        await db.commit()
+        logger.info("oauth provider auto-registered: %s", provider_code)
+
+    async def get_token_meta(self, provider_code: str, db: AsyncSession,
+                             owner: str = "__default") -> dict:
+        """连接记录的 scope 列若为 JSON（qoder 存 COSY 签名元数据）则解析返回，否则 {}。"""
+        row = await self._get_token_record(db, provider_code, owner)
+        if not row or not row.scope:
+            return {}
+        try:
+            import json as _json
+            data = _json.loads(row.scope)
+            return data if isinstance(data, dict) else {}
+        except ValueError:
+            return {}
 
     # 用于 admin 端点列出所有 oauth 连接
     async def list_connections(self, db: AsyncSession) -> list:

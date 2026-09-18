@@ -267,6 +267,9 @@ export default {
   refreshOAuthConnection: (id) => apiPost(`/admin/oauth/refresh/${id}`),
   deleteOAuthConnection: (id) => apiDelete(`/admin/oauth/connections/${id}`),
   importOAuthToken: (data) => apiPost('/admin/oauth/import-token', data),
+  // 额度/余额查询（usage 端点缓存 5 分钟，force=true 强刷）
+  getOAuthConnectionUsage: (id, force = false) =>
+    apiGet(`/admin/oauth/connections/${id}/usage${force ? '?force=true' : ''}`),
 
   // ── v2 路线新增 ──
   // D1 网关密钥（下游客户端钥匙）

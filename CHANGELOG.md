@@ -5,6 +5,9 @@
 ## [Unreleased]
 
 ### Added
+- OAuth 连接即自动登记服务商（credential_type=oauth，幂等；同名手工服务商只补 oauth 指向）；模型刷新支持 OAuth 服务商：在线 list_models，失败/无端点回退注册表静态种子（claude_code/codex/github_copilot/antigravity/cursor/codebuddy 国服国际服/cline/qoder 已配种子）
+- 额度/余额查询 `GET /admin/oauth/connections/{id}/usage`（5 分钟缓存 + 并发合流 + Claude 429 冷却）：claude_code 5h/7d/模型级周窗、codex 会话/周/review/spark+重置券、github_copilot 付费/免费双形态、antigravity 按模型分数+周额度、codebuddy 续包/赠包分列、qoder 用户/组织配额（PAT 先换 job token）、u1s1 永久余额+今日免费（USD/token 双口径）——覆盖范围与 9router usage 一致；隐藏页内「查询余额」进度条面板
+- Qoder 推理代理（端口自 9router qoder 全栈）：`QoderAdapter` COSY 签名（RSA+AES-CBC+MD5、17 指纹头）+ WAF 绕过编码（&Encode=1）+ `{statusCodeValue,body}` SSE 信封解包与 finish/usage 合流 + 服务端下发的 per-model model_config（缺键硬错、1h 目录缓存）+ 上下文档位自动升档 + 首帧计费拦截转回退；设备流登录一键连接（本地 PKCE/nonce → 轮询 deviceToken/poll 收 dt- token，签名元数据存连接 scope）；PAT(pt-) 自动换 job token(jt-，api2 路由)
 - OAuth 连接隐藏管理页 `/providers/oauth`：设备流一键连接（自动侦测收取 token）、浏览器授权、手动导入 token，连接列表含到期倒计时/强制刷新/断开；不在导航留入口，浏览器授权完成后自动落回本页
 - 隐藏 bug 猎捕审计落档 `docs/findings-bughunt-2026-09-18.md`（5 路分区审查+逐条复核：P0×5 / P1×23 / P2·P3 若干，含修复顺序与勾选清单）
 - u1s1（有一说一）额度平台接入：服务端复刻官方 CLI 设备登录（start→浏览器批准→poll 收 api_key），免下载客户端；api_key 为长期 Bearer 凭证，OpenAI 兼容直连 api.u1s1.io/v1

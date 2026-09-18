@@ -77,6 +77,9 @@ def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) ->
         return CodexResponsesAdapter(timeout=timeout) if timeout else CodexResponsesAdapter()
     elif api_type == "atomcode":
         return AtomCodeAdapter(timeout=timeout) if timeout else AtomCodeAdapter()
+    elif api_type == "qoder":
+        from server.adapters.qoder_adapter import QoderAdapter
+        return QoderAdapter(timeout=timeout) if timeout else QoderAdapter()
     else:
         return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
 class ModelCatalog:
@@ -326,6 +329,38 @@ class ModelCatalog:
                         all_model_infos.setdefault(mi.model_id, mi)
             except Exception as e:
                 logger.warning(f"atomcode list_models failed for {provider.name}: {e}")
+        elif cred_type == "oauth":
+            # OAuth 服务商：在线 list_models（token 来自连接记录），失败/无端点回退注册表静态种子
+            from server.core.oauth_client import get_oauth_client as _goc
+            from server.core.oauth_registry import get_oauth_provider as _gop
+            oauth_code = getattr(provider, "oauth_code", None) or provider.name
+            oauth_p = _gop(oauth_code)
+            token = None
+            try:
+                token = await _goc().pick_access_token(oauth_code, session)
+            except Exception as e:
+                logger.warning(f"oauth pick_access_token failed for {provider.name}: {e}")
+            if token:
+                try:
+                    eh = dict(extra_headers or {})
+                    eh["__oauth"] = True
+                    _m = await adapter.list_models(token, provider.base_url, eh)
+                    if _m:
+                        any_success = True
+                        for mi in _m:
+                            all_model_infos.setdefault(mi.model_id, mi)
+                except Exception as e:
+                    logger.warning(f"oauth list_models failed for {provider.name}: {e}")
+            if not any_success and oauth_p and oauth_p.static_models:
+                any_success = True
+                for sm in oauth_p.static_models:
+                    all_model_infos.setdefault(sm["model_id"], ModelInfo(
+                        model_id=sm["model_id"], display_name=sm.get("display_name") or sm["model_id"],
+                        is_free=False, input_price=0.0, output_price=0.0,
+                        supports_streaming=True, context_length=4096,
+                    ))
+            if not any_success:
+                return {"error": f"OAuth provider '{oauth_code}' 未连接且无静态模型种子，请先在 /providers/oauth 完成连接"}
         else:
             keys = (await session.execute(
                 select(ApiKey).where(

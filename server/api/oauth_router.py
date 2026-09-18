@@ -53,6 +53,8 @@ async def list_oauth_providers():
             "extra_params": p.extra_params or {},
             "client_id": (p.client_id or "")[:16] + ("…" if p.client_id and len(p.client_id) > 16 else ""),
             "authorize_url": p.authorize_url,
+            "adapter_api_type": p.adapter_api_type,
+            "static_models": p.static_models or [],
         })
     return out
 
@@ -99,6 +101,19 @@ async def start_oauth_authorize(provider_code: str, request: Request, owner: str
             "poll_interval_ms": r["poll_interval_ms"],
             "message": "请在新窗口登录 u1s1 并批准本设备，批准后系统会自动收取 api_key",
         }
+    # ── Qoder 设备流（本地 PKCE+nonce → 轮询收 dt- token + 签名元数据）────
+    if (provider.extra_params or {}).get("auth_mode") == "qoder_device":
+        async with AsyncSessionLocal() as db:
+            r = await get_oauth_client().start_qoder_device(provider_code, db, owner=owner)
+        if "error" in r:
+            raise HTTPException(status_code=400, detail=r["error"])
+        return {
+            "device_poll": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "poll_interval_ms": r["poll_interval_ms"],
+            "message": "请在新窗口登录 Qoder 并选择账号，批准后系统会自动收取 device token（约 30 天有效）",
+        }
     # 运行时 redirect_uri：用本机 incoming host:port 替换默认 localhost:8000
     redirect_override = None
     if request:
@@ -110,8 +125,6 @@ async def start_oauth_authorize(provider_code: str, request: Request, owner: str
     client = get_oauth_client()
     client.redirect_override = redirect_override
     url, state, _verifier = client.build_authorize_url(provider, owner=owner)
-    if not url and (provider.extra_params or {}).get("device_code_only"):
-        return {"device_code": True, "message": "请使用 Qoder 设备授权流手动输入"}
     if not url:
         raise HTTPException(status_code=400, detail="this provider has no authorize_url")
     return {"authorize_url": url, "state": state, "provider": provider_code}
@@ -184,6 +197,22 @@ async def oauth_callback(code: str = "", state: str = "", error: str = "", db: A
     if not ok:
         return _landing(False, msg)
     return _landing(True)
+
+
+# ── 额度/余额查询（端口自 9router usage handlers） ─────────────
+
+@router.get("/connections/{connection_id}/usage")
+async def connection_usage(connection_id: int, force: bool = False,
+                           db: AsyncSession = Depends(get_db)):
+    """按连接查上游额度/余额。失败与未实现均以 message 字段表达（HTTP 恒 200）。"""
+    from server.core.oauth_usage import get_connection_usage
+    row = await db.get(OAuthToken, connection_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="connection not found")
+    from server.core.oauth_client import get_oauth_client
+    token = get_oauth_client()._crypto.decrypt(row.access_token_enc)
+    result = await get_connection_usage(row.provider_code, token, force=force)
+    return {**result, "connection_id": row.id, "owner": row.owner}
 
 
 # ── 手动刷新 ──────────────────────────────────────────

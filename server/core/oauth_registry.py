@@ -47,10 +47,18 @@ class OAuthProviderConfig:
     extra_params: dict = None
     api_base_url: Optional[str] = None       # 该 provider 实际 LLM API 调用 base_url
     notes: str = ""                          # 描述
+    # 自动建服务商（连接成功即入服务商列表）用：
+    adapter_api_type: str = "openai_compat"  # AIGate 适配器选择（anthropic/codex_responses/github/qoder…）
+    static_models: List[dict] = None         # 在线拉取模型不可用时的兜底种子 [{model_id, display_name}]
 
 
 # AIGate 默认 callback（运行时由请求 host + port 动态生成也行，这里写死兜底）
 _DEFAULT_REDIRECT = "http://localhost:8000/admin/oauth/callback"
+
+
+def _seed(*pairs):
+    """静态模型种子（id, 显示名）→ [{model_id, display_name}]"""
+    return [{"model_id": mid, "display_name": name} for mid, name in pairs]
 
 
 def _env_client_id(code: str, placeholder: str = "CHANGE_ME") -> str:
@@ -78,6 +86,14 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         use_pkce=True,
         refresh_lead_seconds=300,            # 5 分钟前置
         api_base_url="https://api.anthropic.com",
+        adapter_api_type="anthropic",
+        static_models=_seed(
+            ("claude-opus-5", "Claude Opus 5"),
+            ("claude-fable-5-1", "Claude Fable 5.1"),
+            ("claude-fable-5", "Claude Fable 5"),
+            ("claude-sonnet-5", "Claude Sonnet 5"),
+            ("claude-haiku-4-5-20251001", "Claude 4.5 Haiku"),
+        ),
         notes="Claude Code 订阅 OAuth — 5 分钟提前刷新",
     ),
     # ── OpenAI Codex（Plus/Pro） ──
@@ -93,7 +109,18 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         scope="openid profile email offline_access",
         use_pkce=True,
         refresh_lead_seconds=5 * 24 * 3600,  # 5 天提前刷
-        api_base_url="https://chatgpt.com/backend-api/codex/responses",
+        api_base_url="https://chatgpt.com/backend-api/codex",
+        adapter_api_type="codex_responses",
+        static_models=_seed(
+            ("gpt-6-astra", "GPT 6.0 Astra"),
+            ("gpt-5.6-sol", "GPT 5.6 Sol"),
+            ("gpt-5.6-terra", "GPT 5.6 Terra"),
+            ("gpt-5.6-luna", "GPT 5.6 Luna"),
+            ("gpt-5.5", "GPT 5.5"),
+            ("gpt-5.4", "GPT 5.4"),
+            ("gpt-5.4-mini", "GPT 5.4 Mini"),
+            ("gpt-5.3-codex-spark", "GPT 5.3 Codex Spark"),
+        ),
         notes="OpenAI Codex 订阅 OAuth — 5 天前置刷新",
     ),
     # ── GitHub Copilot ──
@@ -111,6 +138,20 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         use_pkce=True,
         refresh_lead_seconds=300,
         api_base_url="https://api.githubcopilot.com",
+        adapter_api_type="github",
+        static_models=_seed(
+            ("gpt-5.2", "GPT-5.2"),
+            ("gpt-5.2-codex", "GPT-5.2 Codex"),
+            ("gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("gpt-5.4", "GPT-5.4"),
+            ("gpt-5.4-mini", "GPT-5.4 Mini"),
+            ("claude-haiku-4.5", "Claude Haiku 4.5"),
+            ("claude-sonnet-4.6", "Claude Sonnet 4.6"),
+            ("claude-opus-4.6", "Claude Opus 4.6"),
+            ("claude-opus-4.7", "Claude Opus 4.7"),
+            ("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            ("gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+        ),
         notes="GitHub Copilot — PKCE + 每月刷新",
     ),
     # ── Antigravity ──
@@ -127,6 +168,21 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         use_pkce=True,
         refresh_lead_seconds=300,            # 5 分钟
         api_base_url="https://antigravity.google.com/v1",
+        adapter_api_type="openai_compat",
+        static_models=_seed(
+            ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+            ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+            ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+            ("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)"),
+            ("gemini-3.7-flash-medium", "Gemini 3.7 Flash (Medium)"),
+            ("gemini-3.5-flash-low", "Gemini 3.5 Flash (Low)"),
+            ("gemini-pro-agent", "Gemini Pro Agent"),
+            ("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-6-thinking", "Claude Opus 4.6 Thinking"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B"),
+            ("gemini-3.1-flash-image", "Gemini 3.1 Flash Image"),
+        ),
         notes="Google Antigravity — 5 分钟前置刷新",
     ),
     # ── Cursor IDE（订阅） ──
@@ -143,24 +199,60 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         use_pkce=True,
         refresh_lead_seconds=600,
         api_base_url="https://api2.cursor.sh/v1",
+        adapter_api_type="openai_compat",
+        static_models=_seed(
+            ("default", "Auto (Server Picks)"),
+            ("claude-4.6-opus-max", "Claude 4.6 Opus Max"),
+            ("claude-4.6-sonnet-medium-thinking", "Claude 4.6 Sonnet Thinking"),
+            ("claude-4.5-opus-high", "Claude 4.5 Opus High"),
+            ("claude-4.5-sonnet", "Claude 4.5 Sonnet"),
+            ("claude-4.5-haiku", "Claude 4.5 Haiku"),
+            ("gpt-5.2-codex", "GPT 5.2 Codex"),
+            ("gpt-5.3-codex", "GPT 5.3 Codex"),
+            ("gpt-5.2", "GPT 5.2"),
+            ("kimi-k2.5", "Kimi K2.5"),
+            ("gemini-3-flash-preview", "Gemini 3 Flash Preview"),
+        ),
         notes="Cursor IDE 订阅 OAuth",
     ),
-    # ── Qoder - 30 天 device_token（不是 PKCE） ──
+    # ── Qoder — 官方设备流 + COSY 签名推理代理（端口自 9router qoder 全栈） ──
+    # 流程：本地生成 PKCE(S256) + nonce + machine_id → 浏览器打开
+    #   https://qoder.com/device/selectAccounts?challenge=..&nonce=..&machine_id=..
+    #   → 轮询 openapi.qoder.sh/api/v1/deviceToken/poll?nonce&verifier（202/404=pending，
+    #   200 带 dt- token）→ userinfo 补 uid/email → scope 列存 COSY 签名所需元数据。
+    # device token 约 30 天；upstream refresh 对本流返回 403 → refresh_style=none。
     "qoder": OAuthProviderConfig(
         code="qoder",
-        name="Qoder (device_code)",
-        client_id=_env_client_id("qoder"),
+        name="Qoder",
+        client_id="",
         client_secret="",
-        authorize_url="",                    # Qoder 走 device_code flow，无浏览器授权 URL
-        token_url="https://api.qoder.com/oauth/device_token",
-        refresh_url="https://api.qoder.com/oauth/token",
-        redirect_uri="urn:ietf:wg:oauth:2.0:oob",
-        scope="openid profile",
-        use_pkce=False,                       # device_code flow
-        refresh_lead_seconds=2 * 24 * 3600, # 30 天 device token，每 2 天提前刷
-        api_base_url="https://api.qoder.com/v1",
-        extra_params={"device_code_only": True},
-        notes="Qoder 设备流（30 天 token）",
+        authorize_url="",
+        token_url="https://openapi.qoder.sh/api/v1/deviceToken/poll",
+        refresh_url="",
+        redirect_uri="",
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=24 * 3600,      # 每天看一眼（实际不刷，仅标记过期临近提醒重登）
+        api_base_url="https://api3.qoder.sh/algo/api/v2",
+        adapter_api_type="qoder",
+        extra_params={
+            "auth_mode": "qoder_device",
+            "refresh_style": "none",
+            "login_url": "https://qoder.com/device/selectAccounts",
+            "userinfo_url": "https://openapi.qoder.sh/api/v1/userinfo",
+            "quota_usage_url": "https://openapi.qoder.sh/api/v2/quota/usage",
+        },
+        static_models=_seed(
+            ("auto", "Auto"), ("ultimate", "Ultimate"), ("performance", "Performance"),
+            ("efficient", "Efficient"), ("lite", "Lite"),
+            ("qmodel_38max", "Qwen3.8-Max"), ("qmodel_latest", "Qwen3.7-Max"),
+            ("qmodel", "Qwen3.7-Plus"), ("qfmodel", "Qwen3.8-Flash"),
+            ("kmodel_latest", "Kimi-K3"), ("kmodel", "Kimi-K2.7-Code"),
+            ("gmodel", "GLM-5.3"), ("gfmodel", "GLM-5.3-Flash"),
+            ("dmodel", "DeepSeek-V4-Pro"), ("dfmodel", "DeepSeek-V4-Flash"),
+            ("mmodel", "MiniMax-M3"),
+        ),
+        notes="Qoder 设备流（30 天 token）+ COSY 签名推理（api3.qoder.sh）",
     ),
     # ── CodeBuddy CN（腾讯 copilot.tencent.com） ──
     # 流程（对齐 9router codebuddy-cn provider 实测）：
@@ -191,6 +283,15 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "poll_interval_ms": 5000,
         },
         api_base_url="https://copilot.tencent.com/v2/chat/completions",
+        static_models=_seed(
+            ("glm-5.2", "GLM-5.2"), ("glm-5.1", "GLM-5.1"), ("glm-5.3", "GLM-5.3"),
+            ("glm-5.3-flash", "GLM-5.3-Flash"), ("glm-5v-turbo", "GLM-5v-Turbo"),
+            ("minimax-m3", "MiniMax-M3"), ("kimi-k2.7", "Kimi-K2.7-Code"),
+            ("kimi-k2.6", "Kimi-K2.6"), ("kimi-k3-1", "Kimi-K3"),
+            ("hy3", "Hy3"), ("hy4-preview", "Hy4-Preview"),
+            ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+            ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+        ),
         notes="腾讯 CodeBuddy — state 轮询登录 + X-Refresh-Token 头刷新",
     ),
     # ── CodeBuddy International（www.codebuddy.ai）──
@@ -218,6 +319,16 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "poll_interval_ms": 5000,
         },
         api_base_url="https://www.codebuddy.ai/v2/chat/completions",
+        static_models=_seed(
+            ("glm-5.2", "GLM-5.2"), ("glm-5.1", "GLM-5.1"), ("glm-5.0", "GLM-5.0"),
+            ("glm-5v-turbo", "GLM-5v-Turbo"), ("glm-4.7", "GLM-4.7"),
+            ("minimax-m3", "MiniMax-M3"), ("minimax-m2.7", "MiniMax-M2.7"),
+            ("kimi-k2.7", "Kimi-K2.7-Code"), ("kimi-k2.6", "Kimi-K2.6"),
+            ("hy3-preview", "Hy3 Preview"),
+            ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+            ("deepseek-v4-flash", "DeepSeek-V4-Flash"),
+            ("deepseek-v3-2-volc", "DeepSeek-V3.2"),
+        ),
         notes="CodeBuddy 国际服 — 与 CN 同协议（state 轮询 + X-Refresh-Token 刷新）",
     ),
     # ── Cline（api.cline.bot 订阅网关）──
@@ -244,6 +355,16 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "client_type": "extension",
         },
         api_base_url="https://api.cline.bot/api/v1/chat/completions",
+        static_models=_seed(
+            ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
+            ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
+            ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
+            ("openai/gpt-5.3-codex", "GPT-5.3 Codex"),
+            ("openai/gpt-5.4", "GPT-5.4"),
+            ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+            ("google/gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite"),
+            ("kwaipilot/kat-coder-pro", "KAT Coder Pro"),
+        ),
         notes="Cline 订阅 — code 即 base64 token（自解码）+ JSON 刷新 + workos: 前缀",
     ),
     # ── u1s1（有一说一）额度平台 ──
