@@ -178,6 +178,40 @@ def test_scope_unknown_combo_404(monkeypatch):
     assert new_r.model == "gpt-4o"  # 未改写
 
 
+def _patch_resolves(monkeypatch, result):
+    import server.api.v1_router as vr
+    async def _resolves(db, name):
+        return result
+    monkeypatch.setattr(vr, "_model_name_resolves", _resolves)
+
+
+def test_scope_concrete_model_direct(monkeypatch):
+    """前缀组合端点里指定可解析的具体模型 → 直达该模型，不做组合改写。"""
+    from server.api.v1_router import _apply_combo_scope
+    _patch_combo(monkeypatch, "918")
+    _patch_resolves(monkeypatch, True)
+    new_r, err = asyncio.run(_apply_combo_scope(None, _fake_raw("918"), _req("sensenova/kimi-k3")))
+    assert err is None and new_r.model == "sensenova/kimi-k3"
+
+
+def test_scope_unresolvable_model_still_combo(monkeypatch):
+    """具体模型但不可解析 → 仍走前缀组合（改写），避免误伤。"""
+    from server.api.v1_router import _apply_combo_scope
+    _patch_combo(monkeypatch, "my-fast")
+    _patch_resolves(monkeypatch, False)
+    new_r, err = asyncio.run(_apply_combo_scope(None, _fake_raw("918"), _req("no-such-model")))
+    assert err is None and new_r.model == "combo:my-fast"
+
+
+def test_scope_star_uses_combo(monkeypatch):
+    """model 为 "*"（未指定）→ 走 combo。"""
+    from server.api.v1_router import _apply_combo_scope
+    _patch_combo(monkeypatch, "my-fast")
+    _patch_resolves(monkeypatch, True)
+    new_r, err = asyncio.run(_apply_combo_scope(None, _fake_raw("918"), _req("*")))
+    assert err is None and new_r.model == "combo:my-fast"
+
+
 # ── /v1/models 组合过滤 ──────────────────────────────────────
 
 def test_list_models_combo_scope(tmp_path, monkeypatch):

@@ -1213,24 +1213,33 @@ async def _model_name_resolves(db: AsyncSession, name: str) -> bool:
 
 async def _apply_combo_scope(db: AsyncSession, raw_request: Request,
                              request: ChatCompletionRequest):
-    """combo 前缀路由注入：/combo:<ref>/... 下把 model 改写为 "combo:<名称>"。
+    """combo 前缀路由注入：/combo:<ref>/... 下锁定组合，但**具体模型优先**。
 
-    ref 支持组合名称或数字 id；原模型名尾部的思考强度后缀（-high 等）
-    保留拼到组合名后，由下游既有的后缀解析逻辑处理。前缀是访问边界：
-    即使请求体显式写了别的 combo 也以前缀为准。
+    语义分层（ref=路径前缀，记入 scope）：
+      - 请求体 model 为空 / "*" / 是另一个 combo（combo:xxx）
+          → 前缀组合为访问边界，改写为 "combo:<前缀组合名>"，走整套回退。
+      - 请求体 model 是**可解析的具体模型**（provider/model_id 或裸 model_id）
+        → 视为"指定模型直达"，不改写，走直连路由命中该模型。
+    ref 支持组合名称或数字 id；原模型名尾部思考深度(-high 等)在改写路径里
+    保留拼到组合后，由下游既有后缀解析逻辑处理。
 
     返回 (改写后的 request, 错误响应|None)。无 combo_scope 时原样返回。
     """
     ref = getattr(getattr(raw_request, "state", None), "combo_scope", None)
     if not ref:
         return request, None
-    from server.core.combo_router import find_combo_by_ref
+    from server.core.combo_router import find_combo_by_ref, is_combo_request
     combo = await find_combo_by_ref(db, ref)
     if combo is None:
         return request, JSONResponse(
             status_code=404,
             content=_api_error(f"Combo '{ref}' not found", status=404))
-    _base, _sfx = _split_effort_suffix(request.model or "")
+    _raw = (request.model or "").strip()
+    _base, _sfx = _split_effort_suffix(_raw)
+    # 具体模型（非 combo、非空、可解析）→ 直接命中该模型，不做组合改写。
+    _is_combo, _ = is_combo_request(_raw)
+    if not _is_combo and _base and _base != "*" and await _model_name_resolves(db, _base):
+        return request, None
     new_model = f"combo:{combo.name}" + (f"-{_sfx}" if _sfx else "")
     return request.model_copy(update={"model": new_model}), None
 
