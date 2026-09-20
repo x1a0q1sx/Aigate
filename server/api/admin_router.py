@@ -1084,6 +1084,13 @@ async def list_models(
     # 预加载 provider 关系：一次性取全部 provider 建 dict，替代逐模型 db.get（1147 模型时曾产生 1147 次点查）
     prov_rows = (await db.execute(select(ProvModel))).scalars().all()
     prov_map = {p.id: p for p in prov_rows}
+    # 预加载分组归属：combo.model_ids 反查 (provider_name, model_id) → [combo 名]，一次查询建映射
+    from server.models.combo import Combo as ComboModel
+    _combo_map = {}
+    for c in (await db.execute(select(ComboModel))).scalars().all():
+        for e in (c.model_ids or []):
+            if isinstance(e, dict):
+                _combo_map.setdefault((e.get("provider"), e.get("model_id")), []).append(c.name)
     # v3.3 跳过 provider 已被删除的孤儿 model
     orphan_count = 0
     valid_models = []
@@ -1098,6 +1105,7 @@ async def list_models(
     result = []
     for m in models:
         item = ModelInfoResponse.from_orm(m)
+        item.combos = _combo_map.get((item.provider_name, m.model_id), [])
         # 附加延迟 + 冷却信息
         if hc:
             cached = hc.get_cached_status(m.id)
@@ -1135,6 +1143,38 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
     return ModelInfoResponse.from_orm(model)
+
+class ModelGroupsUpdate(BaseModel):
+    # 模型分组归属：Auto 开关 + 所属 combo 名称列表（一个模型可属多个分组）
+    auto_enabled: Optional[bool] = None
+    combos: Optional[list] = None  # None=不改分组；[] 或名称列表=按目标集合增删
+
+@router.put("/models/{model_id}/groups")
+async def update_model_groups(model_id: int, data: ModelGroupsUpdate, db: AsyncSession = Depends(get_db)):
+    """复选保存分组：Auto 写 model.auto_enabled；各 combo 的 model_ids 按目标集合增删（新增追加到末尾）"""
+    from server.models.combo import Combo as ComboModel
+    m = (await db.execute(select(Model).where(Model.id == model_id))).scalar_one_or_none()
+    if not m:
+        raise HTTPException(status_code=404, detail="Model not found")
+    provider = (await db.execute(select(Provider).where(Provider.id == m.provider_id))).scalar_one_or_none()
+    if not provider:
+        raise HTTPException(status_code=404, detail="Provider not found")
+    if data.auto_enabled is not None:
+        m.auto_enabled = bool(data.auto_enabled)
+    if data.combos is not None:
+        want = {str(x) for x in data.combos}
+        for c in (await db.execute(select(ComboModel))).scalars().all():
+            entries = [e for e in (c.model_ids or []) if isinstance(e, dict)]
+            mine = lambda e: e.get("provider") == provider.name and e.get("model_id") == m.model_id
+            has = any(mine(e) for e in entries)
+            if c.name in want and not has:
+                entries.append({"provider": provider.name, "model_id": m.model_id})
+                c.model_ids = entries
+            elif c.name not in want and has:
+                c.model_ids = [e for e in entries if not mine(e)]
+    await db.commit()
+    return {"ok": True, "auto_enabled": bool(m.auto_enabled)}
+
 @router.delete("/models/orphans")
 async def delete_orphan_models(db: AsyncSession = Depends(get_db)):
     """Delete model rows whose provider no longer exists."""

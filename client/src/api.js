@@ -157,6 +157,8 @@ export default {
     return apiGet(`/admin/api/models?${qs.toString()}`)
   },
   updateModel: (id, data) => apiPut(`/admin/api/models/${id}`, data),
+  // 分组复选：Auto + 所属 combo 名称列表（一个模型可属多个分组）
+  setModelGroups: (id, data) => apiPut(`/admin/api/models/${id}/groups`, data),
   deleteModel: (id) => apiDelete(`/admin/api/models/${id}`),
   cleanOrphanModels: () => apiDelete('/admin/api/models/orphans'),
   createProviderModel: (providerId, data) => apiPost(`/admin/api/providers/${providerId}/models`, data),

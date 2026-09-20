@@ -87,7 +87,7 @@
                 <AppIcon v-if="sortKey === 'success_rate'" :name="sortOrder === 'asc' ? 'chevronUp' : 'chevronDown'" :size="12" />
               </th>
               <th>免费</th>
-              <th>Auto</th>
+              <th>分组</th>
               <th>思考</th>
               <th>延迟/TPS</th>
               <th>干预</th>
@@ -127,10 +127,24 @@
                 </span>
               </td>
               <td>
-                <label class="switch">
-                  <input type="checkbox" :checked="m.auto_enabled" @change="toggleAuto(m)" />
-                  <span class="slider"></span>
-                </label>
+                <details class="group-pop">
+                  <summary class="group-summary" title="Auto 与所属分组，点选编辑">
+                    <span class="badge" :class="m.auto_enabled ? 'badge-success' : 'badge-neutral'">Auto</span>
+                    <span v-for="c in (m.combos || [])" :key="c" class="badge badge-info" :title="'分组: ' + c">{{ c }}</span>
+                    <AppIcon name="chevronDown" :size="12" class="text-muted" />
+                  </summary>
+                  <div class="group-menu">
+                    <label class="group-opt">
+                      <input type="checkbox" :checked="m.auto_enabled" @change="toggleGroup(m, null, $event.target.checked)" />
+                      <span>Auto（参与自动选举）</span>
+                    </label>
+                    <label class="group-opt" v-for="c in comboNames" :key="c">
+                      <input type="checkbox" :checked="(m.combos || []).includes(c)" @change="toggleGroup(m, c, $event.target.checked)" />
+                      <span>{{ c }}</span>
+                    </label>
+                    <div v-if="!comboNames.length" class="text-xs text-muted" style="padding: 4px 0">暂无分组，可在「组合」页创建</div>
+                  </div>
+                </details>
                 <span v-if="m.auto_excluded" class="badge badge-danger text-xs" style="margin-left: 4px">排除</span>
                 <span v-if="m.cooldown_until" class="badge badge-warning text-xs" style="margin-left: 4px" :title="'冷却至 ' + m.cooldown_until">
                   <AppIcon name="clock" :size="10" /> {{ cooldownRemaining(m) }}
@@ -359,6 +373,7 @@ export default {
     return {
       models: [],
       providers: [],
+      comboNames: [],
       filterProvider: '',
       filterFree: false,
       filterAuto: false,
@@ -453,7 +468,12 @@ export default {
     },
     async load() {
       try {
-        this.providers = await api.getProviders()
+        const [providers, combos] = await Promise.all([
+          api.getProviders(),
+          api.getCombos().catch(() => []),
+        ])
+        this.providers = providers || []
+        this.comboNames = (combos || []).map((c) => c.name)
         const params = this._buildParams(0)
         const loadedModels = await api.getModels(params)
         const arr = loadedModels || []
@@ -572,12 +592,20 @@ export default {
       if (s < 3600) return Math.ceil(s / 60) + 'm'
       return Math.ceil(s / 3600) + 'h'
     },
-    async toggleAuto(model) {
+    // 分组复选：comboName 为 null 表示 Auto；一个模型可同时属多个分组
+    async toggleGroup(model, comboName, checked) {
+      const targetAuto = comboName === null ? checked : model.auto_enabled
+      const current = (model.combos || []).slice()
+      let targetCombos = current
+      if (comboName !== null) {
+        targetCombos = checked ? [...current, comboName] : current.filter((c) => c !== comboName)
+      }
       try {
-        await api.updateModel(model.id, { auto_enabled: !model.auto_enabled })
-        model.auto_enabled = !model.auto_enabled
+        await api.setModelGroups(model.id, { auto_enabled: targetAuto, combos: targetCombos })
+        model.auto_enabled = targetAuto
+        model.combos = targetCombos
       } catch (e) {
-        toast.error('更新失败: ' + e.message)
+        toast.error('分组更新失败: ' + e.message)
       }
     },
     async boostModel(model, delta) {
@@ -913,6 +941,37 @@ input:checked + .slider {
 }
 input:checked + .slider:before {
   transform: translateX(16px);
+}
+
+/* 分组复选面板（点击行内展开，不做绝对定位避免表格容器裁剪） */
+.group-pop { position: relative; }
+.group-pop > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.group-pop > summary::-webkit-details-marker { display: none; }
+.group-menu {
+  margin-top: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-medium);
+  border-radius: var(--radius-md);
+  background: var(--surface-1, var(--surface-base, #fff));
+  max-height: 240px;
+  overflow-y: auto;
+  min-width: 170px;
+}
+.group-opt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-sm);
+  padding: 3px 0;
+  cursor: pointer;
+  white-space: nowrap;
 }
 
 /* 表单 */

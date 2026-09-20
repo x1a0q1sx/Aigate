@@ -93,6 +93,8 @@ class ModelInfoResponse(BaseModel):
     # 冷却信息
     cooldown_until: Optional[str] = None  # ISO 时间字符串，非空表示正在冷却
     fail_count: int = 0
+    # 所属分组（combo 名称列表，由列表接口附带；不在 ORM 上，from_orm 不填）
+    combos: Optional[list] = None
     class Config:
         from_attributes = True
     @classmethod
