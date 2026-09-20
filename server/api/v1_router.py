@@ -1662,8 +1662,10 @@ async def _chat_completions_impl(
                     cdb = _CS()
                     stream_errs = []
                     ctx_by_idx = {}
-                    # max_fallbacks 契约与 auto 对齐：总尝试 = min(候选数, max_fallbacks + 1)
-                    max_r = min(len(combo_full_ids), max(1, ar.config.max_fallbacks + 1))
+                    # combo 候选列表是用户显式配置 → 全部尝试；max_fallbacks 只限 auto 的动态大池
+                    # （此前照抄 auto 的 min(candidates, max_fallbacks+1) 窗口：17 候选的池子
+                    #   前 6 个全被冷却/预检跳过后，第 7 个起的可用候选没机会打就报 all targets failed）
+                    max_r = len(combo_full_ids)
                     yield b": keepalive\n\n"
 
                     async def _launch(st_attempt: int):
@@ -1919,8 +1921,8 @@ async def _chat_completions_impl(
                 return StreamingResponse(_combo_cascade_stream(), media_type="text/event-stream")
             # ─── 非流式 combo：循环尝试（含冷却），不再走 is_auto 级联路径 ───
             combo_attempts = []
-            # max_fallbacks 契约与 auto/流式对齐：总尝试 = min(候选数, max_fallbacks + 1)
-            _attempt_limit = min(len(ordered_targets), max(1, ar.config.max_fallbacks + 1))
+            # combo 候选列表是用户显式配置 → 全部尝试；max_fallbacks 只限 auto 的动态大池
+            _attempt_limit = len(ordered_targets)
             # Race（config.race.enabled）：N 秒无返回 → 并行打下一候选，先回者胜；败者罚冷却
             from server.core.race import NoMoreCandidates as _NoMore, RaceAllFailed as _RaceAllFailed, run_race as _run_race
             _rc_cfg = getattr(config, "race", None)

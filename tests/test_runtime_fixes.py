@@ -636,7 +636,8 @@ def test_chunk_has_substance_lock_semantics():
 
 
 def test_combo_stream_max_fallbacks_contract():
-    """总尝试 = min(候选数, max_fallbacks + 1)——与 auto 契约一致。"""
+    """候选游标语义。注意：combo 的流式/非流式路径**不受 max_fallbacks 截断**
+    （组合候选是用户显式配置 → 全部尝试；2026-09-20 修正），max_fallbacks 窗口只限 auto。"""
     from server.core.combo_router import pick_next_index
 
     assert pick_next_index(1, 5, "fallback") == 0
