@@ -113,9 +113,17 @@
       </table>
       <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0;">
         <span style="color: var(--gray-500); font-size: 13px;">共 {{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页</span>
-        <div style="display: flex; gap: 8px;">
+        <div style="display: flex; gap: 8px; align-items: center;">
           <button class="btn btn-outline btn-sm" :disabled="page <= 1" @click="loadPage(page - 1)">上一页</button>
           <button class="btn btn-outline btn-sm" :disabled="page >= totalPages" @click="loadPage(page + 1)">下一页</button>
+          <span style="display: flex; gap: 4px; align-items: center; margin-left: 4px;">
+            跳至
+            <input v-model.number="pageJump" type="number" min="1" :max="totalPages"
+                   @keyup.enter="jumpToPage"
+                   style="width: 64px; padding: 4px 6px; font-size: 13px;" />
+            页
+            <button class="btn btn-outline btn-sm" @click="jumpToPage">跳转</button>
+          </span>
         </div>
       </div>
     </div>
@@ -547,6 +555,7 @@ export default {
       summary: null,
       items: [],
       page: 1,
+      pageJump: null,
       total: 0,
       totalPages: 1,
       filterStatus: '',
@@ -887,6 +896,8 @@ export default {
       this.trendTipY = yPx
     },
     async loadPage(p) {
+      // 换页才同步跳转输入框；5s 自动刷新原位重载不动用户正在输入的内容
+      if (p !== this.page) this.pageJump = p
       this.page = p
       const params = { page: p, page_size: 10 }
       if (this.filterStatus) params.status = this.filterStatus
@@ -897,6 +908,13 @@ export default {
         this.total = data.total || 0
         this.totalPages = data.total_pages || 1
       } catch (e) { toast.error('加载日志失败: ' + e.message) }
+    },
+    jumpToPage() {
+      let n = parseInt(this.pageJump, 10)
+      if (!Number.isFinite(n) || n < 1) n = 1
+      if (n > this.totalPages) n = this.totalPages
+      if (n === this.page) { this.pageJump = n; return }
+      this.loadPage(n)
     },
     showDetail(r, full = false) {
       this.detailLoading = true
