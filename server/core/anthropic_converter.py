@@ -55,6 +55,7 @@ def anthropic_to_openai_request(req: dict) -> dict:
             images = []
             tool_calls = []
             reasoning_text = ""
+            _emitted_tool_result = False  # P0-5: 本条消息已产出 tool 消息则不再补空兜底
             for block in (content or []):
                 btype = block.get("type", "")
                 if btype == "text":
@@ -103,8 +104,11 @@ def anthropic_to_openai_request(req: dict) -> dict:
                         if img_urls:
                             tc_content = (str(tc_content) + "\n" if tc_content else "") + "\n".join(
                                 f"[image attached: {u[:64]}...]" for u in img_urls)
+                    # P0-5: tool_result → OpenAI role:"tool"（Anthropic 侧它挂在 user 消息里，
+                    # 但转成 OpenAI 语义必须是 tool 消息，否则 tool_use/tool_result 配对断裂）
+                    _emitted_tool_result = True
                     messages.append({
-                        "role": role,
+                        "role": "tool",
                         "content": str(tc_content),
                         "tool_call_id": block.get("tool_use_id", ""),
                     })
@@ -129,7 +133,8 @@ def anthropic_to_openai_request(req: dict) -> dict:
                 messages.append(m)
             elif reasoning_text:
                 messages.append({"role": role, "content": "", "reasoning_content": reasoning_text})
-            else:
+            elif not _emitted_tool_result:
+                # P0-5: 纯 tool_result 消息已在上面产出 tool 消息，不再凭空追加空 user 消息
                 messages.append({"role": role, "content": ""})
         else:
             messages.append({"role": role, "content": content})

@@ -393,6 +393,13 @@ class AnthropicAdapter(BaseAdapter):
         tool_buf = {}
         text_done_marker = False
         _produced = False  # 整个流是否产出过任何有效事件（内容/思考/工具/usage）
+        # P0-4: 终态只发一次——message_delta 已发 finish / error 事件终止后，不再补发 stop
+        _finish_sent = False
+        _error_sent = False
+        # P1-11: message_start 携带 input/cache usage（官方 usage 语义所在），先缓存，
+        # 与 message_delta 的 output usage 合并后一次性下发，避免 prompt_tokens=0 走粗估。
+        _start_usage = {}
+        _usage_emitted = False
         async with httpx.AsyncClient(timeout=(5, self.timeout * 5), **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
@@ -426,6 +433,10 @@ class AnthropicAdapter(BaseAdapter):
                     evt = data.get("type")
                     if evt == "message_start":
                         msg = data.get("message") or {}
+                        # P1-11: 缓存 message_start 的 usage（input_tokens/cache_* 在这里）
+                        _su = msg.get("usage") or {}
+                        if isinstance(_su, dict) and _su:
+                            _start_usage = _su
                         for c in (msg.get("content") or []):
                             idx = c.get("index", 0)
                             current_block_idx = idx
@@ -499,35 +510,58 @@ class AnthropicAdapter(BaseAdapter):
                             if tool_calls:
                                 chunk["choices"][0]["delta"]["tool_calls"] = tool_calls
                             _produced = True
+                            _finish_sent = True
                             yield chunk
                         usage = (data.get("usage") or {})
-                        if usage:
+                        # P1-11: 合并 message_start 的 input/cache usage 与 delta 的 output usage
+                        _merged_usage = dict(usage) if isinstance(usage, dict) else {}
+                        for _uk in ("input_tokens", "cache_read_input_tokens",
+                                    "cache_creation_input_tokens"):
+                            if not _merged_usage.get(_uk) and _start_usage.get(_uk):
+                                _merged_usage[_uk] = _start_usage[_uk]
+                        if _merged_usage:
                             _produced = True
+                            _usage_emitted = True
                             yield {
                                 "id": chunk_id, "object": "chat.completion.chunk",
                                 "created": created, "model": model_name,
                                 "choices": [],
                                 # P1-4: 统一归一化（prompt 含缓存）
-                                "usage": normalize_usage(usage).to_openai_chat(),
+                                "usage": normalize_usage(_merged_usage).to_openai_chat(),
                             }
                         continue
                     if evt == "message_stop":
                         continue
                     if evt == "error":
                         err = data.get("error") or {}
+                        _error_sent = True
                         yield {"error": err.get("message") or "upstream error"}
                         break
-        if _produced:
-            yield {
-                "id": chunk_id, "object": "chat.completion.chunk",
-                "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
+        # P0-4: 终态收敛——已发过 finish 或 error 后不再补发 stop，
+        # 杜绝同 choice 双 finish / error 被 stop 伪装成成功。
+        if _error_sent:
+            pass
         else:
-            # 整个流没有任何有效事件（内容/思考/工具/usage），视为上游空/失败响应
-            # （典型：代理出口被 WAF/验证码拦截）。判为错误，让网关记为 error，
-            # 避免客户端把"空成功"当成完成而无限重试。
-            yield {"error": "upstream returned empty stream (no SSE events; possible proxy/WAF block)"}
+            if not _usage_emitted and _start_usage:
+                # 截断流（无 message_delta usage）也要把 input/cache 计量带出去
+                _usage_emitted = True
+                yield {
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [],
+                    "usage": normalize_usage(_start_usage).to_openai_chat(),
+                }
+            if _produced and not _finish_sent:
+                yield {
+                    "id": chunk_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+            elif not _produced:
+                # 整个流没有任何有效事件（内容/思考/工具/usage），视为上游空/失败响应
+                # （典型：代理出口被 WAF/验证码拦截返回的 HTML 页）。判为错误，让网关记为 error，
+                # 避免客户端把"空成功"当成完成而无限重试。
+                yield {"error": "upstream returned empty stream (no SSE events; possible proxy/WAF block)"}
     def _builtin_models(self) -> List[ModelInfo]:
         return [
             ModelInfo(model_id=mid, display_name=name, input_price=15.0 if "opus" in mid else 3.0,

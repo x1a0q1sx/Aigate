@@ -200,8 +200,9 @@ class DaemonClient:
                     s = line.strip()
                     if not s or s.startswith(":"):
                         continue
-                    if s.startswith("data: "):
-                        s = s[6:]
+                    # P1-23: 容忍 "data:" 后无空格
+                    if s.startswith("data:"):
+                        s = s[5:].lstrip()
                     ev = _parse_sse(s)
                     if ev is not None:
                         yield ev

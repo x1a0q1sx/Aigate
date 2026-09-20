@@ -87,3 +87,15 @@ token_saver:
 token_saver_extra:
   caveman_enabled: false
   ponytail_enabled: false
+
+# 流口水自动冷却：同一模型连续 N 次返回一字不差的相同答案 → 强制罚时冷却
+drool_guard:
+  enabled: true
+  threshold: 5
+  cooldown_minutes: 30
+  min_answer_chars: 40
+
+# 候选竞速：组合/auto 中候选 N 秒没返回内容 → 并行打下一候选，先返回者胜，败者罚冷却
+race:
+  enabled: true
+  no_content_seconds: 15

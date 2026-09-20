@@ -112,7 +112,9 @@ async def check_budget(db, key_id: int) -> dict:
         )
     )).first()
     pt, ct, crt, cwt, cost, reqs = row
-    tokens = int(pt or 0) + int(ct or 0) + int(crt or 0) + int(cwt or 0)
+    # P1-9: 归一化契约里 prompt_tokens 已包含缓存读写 token（_segmented_cost 的
+    # max(0, pt-crt-cwt) 反证），再叠加 crt/cwt 会让预算最快双倍速耗尽 → 只算 pt+ct
+    tokens = int(pt or 0) + int(ct or 0)
     cost = float(cost or 0)
     key = (await db.execute(
         select(GatewayKey.daily_token_limit, GatewayKey.daily_cost_limit_usd)

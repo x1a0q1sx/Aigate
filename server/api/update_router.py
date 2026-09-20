@@ -72,16 +72,23 @@ def _probe_proxy() -> Optional[str]:
 
 
 def _git(args: str, capture=True) -> subprocess.CompletedProcess:
-    """执行 git 命令。探测到可用代理时临时注入 -c 参数（不改全局配置）。"""
+    """执行 git 命令。探测到可用代理时临时注入 -c 参数（不改全局配置）。
+
+    P1-16: 必带超时——远端黑洞时 subprocess 会挂到天荒地老，
+    调用方都是 async 路由，事件循环冻结 = 全部 /v1 流量停摆。"""
     proxy = _probe_proxy()
     cmd = "git"
     if proxy:
         cmd += f' -c http.proxy={proxy} -c https.proxy={proxy}'
     cmd += f" {args}"
-    return subprocess.run(
-        cmd, cwd=str(ROOT), shell=True, capture_output=capture,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    try:
+        return subprocess.run(
+            cmd, cwd=str(ROOT), shell=True, capture_output=capture,
+            text=True, encoding="utf-8", errors="replace", timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=124, stdout="", stderr="git command timed out after 120s")
 
 
 def _read_log(tail: int = 300) -> str:
@@ -133,9 +140,8 @@ def _current_commit() -> dict:
         return {"sha": "", "message": "", "date": ""}
 
 
-@router.get("/check")
-async def check_update():
-    """检查更新：git fetch 后对比本地/远端 HEAD，返回是否可更新及更新内容。"""
+def _check_update_sync():
+    """Check for updates: after git fetch, compare local/remote HEAD, return whether an update is available and what the update contains."""
     current = _current_commit()
     result = {
         "current": current,
@@ -189,6 +195,13 @@ async def check_update():
     return result
 
 
+@router.get("/check")
+async def check_update():
+    # P1-16: git fetch/代理探测全是阻塞操作，必须线程化——
+    # 远端不可达时同步挂 1~3 分钟会冻结事件循环，期间全部 /v1 流量停摆。
+    return await asyncio.to_thread(_check_update_sync)
+
+
 @router.post("/apply")
 async def apply_update():
     """后台执行更新（scripts/update.py --stash）。执行期间请勿重复触发。"""
@@ -202,7 +215,8 @@ async def apply_update():
     try:
         # 给子进程注入可用代理环境变量（update.py 内部 git 命令会继承）
         env = os.environ.copy()
-        proxy = _probe_proxy()
+        # P1-16: 同步 TCP 探测线程化，避免卡事件循环
+        proxy = await asyncio.to_thread(_probe_proxy)
         if proxy:
             env["http_proxy"] = proxy
             env["https_proxy"] = proxy

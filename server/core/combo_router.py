@@ -110,17 +110,21 @@ async def resolve_combo_targets(
             # v4.0: 服务商被禁用 → 请求时跳过该候选，但保留组合顺序不删除
             if not getattr(provider, "enabled", True):
                 continue
+            # P1-2: 查询不带 enabled 过滤——禁用模型"跳过不删"（与 provider 禁用豁免对齐）。
+            # 此前查不到禁用模型即判 stale 顺手清出组合，与注释承诺矛盾。
             m_result = await db.execute(
                 select(Model).where(
                     Model.provider_id == provider.id,
                     Model.model_id == mod_id,
-                    Model.enabled == True,
                 ).limit(1)
             )
             model = m_result.scalar_one_or_none()
             if not model:
                 # 模型已在刷新中被上游移除 → 失效，自动删除
                 stale_idx.append(idx)
+                continue
+            if not model.enabled:
+                # 临时禁用：请求时跳过，保留组合顺序不删除
                 continue
             targets.append({
                 "provider": provider,
@@ -198,11 +202,11 @@ async def prune_stale_combo_targets(db: AsyncSession) -> int:
                 if not getattr(p, "enabled", True):
                     cleaned.append(item)
                     continue
+                # P1-2: 同 resolve——禁用模型只跳过保留，不标失效删除
                 m = (await db.execute(
                     select(Model).where(
                         Model.provider_id == p.id,
                         Model.model_id == mod_id,
-                        Model.enabled == True,
                     ).limit(1)
                 )).scalar_one_or_none()
                 if not m:

@@ -251,14 +251,36 @@ async def stop_log_queue() -> None:
     global stopped, _worker_task
     stopped = True
     if _worker_task is not None and not _worker_task.done():
-        # worker 在 stopped=True 后会把队列剩余部分取完（get 超时循环退出前再清一轮）
-        q = _get_queue()
-        deadline = time.time() + 8
-        while not q.empty() and time.time() < deadline:
-            await asyncio.sleep(0.1)
+        # P1-8: worker 的 while not stopped 循环在 stopped=True 后直接退出、不会排空——
+        # 旧注释是错的，且 "while not q.empty()" 会白等 8s 后把未落库日志全丢
+        # （重启后这些 pending 行 30 分钟被 sweep 成 error，虚增错误率）。
+        # 现在：先让 worker 自然收尾（≤2s），再在本函数内把剩余队列成批落库。
         try:
-            await asyncio.wait_for(_worker_task, timeout=5)
+            await asyncio.wait_for(_worker_task, timeout=2)
         except Exception:
-            pass
+            if not _worker_task.done():
+                _worker_task.cancel()
+        _worker_task = None
+    q = _get_queue()
+    deadline = time.time() + 8
+    drained = 0
+    while not q.empty() and time.time() < deadline:
+        batch = []
+        while len(batch) < _BATCH_MAX:
+            try:
+                batch.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not batch:
+            break
+        try:
+            await _write_batch(batch)
+            drained += len(batch)
+        except Exception as e:
+            stats["errors"] += 1
+            stats["last_error"] = f"drain: {str(e)[:150]}"
+            break
+    if drained:
+        stats["written"] = stats.get("written", 0) + drained
     _worker_task = None
-    logger.info("Log write queue stopped: %s", stats)
+    logger.info("Log write queue stopped (drained %d): %s", drained, stats)

@@ -64,12 +64,18 @@ def test_response_cache_disabled(monkeypatch):
 # ─────────────── E2: combo 权重抽签 ───────────────
 
 def test_pick_start_index_weighted_respects_weight():
+    import random as _rnd
     from server.core.combo_router import pick_start_index
     targets = [{"full_id": "a", "weight": 100}, {"full_id": "b", "weight": 0.001}]
+    _rnd.seed(42)
     picks = {pick_start_index(targets, 1, "weighted") for _ in range(200)}
-    assert picks == {0, 1} or picks == {0}   # 高权重几乎必中；允许极小概率出现 1
+    assert picks == {0}   # 高权重 100:0.001 → 200 次必中 0（固定种子保证确定性）
     zero = [{"full_id": "a", "weight": 100}, {"full_id": "b", "weight": 0}]
-    assert pick_start_index(zero, 1, "weighted") == 0  # weight<=0 视为 1，不崩
+    picks_z = [pick_start_index(zero, 1, "weighted") for _ in range(200)]
+    assert set(picks_z) <= {0, 1}            # weight<=0 视为 1（100:1 仍会偶中），不崩不返回越界
+    assert picks_z.count(0) > 150            # 高权重占绝对多数
+    _rnd.seed(43)
+    assert all(p in (0, 1) for p in picks_z)
     assert pick_start_index(targets, 1, "fallback") == 0
     assert pick_start_index(targets, 1, "round_robin") in (0, 1)
 

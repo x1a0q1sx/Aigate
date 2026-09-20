@@ -327,8 +327,10 @@ class OpenAICompatAdapter(BaseAdapter):
                                 line = line.strip()
                                 if not line:
                                     continue
-                                if line.startswith('data: '):
-                                    line = line[6:]
+                                # P1-23: SSE 规范里 "data:" 后的空格可选；此前只认带空格形态，
+                                # 无空格上游整条流被静默丢弃。与聚合路径 startswith("data:") 对齐。
+                                if line.startswith('data:'):
+                                    line = line[5:].lstrip()
                                 if line == '[DONE]':
                                     break
                                 try:

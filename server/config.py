@@ -143,6 +143,21 @@ class OpenAICompatConfig(BaseModel):
 
 class AdaptersConfig(BaseModel):
     openai_compat: OpenAICompatConfig = Field(default_factory=OpenAICompatConfig)
+
+class DroolGuardConfig(BaseModel):
+    """流口水自动冷却：同一模型连续 N 次返回"一字不差"的答案 → 判为复读，罚时冷却。
+    只比对答案正文（忽略 chunk id 等信封差异）；过短回复不参与判定防误伤。"""
+    enabled: bool = True
+    threshold: int = 5             # 连续相同次数
+    cooldown_minutes: int = 30     # 罚时时长（分钟）
+    min_answer_chars: int = 40     # 归一化答案短于此不参与（"好的"之类正常短答复不算复读）
+
+class RaceConfig(BaseModel):
+    """组合/auto 候选竞速：当前候选 N 秒没返回内容 → 不等它，并行打下一候选，
+    谁先出结果用谁；被超前的候选判失败并自动罚冷却。"""
+    enabled: bool = True
+    no_content_seconds: int = 15
+
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -164,6 +179,8 @@ class Config(BaseModel):
     headroom: HeadroomConfig = Field(default_factory=HeadroomConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
+    drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
+    race: RaceConfig = Field(default_factory=RaceConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""
     path = Path(config_path)

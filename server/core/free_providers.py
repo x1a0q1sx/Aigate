@@ -312,8 +312,9 @@ class FreeProviderExecutor:
                         line = line.strip()
                         if not line:
                             continue
-                        if line.startswith("data: "):
-                            line = line[6:]
+                        # P1-23: 容忍 "data:" 后无空格的 SSE 上游
+                        if line.startswith("data:"):
+                            line = line[5:].lstrip()
                         if line == "[DONE]":
                             break
                         try:
@@ -331,8 +332,9 @@ class FreeProviderExecutor:
                             line = line.strip()
                             if not line:
                                 continue
-                            if line.startswith("data: "):
-                                line = line[6:]
+                            # P1-23: 容忍 "data:" 后无空格的 SSE 上游
+                            if line.startswith("data:"):
+                                line = line[5:].lstrip()
                             if line == "[DONE]":
                                 break
                             try:

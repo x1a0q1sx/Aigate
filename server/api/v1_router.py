@@ -847,61 +847,147 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             ))
         max_retries = len(combo_candidates)
     
-    for attempt in range(max_retries + 1):
-        _diag(conversation_id, "auto_candidate_start", diag_start_ts, attempt=attempt)
-        if combo_candidates:
-            if attempt >= len(combo_candidates):
-                break
-            candidate = combo_candidates[attempt]
-        else:
-            candidate = await ar.get_best_candidate(db, conversation_id, exclude_model_ids=tried_ids)
-        _diag(conversation_id, "auto_candidate_done", diag_start_ts, attempt=attempt, success=candidate.success if candidate else None)
-        last_result = candidate
-        if not candidate.success:
-            print(f"[CASCADE-NONSTREAM] exhausted at attempt {attempt}: {candidate.error} tried={tried_ids}", flush=True)
-            attempt_errors.append({"attempt": attempt, "error": candidate.error})
-            break
-        if candidate.model and candidate.model.id in tried_ids:
-            attempt_errors.append({"attempt": attempt, "error": "duplicate candidate, no more options"})
-            break
-        if candidate.model:
-            tried_ids.add(candidate.model.id)
-        # 上下文预检：估算输入装不进窗口的候选直接跳过（不打上游、不进冷却）
-        # P1-5: 按该服务商+模型的历史估算系数校准；observed_context_limit 收紧标称窗口
-        if candidate.model:
-            _pf = await get_estimate_factor(db, candidate.provider.id, candidate.model.model_id)
-            _est_adj = int(est_tokens * _pf)
-            _obs = int(getattr(candidate.model, "observed_context_limit", 0) or 0)
-        if candidate.model and context_overflows(candidate.model, _est_adj, observed_limit=_obs):
-            attempt_errors.append({
-                "attempt": attempt,
-                "model": f"{candidate.provider.name}/{candidate.model.model_id}",
-                "error": f"skip: est ~{_est_adj} tokens (x{_pf:.2f}) > context window {candidate.model.context_length}",
-            })
-            _decision_skip(
-                conversation_id,
-                model_pk=candidate.model.id,
-                provider=candidate.provider.name,
-                model=candidate.model.model_id,
-                reason="context window too small",
+    # ── Race（config.race.enabled）：候选 N 秒无返回 → 并行打下一候选，先回者用；
+    #    被超前的候选判失败+罚冷却。关闭时 max_inflight=1 且无超时 = 旧的顺序回退。──
+    from server.core.race import NoMoreCandidates, RaceAllFailed, run_race
+    _rc_cfg = getattr(config, "race", None)
+    race_on = bool(_rc_cfg and getattr(_rc_cfg, "enabled", False))
+    race_secs = max(3, int(getattr(_rc_cfg, "no_content_seconds", 15) or 15))
+    _db_lock = asyncio.Lock()  # AsyncSession 不可并发使用：DB 短操作串行化，HTTP 在锁外
+
+    class _ASkip(Exception):
+        """预检跳过（上下文装不下等）：记录已在 launch 内完成。"""
+
+    class _AFail(Exception):
+        def __init__(self, msg, cand, raw=None):
+            super().__init__(msg)
+            self.cand = cand
+            self.raw = raw
+
+    ctx_by_attempt = {}
+
+    def _cand_full(candidate):
+        if candidate is not None and candidate.provider and candidate.model:
+            return f"{candidate.provider.name}/{candidate.model.model_id}"
+        return "?"
+
+    async def _record_fail(attempt, candidate, err_short, raw_body=None, cooling=True):
+        attempt_errors.append({
+            "attempt": attempt,
+            "model": _cand_full(candidate),
+            "error": err_short,
+        })
+        _decision_attempt(
+            conversation_id,
+            provider=candidate.provider.name,
+            model=candidate.model.model_id,
+            status="failed",
+            attempt=attempt,
+            latency_ms=int((time.time() - (ctx_by_attempt.get(attempt) or {}).get("start", time.time())) * 1000),
+            error=err_short,
+        )
+        if is_context_error(err_short) and candidate.model:
+            await record_context_overflow(candidate.model.id, est_tokens)
+        elif cooling and ar.health_checker and candidate.model:
+            ar.health_checker.mark_failure(candidate.model.id)
+            ar.health_checker.mark_cooling(
+                candidate.model.id,
+                ar.config.cooling_period_seconds,
             )
-            continue
-        # 发起完整业务请求（非探测）
+        # 写一条失败日志，方便在分析页看到每次尝试（含冷却信息）
+        cd_seconds = ar.config.cooling_period_seconds
+        fc = (ar.health_checker._fail_count.get(candidate.model.id, 0) if ar.health_checker else 0)
+        cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
+        cooldown_note = f" | cooldown={cd_actual}s fail#{fc}"
+        try:
+            import json as _j
+            from server.db import AsyncSessionLocal as _LS
+            _diag(conversation_id, "fallback_log_start", diag_start_ts, attempt=attempt)
+            async with _LS() as _ldb:
+                await write_log(_ldb,
+                    conversation_id=conversation_id,
+                    requested_model=request.model if request else "unknown",
+                    routed_provider=candidate.provider.name,
+                    routed_provider_id=candidate.provider.id,
+                    routed_model=candidate.model.model_id,
+                    status="error",
+                    error_type="upstream_error",
+                    error_msg=err_short[:300] + cooldown_note,
+                    fallback_count=attempt,
+                    **_proxy_log_fields(),
+                    request_body=_j.dumps(request.model_dump(), ensure_ascii=False) if request else None,
+                    response_body=raw_body or err_short,
+                )
+                _diag(conversation_id, "fallback_log_done", diag_start_ts, attempt=attempt)
+        except Exception:
+            _diag(conversation_id, "fallback_log_error", diag_start_ts, attempt=attempt)
+        print(f"[CASCADE-NONSTREAM] attempt {attempt} failed, trying next (tried={tried_ids})", flush=True)
+
+    async def _launch(attempt: int):
+        nonlocal last_result
+        if attempt > max_retries:
+            raise NoMoreCandidates()
+        _diag(conversation_id, "auto_candidate_start", diag_start_ts, attempt=attempt)
+        async with _db_lock:
+            if combo_targets:
+                if attempt >= len(combo_candidates):
+                    raise NoMoreCandidates()
+                candidate = combo_candidates[attempt]
+            else:
+                candidate = await ar.get_best_candidate(db, conversation_id, exclude_model_ids=tried_ids)
+            _diag(conversation_id, "auto_candidate_done", diag_start_ts, attempt=attempt,
+                  success=candidate.success if candidate else None)
+            last_result = candidate
+            if not candidate.success:
+                print(f"[CASCADE-NONSTREAM] exhausted at attempt {attempt}: {candidate.error} tried={tried_ids}", flush=True)
+                attempt_errors.append({"attempt": attempt, "error": candidate.error})
+                raise NoMoreCandidates()
+            if candidate.model and candidate.model.id in tried_ids:
+                attempt_errors.append({"attempt": attempt, "error": "duplicate candidate, no more options"})
+                raise NoMoreCandidates()
+            if candidate.model:
+                tried_ids.add(candidate.model.id)
+            # 上下文预检：估算输入装不进窗口的候选直接跳过（不打上游、不进冷却）
+            # P1-5: 按该服务商+模型的历史估算系数校准；observed_context_limit 收紧标称窗口
+            if candidate.model:
+                _pf = await get_estimate_factor(db, candidate.provider.id, candidate.model.model_id)
+                _est_adj = int(est_tokens * _pf)
+                _obs = int(getattr(candidate.model, "observed_context_limit", 0) or 0)
+                if context_overflows(candidate.model, _est_adj, observed_limit=_obs):
+                    attempt_errors.append({
+                        "attempt": attempt,
+                        "model": _cand_full(candidate),
+                        "error": f"skip: est ~{_est_adj} tokens (x{_pf:.2f}) > context window {candidate.model.context_length}",
+                    })
+                    _decision_skip(
+                        conversation_id,
+                        model_pk=candidate.model.id,
+                        provider=candidate.provider.name,
+                        model=candidate.model.model_id,
+                        reason="context window too small",
+                    )
+                    raise _ASkip("context window too small")
+            # free_tier/oauth/atomcode 候选走统一凭证解析（凭证解析在锁内完成）
+            _cred = None
+            if (getattr(candidate.provider, "credential_type", "api_key") in ("free_tier", "oauth")
+                    or getattr(candidate.provider, "api_type", "") == "atomcode"):
+                from server.core.credential_resolver import resolve_credential_async
+                _rc = await resolve_credential_async(candidate.provider, candidate.model, db)
+                if not _rc.ok:
+                    raise _AFail(_rc.error, candidate)
+                _cred = _rc
+        # 发起完整业务请求（非探测）——HTTP 在锁外
         upstream_request = _without_unsupported_reasoning(
             request.model_copy(update={"model": candidate.model.model_id}), candidate.model
         )
         extra_headers = candidate.provider.headers
+        ctx_by_attempt[attempt] = {"candidate": candidate, "start": time.time()}
+        _diag(conversation_id, "upstream_start", diag_start_ts, attempt=attempt,
+              provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
         try:
-            _attempt_started = time.time()
-            _diag(conversation_id, "upstream_start", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
-            # free_tier/oauth/atomcode 候选走统一凭证解析（free executor / OAuth token / daemon 通道）
-            if (getattr(candidate.provider, "credential_type", "api_key") in ("free_tier", "oauth")
-                    or getattr(candidate.provider, "api_type", "") == "atomcode"):
-                from server.core.credential_resolver import resolve_credential_async, call_via
-                _rc = await resolve_credential_async(candidate.provider, candidate.model, db)
-                if not _rc.ok:
-                    raise RuntimeError(_rc.error)
-                result = await call_via(_rc, upstream_request, candidate.provider, candidate.model)
+            from server.core.credential_resolver import call_via
+            if _cred is not None:
+                result = await call_via(_cred, upstream_request, candidate.provider, candidate.model)
             else:
                 result = await candidate.adapter.chat_completion(
                     upstream_request,
@@ -909,112 +995,98 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                     candidate.provider.base_url,
                     extra_headers,
                 )
-            # 校验返回内容有效性（含 tool_calls）
-            if isinstance(result, dict):
-                choices = result.get("choices", [])
-                usage = result.get("usage", {})
-                has_content = any(
-                    c.get("message", {}).get("content") or c.get("delta", {}).get("content")
-                    or c.get("message", {}).get("tool_calls") or c.get("delta", {}).get("tool_calls")
-                    or c.get("text")
-                    for c in choices
-                ) if choices else False
-                if not choices or not has_content:
-                    raise ValueError(f"empty_response: choices={len(choices)} tokens={usage.get('completion_tokens', 0)}")
-            _diag(conversation_id, "upstream_done", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
-            # 成功
-            route = RouteResult(
-                success=True,
-                model=candidate.model,
-                provider=candidate.provider,
-                api_key=candidate.api_key,
-                adapter=candidate.adapter,
-                fallback_count=attempt,
-            )
-            # 确保返回结果中的 model 字段已设为完整标识
-            if isinstance(result, dict):
-                result["model"] = f"{candidate.provider.name}/{candidate.model.model_id}"
-            if ar.health_checker:
-                ar.health_checker.mark_success(candidate.model.id)
-            _decision_attempt(
-                conversation_id,
-                provider=candidate.provider.name,
-                model=candidate.model.model_id,
-                status="success",
-                attempt=attempt,
-                latency_ms=int((time.time() - _attempt_started) * 1000),
-            )
-            return route, result, attempt_errors
+        except asyncio.CancelledError:
+            ctx_by_attempt[attempt]["cancelled"] = True
+            raise
         except Exception as e:
-            _diag(conversation_id, "upstream_error", diag_start_ts, attempt=attempt, provider=candidate.provider.name, model=candidate.model.model_id, error=type(e).__name__)
-            err_short = f"{type(e).__name__}: {str(e)[:200]}"
-            attempt_errors.append({
-                "attempt": attempt,
-                "model": f"{candidate.provider.name}/{candidate.model.model_id}",
-                "error": err_short,
-            })
-            _decision_attempt(
-                conversation_id,
-                provider=candidate.provider.name,
-                model=candidate.model.model_id,
-                status="failed",
-                attempt=attempt,
-                latency_ms=int((time.time() - _attempt_started) * 1000),
-                error=err_short,
-            )
-            if is_context_error(err_short) and candidate.model:
-                await record_context_overflow(candidate.model.id, est_tokens)
-            elif ar.health_checker:
-                ar.health_checker.mark_failure(candidate.model.id)
-                ar.health_checker.mark_cooling(
-                    candidate.model.id,
-                    ar.config.cooling_period_seconds,
-                )
-            # 写一条失败日志，方便在分析页看到每次尝试（含冷却信息）
-            cd_seconds = ar.config.cooling_period_seconds
-            fc = (ar.health_checker._fail_count.get(candidate.model.id, 0) if ar.health_checker else 0)
-            cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
-            cooldown_note = f" | cooldown={cd_actual}s fail#{fc}"
-            try:
-                import json as _j
-                from server.db import AsyncSessionLocal as _LS
-                from server.models.request_log import RequestLog as _RL
-                _diag(conversation_id, "fallback_log_start", diag_start_ts, attempt=attempt)
-                async with _LS() as _ldb:
-                    await write_log(_ldb,
-                        conversation_id=conversation_id,
-                        requested_model=request.model if request else "unknown",
-                        routed_provider=candidate.provider.name,
-                        routed_provider_id=candidate.provider.id,
-                        routed_model=candidate.model.model_id,
-                        status="error",
-                        error_type="upstream_error",
-                        error_msg=err_short + cooldown_note,
-                        fallback_count=attempt,
-                        **_proxy_log_fields(),
-                        request_body=_j.dumps(request.model_dump(), ensure_ascii=False) if request else None,
-                        response_body=_extract_error_body(e) or err_short,
-                    )
-                    _diag(conversation_id, "fallback_log_done", diag_start_ts, attempt=attempt)
-            except Exception:
-                _diag(conversation_id, "fallback_log_error", diag_start_ts, attempt=attempt)
-                pass
-            print(f"[CASCADE-NONSTREAM] attempt {attempt} failed, trying next (tried={tried_ids})", flush=True)
-            continue
-    # 全部失败
-    print(f"[CASCADE-NONSTREAM] all {max_retries+1} attempts exhausted", flush=True)
+            raise _AFail(f"{type(e).__name__}: {str(e)[:200]}", candidate,
+                         raw=_extract_error_body(e)) from e
+        ctx_by_attempt[attempt]["send_end"] = time.time()
+        # 校验返回内容有效性（含 tool_calls）
+        if isinstance(result, dict):
+            choices = result.get("choices", [])
+            usage = result.get("usage", {})
+            has_content = any(
+                c.get("message", {}).get("content") or c.get("delta", {}).get("content")
+                or c.get("message", {}).get("tool_calls") or c.get("delta", {}).get("tool_calls")
+                or c.get("text")
+                for c in choices
+            ) if choices else False
+            if not choices or not has_content:
+                raise _AFail(f"empty_response: choices={len(choices)} tokens={usage.get('completion_tokens', 0)}",
+                             candidate)
+        _diag(conversation_id, "upstream_done", diag_start_ts, attempt=attempt,
+              provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
+        return {"attempt": attempt, "candidate": candidate, "result": result}
+
+    async def _on_fail(attempt, et, exc):
+        if isinstance(exc, _ASkip):
+            return  # 预检跳过的记录已在 launch 完成
+        cand = getattr(exc, "cand", None) or (ctx_by_attempt.get(attempt) or {}).get("candidate")
+        if cand is None:
+            attempt_errors.append({"attempt": attempt, "error": et})
+            return
+        await _record_fail(attempt, cand, et, raw_body=getattr(exc, "raw", None))
+
+    async def _on_loser(attempt):
+        ctx = ctx_by_attempt.get(attempt)
+        if ctx is None or ctx.get("send_end"):
+            return  # 其实已返回（只是没赢），不按失败处理
+        cand = ctx["candidate"]
+        et = (f"race_overtaken: {race_secs}s 内无返回，被更快候选取代（自动罚时冷却）")
+        await _record_fail(attempt, cand, et, raw_body=et)
+
     try:
-        from server.core.notifier import notify_event as _notify_event
-        _notify_event("all_failed", f"auto 级联全部候选失败（非流式，{max_retries+1} 次尝试，末次错误：{str(attempt_errors[-1].get('error') if attempt_errors else '未知')[:120]}）")
-    except Exception:
-        pass
-    terminal_error = None
-    if attempt_errors:
-        terminal_error = attempt_errors[-1].get("error")
-    if not terminal_error and last_result:
-        terminal_error = last_result.error
-    failed = RouteResult(success=False, error=terminal_error or "all candidates failed")
-    return failed, {"error": failed.error, "attempts": attempt_errors}, attempt_errors
+        _, win = await run_race(
+            _launch,
+            no_content_seconds=(race_secs if race_on else None),
+            max_inflight=(2 if race_on else 1),
+            on_failure=_on_fail, on_loser=_on_loser)
+    except RaceAllFailed:
+        # 全部失败
+        print(f"[CASCADE-NONSTREAM] all attempts exhausted ({len(ctx_by_attempt)} candidate attempts)", flush=True)
+        try:
+            from server.core.notifier import notify_event as _notify_event
+            _notify_event("all_failed",
+                          f"auto 级联全部候选失败（非流式，{len(ctx_by_attempt)} 次尝试，"
+                          f"末次错误：{str(attempt_errors[-1].get('error') if attempt_errors else '未知')[:120]}）")
+        except Exception:
+            pass
+        terminal_error = None
+        if attempt_errors:
+            terminal_error = attempt_errors[-1].get("error")
+        if not terminal_error and last_result:
+            terminal_error = last_result.error
+        failed = RouteResult(success=False, error=terminal_error or "all candidates failed")
+        return failed, {"error": failed.error, "attempts": attempt_errors}, attempt_errors
+
+    # ── 胜出候选 ──
+    attempt = win["attempt"]
+    candidate = win["candidate"]
+    result = win["result"]
+    _attempt_started = (ctx_by_attempt.get(attempt) or {}).get("start", time.time())
+    route = RouteResult(
+        success=True,
+        model=candidate.model,
+        provider=candidate.provider,
+        api_key=candidate.api_key,
+        adapter=candidate.adapter,
+        fallback_count=attempt,
+    )
+    # 确保返回结果中的 model 字段已设为完整标识
+    if isinstance(result, dict):
+        result["model"] = f"{candidate.provider.name}/{candidate.model.model_id}"
+    if ar.health_checker and candidate.model:
+        ar.health_checker.mark_success(candidate.model.id)
+    _decision_attempt(
+        conversation_id,
+        provider=candidate.provider.name,
+        model=candidate.model.model_id,
+        status="success",
+        attempt=attempt,
+        latency_ms=int((time.time() - _attempt_started) * 1000),
+    )
+    return route, result, attempt_errors
 
 
 async def _write_stream_log(conversation_id, request, raw_request, status,
@@ -1258,14 +1330,15 @@ async def chat_completions(
     request, _combo_err = await _apply_combo_scope(db, raw_request, request)
     if _combo_err is not None:
         return _combo_err
+    # P0-3: 缓存查询必须在网关鉴权之后 → 移到 _chat_completions_impl（verify 通过后）
     from server.core.response_cache import response_cache
-    _cached = response_cache.get(request)
-    if _cached is not None:
-        return JSONResponse(content=_cached)
     resp = await _chat_completions_impl(request, raw_request, db)
     if isinstance(resp, JSONResponse) and resp.status_code == 200:
         try:
-            response_cache.put(request, json.loads(resp.body))
+            _body = json.loads(resp.body)
+            # 错误体不缓存（上游/网关以 200 返回的 {"error":...} 伪装成功响应）
+            if isinstance(_body, dict) and "error" not in _body:
+                response_cache.put(request, _body)
         except Exception:
             pass
     return resp
@@ -1304,6 +1377,28 @@ async def _chat_completions_impl(
         except Exception:
             pass
         raise auth_err
+    # P0-3: 响应缓存查询放在鉴权之后——未授权客户端无法再靠重放请求体白取他人缓存。
+    # 命中记一条 cache-hit 日志（不走上游，但审计可见）。
+    try:
+        from server.core.response_cache import response_cache as _rcache
+        _cached = _rcache.get(request)
+    except Exception:
+        _cached = None
+    if _cached is not None:
+        try:
+            from server.core.log_queue import enqueue_log as _enq_hit
+            await _enq_hit(
+                conversation_id=conversation_id,
+                requested_model=request.model,
+                status="success",
+                http_status=200,
+                latency_ms=0,
+                user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
+                is_health_check=False,
+            )
+        except Exception:
+            pass
+        return JSONResponse(content=_cached)
     # 请求开始即预落一条「待响应」日志：等上游响应期间日志页即可见（500ms 内出现），
     # 完成时日志队列按 conversation_id 原位更新为最终状态（success/error，单行不补插）。
     try:
@@ -1539,183 +1634,187 @@ async def _chat_completions_impl(
                 return JSONResponse(fresp)
 
             # ─── 流式 combo：统一级联回退（带冷却），与 auto 流式行为一致 ───
+            # Race（config.race.enabled）：当前候选 N 秒没有返回实质内容 → 不杀它，
+            # 并行再打下一候选；谁先出实质内容用谁，落败候选自动罚冷却。
+            # 关闭时 max_inflight=1、无超时 → 完全退化为旧的顺序回退。
             if request.stream:
                 _diag(conversation_id, "combo_stream_start", _diag_start, count=len(combo_full_ids))
+                from server.core.race import NoMoreCandidates as _NoMore, RaceAllFailed as _RaceAllFailed, run_race as _run_race
+
+                _rc_cfg = getattr(config, "race", None)
+                _race_on = bool(_rc_cfg and getattr(_rc_cfg, "enabled", False))
+                _race_secs = max(3, int(getattr(_rc_cfg, "no_content_seconds", 15) or 15))
+
+                class _SkipAttempt(Exception):
+                    def __init__(self, msg, *, full_id, prov=None, model=None, pk=None):
+                        super().__init__(msg)
+                        self.info = {"full_id": full_id, "prov": prov, "model": model, "pk": pk}
+
+                class _FailAttempt(Exception):
+                    def __init__(self, msg, ctx, *, raw_err=None, stream_body=None):
+                        super().__init__(msg)
+                        self.ctx = ctx
+                        self.raw_err = raw_err
+                        self.stream_body = stream_body
 
                 async def _combo_cascade_stream():
                     from server.db import AsyncSessionLocal as _CS
                     cdb = _CS()
-                    tried_sids = set()
                     stream_errs = []
+                    ctx_by_idx = {}
                     # max_fallbacks 契约与 auto 对齐：总尝试 = min(候选数, max_fallbacks + 1)
                     max_r = min(len(combo_full_ids), max(1, ar.config.max_fallbacks + 1))
                     yield b": keepalive\n\n"
-                    try:
-                        for st_attempt in range(max_r):
-                            if st_attempt >= len(combo_full_ids):
-                                break
-                            full_id = combo_full_ids[st_attempt]
-                            prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
-                            from server.models.provider import Provider as _P
-                            from server.models.model import Model as _M
-                            from sqlalchemy import select as _sel
-                            p_r = await cdb.execute(_sel(_P).where(_P.name == prov_name).limit(1))
-                            _prov = p_r.scalar_one_or_none()
-                            # v4.0: 服务商被禁用 → 跳过该候选（不删除组合配置）
-                            if _prov is not None and not getattr(_prov, "enabled", True):
-                                stream_errs.append({"attempt": st_attempt, "error": f"provider disabled: {full_id}"})
-                                _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider disabled")
-                                continue
-                            m_r = await cdb.execute(_sel(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
-                            _mdl = m_r.scalar_one_or_none() if m_r is not None else None
-                            if not _prov or not _mdl:
-                                stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
-                                _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
-                                continue
-                            # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
-                            _pf = await get_estimate_factor(cdb, _prov.id, _mdl.model_id)
-                            _est_adj = int(est_req_tokens * _pf)
-                            _obs = int(getattr(_mdl, "observed_context_limit", 0) or 0)
-                            if context_overflows(_mdl, _est_adj, observed_limit=_obs):
-                                stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_mdl.context_length} < est ~{_est_adj} tokens x{_pf:.2f}): {full_id}"})
-                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="context window too small")
-                                continue
-                            # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
-                            # （此前 free_tier/oauth 候选被无条件跳过，可能耗尽回退）
-                            from server.core.credential_resolver import resolve_credential_async, stream_via
-                            _rc = await resolve_credential_async(_prov, _mdl, cdb)
-                            if not _rc.ok:
-                                stream_errs.append({"attempt": st_attempt, "error": _rc.error})
-                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason=_rc.error)
-                                continue
-                            # 跳过处于冷却（被惩罚）中的 target，避免反复打到坏模型
-                            if ar.health_checker and ar.health_checker.is_cooling(_mdl.id):
-                                stream_errs.append({"attempt": st_attempt, "error": f"skipped (cooling) {full_id}"})
-                                _decision_skip(conversation_id, model_pk=_mdl.id, provider=_prov.name, model=_mdl.model_id, reason="model is cooling down")
-                                continue
-                            mid_full = f"{_prov.name}/{_mdl.model_id}"
-                            _decision_select(conversation_id, provider=_prov.name, model=_mdl.model_id, model_pk=_mdl.id, reason="next combo target")
-                            up_req = _without_unsupported_reasoning(
-                                request.model_copy(update={"model": _mdl.model_id}), _mdl
-                            )
-                            _start = time.time()
-                            try:
-                                _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt, provider=_prov.name, model=_mdl.model_id)
-                                _csc = 0
-                                _cbuf = []
-                                _cu = {}
-                                _cb_ttft_ms = None
-                                _cb_attempt_ttft_ms = None
-                                _fb_eh = _merge_oauth_headers(_prov, _prov.headers)
-                                _fbmov = getattr(_mdl, "request_overrides", None) or {}
-                                if isinstance(_fbmov, dict) and _fbmov.get("headers"):
-                                    _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
-                                # free_tier 走专用 executor（FORCE_PROXY/裸 model_id 由 resolver 处理）
-                                if _rc.kind == "free_tier":
-                                    gen = stream_via(_rc, up_req, _prov, _mdl)
-                                else:
-                                    gen = _rc.adapter.stream_chat_completion(up_req, _rc.api_key, _prov.base_url, _fb_eh)
-                                # ── 实质 chunk 锁定语义：实质（正文/思考/工具调用）出现前只缓冲元数据；
-                                #    出现即 flush 锁定候选；流结束仍无实质 → 丢弃缓冲无感回退，
-                                #    彻底避免"候选A的 reasoning + 候选B的正文"拼接 ──
-                                _prebuf = []
-                                _committed = False
-                                async for ck in gen:
-                                    # 首字延迟：首个 chunk 距请求开始的时间
-                                    if _cb_ttft_ms is None:
-                                        _cb_ttft_ms = int((time.time() - _send_time) * 1000)
-                                        _cb_attempt_ttft_ms = int((time.time() - _start) * 1000)
-                                    if isinstance(ck, dict) and "error" in ck:
-                                        raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
-                                    _csc += 1
-                                    _cbuf.append(ck)
-                                    u = _stream_usage_dict(ck) if isinstance(ck, dict) else {}
-                                    if u:
-                                        _cu = u
-                                    if not _committed:
-                                        if _chunk_has_substance(ck):
-                                            _committed = True
-                                            for _pb in _prebuf:
-                                                yield _format_sse_chunk(_pb, mid_full)
-                                            _prebuf.clear()
-                                            yield _format_sse_chunk(ck, mid_full)
-                                        else:
-                                            _prebuf.append(ck)
-                                    else:
-                                        yield _format_sse_chunk(ck, mid_full)
-                                _diag(conversation_id, "upstream_stream_done", _diag_start, attempt=st_attempt, provider=_prov.name, model=_mdl.model_id, chunks=_csc)
-                                # ── 空输出判定：已锁定（外发过实质内容）→ 成功；否则缓冲未外发，无感回退 ──
-                                if not _committed:
-                                    err_s = "empty_stream_output: 上游返回成功但无实质内容"
-                                    stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
-                                    _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
-                                    if ar.health_checker:
-                                        ar.health_checker.mark_failure(_mdl.id)
-                                        ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
-                                    print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={_prov.name} 模型={_mdl.model_id} 空输出，正在尝试下一个候选", flush=True)
-                                    import json as _cj
-                                    await _write_stream_log(conversation_id, request, raw_request, "error",
-                                        _prov.name, _mdl.model_id, err_s, st_attempt, None,
-                                        stream_body=_cj.dumps(_cbuf, ensure_ascii=False) if _cbuf else None, diag_start_ts=_diag_start)
-                                    continue
-                                # 注意：成功日志必须在 yield [DONE] 之前写。
-                                # 客户端收到 [DONE] 会立即断开连接，生成器被取消，
-                                # 若日志写在 DONE 之后，await commit 会被取消导致成功日志丢失。
-                                import json as _cj
-                                _combo_latency = int((time.time() - _start) * 1000)
-                                _combo_body = _cj.dumps(_cbuf, ensure_ascii=False) if _cbuf else None
-                                _nu = _normalize_usage(_cu)
-                                _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
-                                _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
-                                _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_chunks(_cbuf))
-                                _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="success", attempt=st_attempt, latency_ms=_combo_latency, ttft_ms=_cb_attempt_ttft_ms)
-                                await _write_stream_log(conversation_id, request, raw_request, "success",
-                                    _prov.name, _mdl.model_id, None, st_attempt, None,
-                                    stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
-                                    cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                                    latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms, diag_start_ts=_diag_start,
-                                    est_prompt_tokens=est_req_tokens)
-                                if ar.health_checker:
-                                    ar.health_checker.mark_success(_mdl.id)
-                                yield b"data: [DONE]\n\n"
-                                return
-                            except Exception as se:
-                                err_s = f"{type(se).__name__}: {str(se)[:200]}"
-                                stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
-                                _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _start) * 1000), ttft_ms=_cb_attempt_ttft_ms, error=err_s)
-                                # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                                # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却
-                                if is_context_error(err_s):
-                                    await record_context_overflow(_mdl.id, est_req_tokens)
-                                elif ar.health_checker and not _is_stream_content_validation_error(err_s):
-                                    ar.health_checker.mark_failure(_mdl.id)
-                                    ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
-                                raw_err = _extract_error_body(se) or err_s
-                                # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端；
-                                # 实质内容前失败（仅缓冲元数据）→ 丢弃缓冲，回退下一候选
-                                if _committed:
-                                    yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
-                                    yield b"data: [DONE]\n\n"
-                                    await _write_stream_log(conversation_id, request, raw_request, "error",
-                                        _prov.name, _mdl.model_id, err_s, st_attempt, stream_errs,
-                                        stream_body=raw_err, diag_start_ts=_diag_start)
-                                    return
-                                await _write_stream_log(conversation_id, request, raw_request, "error",
-                                    _prov.name, _mdl.model_id, err_s, st_attempt, None,
-                                    stream_body=raw_err, diag_start_ts=_diag_start)
-                                print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={_prov.name} 模型={_mdl.model_id} 失败：{err_s}，正在尝试下一个候选", flush=True)
-                                continue
-                        # 全部候选失败
+
+                    async def _launch(st_attempt: int):
+                        if st_attempt >= max_r:
+                            raise _NoMore()
+                        full_id = combo_full_ids[st_attempt]
+                        prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
+                        from server.models.provider import Provider as _P
+                        from server.models.model import Model as _M
+                        from sqlalchemy import select as _sel
+                        p_r = await cdb.execute(_sel(_P).where(_P.name == prov_name).limit(1))
+                        _prov = p_r.scalar_one_or_none()
+                        # v4.0: 服务商被禁用 → 跳过该候选（不删除组合配置）
+                        if _prov is not None and not getattr(_prov, "enabled", True):
+                            raise _SkipAttempt(f"provider disabled: {full_id}",
+                                               full_id=full_id, prov=prov_name, model=m_id)
+                        m_r = await cdb.execute(_sel(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
+                        _mdl = m_r.scalar_one_or_none() if m_r is not None else None
+                        if not _prov or not _mdl:
+                            raise _SkipAttempt(f"combo target {full_id} not found",
+                                               full_id=full_id, prov=prov_name, model=m_id)
+                        # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
+                        _pf = await get_estimate_factor(cdb, _prov.id, _mdl.model_id)
+                        _est_adj = int(est_req_tokens * _pf)
+                        _obs = int(getattr(_mdl, "observed_context_limit", 0) or 0)
+                        if context_overflows(_mdl, _est_adj, observed_limit=_obs):
+                            raise _SkipAttempt(
+                                f"skip (context window {_mdl.context_length} < est ~{_est_adj} tokens x{_pf:.2f}): {full_id}",
+                                full_id=full_id, prov=_prov.name, model=_mdl.model_id, pk=_mdl.id)
+                        # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
+                        from server.core.credential_resolver import resolve_credential_async, stream_via
+                        _rc = await resolve_credential_async(_prov, _mdl, cdb)
+                        if not _rc.ok:
+                            raise _SkipAttempt(_rc.error, full_id=full_id,
+                                               prov=_prov.name, model=_mdl.model_id, pk=_mdl.id)
+                        # 跳过处于冷却（被惩罚）中的 target，避免反复打到坏模型
+                        if ar.health_checker and ar.health_checker.is_cooling(_mdl.id):
+                            raise _SkipAttempt(f"skipped (cooling) {full_id}", full_id=full_id,
+                                               prov=_prov.name, model=_mdl.model_id, pk=_mdl.id)
+                        mid_full = f"{_prov.name}/{_mdl.model_id}"
+                        _decision_select(conversation_id, provider=_prov.name, model=_mdl.model_id,
+                                         model_pk=_mdl.id, reason="next combo target")
+                        up_req = _without_unsupported_reasoning(
+                            request.model_copy(update={"model": _mdl.model_id}), _mdl)
+                        _start = time.time()
+                        _diag(conversation_id, "upstream_stream_start", _diag_start,
+                              attempt=st_attempt, provider=_prov.name, model=_mdl.model_id)
+                        _fb_eh = _merge_oauth_headers(_prov, _prov.headers)
+                        _fbmov = getattr(_mdl, "request_overrides", None) or {}
+                        if isinstance(_fbmov, dict) and _fbmov.get("headers"):
+                            _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
+                        # free_tier 走专用 executor（FORCE_PROXY/裸 model_id 由 resolver 处理）
+                        if _rc.kind == "free_tier":
+                            # P0-1: stream_via 是协程函数，必须 await 拿到异步生成器
+                            gen = await stream_via(_rc, up_req, _prov, _mdl)
+                        else:
+                            gen = _rc.adapter.stream_chat_completion(
+                                up_req, _rc.api_key, _prov.base_url, _fb_eh)
+                        # ── 实质 chunk 锁定语义：缓冲直到出现实质（正文/思考/工具调用）；
+                        #    出现即返回给主协程接管外发；流结束仍无实质 → 判失败回退 ──
+                        ctx = {"gen": gen, "buf": [], "committed": False, "usage": {},
+                               "ttft_ms": None, "attempt_ttft_ms": None,
+                               "prov": _prov, "mdl": _mdl, "mid_full": mid_full,
+                               "start": _start, "attempt": st_attempt}
+                        ctx_by_idx[st_attempt] = ctx
                         try:
-                            from server.core.notifier import notify_event as _notify_event
-                            _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（流式，{st_attempt} 次尝试）")
-                        except Exception:
-                            pass
-                        yield _format_sse_chunk(_api_error("combo all targets failed", status=503, attempts=stream_errs), "unknown")
-                        yield b"data: [DONE]\n\n"
+                            async for ck in gen:
+                                if ctx["ttft_ms"] is None:
+                                    ctx["ttft_ms"] = int((time.time() - _send_time) * 1000)
+                                    ctx["attempt_ttft_ms"] = int((time.time() - _start) * 1000)
+                                if isinstance(ck, dict) and "error" in ck:
+                                    raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
+                                ctx["buf"].append(ck)
+                                u = _stream_usage_dict(ck) if isinstance(ck, dict) else {}
+                                if u:
+                                    ctx["usage"] = u
+                                if _chunk_has_substance(ck):
+                                    ctx["committed"] = True
+                                    return ctx
+                            import json as _cj
+                            raise _FailAttempt(
+                                "empty_stream_output: 上游返回成功但无实质内容", ctx,
+                                stream_body=_cj.dumps(ctx["buf"], ensure_ascii=False) if ctx["buf"] else None)
+                        except (_SkipAttempt, _FailAttempt, _NoMore):
+                            raise
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            raw = _extract_error_body(e) or f"{type(e).__name__}: {str(e)[:200]}"
+                            raise _FailAttempt(f"{type(e).__name__}: {str(e)[:200]}", ctx,
+                                               raw_err=raw) from e
+                        finally:
+                            if not ctx["committed"]:
+                                try:
+                                    await gen.aclose()
+                                except Exception:
+                                    pass
+
+                    async def _on_fail(st_attempt, et, exc):
+                        if isinstance(exc, _SkipAttempt):
+                            stream_errs.append({"attempt": st_attempt, "error": et})
+                            info = exc.info
+                            _decision_skip(conversation_id, model_pk=info.get("pk"),
+                                           provider=info.get("prov"), model=info.get("model"),
+                                           reason=str(exc)[:120])
+                            return
+                        ctx = getattr(exc, "ctx", None)
+                        if ctx is None:
+                            stream_errs.append({"attempt": st_attempt, "error": et})
+                            return
+                        stream_errs.append({"attempt": st_attempt, "model": ctx["mid_full"], "error": et})
+                        _decision_attempt(conversation_id, provider=ctx["prov"].name,
+                                          model=ctx["mdl"].model_id, status="failed",
+                                          attempt=st_attempt,
+                                          latency_ms=int((time.time() - ctx["start"]) * 1000),
+                                          ttft_ms=ctx["attempt_ttft_ms"], error=et)
+                        # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避）
+                        # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却
+                        if is_context_error(et):
+                            await record_context_overflow(ctx["mdl"].id, est_req_tokens)
+                        elif ar.health_checker and not _is_stream_content_validation_error(et):
+                            ar.health_checker.mark_failure(ctx["mdl"].id)
+                            ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
+                        raw_err = getattr(exc, "raw_err", None) or getattr(exc, "stream_body", None) or et
                         await _write_stream_log(conversation_id, request, raw_request, "error",
-                            None, None, "combo all targets failed", 0, stream_errs, diag_start_ts=_diag_start)
-                    finally:
+                            ctx["prov"].name, ctx["mdl"].model_id, et[:500], st_attempt, None,
+                            stream_body=raw_err, diag_start_ts=_diag_start)
+                        print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={ctx['prov'].name} "
+                              f"模型={ctx['mdl'].model_id} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
+
+                    async def _on_loser(st_attempt):
+                        # 被更快候选超前的在途尝试：取消已发起，判失败 + 罚冷却
+                        ctx = ctx_by_idx.get(st_attempt)
+                        if ctx is None or ctx["committed"]:
+                            return
+                        et = (f"race_overtaken: {_race_secs}s 内无实质内容，"
+                              f"被更快候选取代（自动罚时冷却）")
+                        stream_errs.append({"attempt": st_attempt, "model": ctx["mid_full"], "error": et})
+                        _decision_attempt(conversation_id, provider=ctx["prov"].name,
+                                          model=ctx["mdl"].model_id, status="failed",
+                                          attempt=st_attempt,
+                                          latency_ms=int((time.time() - ctx["start"]) * 1000),
+                                          ttft_ms=ctx["attempt_ttft_ms"], error=et)
+                        if ar.health_checker:
+                            ar.health_checker.mark_failure(ctx["mdl"].id)
+                            ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
+                        await _write_stream_log(conversation_id, request, raw_request, "error",
+                            ctx["prov"].name, ctx["mdl"].model_id, et, st_attempt, None,
+                            diag_start_ts=_diag_start)
+
+                    async def _finish_session():
                         await cdb.close()
                         try:
                             await asyncio.shield(_decision_finish(
@@ -1728,13 +1827,122 @@ async def _chat_completions_impl(
                         except Exception:
                             pass
 
+                    try:
+                        winner_idx, ctx = await _run_race(
+                            _launch,
+                            no_content_seconds=(_race_secs if _race_on else None),
+                            max_inflight=(2 if _race_on else 1),
+                            on_failure=_on_fail, on_loser=_on_loser)
+                    except _RaceAllFailed:
+                        try:
+                            from server.core.notifier import notify_event as _notify_event
+                            _notify_event("all_failed",
+                                          f"组合 '{combo_name}' 全部候选失败（流式，{len(ctx_by_idx)} 次尝试）")
+                        except Exception:
+                            pass
+                        yield _format_sse_chunk(_api_error("combo all targets failed", status=503,
+                                                           attempts=stream_errs), "unknown")
+                        yield b"data: [DONE]\n\n"
+                        await _write_stream_log(conversation_id, request, raw_request, "error",
+                            None, None, "combo all targets failed", 0, stream_errs,
+                            diag_start_ts=_diag_start)
+                        await _finish_session()
+                        return
+
+                    # ── 胜出候选接管外发：重放已缓冲 chunk，继续流式消费 ──
+                    _prov, _mdl, mid_full = ctx["prov"], ctx["mdl"], ctx["mid_full"]
+                    _start = ctx["start"]
+                    st_attempt = winner_idx
+                    _cb_ttft_ms = ctx["ttft_ms"]
+                    _cb_attempt_ttft_ms = ctx["attempt_ttft_ms"]
+                    _cbuf = ctx["buf"]
+                    _cu = ctx["usage"]
+                    _diag(conversation_id, "combo_stream_commit", _diag_start,
+                          attempt=winner_idx, provider=_prov.name, model=_mdl.model_id,
+                          raced=_race_on)
+                    for _ck in _cbuf:
+                        yield _format_sse_chunk(_ck, mid_full)
+                    try:
+                        async for ck in ctx["gen"]:
+                            if isinstance(ck, dict) and "error" in ck:
+                                raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
+                            _cbuf.append(ck)
+                            u = _stream_usage_dict(ck) if isinstance(ck, dict) else {}
+                            if u:
+                                _cu = u
+                            yield _format_sse_chunk(ck, mid_full)
+                        # 注意：成功日志必须在 yield [DONE] 之前写（客户端收到 DONE 即断开，
+                        # 生成器被取消会吃掉 DONE 之后的 await）。
+                        import json as _cj
+                        _combo_latency = int((time.time() - _start) * 1000)
+                        _combo_body = _cj.dumps(_cbuf, ensure_ascii=False) if _cbuf else None
+                        _nu = _normalize_usage(_cu)
+                        _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
+                        _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
+                        _pt, _ct = _sanitize_token_counts(request, _pt, _ct,
+                                                         _output_text_from_chunks(_cbuf))
+                        _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id,
+                                          status="success", attempt=st_attempt,
+                                          latency_ms=_combo_latency, ttft_ms=_cb_attempt_ttft_ms)
+                        await _write_stream_log(conversation_id, request, raw_request, "success",
+                            _prov.name, _mdl.model_id, None, st_attempt, None,
+                            stream_body=_combo_body, prompt_tokens=_pt, completion_tokens=_ct,
+                            cache_read_tokens=_crd, cache_write_tokens=_cwt,
+                            latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms,
+                            diag_start_ts=_diag_start,
+                            est_prompt_tokens=est_req_tokens)
+                        if ar.health_checker:
+                            ar.health_checker.mark_success(_mdl.id)
+                        yield b"data: [DONE]\n\n"
+                    except Exception as se:
+                        # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端
+                        err_s = f"{type(se).__name__}: {str(se)[:200]}"
+                        stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
+                        _decision_attempt(conversation_id, provider=_prov.name, model=_mdl.model_id,
+                                          status="failed", attempt=st_attempt,
+                                          latency_ms=int((time.time() - _start) * 1000),
+                                          ttft_ms=_cb_attempt_ttft_ms, error=err_s)
+                        if is_context_error(err_s):
+                            await record_context_overflow(_mdl.id, est_req_tokens)
+                        elif ar.health_checker and not _is_stream_content_validation_error(err_s):
+                            ar.health_checker.mark_failure(_mdl.id)
+                            ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
+                        raw_err = _extract_error_body(se) or err_s
+                        yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
+                        yield b"data: [DONE]\n\n"
+                        await _write_stream_log(conversation_id, request, raw_request, "error",
+                            _prov.name, _mdl.model_id, err_s, st_attempt, stream_errs,
+                            stream_body=raw_err, diag_start_ts=_diag_start)
+                    finally:
+                        await _finish_session()
+
                 return StreamingResponse(_combo_cascade_stream(), media_type="text/event-stream")
             # ─── 非流式 combo：循环尝试（含冷却），不再走 is_auto 级联路径 ───
             combo_attempts = []
-            last_error = None
             # max_fallbacks 契约与 auto/流式对齐：总尝试 = min(候选数, max_fallbacks + 1)
             _attempt_limit = min(len(ordered_targets), max(1, ar.config.max_fallbacks + 1))
-            for t_idx, t in enumerate(ordered_targets[:_attempt_limit]):
+            # Race（config.race.enabled）：N 秒无返回 → 并行打下一候选，先回者胜；败者罚冷却
+            from server.core.race import NoMoreCandidates as _NoMore, RaceAllFailed as _RaceAllFailed, run_race as _run_race
+            _rc_cfg = getattr(config, "race", None)
+            _race_on = bool(_rc_cfg and getattr(_rc_cfg, "enabled", False))
+            _race_secs = max(3, int(getattr(_rc_cfg, "no_content_seconds", 15) or 15))
+
+            class _NSkip(Exception):
+                def __init__(self, msg, *, pk=None, prov=None, model=None):
+                    super().__init__(msg)
+                    self.info = {"pk": pk, "prov": prov, "model": model}
+
+            class _NFail(Exception):
+                def __init__(self, msg, ctx):
+                    super().__init__(msg)
+                    self.ctx = ctx
+
+            _ns_ctx_by_idx = {}
+
+            async def _ns_launch(t_idx: int):
+                if t_idx >= _attempt_limit:
+                    raise _NoMore()
+                t = ordered_targets[t_idx]
                 full_id = t["full_id"]
                 prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
                 # 查找 provider + model
@@ -1745,37 +1953,28 @@ async def _chat_completions_impl(
                     select(Model).where(Model.provider_id == provider.id, Model.model_id == m_id, Model.enabled == True).limit(1)
                 )).scalar_one_or_none() if provider else None
                 if not provider or not model:
-                    combo_attempts.append({"target": full_id, "error": "provider or model not found"})
-                    _decision_skip(conversation_id, provider=prov_name, model=m_id, reason="provider or model not found")
-                    continue
+                    raise _NSkip("provider or model not found", prov=prov_name, model=m_id)
                 # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
                 _pf = await get_estimate_factor(db, provider.id, model.model_id)
                 _est_adj = int(est_req_tokens * _pf)
                 _obs = int(getattr(model, "observed_context_limit", 0) or 0)
                 if context_overflows(model, _est_adj, observed_limit=_obs):
-                    combo_attempts.append({"target": full_id, "error": f"skip: est ~{_est_adj} tokens (x{_pf:.2f}) > context window {model.context_length}"})
-                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="context window too small")
-                    continue
+                    raise _NSkip(f"est ~{_est_adj} tokens (x{_pf:.2f}) > context window {model.context_length}",
+                                 pk=model.id, prov=provider.name, model=model.model_id)
                 # 跳过处于冷却（被惩罚）中的 target，让后续健康候选顶上
                 if ar.health_checker and ar.health_checker.is_cooling(model.id):
-                    combo_attempts.append({"target": full_id, "error": "skipped (cooling)"})
-                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason="model is cooling down")
-                    continue
+                    raise _NSkip("skipped (cooling)", pk=model.id, prov=provider.name, model=model.model_id)
                 # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
                 from server.core.credential_resolver import resolve_credential_async, call_via
                 _rc = await resolve_credential_async(provider, model, db)
                 if not _rc.ok:
-                    combo_attempts.append({"target": full_id, "error": _rc.error})
-                    _decision_skip(conversation_id, model_pk=model.id, provider=provider.name, model=model.model_id, reason=_rc.error)
-                    continue
-                api_key = _rc.api_key
-                adapter = _rc.adapter
-                upstream_req = _without_unsupported_reasoning(
-                    request.model_copy(update={"model": model.model_id}), model
-                )
+                    raise _NSkip(_rc.error, pk=model.id, prov=provider.name, model=model.model_id)
                 extra_hdr = _merge_oauth_headers(provider, provider.headers if provider.headers else None)
                 if _rc.extra_headers:
                     extra_hdr = {**(extra_hdr or {}), **_rc.extra_headers}
+                upstream_req = _without_unsupported_reasoning(
+                    request.model_copy(update={"model": model.model_id}), model
+                )
                 model_overrides = getattr(model, "request_overrides", None) or {}
                 if isinstance(model_overrides, dict):
                     ov_headers = model_overrides.get("headers") or {}
@@ -1790,88 +1989,135 @@ async def _chat_completions_impl(
                             upstream_req = upstream_req.model_copy(update=ov_body)
                         except Exception:
                             pass
+                ctx = {"t_idx": t_idx, "full_id": full_id, "provider": provider, "model": model,
+                       "start": time.time()}
+                _ns_ctx_by_idx[t_idx] = ctx
+                _decision_select(conversation_id, provider=provider.name, model=model.model_id,
+                                 model_pk=model.id, reason="next combo target")
                 try:
-                    _combo_send_time = time.time()
-                    _decision_select(conversation_id, provider=provider.name, model=model.model_id, model_pk=model.id, reason="next combo target")
                     if _rc.kind == "free_tier":
                         result = await call_via(_rc, upstream_req, provider, model)
                     else:
-                        result = await adapter.chat_completion(
-                            upstream_req, api_key, provider.base_url, extra_hdr
+                        result = await _rc.adapter.chat_completion(
+                            upstream_req, _rc.api_key, provider.base_url, extra_hdr
                         )
-                    if isinstance(result, dict):
-                        result["model"] = f"{provider.name}/{model.model_id}"
-                    # ── 空输出判定：HTTP 成功但无 content/无 tool_calls/无 completion token
-                    #    → 视为候选失败，继续 fallback 到下一个候选（combo 专用，不影响直连）──
-                    if _openai_completion_is_empty(result):
-                        err_str = "empty_output: upstream 返回 200 但无内容/tool_calls/usage"
-                        combo_attempts.append({"target": full_id, "error": err_str})
-                        last_error = err_str
-                        _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000), error=err_str)
-                        if ar.health_checker:
-                            ar.health_checker.mark_failure(model.id)
-                            ar.health_checker.mark_cooling(model.id, ar.config.cooling_period_seconds)
-                        print(f"[组合路由] 目标 {full_id} 空输出，判定为失败，正在尝试下一个候选", flush=True)
-                        continue
-                    if ar.health_checker:
-                        ar.health_checker.mark_success(model.id)
-                    _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000))
-                    # combo 分支独立于集中日志（964 行），需自行写请求日志
-                    try:
-                        import json as _j
-                        _usage = result.get("usage", {}) if isinstance(result, dict) else {}
-                        _nu = _normalize_usage(_usage)
-                        _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
-                        _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
-                        _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_result(result))
-                        await _write_stream_log(
-                            conversation_id, request, raw_request, "success",
-                            provider.name, model.model_id, None, 0, None,
-                            stream_body=_j.dumps(result, ensure_ascii=False),
-                            prompt_tokens=_pt,
-                            completion_tokens=_ct,
-                            cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                            latency_ms=int((time.time() - _combo_send_time) * 1000),
-                            diag_start_ts=_diag_start,
-                        )
-                    except Exception:
-                        pass
-                    _diag(conversation_id, "combo_hit", _diag_start, target=full_id)
-                    return JSONResponse(content=result)
+                except asyncio.CancelledError:
+                    ctx["cancelled"] = True
+                    raise
                 except Exception as e:
-                    err_str = f"{type(e).__name__}: {str(e)[:200]}"
-                    combo_attempts.append({"target": full_id, "error": err_str})
-                    last_error = err_str
-                    _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=t_idx, latency_ms=int((time.time() - _combo_send_time) * 1000), error=err_str)
-                    # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                    if is_context_error(err_str) and model:
-                        await record_context_overflow(model.id, est_req_tokens)
-                    elif ar.health_checker and model:
-                        ar.health_checker.mark_failure(model.id)
-                        ar.health_checker.mark_cooling(model.id, ar.config.cooling_period_seconds)
-                    print(f"[组合路由] 目标 {full_id} 失败：{err_str}，正在尝试下一个候选", flush=True)
-                    continue
-            # 全部 target 失败
+                    raise _NFail(f"{type(e).__name__}: {str(e)[:200]}", ctx) from e
+                ctx["send_end"] = time.time()
+                if isinstance(result, dict):
+                    result["model"] = f"{provider.name}/{model.model_id}"
+                # ── 空输出判定：HTTP 成功但无 content/无 tool_calls/无 completion token
+                #    → 视为候选失败，继续 fallback 到下一个候选（combo 专用，不影响直连）──
+                if _openai_completion_is_empty(result):
+                    raise _NFail("empty_output: upstream 返回 200 但无内容/tool_calls/usage", ctx)
+                return result
+
+            async def _ns_on_fail(t_idx, et, exc):
+                if isinstance(exc, _NSkip):
+                    combo_attempts.append({"target": et, "error": et})
+                    info = exc.info
+                    if info.get("pk"):
+                        _decision_skip(conversation_id, model_pk=info["pk"], provider=info.get("prov"),
+                                       model=info.get("model"), reason=str(exc)[:120])
+                    else:
+                        _decision_skip(conversation_id, provider=info.get("prov"), model=info.get("model"),
+                                       reason=str(exc)[:120])
+                    return
+                ctx = getattr(exc, "ctx", None)
+                if ctx is None:
+                    combo_attempts.append({"target": f"idx{t_idx}", "error": et})
+                    return
+                combo_attempts.append({"target": ctx["full_id"], "error": et})
+                _decision_attempt(conversation_id, provider=ctx["provider"].name,
+                                  model=ctx["model"].model_id, status="failed", attempt=t_idx,
+                                  latency_ms=int((time.time() - ctx["start"]) * 1000), error=et)
+                # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
+                # 上下文超限不是模型自身故障，不进冷却
+                if is_context_error(et):
+                    await record_context_overflow(ctx["model"].id, est_req_tokens)
+                elif ar.health_checker:
+                    ar.health_checker.mark_failure(ctx["model"].id)
+                    ar.health_checker.mark_cooling(ctx["model"].id, ar.config.cooling_period_seconds)
+                print(f"[组合路由] 目标 {ctx['full_id']} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
+
+            async def _ns_on_loser(t_idx):
+                ctx = _ns_ctx_by_idx.get(t_idx)
+                if ctx is None or ctx.get("send_end"):
+                    return  # 其实已返回（只是没赢），不按失败处理
+                et = (f"race_overtaken: {_race_secs}s 内无返回，被更快候选取代（自动罚时冷却）")
+                combo_attempts.append({"target": ctx["full_id"], "error": et})
+                _decision_attempt(conversation_id, provider=ctx["provider"].name,
+                                  model=ctx["model"].model_id, status="failed", attempt=t_idx,
+                                  latency_ms=int((time.time() - ctx["start"]) * 1000), error=et)
+                if ar.health_checker:
+                    ar.health_checker.mark_failure(ctx["model"].id)
+                    ar.health_checker.mark_cooling(ctx["model"].id, ar.config.cooling_period_seconds)
+                print(f"[组合路由] 目标 {ctx['full_id']} 超时未返回，判失败并罚冷却", flush=True)
+
             try:
-                from server.core.notifier import notify_event as _notify_event
-                _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（{len(combo_attempts)} 个候选）")
-            except Exception:
-                pass
-            _diag(conversation_id, "combo_all_failed", _diag_start, attempts=combo_attempts)
+                winner_idx, result = await _run_race(
+                    _ns_launch,
+                    no_content_seconds=(_race_secs if _race_on else None),
+                    max_inflight=(2 if _race_on else 1),
+                    on_failure=_ns_on_fail, on_loser=_ns_on_loser)
+            except _RaceAllFailed:
+                # 全部 target 失败
+                try:
+                    from server.core.notifier import notify_event as _notify_event
+                    _notify_event("all_failed", f"组合 '{combo_name}' 全部候选失败（{len(combo_attempts)} 个候选）")
+                except Exception:
+                    pass
+                _diag(conversation_id, "combo_all_failed", _diag_start, attempts=combo_attempts)
+                try:
+                    import json as _j
+                    await _write_stream_log(
+                        conversation_id, request, raw_request, "error",
+                        None, None, f"Combo '{combo_name}' all targets failed", 0, combo_attempts,
+                        stream_body=_j.dumps({"attempts": combo_attempts}, ensure_ascii=False),
+                        diag_start_ts=_diag_start,
+                    )
+                except Exception:
+                    pass
+                return JSONResponse(
+                    status_code=503,
+                    content=_api_error(f"Combo '{combo_name}' all targets failed", status=503, attempts=combo_attempts),
+                )
+            # ── 胜出候选：计量、成功日志、返回 ──
+            _wctx = _ns_ctx_by_idx.get(winner_idx)
+            _w_provider = _wctx["provider"] if _wctx else None
+            _w_model = _wctx["model"] if _wctx else None
+            _w_start = _wctx["start"] if _wctx else _diag_start
+            if ar.health_checker and _w_model is not None:
+                ar.health_checker.mark_success(_w_model.id)
+            _decision_attempt(conversation_id, provider=_w_provider.name, model=_w_model.model_id,
+                              status="success", attempt=winner_idx,
+                              latency_ms=int((time.time() - _w_start) * 1000))
+            # combo 分支独立于集中日志（964 行），需自行写请求日志
             try:
                 import json as _j
+                _usage = result.get("usage", {}) if isinstance(result, dict) else {}
+                _nu = _normalize_usage(_usage)
+                _pt, _ct = _nu.prompt_tokens, _nu.completion_tokens
+                _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
+                _pt, _ct = _sanitize_token_counts(request, _pt, _ct, _output_text_from_result(result))
                 await _write_stream_log(
-                    conversation_id, request, raw_request, "error",
-                    None, None, f"Combo '{combo_name}' all targets failed", 0, combo_attempts,
-                    stream_body=_j.dumps({"attempts": combo_attempts}, ensure_ascii=False),
+                    conversation_id, request, raw_request, "success",
+                    _w_provider.name, _w_model.model_id, None, winner_idx, None,
+                    stream_body=_j.dumps(result, ensure_ascii=False),
+                    prompt_tokens=_pt,
+                    completion_tokens=_ct,
+                    cache_read_tokens=_crd, cache_write_tokens=_cwt,
+                    latency_ms=int((time.time() - _w_start) * 1000),
                     diag_start_ts=_diag_start,
                 )
             except Exception:
                 pass
-            return JSONResponse(
-                status_code=503,
-                content=_api_error(f"Combo '{combo_name}' all targets failed", status=503, attempts=combo_attempts),
-            )
+            _diag(conversation_id, "combo_hit", _diag_start,
+                  target=_wctx["full_id"] if _wctx else None, raced=_race_on)
+            return JSONResponse(content=result)
         else:
             # 直接路由：解析 model + provider
             if "/" in request.model:
@@ -1927,7 +2173,7 @@ async def _chat_completions_impl(
                 else:
                     # 兜底：provider 第一把 active key
                     result = await db.execute(
-                        sa_select(ApiKey).where(ApiKey.provider_id == provider.id, ApiKey.is_active == True).limit(1)
+                        select(ApiKey).where(ApiKey.provider_id == provider.id, ApiKey.is_active == True).limit(1)  # noqa: E712
                     )
                     key = result.scalar_one_or_none()
                     if not key:
@@ -2043,243 +2289,225 @@ async def _chat_completions_impl(
     # ─── auto 路由 ───
     elif is_auto and request.stream:
         _diag(conversation_id, "auto_stream_response_created", _diag_start)
-        # 流式级联回退：直接拉流，连接失败自动换下一个候选
+        # 流式级联回退：拉流，无内容自动换下一候选。
+        # Race（config.race.enabled）：当前候选 N 秒没吐内容 → 不杀它，并行打下一候选，
+        # 谁先出实质内容用谁；被超前的候选判失败+罚冷却。关闭时退化为顺序回退（旧语义）。
+        from types import SimpleNamespace as _NS
+        from server.core.race import NoMoreCandidates as _NoMore, RaceAllFailed as _RaceAllFailed, run_race as _run_race
+        _rc_cfg = getattr(config, "race", None)
+        _race_on = bool(_rc_cfg and getattr(_rc_cfg, "enabled", False))
+        _race_secs = max(3, int(getattr(_rc_cfg, "no_content_seconds", 15) or 15))
+
+        class _ASkip(Exception):
+            pass
+
+        class _AFail(Exception):
+            def __init__(self, msg, ctx, raw=None):
+                super().__init__(msg)
+                self.ac = ctx
+                self.raw = raw
+
         async def cascade_stream():
             _diag(conversation_id, "auto_stream_generator_start", _diag_start)
             from server.db import AsyncSessionLocal as _CS
             cascade_db = _CS()
+            _db_lock = asyncio.Lock()  # session 不可并发：DB 短操作串行化，HTTP 在锁外
             max_r = max(1, ar.config.max_fallbacks)
             first_chunk_timeout = max(5, int(getattr(ar.config, "stream_first_chunk_timeout_seconds", 20)))
             first_response_budget = max(first_chunk_timeout, int(getattr(ar.config, "stream_first_response_budget_seconds", 75)))
             first_response_deadline = time.monotonic() + first_response_budget
             tried_sids = set()
             stream_errs = []
+            ctx_by_idx = {}
             # v3.0: combo 路由会用自定义候选池替代 ar.get_best_candidate
             import server.api.v1_router as _vr_mod
             combo_pool = getattr(_vr_mod, '_combo_targets_map', {}).get(conversation_id, [])
             # 立即发一个 SSE 注释块，防客户端超时
             yield b": keepalive\n\n"
-            try:
-                for st_attempt in range(max_r + 1):
-                    remaining_first_response = first_response_deadline - time.monotonic()
-                    if remaining_first_response <= 0:
-                        stream_errs.append({
-                            "attempt": st_attempt,
-                            "error": f"first response budget exceeded ({first_response_budget}s)"
-                        })
-                        break
-                    _diag(conversation_id, "auto_stream_candidate_start", _diag_start, attempt=st_attempt)
+
+            async def _launch(st_attempt: int):
+                remaining_first_response = first_response_deadline - time.monotonic()
+                if remaining_first_response <= 0 or st_attempt > max_r:
+                    stream_errs.append({
+                        "attempt": st_attempt,
+                        "error": f"first response budget exceeded ({first_response_budget}s)"
+                    })
+                    raise _NoMore()
+                _diag(conversation_id, "auto_stream_candidate_start", _diag_start, attempt=st_attempt)
+                async with _db_lock:
                     if combo_pool:
                         # combo 路径：按池子顺序取下一个未试目标
                         if st_attempt >= len(combo_pool):
-                            _diag(conversation_id, "combo_stream_exhausted", _diag_start, attempted=st_attempt)
-                            err_data = _api_error("combo pool exhausted", status=503, attempts=stream_errs)
-                            yield _format_sse_chunk(err_data, "unknown")
-                            yield b"data: [DONE]\n\n"
-                            await _write_stream_log(conversation_id, request, raw_request, "error",
-                                None, None, "combo pool exhausted", st_attempt, stream_errs,
-                                diag_start_ts=_diag_start)
-                            return
+                            raise _NoMore()
                         full_id = combo_pool[st_attempt]
-                        # 解析 provider/model
                         prov_name, m_id = full_id.split("/", 1) if "/" in full_id else (None, full_id)
                         from server.models.provider import Provider as _P
+                        from server.models.model import Model as _M
                         from sqlalchemy import select as _sel
                         p_r = await cascade_db.execute(_sel(_P).where(_P.name == prov_name).limit(1))
                         _prov = p_r.scalar_one_or_none()
-                        from server.models.model import Model as _M
                         m_r = await cascade_db.execute(_sel(_M).where(_M.provider_id == _prov.id, _M.model_id == m_id, _M.enabled == True).limit(1)) if _prov else None
                         _mdl = m_r.scalar_one_or_none() if m_r is not None else None
                         if not _prov or not _mdl:
                             stream_errs.append({"attempt": st_attempt, "error": f"combo target {full_id} not found"})
-                            continue
-                        # 统一凭证解析：free_tier/oauth/atomcode/标准密钥一个入口
-                        from server.core.credential_resolver import resolve_credential_async, stream_via
-                        _rc = await resolve_credential_async(_prov, _mdl, cascade_db)
-                        if not _rc.ok:
-                            stream_errs.append({"attempt": st_attempt, "error": _rc.error})
-                            continue
-                        from server.core.auto_router import RouteResult as _RR
-                        cand = _RR(success=True, model=_mdl, provider=_prov, api_key=_rc.api_key,
-                                   adapter=_rc.adapter, extra_headers=_rc.extra_headers, fallback_count=st_attempt)
+                            _decision_skip(conversation_id, provider=prov_name, model=m_id,
+                                           reason="provider or model not found")
+                            raise _ASkip("target not found")
+                        _prov_obj, _mdl_obj = _prov, _mdl
+                        _sel_reason = None
                     else:
                         cand = await ar.get_best_candidate(cascade_db, conversation_id, exclude_model_ids=tried_sids)
-                    _diag(conversation_id, "auto_stream_candidate_done", _diag_start, attempt=st_attempt, success=cand.success if cand else None)
-                    if not cand.success or (cand.model and cand.model.id in tried_sids):
-                        print(f"[CASCADE] exhausted at attempt {st_attempt}: {cand.error if cand else 'no cand'} tried={tried_sids}", flush=True)
-                        err_data = _api_error(str(cand.error or "no more candidates"), status=503, attempts=stream_errs)
-                        yield _format_sse_chunk(err_data, "unknown")
-                        yield b"data: [DONE]\n\n"
-                        await _write_stream_log(conversation_id, request, raw_request, "error",
-                            None, None, str(cand.error if cand else "no candidates"), st_attempt, stream_errs,
-                            diag_start_ts=_diag_start)
-                        return
-                    tried_sids.add(cand.model.id)
-                    # 防 MissingGreenlet：流式回退过程中 session 可能因限流/日志写入发生 commit/rollback，
-                    # ORM 对象属性可能过期。这里先显式刷新并把后续要用的字段拷贝成普通 Python 值。
+                        _diag(conversation_id, "auto_stream_candidate_done", _diag_start,
+                              attempt=st_attempt, success=cand.success if cand else None)
+                        if not cand.success or (cand.model and cand.model.id in tried_sids):
+                            raise _NoMore()
+                        _prov_obj, _mdl_obj = cand.provider, cand.model
+                        _sel_reason = getattr(cand, "selection_reason", None)
                     try:
-                        await cascade_db.refresh(cand.provider, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_enabled"])
-                        await cascade_db.refresh(cand.model, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort"])
+                        await cascade_db.refresh(_prov_obj, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_enabled"])
+                        await cascade_db.refresh(_mdl_obj, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort", "observed_context_limit"])
                     except Exception:
                         pass
-                    cand_model_pk = cand.model.id
-                    cand_model_id = cand.model.model_id
-                    cand_provider_name = cand.provider.name
-                    cand_provider_base_url = cand.provider.base_url
-                    cand_provider_headers = cand.provider.headers
-                    mid_full = f"{cand_provider_name}/{cand_model_id}"
+                    _mdl_ns = _NS(model_id=_mdl_obj.model_id, id=_mdl_obj.id,
+                                  supports_reasoning_effort=getattr(_mdl_obj, "supports_reasoning_effort", None),
+                                  context_length=int(getattr(_mdl_obj, "context_length", 0) or 0),
+                                  observed_context_limit=int(getattr(_mdl_obj, "observed_context_limit", 0) or 0),
+                                  request_overrides=getattr(_mdl_obj, "request_overrides", None))
+                    _prov_ns = _NS(name=_prov_obj.name, base_url=_prov_obj.base_url,
+                                   headers=_prov_obj.headers, id=_prov_obj.id,
+                                   credential_type=getattr(_prov_obj, "credential_type", "api_key"),
+                                   api_type=getattr(_prov_obj, "api_type", ""),
+                                   oauth_code=getattr(_prov_obj, "oauth_code", None),
+                                   proxy_enabled=getattr(_prov_obj, "proxy_enabled", False))
+                    if _mdl_ns.id and _mdl_ns.id in tried_sids:
+                        raise _NoMore()
+                    if _mdl_ns.id:
+                        tried_sids.add(_mdl_ns.id)
+                    mid_full = f"{_prov_ns.name}/{_mdl_ns.model_id}"
                     # 上下文预检：装不下的候选直接跳过（不打上游、不进冷却；动态因子 + observed 窗口）
-                    _cand_ctx_len = int(getattr(cand.model, "context_length", 0) or 0)
-                    _pf = await get_estimate_factor(cascade_db, cand.provider.id, cand_model_id)
+                    _pf = await get_estimate_factor(cascade_db, _prov_ns.id, _mdl_ns.model_id)
                     _est_adj = int(est_req_tokens * _pf)
-                    _obs = int(getattr(cand.model, "observed_context_limit", 0) or 0)
-                    if (_cand_ctx_len > 0 and _est_adj + 1024 > _cand_ctx_len) or (_obs > 0 and _est_adj + 1024 > _obs):
-                        stream_errs.append({"attempt": st_attempt, "error": f"skip (context window {_cand_ctx_len} < est ~{_est_adj} tokens x{_pf:.2f})"})
-                        _decision_skip(conversation_id, model_pk=cand_model_pk, provider=cand_provider_name, model=cand_model_id, reason="context window too small")
-                        continue
+                    if ((_mdl_ns.context_length > 0 and _est_adj + 1024 > _mdl_ns.context_length)
+                            or (_mdl_ns.observed_context_limit > 0 and _est_adj + 1024 > _mdl_ns.observed_context_limit)):
+                        stream_errs.append({"attempt": st_attempt,
+                                            "error": f"skip (context window {_mdl_ns.context_length} < est ~{_est_adj} tokens x{_pf:.2f})"})
+                        _decision_skip(conversation_id, model_pk=_mdl_ns.id, provider=_prov_ns.name,
+                                       model=_mdl_ns.model_id, reason="context window too small")
+                        raise _ASkip("context window too small")
                     up_req = _without_unsupported_reasoning(
-                        request.model_copy(update={"model": cand_model_id}), cand.model
+                        request.model_copy(update={"model": _mdl_ns.model_id}), _mdl_ns
                     )
-                    _decision_select(conversation_id, provider=cand_provider_name, model=cand_model_id, model_pk=cand_model_pk, reason=getattr(cand, "selection_reason", None) or "next ranked candidate")
-                    gen = None
-                    sc = 0
-                    stream_buf = []
-                    _candidate_started = time.time()
-                    try:
-                        _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id)
-                        _cascade_eh = _merge_oauth_headers(cand.provider, cand_provider_headers)
-                        _cmov = getattr(cand.model, "request_overrides", None) or {}
-                        if isinstance(_cmov, dict) and _cmov.get("headers"):
-                            _cascade_eh = {**(_cascade_eh or {}), **_cmov["headers"]}
-                        # free_tier/oauth/atomcode 走统一凭证解析通道（free executor / OAuth token / daemon）
-                        if (getattr(cand.provider, "credential_type", "api_key") in ("free_tier", "oauth")
-                                or getattr(cand.provider, "api_type", "") == "atomcode"):
-                            from server.core.credential_resolver import resolve_credential_async, stream_via
-                            _rc = await resolve_credential_async(cand.provider, cand.model, cascade_db)
-                            if not _rc.ok:
-                                raise RuntimeError(_rc.error)
-                            gen = stream_via(_rc, up_req, cand.provider, cand.model)
-                        else:
-                            gen = cand.adapter.stream_chat_completion(
-                                up_req, cand.api_key, cand_provider_base_url, _cascade_eh
-                            )
-                        stream_buf = []
-                        last_usage = {}
-                        stream_has_error = False
-                        stream_err_detail = ""
-                        _cascade_ttft_ms = None
-                        _candidate_ttft_ms = None
-                        # 实质 chunk 锁定语义（与 combo 流式一致）：实质（正文/思考/工具调用）出现前
-                        # 只缓冲元数据；出现即 flush 锁定候选；结束仍无实质 → 丢弃缓冲无感回退
-                        _prebuf = []
-                        _committed = False
-                        candidate_first_chunk_timeout = min(first_chunk_timeout, remaining_first_response)
-                        async for ck in _stream_with_first_chunk_timeout(gen, candidate_first_chunk_timeout):
-                            # 首字延迟：首个 chunk 距请求开始的时间
-                            if _cascade_ttft_ms is None:
-                                _cascade_ttft_ms = int((time.time() - _send_time) * 1000)
-                                _candidate_ttft_ms = int((time.time() - _candidate_started) * 1000)
-                            sc += 1
-                            if isinstance(ck, dict) and "error" in ck:
-                                stream_has_error = True
-                                stream_err_detail = str(ck.get("error", "unknown"))[:200]
-                                break
-                            stream_buf.append(ck)
-                            u = _stream_usage_dict(ck)
-                            if u:
-                                last_usage = u
-                            if not _committed:
-                                if _chunk_has_substance(ck):
-                                    _committed = True
-                                    for _pb in _prebuf:
-                                        yield _format_sse_chunk(_pb, mid_full)
-                                    _prebuf.clear()
-                                    yield _format_sse_chunk(ck, mid_full)
-                                else:
-                                    _prebuf.append(ck)
-                            else:
-                                yield _format_sse_chunk(ck, mid_full)
-                        if stream_has_error:
-                            raise RuntimeError(f"upstream_stream_error: {stream_err_detail}")
-                        # ── 空输出判定：已锁定 → 成功；否则缓冲未外发，无感回退 ──
-                        if not _committed:
-                            err_s = "empty_stream_output: 上游返回成功但无内容"
-                            stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
-                            _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
-                            if ar.health_checker:
-                                ar.health_checker.mark_failure(cand_model_pk)
-                                ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
-                            print(f"[CASCADE] 第{st_attempt + 1}次尝试 服务商={cand_provider_name} 模型={cand_model_id} 空输出，正在尝试下一个候选", flush=True)
-                            import json as _cjs
-                            await _write_stream_log(conversation_id, request, raw_request, "error",
-                                cand_provider_name, cand_model_id, err_s, st_attempt, None,
-                                stream_body=_cjs.dumps(stream_buf, ensure_ascii=False) if stream_buf else None, diag_start_ts=_diag_start)
-                            continue
-                        _diag(conversation_id, "upstream_stream_done", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id, chunks=sc)
-                        resp_snapshot = None
-                        if stream_buf:
-                            import json as _json_mod
-                            resp_snapshot = _json_mod.dumps(stream_buf, ensure_ascii=False)
-                        _nu = _normalize_usage(last_usage)
-                        pt, ct = _nu.prompt_tokens, _nu.completion_tokens
-                        _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
-                        # 上游漏报 usage 时按实际输出文本粗估 completion（prompt 由 sanitize 兜底）
-                        _pt, _ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(stream_buf))
-                        _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="success", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms)
-                        await _write_stream_log(conversation_id, request, raw_request, "success",
-                            cand_provider_name, cand_model_id, None, st_attempt, None,
-                            stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
-                            cache_read_tokens=_crd, cache_write_tokens=_cwt,
-                            latency_ms=int((time.time() - _send_time) * 1000),
-                            ttft_ms=_cascade_ttft_ms, diag_start_ts=_diag_start,
-                            est_prompt_tokens=est_req_tokens)
-                        if ar.health_checker:
-                            ar.health_checker.mark_success(cand_model_pk)
-                        yield b"data: [DONE]\n\n"
-                        return
-                    except Exception as se:
-                        _diag(conversation_id, "upstream_stream_error", _diag_start, attempt=st_attempt, provider=cand_provider_name, model=cand_model_id, error=type(se).__name__)
-                        err_s = f"{type(se).__name__}: {str(se)[:200]}"
-                        stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": err_s})
-                        _decision_attempt(conversation_id, provider=cand_provider_name, model=cand_model_id, status="failed", attempt=st_attempt, latency_ms=int((time.time() - _candidate_started) * 1000), ttft_ms=_candidate_ttft_ms, error=err_s)
-                        if is_context_error(err_s):
-                            await record_context_overflow(cand_model_pk, est_req_tokens)
-                        elif ar.health_checker and not _is_stream_content_validation_error(err_s):
-                            # 上游内容校验失败（如思考模型零正文）同样不代表模型故障，不冷却
-                            ar.health_checker.mark_failure(cand_model_pk)
-                            ar.health_checker.mark_cooling(cand_model_pk, ar.config.cooling_period_seconds)
-                        cd_seconds = ar.config.cooling_period_seconds
-                        fc = (ar.health_checker._fail_count.get(cand_model_pk, 0) if ar.health_checker else 0)
-                        cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
-                        err_s_annotated = f"{err_s} | cooldown={cd_actual}s fail#{fc}"
-                        raw_err = _extract_error_body(se) or err_s
-                        # 只有已经向客户端吐出过实质内容（正文/思考/tool_calls）的中途失败才应截断；
-                        # 错误发生在实质内容之前（仅缓冲了元数据）→ 丢弃缓冲，回退下一候选
-                        if _committed:
-                            yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
-                            yield b"data: [DONE]\n\n"
-                            await _write_stream_log(conversation_id, request, raw_request, "error",
-                                cand_provider_name, cand_model_id, err_s_annotated, st_attempt, stream_errs,
-                                stream_body=raw_err, diag_start_ts=_diag_start)
-                            return
-                        print(f"[CASCADE] attempt {st_attempt} failed ({err_s[:60]}), trying next (tried={tried_sids})", flush=True)
-                        await _write_stream_log(conversation_id, request, raw_request, "error",
-                            cand_provider_name, cand_model_id, err_s_annotated, st_attempt, None,
-                            stream_body=raw_err, diag_start_ts=_diag_start)
-                        continue
-                    finally:
-                        # 显式关闭上游 async generator，防止 GC 时 aclose() 与正在运行的 generator 竞态
-                        if gen is not None:
-                            try:
-                                await gen.aclose()
-                            except Exception:
-                                pass
-                yield _format_sse_chunk({"error": "all cascade fallbacks exhausted", "attempts": stream_errs}, "unknown")
-                yield b"data: [DONE]\n\n"
+                    _decision_select(conversation_id, provider=_prov_ns.name, model=_mdl_ns.model_id,
+                                     model_pk=_mdl_ns.id, reason=_sel_reason or "next ranked candidate")
+                    # 统一凭证解析（锁内完成；oauth 刷新等 DB 操作也收敛于此）
+                    from server.core.credential_resolver import resolve_credential_async
+                    _rc0 = await resolve_credential_async(_prov_ns, _mdl_ns, cascade_db)
+                    if not _rc0.ok:
+                        stream_errs.append({"attempt": st_attempt, "model": mid_full, "error": _rc0.error})
+                        _decision_skip(conversation_id, model_pk=_mdl_ns.id, provider=_prov_ns.name,
+                                       model=_mdl_ns.model_id, reason=_rc0.error)
+                        raise _ASkip(_rc0.error)
+                    ctx = {"attempt": st_attempt, "full_id": mid_full, "prov": _prov_ns, "mdl": _mdl_ns,
+                           "rc": _rc0, "up_req": up_req,
+                           "is_free_channel": _rc0.kind == "free_tier",
+                           "start": time.time(), "gen": None, "buf": [], "committed": False,
+                           "usage": {}, "ttft_ms": None, "attempt_ttft_ms": None,
+                           "first_chunk_timeout": max(5.0, min(first_chunk_timeout, remaining_first_response))}
+                    ctx_by_idx[st_attempt] = ctx
+                # HTTP 在锁外
+                _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt,
+                      provider=_prov_ns.name, model=_mdl_ns.model_id)
+                _cascade_eh = _merge_oauth_headers(_prov_ns, _prov_ns.headers)
+                _cmov = _mdl_ns.request_overrides or {}
+                if isinstance(_cmov, dict) and _cmov.get("headers"):
+                    _cascade_eh = {**(_cascade_eh or {}), **_cmov["headers"]}
+                gen = None
+                try:
+                    if ctx["is_free_channel"]:
+                        from server.core.credential_resolver import stream_via
+                        # P0-1: stream_via 是协程函数，必须 await 拿到异步生成器
+                        gen = await stream_via(_rc0, up_req, _prov_ns, _mdl_ns)
+                    elif ctx["rc"].kind in ("oauth", "atomcode"):
+                        gen = ctx["rc"].adapter.stream_chat_completion(
+                            up_req, ctx["rc"].api_key, _prov_ns.base_url,
+                            {**(_cascade_eh or {}), **(ctx["rc"].extra_headers or {})}
+                        )
+                    else:
+                        gen = ctx["rc"].adapter.stream_chat_completion(
+                            up_req, ctx["rc"].api_key, _prov_ns.base_url, _cascade_eh
+                        )
+                    ctx["gen"] = gen
+                    async for ck in _stream_with_first_chunk_timeout(gen, ctx["first_chunk_timeout"]):
+                        if ctx["ttft_ms"] is None:
+                            ctx["ttft_ms"] = int((time.time() - _send_time) * 1000)
+                            ctx["attempt_ttft_ms"] = int((time.time() - ctx["start"]) * 1000)
+                        if isinstance(ck, dict) and "error" in ck:
+                            raise RuntimeError(f"upstream_stream_error: {str(ck.get('error', 'unknown'))[:200]}")
+                        ctx["buf"].append(ck)
+                        u = _stream_usage_dict(ck)
+                        if u:
+                            ctx["usage"] = u
+                        if _chunk_has_substance(ck):
+                            ctx["committed"] = True
+                            return ctx
+                    import json as _cjs
+                    raise _AFail("empty_stream_output: 上游返回成功但无内容", ctx,
+                                 raw=_cjs.dumps(ctx["buf"], ensure_ascii=False) if ctx["buf"] else None)
+                except (_ASkip, _AFail, _NoMore):
+                    raise
+                except asyncio.CancelledError:
+                    ctx["cancelled"] = True
+                    raise
+                except Exception as e:
+                    raise _AFail(f"{type(e).__name__}: {str(e)[:200]}", ctx,
+                                 raw=_extract_error_body(e)) from e
+                finally:
+                    if not ctx["committed"] and ctx["gen"] is not None:
+                        try:
+                            await ctx["gen"].aclose()
+                        except Exception:
+                            pass
+
+            async def _record_fail(st_attempt, ctx, et, raw_body, cooling=True):
+                stream_errs.append({"attempt": st_attempt, "model": ctx["full_id"], "error": et})
+                _decision_attempt(conversation_id, provider=ctx["prov"].name, model=ctx["mdl"].model_id,
+                                  status="failed", attempt=st_attempt,
+                                  latency_ms=int((time.time() - ctx["start"]) * 1000),
+                                  ttft_ms=ctx["attempt_ttft_ms"], error=et)
+                cd_seconds = ar.config.cooling_period_seconds
+                fc = (ar.health_checker._fail_count.get(ctx["mdl"].id, 0) if (ar.health_checker and ctx["mdl"].id) else 0)
+                cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
+                err_annotated = f"{et} | cooldown={cd_actual}s fail#{fc}"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
-                    None, None, "all cascade fallbacks exhausted", 0, stream_errs,
-                    diag_start_ts=_diag_start)
-            finally:
+                    ctx["prov"].name, ctx["mdl"].model_id, err_annotated, st_attempt, None,
+                    stream_body=raw_body or et, diag_start_ts=_diag_start)
+                if cooling and ar.health_checker and not _is_stream_content_validation_error(et) and ctx["mdl"].id:
+                    ar.health_checker.mark_failure(ctx["mdl"].id)
+                    ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
+                print(f"[CASCADE] attempt {st_attempt} failed ({et[:60]}), trying next (tried={tried_sids})", flush=True)
+
+            async def _on_fail(st_attempt, et, exc):
+                if isinstance(exc, _ASkip):
+                    return  # 预检跳过已在 launch 内记录
+                ctx = getattr(exc, "ac", None) or ctx_by_idx.get(st_attempt)
+                if ctx is None:
+                    stream_errs.append({"attempt": st_attempt, "error": et})
+                    return
+                # 上下文超限不是模型自身故障：记录但不冷却
+                if is_context_error(et):
+                    await record_context_overflow(ctx["mdl"].id, est_req_tokens)
+                    await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None), cooling=False)
+                    return
+                await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None))
+
+            async def _on_loser(st_attempt):
+                ctx = ctx_by_idx.get(st_attempt)
+                if ctx is None or ctx.get("committed"):
+                    return
+                et = (f"race_overtaken: {_race_secs}s 内无实质内容，被更快候选取代（自动罚时冷却）")
+                await _record_fail(st_attempt, ctx, et, et)
+
+            async def _finish_session():
                 await cascade_db.close()
                 try:
                     await asyncio.shield(_decision_finish(
@@ -2291,6 +2519,76 @@ async def _chat_completions_impl(
                     ))
                 except Exception:
                     pass
+
+            try:
+                winner_idx, ctx = await _run_race(
+                    _launch,
+                    no_content_seconds=(_race_secs if _race_on else None),
+                    max_inflight=(2 if _race_on else 1),
+                    on_failure=_on_fail, on_loser=_on_loser)
+            except _RaceAllFailed:
+                yield _format_sse_chunk(_api_error("no more candidates", status=503,
+                                                   attempts=stream_errs), "unknown")
+                yield b"data: [DONE]\n\n"
+                await _write_stream_log(conversation_id, request, raw_request, "error",
+                    None, None, "no more candidates", 0, stream_errs, diag_start_ts=_diag_start)
+                await _finish_session()
+                return
+
+            # ── 胜出候选接管外发：重放缓冲 → 继续消费 → 收尾日志 ──
+            mid_full = ctx["full_id"]
+            try:
+                for _ck in ctx["buf"]:
+                    yield _format_sse_chunk(_ck, mid_full)
+                async for ck in ctx["gen"]:
+                    if isinstance(ck, dict) and "error" in ck:
+                        raise RuntimeError(f"upstream_stream_error: {str(ck.get('error', 'unknown'))[:200]}")
+                    ctx["buf"].append(ck)
+                    u = _stream_usage_dict(ck)
+                    if u:
+                        ctx["usage"] = u
+                    yield _format_sse_chunk(ck, mid_full)
+                import json as _json_mod
+                _diag(conversation_id, "upstream_stream_done", _diag_start, attempt=winner_idx,
+                      provider=ctx["prov"].name, model=ctx["mdl"].model_id, chunks=len(ctx["buf"]))
+                resp_snapshot = _json_mod.dumps(ctx["buf"], ensure_ascii=False) if ctx["buf"] else None
+                _nu = _normalize_usage(ctx["usage"])
+                pt, ct = _nu.prompt_tokens, _nu.completion_tokens
+                _crd, _cwt = _nu.cache_read_tokens, _nu.cache_write_tokens
+                _pt, _ct = _sanitize_token_counts(request, pt, ct, _output_text_from_chunks(ctx["buf"]))
+                _decision_attempt(conversation_id, provider=ctx["prov"].name, model=ctx["mdl"].model_id,
+                                  status="success", attempt=winner_idx,
+                                  latency_ms=int((time.time() - ctx["start"]) * 1000),
+                                  ttft_ms=ctx["attempt_ttft_ms"])
+                await _write_stream_log(conversation_id, request, raw_request, "success",
+                    ctx["prov"].name, ctx["mdl"].model_id, None, winner_idx, None,
+                    stream_body=resp_snapshot, prompt_tokens=_pt, completion_tokens=_ct,
+                    cache_read_tokens=_crd, cache_write_tokens=_cwt,
+                    latency_ms=int((time.time() - _send_time) * 1000),
+                    ttft_ms=ctx["ttft_ms"], diag_start_ts=_diag_start,
+                    est_prompt_tokens=est_req_tokens)
+                if ar.health_checker and ctx["mdl"].id:
+                    ar.health_checker.mark_success(ctx["mdl"].id)
+                yield b"data: [DONE]\n\n"
+            except Exception as se:
+                # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端
+                _diag(conversation_id, "upstream_stream_error", _diag_start, attempt=winner_idx,
+                      provider=ctx["prov"].name, model=ctx["mdl"].model_id, error=type(se).__name__)
+                err_s = f"{type(se).__name__}: {str(se)[:200]}"
+                if is_context_error(err_s):
+                    await record_context_overflow(ctx["mdl"].id, est_req_tokens)
+                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s, cooling=False)
+                else:
+                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s)
+                yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
+                yield b"data: [DONE]\n\n"
+            finally:
+                if ctx["gen"] is not None:
+                    try:
+                        await ctx["gen"].aclose()
+                    except Exception:
+                        pass
+                await _finish_session()
 
         return StreamingResponse(cascade_stream(), media_type="text/event-stream")
 
@@ -2619,7 +2917,12 @@ async def _chat_completions_impl(
                             error=f"{type(e).__name__}: {str(e)[:200]}",
                             reason="retrying another key",
                         )
-                        _rot.mark_failure(_cur_kid, getattr(e, "status_code", None))
+                        # P1-3: httpx.HTTPStatusError 的状态码在 .response.status_code，
+                        # getattr(e,"status_code") 恒 None → 401/403 硬熔断永不生效。
+                        _e_status = getattr(e, "status_code", None)
+                        if _e_status is None:
+                            _e_status = getattr(getattr(e, "response", None), "status_code", None)
+                        _rot.mark_failure(_cur_kid, _e_status)
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                         if not _same_key_retried and _is_transient_upstream_error(f"{type(e).__name__}: {str(e)[:200]}"):
                             _same_key_retried = True

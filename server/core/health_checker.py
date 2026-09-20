@@ -133,6 +133,24 @@ class HealthChecker:
         except Exception:
             pass
 
+    def penalize(self, model_id: int, seconds: int):
+        """固定时长罚时（不走指数退避）：流口水复读检测等强制冷却场景。"""
+        self._fail_count.pop(model_id, None)
+        self._cooling[model_id] = datetime.utcnow() + timedelta(seconds=seconds)
+        self._persist_cooling(model_id)
+        try:
+            import asyncio as _asyncio
+            from server.core.notifier import notify_event, resolve_model_name
+
+            async def _notify():
+                name = await resolve_model_name(model_id)
+                notify_event("cooldown",
+                             f"模型被强制罚时冷却：{name}（{seconds}s）")
+
+            _asyncio.get_running_loop().create_task(_notify())
+        except Exception:
+            pass
+
     def mark_failure(self, model_id: int):
         """记录一次失败"""
         self._load_cooling_from_db(model_id)

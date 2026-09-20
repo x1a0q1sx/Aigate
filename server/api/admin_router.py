@@ -1662,7 +1662,10 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     route_result = None
 
     # ─── 日志写入辅助（提前定义到 try 之前，避免 free_tier / oauth 早期 miss 兜底 _write_log 未绑定） ───
-    async def _write_log(status, resp_dict, latency_ms, error_msg=None, *, _route_result=route_result, _conversation_id=conversation_id, _request=request, _raw_request=raw_request):
+    # P1-19: _route_result 不做默认参数（def 时求值冻结为 None，后续赋值不可见 →
+    # routed_provider/model 恒 NULL）。route_result 在外层函数体赋值，闭包运行时读取即为最新值。
+    async def _write_log(status, resp_dict, latency_ms, error_msg=None, *, _conversation_id=conversation_id, _request=request, _raw_request=raw_request):
+        _route_result = route_result
         try:
             from server.db import AsyncSessionLocal as _LogSession
             usage = resp_dict.get("usage", {}) if resp_dict else {}

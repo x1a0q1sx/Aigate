@@ -302,6 +302,11 @@ export default {
   getNotify: () => apiGet('/admin/api/notify'),
   updateNotify: (data) => apiPut('/admin/api/notify', data),
   testNotify: () => apiPost('/admin/api/notify/test', {}),
+  // 流口水自动冷却 / 候选竞速
+  getDroolGuard: () => apiGet('/admin/api/drool-guard'),
+  updateDroolGuard: (data) => apiPut('/admin/api/drool-guard', data),
+  getRace: () => apiGet('/admin/api/race'),
+  updateRace: (data) => apiPut('/admin/api/race', data),
   // D4 价格健康
   getPriceHealth: () => apiGet('/admin/api/price-health'),
   // C3 数据库备份文件

@@ -137,6 +137,46 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>流口水自动冷却</h2>
+          <p>同一模型连续多次返回一字不差的相同答案 → 判为复读死循环，自动罚时冷却。</p>
+        </div>
+        <span class="status-pill" :class="drool.enabled ? 'ok' : 'muted'">{{ drool.enabled ? '已启用' : '未启用' }}</span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="drool.enabled" /> 启用流口水检测</label>
+      </div>
+      <div class="notify-fields">
+        <label>连续相同次数阈值<input v-model.number="drool.threshold" type="number" min="2" /></label>
+        <label>罚时冷却（分钟）<input v-model.number="drool.cooldown_minutes" type="number" min="1" /></label>
+        <label>最短参与长度（字符）<input v-model.number="drool.min_answer_chars" type="number" min="10" /></label>
+      </div>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveDrool" :disabled="droolSaving">{{ droolSaving ? '保存中...' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
+          <h2>候选竞速（Race）</h2>
+          <p>组合/auto 中候选超时未返回时，不杀它、并行再打下一个候选；谁先返回用谁的，慢的那个判失败并自动罚冷却。</p>
+        </div>
+        <span class="status-pill" :class="race.enabled ? 'ok' : 'muted'">{{ race.enabled ? '已启用' : '未启用' }}</span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="race.enabled" /> 启用竞速切换</label>
+      </div>
+      <div class="notify-fields">
+        <label>无返回判定（秒）<input v-model.number="race.no_content_seconds" type="number" min="3" /></label>
+      </div>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveRace" :disabled="raceSaving">{{ raceSaving ? '保存中...' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>响应缓存</h2>
           <p>config.yaml 的 response_cache.enabled 开启后，相同请求指纹的非流式响应在 TTL 内直接复用。</p>
         </div>
@@ -199,6 +239,10 @@ export default {
       backing: false,
       notify: { enabled: false, webhook_url: '', telegram_bot_token: '', telegram_chat_id: '', dingtalk_webhook: '', notify_model_cooldown: true, notify_all_failed: true, notify_budget_exceeded: true, min_interval_seconds: 300 },
       notifySaving: false,
+      drool: { enabled: true, threshold: 5, cooldown_minutes: 30, min_answer_chars: 40 },
+      droolSaving: false,
+      race: { enabled: true, no_content_seconds: 15 },
+      raceSaving: false,
       testing: false,
       testResults: null,
       testOk: false,
@@ -238,7 +282,7 @@ export default {
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace()])
       } finally {
         this.loading = false
       }
@@ -336,6 +380,32 @@ export default {
     async loadNotify() {
       try { this.notify = { ...this.notify, ...(await api.getNotify()) } }
       catch (e) { /* 配置加载失败保持默认 */ }
+    },
+    async loadDrool() {
+      try { this.drool = { ...this.drool, ...(await api.getDroolGuard()) } }
+      catch (e) { /* ignore */ }
+    },
+    async saveDrool() {
+      this.droolSaving = true
+      try {
+        this.drool = { ...this.drool, ...(await api.updateDroolGuard(this.drool)) }
+        toast.success('流口水检测配置已保存')
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.droolSaving = false }
+    },
+    async loadRace() {
+      try { this.race = { ...this.race, ...(await api.getRace()) } }
+      catch (e) { /* ignore */ }
+    },
+    async saveRace() {
+      this.raceSaving = true
+      try {
+        this.race = { ...this.race, ...(await api.updateRace(this.race)) }
+        toast.success('竞速配置已保存')
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.raceSaving = false }
     },
     async saveNotify() {
       this.notifySaving = true

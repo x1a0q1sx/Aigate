@@ -304,6 +304,60 @@ async def put_notify_config(body: NotifyConfigModel):
     return cfg.model_dump()
 
 
+# ─────────────────────────── DroolGuard: 流口水自动冷却 ───────────────────────────
+
+class DroolGuardModel(BaseModel):
+    enabled: Optional[bool] = None
+    threshold: Optional[int] = None
+    cooldown_minutes: Optional[int] = None
+    min_answer_chars: Optional[int] = None
+
+
+@router.get("/drool-guard")
+async def get_drool_guard():
+    from server.config import get_config
+    return get_config().drool_guard.model_dump()
+
+
+@router.put("/drool-guard")
+async def put_drool_guard(body: DroolGuardModel):
+    """保存设置并清空内存中的连续计数（阈值改了从头算，避免旧链用新阈值误触发）。"""
+    from server.config import get_config, save_config
+    cfg = get_config().drool_guard
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(cfg, k, v)
+    save_config()
+    try:
+        from server.core.drool_guard import reset_state
+        reset_state()
+    except Exception:
+        pass
+    return cfg.model_dump()
+
+
+# ─────────────────────────── Race: 候选竞速 ───────────────────────────
+
+class RaceModel(BaseModel):
+    enabled: Optional[bool] = None
+    no_content_seconds: Optional[int] = None
+
+
+@router.get("/race")
+async def get_race_config():
+    from server.config import get_config
+    return get_config().race.model_dump()
+
+
+@router.put("/race")
+async def put_race_config(body: RaceModel):
+    from server.config import get_config, save_config
+    cfg = get_config().race
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(cfg, k, v)
+    save_config()
+    return cfg.model_dump()
+
+
 @router.post("/notify/test")
 async def notify_test():
     from server.core.notifier import send_test

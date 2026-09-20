@@ -5,6 +5,8 @@
 ## [Unreleased]
 
 ### Added
+- 流口水自动冷却（DroolGuard）：同一模型连续 5 次返回一字不差的相同答案 → 判为复读死循环 → 强制罚时冷却 30 分钟（阈值/时长/最短参与长度可调，设置页开关）。比对的是**答案正文**（流式 chunk 拼接后去空白）而非响应哈希——chunk id 每次都变，哈希抓不到复读；现场依据：2026-09-19 烁公益站/kimi-k3 连续 5 次逐字返回同一条 "The input channel is healthy..."（北京 06:06-06:13）
+- 候选竞速（Race）：组合/auto 回退链中当前候选 15 秒没有返回内容 → 不杀它，并行再打下一个候选，谁先出结果用谁的；被超前的候选判失败并自动罚冷却。覆盖 combo 流式/非流式与 auto 级联流式/非流式四条路径（`server/core/race.py` 统一 runner），设置页可开关与调秒数；关闭时完全退化为旧的顺序回退
 - Combo 前缀路由（组合即端点）：`http://host:8000/combo:<名称或id>/v1` 直接把 Base URL 锁进某个组合——`/combo:918/v1/chat/completions`、`/v1/messages`、`/v1/responses` 的请求被强制改写为该组合级联路由（思考强度后缀保留），`/combo:918/v1/models`（简写 `/combo:918/models`）只列该组合候选模型；实现为路径改写中间件 + v1 入口注入，三协议零重复逻辑；Combos 页每条组合展示可复制的访问端点
 - 登录会话持久化：session 落库 `admin_sessions`（此前纯内存，服务每次重启全员掉线=「一会儿就过期」的根因），重启不丢登录态；活跃会话剩余不足一半时长自动滑动续期；过期时长调整为 2 小时（`auth.session_timeout_hours`）
 - OAuth 连接即自动登记服务商（credential_type=oauth，幂等；同名手工服务商只补 oauth 指向）；模型刷新支持 OAuth 服务商：在线 list_models，失败/无端点回退注册表静态种子（claude_code/codex/github_copilot/antigravity/cursor/codebuddy 国服国际服/cline/qoder 已配种子）
@@ -31,6 +33,7 @@
 - 模型管理/Playground/日志详情性能优化（N+1 消除、懒加载、截断）
 
 ### Fixed
+- 隐藏 Bug 猎捕审计第一批修复（docs/findings-bughunt-2026-09-18.md 勾选同步）：**P0-1** `stream_via` 漏 await（combo 流式 free_tier 与 auto 级联两处的 free/oauth/atomcode 候选 100% 失败并污染健康冷却池）；**P0-3** 响应缓存命中绕过网关鉴权/预算/日志（查询挪到 verify 之后，命中补 cache-hit 日志，error 体拒缓存）；**P0-4** Anthropic 适配器流式 finish 双发 + error 被 stop 伪装成功（finish_sent/error_sent 终态收敛），同函数带 **P1-11** message_start 的 input/cache usage 被丢弃（prompt_tokens=0 走粗估、缓存费恒 0）一并修复；**P0-5** /v1/messages 入站 tool_result 映射 role:"user" + 凭空追加空 user 消息（Claude Code 工具链配对断裂 → 上游 400）；**P1-1** `sa_select` NameError 兜底分支裸 500；**P1-2** combo 清理误删"临时禁用"模型（禁用只跳过不删）；**P1-3** 401/403 硬熔断恒失效（httpx 状态码取错属性）+ `_fallback_key` 不查熔断集合；**P1-8** log_queue 关闭不排空（每次重启白等 8s + 丢在途日志 → 被 sweep 成假 error）；**P1-9** 网关每日 token 预算双倍计缓存 token（最快 2 倍速耗尽误伤 429）；**P1-13** rank 缓存 key 含微秒时间戳恒 0 命中 + dict 无界增长（量化到秒 + 封顶淘汰）；**P1-16** 更新检查 git fetch/代理探测同步阻塞冻结事件循环（远端不可达=全站停摆）；**P1-19** Playground 日志路由归属恒 NULL（闭包默认参数冻结）；**P1-23** openai_compat/github/free_providers 流式只认 `data: ` 带空格形态（无空格上游整条流静默丢弃）
 - OAuth 服务商模型刷新 404（「Cline 免费模型获取不到」根因）：注册表 api_base_url 填到推理端点级别（`…/api/v1/chat/completions`）时，models 列表 URL 又拼了一层 `/v1/models` 成 `…/chat/completions/v1/models`；现剥除 chat/completions、messages、responses、embeddings 等端点后缀再挂 `/models`（已是版本根则直接拼），Cline 实时目录 445 模型（含 `:free` 后缀免费模型）正常入库；`/models` 裸数组响应形态同步兼容（此前只认 `{"data":[...]}`），CodeBuddy 的同类刷新 404 一并治愈
 - 改密码后强制全员重新登录现会同时清除落库会话（此前只清内存，DB 行在重启回填后仍「可复活」）
 - OAuth 浏览器回调 `/admin/oauth/callback` 被 auth 中间件拦成 SPA 页面（回调是浏览器顶层导航，不可能带 Authorization 头），authorization_code 流在默认配置下全断（审计 P0-2）→ 精确豁免该路径（其防线本就是 state/PKCE 而非登录态）；回调结果 redirect 到 /providers/oauth 的 success/error 落地提示，用户拒登的 error 回跳与换票异常不再裸 422/500

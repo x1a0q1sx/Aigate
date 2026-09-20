@@ -164,16 +164,18 @@ class KeyRotator:
             or getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth")
         ):
             return (None, None)
+        # P1-3: 兜底也必须绕开 hard_disabled——拉黑的 key 不能再被兜底返回
         res = await db.execute(
             select(ApiKey)
             .where(ApiKey.provider_id == provider_id, ApiKey.is_active == True)
             .order_by(ApiKey.id)
-            .limit(1)
+            .limit(20)
         )
-        k = res.scalar_one_or_none()
-        if not k:
-            return (None, None)
-        return k.id, self._crypto.decrypt(k.key_encrypted)
+        for k in res.scalars().all():
+            if k.id in self._hard_disabled:
+                continue
+            return k.id, self._crypto.decrypt(k.key_encrypted)
+        return (None, None)
 
     def mark_success(self, api_key_id: int):
         """单次请求成功 → 清空 fail_count"""

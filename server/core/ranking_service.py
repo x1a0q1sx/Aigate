@@ -357,9 +357,16 @@ class RankingService:
         ② 速度/稳定性统计批量聚合（此前每个模型 2 次查询，千级模型 = 数千次 SQL）。"""
         import time as _time
         import hashlib as _hashlib
+        # P1-13: 冷却时间参与 key 必须量化到秒——datetime 带微秒时每请求 key 都不同，
+        # TTL 缓存命中率恒为 0（且缓存 dict 无界增长）。
+        def _q(v):
+            try:
+                return v.replace(microsecond=0).isoformat()
+            except Exception:
+                return str(v)
         _ck_src = (
             tuple(sorted(m.id for m in models)),
-            tuple(sorted((k, str(v)) for k, v in (health_cooling or {}).items())),
+            tuple(sorted((k, _q(v)) for k, v in (health_cooling or {}).items())),
         )
         ck = _hashlib.md5(repr(_ck_src).encode()).hexdigest()
         cached = self._rank_cache.get(ck)
@@ -486,6 +493,14 @@ class RankingService:
                 0 if s.is_free else 1,
             )
         scores.sort(key=sort_key)
+        # P1-13: rank 缓存封顶——先清过期项，仍超限再插除最旧，杜绝无界增长
+        if len(self._rank_cache) > 256:
+            _now2 = _time.time()
+            for _k2 in [k2 for k2, (_, ts2) in self._rank_cache.items()
+                        if _now2 - ts2 >= self._RANK_TTL]:
+                self._rank_cache.pop(_k2, None)
+            while len(self._rank_cache) > 256:
+                self._rank_cache.pop(next(iter(self._rank_cache)))
         self._rank_cache[ck] = (scores, _time.time())
         return scores
     async def rank_top_speed(self, db: AsyncSession, limit: int = 5) -> List[Dict[str, Any]]:

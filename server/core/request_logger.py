@@ -280,6 +280,14 @@ async def write_log(db: AsyncSession, **kwargs) -> int:
     worker 停止（服务关闭 flush 后）时回退同步写，保证关闭瞬间的日志不丢。"""
     # D1: 鉴权阶段设置的下游网关密钥 id 自动随日志落库（调用方未显式传时）
     apply_downstream_key(kwargs)
+    # DroolGuard：成功且有响应体的日志记一笔（纯内存计数，命中阈值才异步罚时）
+    if kwargs.get("status") == "success" and kwargs.get("response_body"):
+        try:
+            from server.core.drool_guard import note_success
+            note_success(kwargs.get("routed_provider"), kwargs.get("routed_model"),
+                         kwargs.get("response_body"))
+        except Exception:
+            pass
     try:
         from server.core.log_queue import enqueue_log, is_running
         if is_running():
