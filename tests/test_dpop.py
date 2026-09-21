@@ -68,6 +68,8 @@ def test_openai_compat_headers_apply_dpop_and_strip_marker():
                              url="https://api.u1s1.io/v1/chat/completions", method="POST")
     assert headers["Authorization"] == "DPoP u1s1d-marker"
     assert "__dpop" not in headers and "." in headers["DPoP"]
+    # 客户端完整性审查判据：出站必须带 user-agent: u1s1-cli（实测缺它 → 403 client_integrity_review）
+    assert headers.get("user-agent") == "u1s1-cli"
     # 无 __dpop 时保持 Bearer 旧行为
     h2 = a._get_headers("u1s1-key", {"__oauth": True}, "https://api.u1s1.io/v1",
                         url="https://api.u1s1.io/v1/chat/completions")

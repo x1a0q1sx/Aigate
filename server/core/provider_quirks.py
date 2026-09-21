@@ -96,10 +96,13 @@ _CLINE = ProviderQuirks(
 # u1s1（有一说一）：OpenAI 兼容。推理「客户端信号」= RFC9449 DPoP（官方 CLI device-auth.js
 # 同协议）：Authorization: DPoP <u1s1d-…> + dpop proof 逐请求现签，签名材料来自设备登录时
 # 持久化的密钥对（credential_resolver 注入 __dpop 内部标记，openai_compat 出站前签发）。
+# 客户端完整性审查（client_integrity_review 403）实测判据 = user-agent: u1s1-cli
+#（官方 tools.js 同源）；缺 DPoP → 401/缺 UA → 403，二者皆必需，缺一仍被拦。
 # 归因头（x-u1s1-*）对齐官方 CLI 形态，随域名方言统一附加。
 _U1S1 = ProviderQuirks(
     name="u1s1",
     default_headers={
+        "user-agent": "u1s1-cli",
         "x-u1s1-client": "terminal",
         "x-u1s1-version": "1.11.2",
         "x-u1s1-platform": "linux-x64",
