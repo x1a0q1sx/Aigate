@@ -1235,16 +1235,27 @@ async def delete_model(model_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/models/refresh")
 async def refresh_models(
     provider_id: Optional[int] = None,
+    trigger: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """刷新模型列表，如果 provider_id 指定则只刷新该服务商"""
+    """刷新模型列表，如果 provider_id 指定则只刷新该服务商
+    trigger: 日志来源标记（manual/scheduled）；scheduled 时刷新全部启用服务商（不限有密钥者）。"""
+    _trig = (trigger or "manual").strip() or "manual"
+    if _trig not in ("manual", "scheduled"):
+        _trig = "manual"
     if provider_id:
         provider = await db.get(Provider, provider_id)
         if not provider:
             raise HTTPException(status_code=404, detail="Provider not found")
         providers = [provider]
+    elif _trig == "scheduled":
+        # 定时刷新覆盖所有启用服务商（含 free_tier / oauth / 无密钥者）
+        result = await db.execute(
+            select(Provider).where(Provider.enabled.is_(True)).order_by(Provider.id)
+        )
+        providers = list(result.scalars().all())
     else:
-        # 刷新所有有密钥的 provider
+        # 手动刷新所有有密钥的 provider
         result = await db.execute(
             select(Provider).join(ApiKey, Provider.id == ApiKey.provider_id).distinct()
         )
@@ -1259,7 +1270,7 @@ async def refresh_models(
     added_details = []
     removed_details = []
     for provider in providers:
-        result = await _model_catalog.refresh_models_from_provider(db, provider, _key_manager)
+        result = await _model_catalog.refresh_models_from_provider(db, provider, _key_manager, trigger=_trig)
         if "error" in result:
             continue
         total_added += result.get("added", 0)

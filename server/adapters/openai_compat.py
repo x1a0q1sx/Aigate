@@ -170,11 +170,14 @@ class OpenAICompatAdapter(BaseAdapter):
             headers.update({k: v for k, v in extra_headers.items()
                             if k not in ("__proxy_force", "__proxy_url", "__oauth", "__dpop")})
         headers["Content-Type"] = "application/json"
-        # u1s1 设备凭证：官方「客户端信号」= RFC9449 DPoP，逐请求现签（htm/htu 绑定目标 URL）
+        # u1s1 设备凭证：官方「客户端信号」= RFC9449 DPoP，逐请求现签（htm/htu 绑定目标 URL）；
+        # x-u1s1-attestation 为平台完整性审查的客户端证明（/v1/models 领取，见 u1s1_attestation）
         dp = (extra_headers or {}).get("__dpop")
         if dp and url:
             from server.core.dpop import sign_proof
             headers.update(sign_proof(dp["jwk"], dp["token"], method, url))
+            if dp.get("att"):
+                headers["x-u1s1-attestation"] = str(dp["att"])
         return headers
     async def chat_completion(
         self,

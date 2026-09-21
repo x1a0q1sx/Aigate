@@ -1717,6 +1717,10 @@ async def _chat_completions_impl(
                         _fbmov = getattr(_mdl, "request_overrides", None) or {}
                         if isinstance(_fbmov, dict) and _fbmov.get("headers"):
                             _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
+                        # 统一解析器的附加头必须随行（oauth 专属头 + __dpop 内部标记；
+                        # 丢了标记 = DPoP 设备凭证被当 Bearer 裸发 → u1s1 401 认证方式不支持）
+                        if _rc.extra_headers:
+                            _fb_eh = {**(_fb_eh or {}), **_rc.extra_headers}
                         # free_tier 走专用 executor（FORCE_PROXY/裸 model_id 由 resolver 处理）
                         if _rc.kind == "free_tier":
                             # P0-1: stream_via 是协程函数，必须 await 拿到异步生成器

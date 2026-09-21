@@ -68,6 +68,8 @@ class ModelRefreshConfig(BaseModel):
     刷新会顺序请求上游 /v1/models 与定价接口，上游慢或不可达时这里决定最多等多久。"""
     timeout_seconds: int = 20               # 单次网络请求超时（list_models 与 pricing 各算一次）
     remove_missing_models: bool = True      # 刷新时自动删除上游已下架、本地仍存在的自动同步模型（保留手动添加的 is_manual=True）
+    scheduled_enabled: bool = False         # 定时自动刷新全部服务商模型（默认关闭；每次落 model_refresh_logs，分析页可查详情）
+    interval_minutes: int = 720             # 定时刷新间隔（分钟），仅 scheduled_enabled=true 时生效
 
 
 class ArenaConfig(BaseModel):

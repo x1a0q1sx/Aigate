@@ -78,8 +78,17 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
                     material = None
                 if material:
                     rc.api_key = material["bearer"]
+                    # 客户端证明（完整性审查第二段）：官方 CLI 从 /v1/models 响应领 token，
+                    # 推理请求逐条附 x-u1s1-attestation；缺了它 DPoP 过了照样 403
+                    from server.core.u1s1_attestation import get_attestation
+                    try:
+                        att = await get_attestation(rc.base_url)
+                    except Exception:
+                        att = None
                     rc.extra_headers = {**(rc.extra_headers or {}),
-                                        "__dpop": {"token": material["bearer"], "jwk": material["priv"]}}
+                                        "__dpop": {"token": material["bearer"],
+                                                   "jwk": material["priv"],
+                                                   "att": att}}
             rc.adapter = create_adapter_for_provider(api_type)
             return rc
         # free_tier

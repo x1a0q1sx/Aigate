@@ -5,6 +5,8 @@ v2.0: 支持 priority_boost + auto_excluded
 """
 import logging
 import asyncio
+import json
+import time
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -243,6 +245,57 @@ class ModelCatalog:
         await session.refresh(model)
         return model
     async def refresh_models_from_provider(
+        self,
+        session: AsyncSession,
+        provider: Provider,
+        key_manager: KeyManager,
+        trigger: str = "manual"
+    ) -> dict:
+        """刷新主体计时 + 落 model_refresh_logs（分析页「模型刷新」日志类型可查详情）。"""
+        t0 = time.monotonic()
+        try:
+            result = await self._refresh_models_inner(session, provider, key_manager)
+        except Exception as e:
+            await self._record_refresh(session, provider,
+                                       {"error": f"{type(e).__name__}: {e}"[:400]}, trigger, t0)
+            raise
+        await self._record_refresh(session, provider, result, trigger, t0)
+        return result
+
+    async def _record_refresh(self, session, provider, result, trigger, t0):
+        result = result if isinstance(result, dict) else {}
+        try:
+            from server.models.model_refresh_log import ModelRefreshLog
+            err = result.get("error")
+            pricing_err = result.get("pricing_error")
+            row = ModelRefreshLog(
+                trigger=trigger,
+                provider_id=getattr(provider, "id", None),
+                provider_name=getattr(provider, "name", "?"),
+                ok=not err,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                added=int(result.get("added") or 0),
+                updated=int(result.get("updated") or 0),
+                removed=int(result.get("removed") or 0),
+                total=int(result.get("total") or 0),
+                pricing_updated=int(result.get("pricing_updated") or 0),
+                metric_updated=int(result.get("metric_updated") or 0),
+                pricing_source=result.get("pricing_source"),
+                error=(str(err)[:500] if err else
+                       (f"定价源: {str(pricing_err)[:300]}" if pricing_err else None)),
+                added_models=json.dumps(result.get("added_models") or [], ensure_ascii=False)[:4000],
+                removed_models=json.dumps(result.get("removed_models") or [], ensure_ascii=False)[:4000],
+            )
+            session.add(row)
+            await session.commit()
+        except Exception as e:
+            logger.warning("模型刷新日志落库失败 %s: %s", getattr(provider, "name", "?"), e)
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+
+    async def _refresh_models_inner(
         self,
         session: AsyncSession,
         provider: Provider,

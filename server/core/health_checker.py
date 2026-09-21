@@ -239,18 +239,18 @@ class HealthChecker:
                 return HealthResult(status="healthy", latency_ms=latency)
             except Exception as e:
                 return HealthResult(status="unhealthy", latency_ms=0, error_message=str(e)[:300])
-        # ── oauth：取 access token 作为临时 key ──
+        # ── oauth：统一凭证解析（u1s1 设备凭证需 __dpop 标记随行，裸 token 会被拒） ──
+        _h_extra = None
         if cred_type == "oauth":
-            from server.core.oauth_client import get_oauth_client
-            from server.core.oauth_registry import get_oauth_provider as _get_oauth_p
-            oc = getattr(provider, "oauth_code", None) or provider.name
-            oauth_p = _get_oauth_p(oc)
-            api_key = await get_oauth_client().pick_access_token(oc, session) if oauth_p else None
-            if not api_key:
+            from server.core.credential_resolver import resolve_credential_async
+            _rc_h = await resolve_credential_async(provider, model, session)
+            if not _rc_h.ok or not _rc_h.api_key:
                 return HealthResult(
                     status="unhealthy", latency_ms=0,
-                    error_message=f"OAuth provider '{oc}' not connected"
+                    error_message=(_rc_h.error or "OAuth credential unavailable")
                 )
+            api_key = _rc_h.api_key
+            _h_extra = _rc_h.extra_headers
         else:
             # atomcode：鉴权由本地 daemon 通过自身 config.toml 完成，不需要 AIGate 的 ApiKey 表密钥
             if provider.api_type == "atomcode":
@@ -272,8 +272,8 @@ class HealthChecker:
                 api_key = key_manager._crypto.decrypt(key.key_encrypted)
         # 创建适配器
         adapter = create_adapter_for_provider(provider)
-        # 执行检查
-        extra_headers = provider.headers if provider.headers else None
+        # 执行检查（oauth 走解析器附加头：已并 provider 头 + __oauth/__dpop）
+        extra_headers = _h_extra or (provider.headers if provider.headers else None)
         result = await adapter.health_check(
             model.model_id,
             api_key,

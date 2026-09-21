@@ -72,3 +72,19 @@ def test_openai_compat_headers_apply_dpop_and_strip_marker():
     h2 = a._get_headers("u1s1-key", {"__oauth": True}, "https://api.u1s1.io/v1",
                         url="https://api.u1s1.io/v1/chat/completions")
     assert h2["Authorization"] == "Bearer u1s1-key" and "DPoP" not in h2
+
+
+def test_openai_compat_headers_apply_attestation():
+    from server.adapters.openai_compat import OpenAICompatAdapter
+    jwk = _make_jwk()
+    a = OpenAICompatAdapter()
+    extra = {"__oauth": True, "__dpop": {"token": "u1s1d-m", "jwk": jwk, "att": "ATT-TOKEN"}}
+    headers = a._get_headers("u1s1d-m", extra, "https://api.u1s1.io/v1",
+                             url="https://api.u1s1.io/v1/chat/completions", method="POST")
+    assert headers.get("x-u1s1-attestation") == "ATT-TOKEN"
+    assert headers["Authorization"] == "DPoP u1s1d-m"  # att 缺失与否不影响 DPoP
+    # 冷却期 att=None：不带该头（对齐 CLI：拿不到 token 就裸发，失败由冷却兜底）
+    extra2 = {"__dpop": {"token": "u1s1d-m2", "jwk": jwk, "att": None}}
+    h2 = a._get_headers("u1s1d-m2", extra2, "https://api.u1s1.io/v1",
+                        url="https://api.u1s1.io/v1/chat/completions", method="POST")
+    assert "x-u1s1-attestation" not in h2 and h2["Authorization"] == "DPoP u1s1d-m2"

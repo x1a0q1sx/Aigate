@@ -95,6 +95,25 @@ def _schedule_maintenance():
         )
         print("✓ 智力评分每周自动同步已排程（周一 05:00）")
 
+    # 定时模型刷新（config.yaml model_refresh.scheduled_enabled，默认关；
+    # 每次刷新增落 model_refresh_logs，分析页日志类型=模型刷新可查详情）
+    mrc = getattr(config, "model_refresh", None)
+    if mrc and getattr(mrc, "scheduled_enabled", False) and int(getattr(mrc, "interval_minutes", 0) or 0) > 0:
+        async def _run_model_refresh():
+            try:
+                from .api.admin_router import refresh_models as _rm
+                async with AsyncSessionLocal() as db:
+                    r = await _rm(None, "scheduled", db)
+                print(f"✓ 定时模型刷新: 新增 {r.added} · 删除 {r.removed}"
+                      f" · 定价 {r.pricing_updated}（详情见分析页·模型刷新）")
+            except Exception as e:
+                print(f"⚠️ 定时模型刷新失败: {e}")
+        _archive_scheduler.add_job(
+            _run_model_refresh, "interval",
+            minutes=int(mrc.interval_minutes), id="model_refresh_scheduled",
+        )
+        print(f"✓ 定时模型刷新已排程（每 {mrc.interval_minutes} 分钟，覆盖全部启用服务商）")
+
     _archive_scheduler.start()
 # 内置服务商模板，首次启动（空数据库）自动创建。
 # 仅保留 3 个开箱即用的免费/直连渠道，其余由用户自行添加。

@@ -59,6 +59,10 @@
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
         <h2>请求日志</h2>
         <div style="display: flex; gap: 8px;">
+          <select v-model="filterLogType" @change="loadPage(1)" style="width: auto;" title="日志类型：请求调用 / 模型列表刷新">
+            <option value="">请求日志</option>
+            <option value="refresh">模型刷新</option>
+          </select>
           <select v-model="filterStatus" @change="loadPage(1)" style="width: auto;">
             <option value="">全部状态</option>
             <option value="pending">⏳ 待响应</option>
@@ -75,6 +79,7 @@
         <thead>
           <tr>
             <th>时间</th>
+            <th>日志类型</th>
             <th>请求模型</th>
             <th>路由到</th>
             <th>状态</th>
@@ -87,10 +92,33 @@
         </thead>
         <tbody>
           <tr v-if="items.length === 0">
-            <td colspan="8" style="text-align: center; padding: 32px; color: var(--gray-500);">暂无请求日志</td>
+            <td colspan="10" style="text-align: center; padding: 32px; color: var(--gray-500);">{{ filterLogType === 'refresh' ? '暂无模型刷新日志（点一次「刷新模型列表」即可看到）' : '暂无请求日志' }}</td>
           </tr>
-          <tr v-for="r in items" :key="r.id">
+          <template v-for="r in items" :key="(r.log_type || 'request') + '-' + r.id">
+            <!-- 模型刷新日志行：服务商/结果/增删明细 -->
+            <tr v-if="r.log_type === 'refresh'">
+              <td style="font-size: 12px; white-space: nowrap;">{{ fmtTime(r.created_at) }}</td>
+              <td><span class="badge badge-info" style="font-size: 11px;">模型刷新</span></td>
+              <td style="font-family: monospace; font-size: 12px;">{{ r.provider_name || '-' }}</td>
+              <td style="font-size: 12px;">{{ r.trigger === 'scheduled' ? '定时' : '手动' }}</td>
+              <td>
+                <span :class="['badge', r.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 11px;" :title="r.error || ''">{{ r.status === 'success' ? '成功' : '失败' }}</span>
+              </td>
+              <td style="font-family: monospace;">{{ fmtLatency(null, r.duration_ms) }}</td>
+              <td style="font-family: monospace; font-size: 12px;" :title="refreshChangesTitle(r)">
+                <span v-if="r.added" style="color: var(--success);">+{{ r.added }}</span>
+                <span v-if="r.updated" style="color: #2b8aef;"> ~{{ r.updated }}</span>
+                <span v-if="r.removed" style="color: var(--danger);"> -{{ r.removed }}</span>
+                <span v-if="!r.added && !r.removed && r.status === 'success'" style="color: var(--gray-500);">无变化</span>
+              </td>
+              <td style="font-family: monospace; font-size: 12px;">{{ r.pricing_updated ? '价' + r.pricing_updated : '-' }}</td>
+              <td></td>
+              <td><button class="btn btn-outline btn-sm" @click="showDetail(r)">详情</button></td>
+            </tr>
+            <!-- 请求日志行（原有） -->
+            <tr v-else>
             <td style="font-size: 12px; white-space: nowrap;">{{ fmtTime(r.created_at) }}</td>
+            <td><span class="badge badge-neutral" style="font-size: 11px;">请求</span></td>
             <td style="font-family: monospace; font-size: 12px;">{{ r.requested_model || '-' }}</td>
             <td style="font-family: monospace; font-size: 12px;">
               <span v-if="r.routed_provider">{{ r.routed_provider }}/{{ r.routed_model }}</span>
@@ -108,7 +136,8 @@
               <span v-else style="color: var(--gray-500); font-size: 12px;">⚪ 直连</span>
             </td>
             <td><button class="btn btn-outline btn-sm" @click="showDetail(r)">详情</button></td>
-          </tr>
+            </tr>
+          </template>
         </tbody>
       </table>
       <div style="display: flex; justify-content: space-between; align-items: center; padding: 12px 0;">
@@ -362,7 +391,64 @@
     <!-- 详情弹窗 -->
     <div v-if="detailRow" class="modal-overlay" @click.self="detailRow = null">
       <div class="modal-content detail-modal">
-        <h3>请求详情</h3>
+        <h3>{{ detailRow.log_type === 'refresh' ? '模型刷新详情' : '请求详情' }}</h3>
+        <!-- 模型刷新详情 -->
+        <template v-if="detailRow.log_type === 'refresh'">
+          <table class="detail-meta" style="width: 100%; margin: 16px 0; table-layout: fixed;">
+            <tbody>
+            <tr>
+              <td class="k">时间</td><td class="v">{{ fmtTime(detailRow.created_at) }}</td>
+              <td class="k">服务商</td><td class="v">{{ detailRow.provider_name }}</td>
+            </tr>
+            <tr>
+              <td class="k">触发方式</td><td class="v">{{ detailRow.trigger === 'scheduled' ? '定时' : '手动' }}</td>
+              <td class="k">耗时</td><td class="v">{{ fmtLatency(null, detailRow.duration_ms) }}</td>
+            </tr>
+            <tr>
+              <td class="k">结果</td>
+              <td class="v">
+                <span :class="['badge', detailRow.status === 'success' ? 'badge-success' : 'badge-danger']" style="font-size: 12px;">{{ detailRow.status === 'success' ? '成功' : '失败' }}</span>
+              </td>
+              <td class="k">模型总数</td><td class="v">{{ detailRow.total_models }}</td>
+            </tr>
+            <tr>
+              <td class="k">新增</td><td class="v" style="color: var(--success);">{{ detailRow.added }}</td>
+              <td class="k">删除</td><td class="v" style="color: var(--danger);">{{ detailRow.removed }}</td>
+            </tr>
+            <tr>
+              <td class="k">更新</td><td class="v">{{ detailRow.updated }}</td>
+              <td class="k">定价/指标更新</td><td class="v">{{ detailRow.pricing_updated }} / {{ detailRow.metric_updated }}</td>
+            </tr>
+            <tr v-if="detailRow.pricing_source">
+              <td class="k">定价来源</td><td class="v" colspan="3" style="font-family: monospace; font-size: 12px; word-break: break-all;">{{ detailRow.pricing_source }}</td>
+            </tr>
+            <tr v-if="detailRow.error">
+              <td class="k">错误</td><td class="v" colspan="3" style="color: var(--danger); word-break: break-all;">{{ detailRow.error }}</td>
+            </tr>
+            </tbody>
+          </table>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+            <div>
+              <h4 style="margin: 0 0 8px; color: var(--success);">➕ 新增模型</h4>
+              <div v-if="(detailRow.added_models || []).length" class="code-block" style="max-height: 320px;">
+                <div v-for="(m, i) in detailRow.added_models" :key="i" style="font-size: 12px; margin-bottom: 4px;">
+                  <strong>{{ m.model_id }}</strong><span v-if="m.display_name && m.display_name !== m.model_id" style="color: #94a3b8;"> · {{ m.display_name }}</span>
+                </div>
+              </div>
+              <p v-else style="color: var(--gray-500); font-size: 13px;">无</p>
+            </div>
+            <div>
+              <h4 style="margin: 0 0 8px; color: var(--danger);">➖ 移除模型</h4>
+              <div v-if="(detailRow.removed_models || []).length" class="code-block" style="max-height: 320px;">
+                <div v-for="(m, i) in detailRow.removed_models" :key="i" style="font-size: 12px; margin-bottom: 4px;">
+                  <strong>{{ m.model_id }}</strong><span v-if="m.display_name && m.display_name !== m.model_id" style="color: #94a3b8;"> · {{ m.display_name }}</span>
+                </div>
+              </div>
+              <p v-else style="color: var(--gray-500); font-size: 13px;">无</p>
+            </div>
+          </div>
+        </template>
+        <template v-else>
         <table class="detail-meta" style="width: 100%; margin: 16px 0; table-layout: fixed;">
           <tbody>
           <tr>
@@ -514,6 +600,7 @@
             </details>
           </div>
         </div>
+        </template>
         <div class="modal-actions">
           <button class="btn btn-outline" @click="detailRow = null">关闭</button>
         </div>
@@ -559,6 +646,7 @@ export default {
       total: 0,
       totalPages: 1,
       filterStatus: '',
+      filterLogType: '',
       detailRow: null,
       detailLoading: false,
       archives: [],
@@ -875,6 +963,15 @@ export default {
       api.getLogProviders().then(d => { this.logProviders = (d && d.providers) || [] }).catch(() => {})
     },
     trendX(i) { return this.trendScale.xOf(i) },
+    // 模型刷新行的悬停摘要：新增/移除的模型名清单
+    refreshChangesTitle(r) {
+      const names = (arr) => (arr || []).map((m) => m.model_id).join('、')
+      const parts = []
+      if ((r.added_models || []).length) parts.push('新增: ' + names(r.added_models))
+      if ((r.removed_models || []).length) parts.push('移除: ' + names(r.removed_models))
+      if (r.error) parts.push('错误: ' + r.error)
+      return parts.join('\n') || (r.status === 'success' ? '无增删' : '')
+    },
     trendYTok(d) { return this.trendScale.yTok(d.tokens || 0) },
     trendYCost(d) { return this.trendScale.yCost(d.cost_usd || 0) },
     trendShowLabel(i) {
@@ -900,6 +997,7 @@ export default {
       if (p !== this.page) this.pageJump = p
       this.page = p
       const params = { page: p, page_size: 10 }
+      if (this.filterLogType) params.log_type = this.filterLogType
       if (this.filterStatus) params.status = this.filterStatus
       if (this.filterProvider) params.provider = this.filterProvider
       try {
@@ -917,6 +1015,8 @@ export default {
       this.loadPage(n)
     },
     showDetail(r, full = false) {
+      // 模型刷新行：列表接口已带全量字段（增删清单/错误），直接展示
+      if (r.log_type === 'refresh') { this.detailRow = { ...r }; return }
       this.detailLoading = true
       if (!full) this.detailRow = { ...r }  // 先显示已有字段
       api.getLogDetail(r.id, full).then(data => {

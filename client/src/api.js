@@ -195,6 +195,7 @@ export default {
     if (params.page_size) qs.append('page_size', params.page_size)
     if (params.status) qs.append('status', params.status)
     if (params.provider) qs.append('provider', params.provider)
+    if (params.log_type) qs.append('log_type', params.log_type)
     return apiGet(`/admin/api/logs?${qs.toString()}`)
   },
   getLogDetail: (id, full = false) => apiGet(`/admin/api/logs/${id}${full ? '?full=1' : ''}`),

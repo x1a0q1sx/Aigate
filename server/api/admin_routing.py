@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, text, desc, func, and_
+from sqlalchemy import select, text, desc, func, and_, false
 from sqlalchemy.orm import defer
 from server.db import AsyncSessionLocal
 from server.models.request_log import RequestLog, AnalyticsCumulative
@@ -430,8 +430,62 @@ async def list_request_logs(
     page_size: int = Query(10, ge=1, le=100),
     status: Optional[str] = None,
     provider: Optional[str] = None,
+    log_type: Optional[str] = Query(None, pattern="^(request|refresh)$"),
     db: AsyncSession = Depends(get_db),
 ):
+    # ── 日志类型=模型刷新：查 model_refresh_logs（每次刷新落一行，含增删明细） ──
+    if log_type == "refresh":
+        from server.models.model_refresh_log import ModelRefreshLog
+        base_q = select(ModelRefreshLog)
+        count_q = select(func.count(ModelRefreshLog.id))
+        if status == "success":
+            base_q = base_q.where(ModelRefreshLog.ok.is_(True))
+            count_q = count_q.where(ModelRefreshLog.ok.is_(True))
+        elif status == "error":
+            base_q = base_q.where(ModelRefreshLog.ok.is_(False))
+            count_q = count_q.where(ModelRefreshLog.ok.is_(False))
+        elif status == "pending":
+            base_q = base_q.where(false())
+            count_q = count_q.where(false())
+        if provider:
+            base_q = base_q.where(ModelRefreshLog.provider_name == provider)
+            count_q = count_q.where(ModelRefreshLog.provider_name == provider)
+        total = (await db.execute(count_q)).scalar_one()
+        rows = (await db.execute(
+            base_q.order_by(desc(ModelRefreshLog.created_at))
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )).scalars().all()
+
+        def _jarr(s):
+            try:
+                v = json.loads(s) if s else []
+                return v if isinstance(v, list) else []
+            except Exception:
+                return []
+
+        return {
+            "page": page, "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "items": [{
+                "log_type": "refresh",
+                "id": r.id,
+                "status": "success" if r.ok else "error",
+                "trigger": r.trigger or "manual",
+                "provider_name": r.provider_name,
+                "duration_ms": r.duration_ms,
+                "added": r.added or 0, "updated": r.updated or 0,
+                "removed": r.removed or 0, "total_models": r.total or 0,
+                "pricing_updated": r.pricing_updated or 0,
+                "metric_updated": r.metric_updated or 0,
+                "pricing_source": r.pricing_source,
+                "error": r.error,
+                "added_models": _jarr(r.added_models),
+                "removed_models": _jarr(r.removed_models),
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            } for r in rows],
+        }
     base_q = select(RequestLog).where(RequestLog.is_health_check.is_(False)).options(
         defer(RequestLog.request_body), defer(RequestLog.response_body)
     )
@@ -461,6 +515,7 @@ async def list_request_logs(
         "total": total,
         "total_pages": max(1, (total + page_size - 1) // page_size),
         "items": [{
+            "log_type": "request",
             "id": r.id,
             "conversation_id": r.conversation_id,
             "requested_model": r.requested_model,

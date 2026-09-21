@@ -209,16 +209,20 @@ class AutoRouter:
                                 # Free Tier / OAuth — key 可空
                                 api_key = None
                                 key_id_for_rate = None
+                                _sticky_extra = None
                                 if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                                     if provider.credential_type == "oauth":
+                                        # 走统一解析器：u1s1 需在附加头里带 __dpop 标记，
+                                        # 裸 pick_access_token 会把设备凭证当 Bearer 发出去
                                         try:
-                                            from server.core.oauth_client import get_oauth_client
-                                            _oc = getattr(provider, "oauth_code", None) or provider.name
-                                            api_key = await get_oauth_client().pick_access_token(_oc, session)
+                                            from server.core.credential_resolver import resolve_credential_async
+                                            _rc_s = await resolve_credential_async(provider, sticky_model, session)
                                         except Exception:
-                                            api_key = None
-                                        if not api_key:
+                                            _rc_s = None
+                                        if _rc_s is None or not _rc_s.ok:
                                             return None   # OAuth 未连接，放走
+                                        api_key = _rc_s.api_key
+                                        _sticky_extra = _rc_s.extra_headers
                                     else:
                                         api_key = ""
                                 else:
@@ -240,7 +244,11 @@ class AutoRouter:
                                 except Exception:
                                     pass
                                 adapter = create_adapter_for_provider(provider.api_type)
-                                _extra = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+                                # resolver 附加头已含 __oauth/provider 头（u1s1 另含 __dpop 标记）；
+                                # 非 oauth 保持原语义 None
+                                _extra = None
+                                if getattr(provider, "credential_type", "") == "oauth":
+                                    _extra = dict(_sticky_extra or {"__oauth": True})
                                 if getattr(provider, "proxy_enabled", False):
                                     _extra = {**(_extra or {}), "__proxy_force": True}
                                 from .route_decision import capture_candidates, mark_selected
@@ -333,14 +341,20 @@ class AutoRouter:
             # Free Tier / OAuth providers — key 可空
             api_key = None
             key = None
+            _cand_extra = None
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                 if provider.credential_type == "oauth":
+                    # 统一解析器：u1s1 需 __dpop 标记随行，裸 token 会被当 Bearer 拒收
                     try:
-                        from server.core.oauth_client import get_oauth_client
-                        _oc = getattr(provider, "oauth_code", None) or provider.name
-                        api_key = await get_oauth_client().pick_access_token(_oc, session)
+                        from server.core.credential_resolver import resolve_credential_async
+                        _rc_c = await resolve_credential_async(provider, candidate, session)
                     except Exception:
+                        _rc_c = None
+                    if _rc_c is None or not _rc_c.ok:
                         api_key = None
+                    else:
+                        api_key = _rc_c.api_key
+                        _cand_extra = _rc_c.extra_headers
                     if not api_key:
                         # OAuth 未连接，跳过此候选
                         if conversation_id:
@@ -433,7 +447,10 @@ class AutoRouter:
                     model_pk=candidate.id,
                     reason="highest ranked available candidate",
                 )
-            _extra_a = {"__oauth": True} if (getattr(provider, "credential_type", "") == "oauth") else None
+            # resolver 附加头含 __oauth/provider 头（u1s1 另含 __dpop 标记）；非 oauth 保持 None
+            _extra_a = None
+            if getattr(provider, "credential_type", "") == "oauth":
+                _extra_a = dict(_cand_extra or {"__oauth": True})
             if getattr(provider, "proxy_enabled", False):
                 _extra_a = {**(_extra_a or {}), "__proxy_force": True}
             return RouteResult(
