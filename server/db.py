@@ -146,6 +146,8 @@ async def init_db():
         "ALTER TABLE request_logs ADD COLUMN downstream_key_id INTEGER DEFAULT NULL",
         # v16: combos 表 fusion 配置（JSON；SQLite 动态类型直接存文本）
         "ALTER TABLE combos ADD COLUMN fusion_config JSON",
+        # u1s1 DPoP 设备私钥（加密 JSON {priv, pub}），登录时持久化
+        "ALTER TABLE oauth_tokens ADD COLUMN device_key_enc TEXT DEFAULT NULL",
     ]
     for sql in _migrations:
         try:

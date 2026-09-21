@@ -17,6 +17,8 @@ class OAuthToken(Base):
     # 加密字段
     access_token_enc = Column(Text, nullable=False)
     refresh_token_enc = Column(Text, nullable=True)
+    # u1s1 等设备 DPoP 签名私钥（加密 JSON {priv, pub}；重登录时写入）
+    device_key_enc = Column(Text, nullable=True)
     # 明文 metadata
     token_type = Column(String(20), default="Bearer")
     scope = Column(String(500), default="")

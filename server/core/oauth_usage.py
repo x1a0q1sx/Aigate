@@ -454,12 +454,25 @@ async def _qoder_usage(token: str) -> dict:
 
 
 async def _u1s1_usage(token: str) -> dict:
-    """GET https://api.u1s1.io/v1/me：永久余额 + 今日免费（USD 与 tokens 双口径）。"""
+    """GET https://api.u1s1.io/v1/me：永久余额 + 今日免费（USD 与 tokens 双口径）。
+
+    有设备密钥（u1s1 重登录过）时按官方 DPoP 形态请求；否则退回 Bearer api_key。"""
     from server.core.provider_quirks import quirks_for
     q = quirks_for("https://api.u1s1.io/v1")
+    url = "https://api.u1s1.io/v1/me"
     headers = {"Authorization": f"Bearer {token}",
                **dict((q.default_headers if q else None) or {})}
-    r = await _get_json("https://api.u1s1.io/v1/me", headers)
+    try:
+        from server.db import AsyncSessionLocal
+        from server.core.oauth_client import get_oauth_client
+        async with AsyncSessionLocal() as db:
+            material = await get_oauth_client().get_device_signing_material("u1s1", db)
+        if material:
+            from server.core.dpop import sign_proof
+            headers.update(sign_proof(material["priv"], material["bearer"], "GET", url))
+    except Exception:
+        pass
+    r = await _get_json(url, headers)
     if not r.is_success:
         return {"quotas": {}, "message": f"u1s1 额度接口返回 {r.status_code}"}
     me = r.json() if r.content else {}

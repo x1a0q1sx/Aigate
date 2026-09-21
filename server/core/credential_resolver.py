@@ -69,6 +69,17 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             # oauth 请求需要 __oauth 标记（adapter 侧据此用 Bearer token 并处理专属头）
             from server.api.v1_router import _merge_oauth_headers
             rc.extra_headers = _merge_oauth_headers(provider, getattr(provider, "headers", None))
+            # u1s1：登录时若已持久化设备密钥，则切换为官方 DPoP 形态
+            #（Authorization: DPoP <u1s1d-…> + 逐请求 dpop proof），赠送额度才放行
+            if oauth_code == "u1s1":
+                try:
+                    material = await get_oauth_client().get_device_signing_material(oauth_code, db)
+                except Exception:
+                    material = None
+                if material:
+                    rc.api_key = material["bearer"]
+                    rc.extra_headers = {**(rc.extra_headers or {}),
+                                        "__dpop": {"token": material["bearer"], "jwk": material["priv"]}}
             rc.adapter = create_adapter_for_provider(api_type)
             return rc
         # free_tier

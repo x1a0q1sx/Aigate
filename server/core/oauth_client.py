@@ -405,10 +405,13 @@ class OAuthClient:
     async def start_u1s1_device(self, provider_code: str, db: AsyncSession,
                                 owner: str = "__default") -> dict:
         """
-        1) 生成 EC P-256 密钥对（服务端本地持有即可，api_key 收票后不再依赖 DPoP）
+        1) 生成 EC P-256 密钥对，私钥随设备凭证持久化（u1s1 现强制「客户端信号」=
+           RFC9449 DPoP：推理请求须 Authorization: DPoP <device_token> + dpop proof，
+           proof 由该私钥逐请求签发；旧的“api_key 不依赖 DPoP”实测结论已被平台收紧）
         2) POST /auth/device/start {public_jwk, device_name, client_version}
         3) 返回 verify_url（用户在浏览器登录并批准）+ 后台轮询 /auth/device/poll
-        4) 批准后拿 {api_key: u1s1-…, device_token: u1s1d-…}，api_key 存为 access_token
+        4) 批准后拿 {api_key: u1s1-…, device_token: u1s1d-…}，api_key 存为 access_token，
+           device_token 存 refresh_token，密钥对加密存 device_key_enc
         """
         provider = get_oauth_provider(provider_code)
         if not provider:
@@ -428,6 +431,10 @@ class OAuthClient:
             public_jwk = {"kty": "EC", "crv": "P-256",
                           "x": _coord(nums.x), "y": _coord(nums.y),
                           "key_ops": ["verify"], "ext": True}
+            # 私钥 JWK（d 同宽 32 字节 b64url）：收票后加密随 token 入库，供 DPoP proof 逐请求签发
+            private_jwk = {"kty": "EC", "crv": "P-256",
+                           "x": _coord(nums.x), "y": _coord(nums.y),
+                           "d": _coord(priv.private_numbers().private_value)}
             body = {"public_jwk": public_jwk,
                     "device_name": ep.get("device_name", "AIGate Gateway"),
                     "client_version": ep.get("client_version", "1.11.2")}
@@ -449,14 +456,16 @@ class OAuthClient:
             interval = int(data.get("interval") or 2)
             expires_in = int(data.get("expires_in") or 900)
             asyncio.create_task(self._poll_u1s1_device(
-                provider_code, poll_secret, owner, interval, expires_in))
+                provider_code, poll_secret, owner, interval, expires_in,
+                device_keys={"priv": private_jwk, "pub": {k: v for k, v in public_jwk.items() if k not in ("key_ops",)}}))
             return {"state": poll_secret, "login_url": verify_url,
                     "poll_interval_ms": max(1, interval) * 1000, "owner": owner}
         except Exception as e:
             return {"error": f"start_u1s1_device exception: {e}"}
 
     async def _poll_u1s1_device(self, provider_code: str, poll_secret: str,
-                                owner: str, interval: int, expires_in: int):
+                                owner: str, interval: int, expires_in: int,
+                                device_keys: Optional[dict] = None):
         """轮询等浏览器批准（官方 CLI 同协议）；status ok 时收 api_key 落库。"""
         provider = get_oauth_provider(provider_code)
         if not provider:
@@ -479,7 +488,7 @@ class OAuthClient:
                 api_key = str(data.get("api_key") or "")
                 if data.get("status") == "ok" and api_key.startswith("u1s1-"):
                     async with AsyncSessionLocal() as db:
-                        await self._save_token(db, provider_code, owner, {
+                        row = await self._save_token(db, provider_code, owner, {
                             "access_token": api_key,
                             "refresh_token": str(data.get("device_token") or ""),
                             # api_key 长期有效（实测无标准刷新）；到期/失效重新登录即可
@@ -487,11 +496,32 @@ class OAuthClient:
                             "token_type": "Bearer",
                             "scope": "u1s1",
                         })
+                        if device_keys and device_keys.get("priv"):
+                            import json as _json
+                            row.device_key_enc = self._crypto.encrypt(_json.dumps(device_keys))
+                            await db.commit()
+                            logger.info("u1s1 device DPoP key persisted")
                     logger.info("u1s1 api_key acquired for %s/%s", provider_code, owner)
                     return
             except Exception as e:
                 logger.debug("u1s1 poll failed: %s", e)
                 continue
+
+    async def get_device_signing_material(self, provider_code: str, db: AsyncSession,
+                                          owner: str = "__default") -> Optional[dict]:
+        """u1s1 DPoP 签名材料：{bearer, priv_jwk, pub_jwk}；未随设备密钥登录过则 None。"""
+        try:
+            row = await self._get_token_record(db, provider_code, owner)
+            if not row or not row.device_key_enc or not row.refresh_token_enc:
+                return None
+            import json as _json
+            keys = _json.loads(self._crypto.decrypt(row.device_key_enc))
+            bearer = self._crypto.decrypt(row.refresh_token_enc)
+            if not bearer.startswith("u1s1d-") or not keys.get("priv"):
+                return None
+            return {"bearer": bearer, "priv": keys["priv"], "pub": keys.get("pub")}
+        except Exception:
+            return None
 
     # ── Qoder 设备流（本地 PKCE+nonce，轮询 deviceToken/poll 收 dt- token） ──
     async def start_qoder_device(self, provider_code: str, db: AsyncSession,

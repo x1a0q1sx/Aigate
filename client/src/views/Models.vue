@@ -473,7 +473,7 @@ export default {
           api.getCombos().catch(() => []),
         ])
         this.providers = providers || []
-        this.comboNames = (combos || []).map((c) => c.name)
+        this.comboNames = ((combos && combos.items) || []).map((c) => c.name)
         const params = this._buildParams(0)
         const loadedModels = await api.getModels(params)
         const arr = loadedModels || []

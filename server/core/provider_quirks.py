@@ -93,9 +93,10 @@ _CLINE = ProviderQuirks(
     },
 )
 
-# u1s1（有一说一）：OpenAI 兼容 + Bearer api_key（实测 chat/models 均按普通 key 鉴权，
-# DPoP/attestation 只是官方 CLI 的 sender-constrained 增强，非必需）。
-# 归因头对齐官方 CLI 形态（device-auth.js 转发时统一附加），降低被指纹识别的差异。
+# u1s1（有一说一）：OpenAI 兼容。推理「客户端信号」= RFC9449 DPoP（官方 CLI device-auth.js
+# 同协议）：Authorization: DPoP <u1s1d-…> + dpop proof 逐请求现签，签名材料来自设备登录时
+# 持久化的密钥对（credential_resolver 注入 __dpop 内部标记，openai_compat 出站前签发）。
+# 归因头（x-u1s1-*）对齐官方 CLI 形态，随域名方言统一附加。
 _U1S1 = ProviderQuirks(
     name="u1s1",
     default_headers={

@@ -146,7 +146,8 @@ class OpenAICompatAdapter(BaseAdapter):
         if not base.endswith('/v1'):
             base += '/v1'
         return f"{base}/models"
-    def _get_headers(self, api_key: str, extra_headers: dict = None, base_url: str = None) -> dict:
+    def _get_headers(self, api_key: str, extra_headers: dict = None, base_url: str = None,
+                     url: str = None, method: str = "POST") -> dict:
         q = quirks_for(base_url) if base_url else None
         token = auth_token_for(q, api_key) if q else str(api_key or "").strip()
         # v3.1：free_tier / OAuth 路径可能给空字符串 — 不带 Authorization 头
@@ -163,12 +164,17 @@ class OpenAICompatAdapter(BaseAdapter):
         # provider 级自定义头优先覆盖
         if q and q.default_headers:
             headers.update(q.default_headers)
-        # 网关内部路由标记（__proxy_* / __oauth）不是上游协议的一部分，绝不出站；
+        # 网关内部路由标记（__proxy_* / __oauth / __dpop）不是上游协议的一部分，绝不出站；
         # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items()
-                            if k not in ("__proxy_force", "__proxy_url", "__oauth")})
+                            if k not in ("__proxy_force", "__proxy_url", "__oauth", "__dpop")})
         headers["Content-Type"] = "application/json"
+        # u1s1 设备凭证：官方「客户端信号」= RFC9449 DPoP，逐请求现签（htm/htu 绑定目标 URL）
+        dp = (extra_headers or {}).get("__dpop")
+        if dp and url:
+            from server.core.dpop import sign_proof
+            headers.update(sign_proof(dp["jwk"], dp["token"], method, url))
         return headers
     async def chat_completion(
         self,
@@ -179,7 +185,7 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> ChatCompletionResponse:
         q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url)
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         # reasoning dict 是网关内部思考控制提示（anthropic 出站方言）；OpenAI 兼容上游
@@ -301,7 +307,7 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> AsyncGenerator[dict, None]:
         q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url)
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
@@ -360,7 +366,7 @@ class OpenAICompatAdapter(BaseAdapter):
         extra_headers: dict = None
     ) -> List[ModelInfo]:
         url = self._build_models_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url)
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="GET")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.get(url, headers=headers)
@@ -397,7 +403,7 @@ class OpenAICompatAdapter(BaseAdapter):
     ) -> HealthResult:
         q = quirks_for(base_url)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url)
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = {
             "model": model,

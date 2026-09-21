@@ -1091,6 +1091,26 @@ async def list_models(
         for e in (c.model_ids or []):
             if isinstance(e, dict):
                 _combo_map.setdefault((e.get("provider"), e.get("model_id")), []).append(c.name)
+    # 真实输出速度 TPS：近 7 天成功聊天请求，tokens/s = completion_tokens / 生成耗时。
+    # 生成耗时 = latency - ttft（流式扣掉首字等待；非流式 ttft 为空即全时长，含 prefill 略保守）
+    from server.models.request_log import RequestLog as _RL
+    from datetime import timedelta as _td
+    _tps_map = {}
+    try:
+        _since = datetime.now(timezone.utc).replace(tzinfo=None) - _td(days=7)
+        _gen_ms = _RL.latency_ms - func.coalesce(_RL.ttft_ms, 0)
+        _tps_rows = (await db.execute(
+            select(_RL.routed_provider, _RL.routed_model,
+                   func.avg(_RL.completion_tokens * 1000.0 / _gen_ms))
+            .where(_RL.created_at >= _since, _RL.status == "success",
+                   _RL.is_health_check == False,  # noqa: E712
+                   _RL.completion_tokens > 0, _RL.latency_ms > 0, _gen_ms > 0,
+                   _RL.media_type.is_(None))
+            .group_by(_RL.routed_provider, _RL.routed_model)
+        )).all()
+        _tps_map = {(r[0], r[1]): round(r[2], 2) for r in _tps_rows if r[2]}
+    except Exception as e:
+        logger.warning("tps aggregation failed: %s", e)
     # v3.3 跳过 provider 已被删除的孤儿 model
     orphan_count = 0
     valid_models = []
@@ -1106,6 +1126,10 @@ async def list_models(
     for m in models:
         item = ModelInfoResponse.from_orm(m)
         item.combos = _combo_map.get((item.provider_name, m.model_id), [])
+        _real_tps = _tps_map.get((item.provider_name, m.model_id))
+        if _real_tps:
+            # 本网关真实流量观测优先于刷新带的远端元数据（Model.avg_tps）
+            item.avg_tps = _real_tps
         # 附加延迟 + 冷却信息
         if hc:
             cached = hc.get_cached_status(m.id)

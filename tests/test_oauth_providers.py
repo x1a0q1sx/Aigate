@@ -315,8 +315,9 @@ async def test_start_u1s1_device_sends_valid_p256_jwk(monkeypatch):
     ]))
     started = {}
 
-    async def fake_poll(provider_code, poll_secret, owner, interval, expires_in):
+    async def fake_poll(provider_code, poll_secret, owner, interval, expires_in, device_keys=None):
         started["args"] = (provider_code, poll_secret, owner, interval, expires_in)
+        started["device_keys"] = device_keys
 
     c._poll_u1s1_device = fake_poll
     r = await c.start_u1s1_device("u1s1", None)
@@ -324,6 +325,10 @@ async def test_start_u1s1_device_sends_valid_p256_jwk(monkeypatch):
     await asyncio.sleep(0.05)
     assert r["login_url"] == "https://u1s1.io/d/abc"
     assert r["state"] == "ps-1"
+    # 设备私钥随 poll 任务下传（收票后加密入库，供 DPoP 逐请求签发）
+    dk = started["device_keys"]
+    assert dk and set(dk) == {"priv", "pub"}
+    assert len(dk["priv"].get("d", "")) == 43 and "d" not in dk["pub"]
     body = calls[0]["json"]
     jwk = body["public_jwk"]
     assert jwk["kty"] == "EC" and jwk["crv"] == "P-256"
