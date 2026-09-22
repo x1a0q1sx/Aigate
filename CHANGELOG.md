@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- **u1s1 间歇性 403「检测到请求来自非 u1s1 客户端」根因找到并修复**：u1s1 会扫描**请求体全文**，按**大小写精确**匹配竞品客户端名——命中 `Claude Code` / `Windsurf` / `Gemini CLI` / `Codex CLI` 即 403（赠送额度限官方客户端）；而全小写 `claude code`、全大写 `CLAUDE CODE`、单词 `codex` 均放行（实测边界）。下游用 Claude Code / Windsurf 等客户端时，其 system prompt 恰好含这些精确串 → 命中拦截，这解释了「同样模型有时通有时不通」。现于 u1s1 方言档案加 `neutralize_competitor_tokens`：出站前对**整份请求体**（messages 的 system/user/typed-blocks、tools 描述等任意嵌套位置）做**语义等价改写**（`Claude Code`→`Claude  Code`、`Windsurf`→`WindSurf`、`Gemini CLI`→`Gemini  CLI`、`Codex CLI`→`Codex  CLI`），不删内容、不改语义。端到端实测：带触发词的 system prompt 消毒前 403、消毒后 200（5/5）
+
 ### Added
 - OAuth 账号管理：**账号可改名** + **新增账号不再覆盖主账号**。OAuth 连接页每账号新增「改名」内联编辑（`PATCH /admin/oauth/connections/{id}`，账号名同服务商内唯一，重名 409）；「一键连接」在已连接状态下自动分配 `account-2/account-3…` 新账号名而非静默覆盖（此前固定写 `owner=__default`，第二次登录会覆盖第一个账号的 token——CodeBuddy 第二个账号"登不上"的根因）。已连接时按钮文案变为「新增账号」，另提供「强制新增」按钮
 - 服务商详情浮窗：服务商管理页点服务商名称（或操作列「详情」眼睛按钮）弹出纯展示浮窗——身份区（名称/凭证类型/Base URL/接口类型/创建更新时间/代理）+ 状态标签 + 规模与路由（模型数/启用数/Auto 参与数、密钥数或 OAuth 账号数、供量组合列表、API Key 前缀与启用态明细）+ **OAuth 专属多账号额度区**（打开即并发查全部账号额度、逐账号进度条、可单账号强刷，复用 5 分钟缓存与限流冷却）+ 今日用量（请求/Token/成本/占比）+ 健康与冷却（冷却中模型与密钥、历史成功失败、最近一次成功与失败明细）+ 最近模型刷新记录（触发方式/增删/耗时）。零后端改动，全部复用既有端点

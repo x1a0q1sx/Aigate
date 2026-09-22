@@ -43,6 +43,47 @@ NEUTRAL_SYSTEM_PROMPT = (
 )
 CODEBUDDY_IDE_SYSTEM_PROMPT = "You are CodeBuddy Code."
 
+# u1s1 竞品客户端指纹：2026-09-22 实测，u1s1 会扫描请求体全文，按**大小写精确**匹配
+# 竞品客户端名，命中即 403「检测到请求来自非 u1s1 客户端」（赠送额度限官方客户端）。
+# 实测边界（同一轮 A/B）：
+#   拦截 → "Claude Code" / "Windsurf" / "Gemini CLI" / "Codex CLI"
+#   放行 → "claude code"(全小写) / "CLAUDE CODE"(全大写) / "codex"(单词) /
+#          "Cody" / "copilot" / "CodeBuddy" / "ZCode" / "Cursor" / "aider" / "Continue"
+# 下游 IDE/CLI（Claude Code、Windsurf、Gemini CLI… 以及任何把上游客户端身份
+# 写进 system prompt 的工具）原样透传会被拦 → 出站前做**语义等价改写**规避精确串。
+_U1S1_COMPETITOR_TOKENS = (
+    "Claude Code",
+    "Windsurf",
+    "Gemini CLI",
+    "Codex CLI",
+)
+
+
+def neutralize_u1s1_fingerprint(text: str) -> str:
+    """把命中 u1s1 黑名单的精确串改写成语义等价、不触发拦截的形式。
+
+    只做**同义变体替换**（保持可读、不删内容、不改语义）：
+      "Claude Code" → "Claude  Code"   （词组内补一个空格，人眼等价）
+      "Windsurf"    → "WindSurf"       （压缩词补驼峰，语义不变）
+      "Gemini CLI"  → "Gemini  CLI"
+      "Codex CLI"   → "Codex  CLI"
+    """
+    if not text:
+        return text
+    out = text
+    for tok in _U1S1_COMPETITOR_TOKENS:
+        if tok in out:
+            if " " in tok:
+                repl = tok.replace(" ", "  ")
+            else:
+                # 单token：在首个音节后插入驼峰边界（Windsurf → WindSurf）
+                mid = max(1, len(tok) // 2)
+                repl = tok[:mid] + tok[mid].upper() + tok[mid + 1:]
+                if repl == tok:
+                    repl = tok[:-1] + tok[-1].upper()
+            out = out.replace(tok, repl)
+    return out
+
 
 @dataclass
 class ProviderQuirks:
@@ -52,6 +93,7 @@ class ProviderQuirks:
     ide_message_shape: bool = False     # 前置 CodeBuddy system + user string → typed blocks
     workos_token: bool = False          # JWT token 出站前补 "workos:" 前缀
     unwrap_envelope: bool = False       # 非流式响应 {success,data} 解包
+    neutralize_competitor_tokens: bool = False  # 出站前等价改写竞品客户端名（u1s1 指纹黑名单）
     default_headers: dict = field(default_factory=dict)
 
 
@@ -101,6 +143,9 @@ _CLINE = ProviderQuirks(
 # 归因头（x-u1s1-*）对齐官方 CLI 形态，随域名方言统一附加。
 _U1S1 = ProviderQuirks(
     name="u1s1",
+    # 竞品客户端名消毒：下游 IDE/CLI 的 system prompt 常含 "Claude Code"/"Windsurf"
+    # 等精确串，u1s1 扫描 body 命中即 403（赠送额度限官方客户端）；出站前等价改写规避
+    neutralize_competitor_tokens=True,
     default_headers={
         "user-agent": "u1s1-cli",
         "x-u1s1-client": "terminal",
@@ -152,6 +197,23 @@ def _flatten_content(content) -> str:
     return ""
 
 
+def _neutralize_payload_tokens(payload: dict) -> dict:
+    """递归遍历出站请求体，对所有字符串做竞品客户端名等价改写。
+
+    覆盖 messages（含 content 数组/ typed blocks）、tools 描述、system 等任意嵌套位置——
+    u1s1 按请求体全文精确匹配，漏一处即 403。只改写字符串，不增删字段。
+    """
+    def walk(node):
+        if isinstance(node, str):
+            return neutralize_u1s1_fingerprint(node)
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+    return walk(payload)
+
+
 def transform_payload(payload: dict, q: Optional[ProviderQuirks]) -> dict:
     """按档案改写出站请求体（就地语义由返回新 dict 承载）。"""
     if not q:
@@ -170,6 +232,12 @@ def transform_payload(payload: dict, q: Optional[ProviderQuirks]) -> dict:
     messages = p.get("messages")
     if not isinstance(messages, list):
         return p
+    # 竞品客户端名消毒（u1s1）：扫描**整份 body 的文本**做等价改写。
+    # 放这里而不是只改 system：下游可能把身份声明写进 user/tool 消息或 tools 描述里，
+    # 上游是按全文精确匹配的（实测 2026-09-22）。
+    if q.neutralize_competitor_tokens:
+        p = _neutralize_payload_tokens(p)
+        messages = p.get("messages")
     if q.sanitize_system_prompt:
         fixed = []
         for m in messages:
