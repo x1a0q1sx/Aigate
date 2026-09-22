@@ -481,7 +481,7 @@ async def _consolidate_openai_stream(chunks, drop_reasoning: bool, chunk_size: i
     - role / tool_calls / usage / finish_reason 均原样即时透传，不被缓冲
     """
     last_meta = {}
-    st = {"sent_role": False, "content": "", "reasoning": "", "reasoning_flushed": False}
+    st = {"sent_role": False, "content": "", "reasoning": ""}
     out = []
 
     def mk(delta, src=None, finish=None):
@@ -498,7 +498,6 @@ async def _consolidate_openai_stream(chunks, drop_reasoning: bool, chunk_size: i
         if st["reasoning"]:
             out.append(mk({"reasoning_content": st["reasoning"]}, src))
             st["reasoning"] = ""
-            st["reasoning_flushed"] = True
 
     def flush_content(src):
         if st["content"]:
@@ -534,8 +533,12 @@ async def _consolidate_openai_stream(chunks, drop_reasoning: bool, chunk_size: i
         if role and not st["sent_role"]:
             out.append(mk({"role": role}, c))
             st["sent_role"] = True
-        # tool_calls 必须立即透传，不能缓冲
-        if tc is not None:
+        # tool_calls 必须立即透传，不能缓冲。
+        # 注意判空：不少上游（实测 CodeBuddy CN）在**每个** chunk 的 delta 里都带
+        # `"tool_calls": []`，早先只判 `is not None` 会把空列表也当成「有工具调用」，
+        # 于是每个 chunk 都 flush 一次缓冲 → 出站流退化成逐字符，
+        # 客户端（ZCode 等）把思考/正文渲染成一行一个字符。空列表必须当没有处理。
+        if tc:
             flush_reasoning(c)
             flush_content(c)
             for oc in out:
@@ -543,12 +546,16 @@ async def _consolidate_openai_stream(chunks, drop_reasoning: bool, chunk_size: i
             out.clear()
             yield c
             continue
-        # reasoning 缓冲（可配置丢弃）
+        # reasoning 缓冲（可配置丢弃）。
+        # 达阈值即 flush：既保证思考是渐进可见的（长思考期间客户端不会干等），
+        # 又避免上游逐字下发时把思考流退化成「一行一个字符」。
         if reasoning and not drop_reasoning:
             st["reasoning"] += reasoning
+            if len(st["reasoning"]) >= chunk_size:
+                flush_reasoning(c)
         # content 缓冲；内容开始时先把已积累的 thinking 前置 flush
         if content:
-            if st["content"] == "" and st["reasoning"] and not st["reasoning_flushed"]:
+            if st["content"] == "" and st["reasoning"]:
                 flush_reasoning(c)
             st["content"] += content
             if len(st["content"]) >= chunk_size:

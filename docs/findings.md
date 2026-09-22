@@ -69,3 +69,20 @@
 - 影响：迁移 PG 时被正确拒绝（PG 强制 FK）；对运行中的 SQLite 网关无实际影响（这些行不可达）
 - 处置：scripts/migrate_to_pg.py 按目标库父表实况预分类为「孤儿跳过」不计坏行；init_db 追加幂等 DELETE 清理三处孤儿引用
 - 迁移工具另踩的方言坑：tz-aware ISO 时间戳 asyncpg 拒绝绑 TIMESTAMP WITHOUT TIME ZONE（解析后剥时区保留字面值）；asyncpg 批量 executemany 的 rowcount 不可靠（改用前后 COUNT 差值统计插入数）
+
+## F10 流式出站退化成「逐字符一行」（CodeBuddy CN）
+- 现象（2026-09-22 用户报告）：ZCode 里思考/正文每个字符单独占一行
+- 位置：`server/adapters/openai_compat.py` `_consolidate_openai_stream`
+- 根因：上游 CodeBuddy CN 逐字下发（每 chunk 1~2 字），且**每个** chunk 的 delta 都带
+  `"tool_calls": []`。合并器原判据 `if tc is not None` 把空列表也当「有工具调用」，
+  于是每个 chunk 都 flush 一次缓冲 → 合并完全失效，出站退化成逐字符。
+  实测生产流：585 分片 / 平均 2.2 字 / 222 个单字符；离线对照
+  `tool_calls=[]` → 30 个 1 字符分片，不带该字段 → 2 个（24+6），一次复现。
+- 影响：所有走 openai_compat 的逐字上游（不只 CodeBuddy）都会命中；
+  客户端把每个字符当独立增量渲染成一行
+- 处置：① 判据改 `if tc:`（空列表=没有工具调用，继续缓冲）；
+  ② reasoning 也按 `content_chunk_size` 阈值 flush（原先只在正文出现 / 流结束时吐出，
+  长思考期间客户端干等，且同样受逐字退化影响）；
+  ③ 清掉因此变成死变量的 `reasoning_flushed`
+- 证据：`tests/test_stream_consolidation.py`（7 项，含空 tool_calls 等价性、
+  真工具调用仍即时透传、reasoning 内容不丢、drop 模式、chunk_size=1 直通、元数据块保留）
