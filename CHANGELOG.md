@@ -5,9 +5,12 @@
 ## [Unreleased]
 
 ### Added
+- OAuth 账号管理：**账号可改名** + **新增账号不再覆盖主账号**。OAuth 连接页每账号新增「改名」内联编辑（`PATCH /admin/oauth/connections/{id}`，账号名同服务商内唯一，重名 409）；「一键连接」在已连接状态下自动分配 `account-2/account-3…` 新账号名而非静默覆盖（此前固定写 `owner=__default`，第二次登录会覆盖第一个账号的 token——CodeBuddy 第二个账号"登不上"的根因）。已连接时按钮文案变为「新增账号」，另提供「强制新增」按钮
 - 服务商详情浮窗：服务商管理页点服务商名称（或操作列「详情」眼睛按钮）弹出纯展示浮窗——身份区（名称/凭证类型/Base URL/接口类型/创建更新时间/代理）+ 状态标签 + 规模与路由（模型数/启用数/Auto 参与数、密钥数或 OAuth 账号数、供量组合列表、API Key 前缀与启用态明细）+ **OAuth 专属多账号额度区**（打开即并发查全部账号额度、逐账号进度条、可单账号强刷，复用 5 分钟缓存与限流冷却）+ 今日用量（请求/Token/成本/占比）+ 健康与冷却（冷却中模型与密钥、历史成功失败、最近一次成功与失败明细）+ 最近模型刷新记录（触发方式/增删/耗时）。零后端改动，全部复用既有端点
 
 ### Fixed
+- OpenCode 免费层 403「can only be used from within OpenCode」：完成逐层取证（复刻官方完整请求头/body、bun 运行时、curl HTTP/2、9router 头部形态全部 403），**判据实为 `x-opencode-session` 前缀须命中官方 CLI 建立的会话**（改末位仍 200、截短 4 位即 403、全新 session 一律 403、官方 CLI 同机实跑 200）。纯 HTTP 转发已不可行（9router 方案在当前上游失效）；本次对齐其头部形态并在 `_surface_free_error` 明确报出该原因，是否内置官方 CLI 待决策，见 `docs/findings-opencode-free-tier.md`
+- 服务商详情浮窗：ProviderResponse 补 `created_at/updated_at`；前端 `fmtTime` 按 UTC 解析裸时间戳（避免东八区 8 小时偏移）；额度重置时间为上游哨兵值（9999-12-31）时不显示
 - **u1s1 直连/Playground 仍 403「仅填写账号 API Key 不受支持」**：`/v1` 主入口按 `服务商/模型` 前缀直连、以及后台 Playground 测试按钮的 OAuth 分支，此前仍用裸 `pick_access_token` 拿设备 token 当 `Authorization: Bearer` 发出，绕过统一凭证解析器 → 不带 `__dpop` 标记 → openai_compat 不现签 DPoP proof。与 combo/auto 路径一致改走 `resolve_credential_async`，把解析器返回的 `extra_headers`（含 `__dpop`）接入 `RouteResult` 并在发送处合并。
 - **combo 冷启动 403「检测到请求来自非 u1s1 客户端」**：u1s1 推理必须附 `x-u1s1-attestation`（仅 DPoP 不够，实测无 attestation 时 `/v1/models` 200 但 `chat/completions` 403）。服务重启后该缓存是冷的，首个命中 u1s1 的请求要现拉（阻塞 ≤4s，慢则冷却 30s，整条 combo 的 u1s1 候选一起 403）。现于 lifespan 启动即后台预热 attestation（token 有效期 7 天、临期自动续），消除冷启动窗口。
 

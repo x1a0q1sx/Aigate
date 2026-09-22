@@ -211,6 +211,17 @@ def _surface_free_error(provider_code: str, resp, mode: str):
         raise RuntimeError(
             "mimo-free risk_control (441): upstream risk control, likely exporter IP banned. try another network or retry later. raw: " + body[:200]
         )
+    # opencode 免费层：上游把入口锁在「官方 CLI 建立的会话」里（FreeTierError）。
+    # 2026-09-22 逐层实测（复刻官方完整请求头/body、bun 运行时、curl h2、9router 头部形态）
+    # 全部 403；唯一放行条件是 x-opencode-session 的前缀命中一个官方 CLI 跑过的会话
+    # （改末位仍 200，截短 4 位即 403）。纯 HTTP 方案在当前上游已不可行，
+    # 需内置官方 CLI（参见 docs/findings-opencode-free-tier.md）或等待上游放宽。
+    if provider_code == "opencode" and err_type == "FreeTierError":
+        raise RuntimeError(
+            "opencode FreeTierError: 上游免费层已收紧为「仅官方 CLI 会话可用」"
+            "（判据 = x-opencode-session 前缀命中官方 CLI 会话，2026-09-22 实测）；"
+            "纯 HTTP 转发不可行，需内置官方 CLI。raw: " + body[:200]
+        )
     raise RuntimeError(f"free provider {provider_code} {mode} HTTP {resp.status_code}: " + body[:300])
 
 
@@ -227,11 +238,12 @@ class FreeProviderExecutor:
         self.meta = _FREE_PROVIDERS_META.get(provider_code)
         if not self.meta:
             raise ValueError(f"unknown free provider: {provider_code}")
-        # mimo 会话黏性（一个 FreeProviderExecutor 实例一个 session id）
-        if provider_code == "mimo-free":
+        # 会话黏性：一个 executor 实例一个 session id（mimo 用于 x-session-affinity，
+        # opencode 用于 x-opencode-session —— 官方 CLI 每次启动生成一个并全程复用）
+        if provider_code in ("mimo-free", "opencode"):
             self._session_id = _gen_session_id(
-                self.meta["session_affinity_prefix"],
-                self.meta["session_id_length"],
+                self.meta.get("session_affinity_prefix", "ses_"),
+                self.meta.get("session_id_length", 24),
             )
             # Keep a stable UA for the lifetime of this executor/session.
             # Changing UA on every request makes one anonymous JWT/session look like multiple devices.
@@ -257,6 +269,13 @@ class FreeProviderExecutor:
         if self.provider_code == "opencode":
             h["Authorization"] = f"Bearer {self.meta['static_token']}"
             h.update(self.meta.get("extra_headers", {}))
+            # 对齐 9router OpenCodeExecutor.buildHeaders（官方 CLI 指纹形态）。
+            # 注意：2026-09-22 实测这些头本身已不足以放行（判据是官方 CLI 会话），
+            # 保留是为了与参考实现一致 + 上游若放宽可即时生效。
+            h["User-Agent"] = "opencode/1.18.32"
+            h["x-opencode-project"] = "global"
+            h["x-opencode-session"] = self._session_id
+            h["x-opencode-request"] = f"msg_{int(time.time() * 1000):x}{os.urandom(4).hex()}"
         elif self.provider_code == "mimo-free":
             jwt = await _bootstrap_mimo_jwt(client, self._user_agent)
             h.update({
