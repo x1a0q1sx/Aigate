@@ -74,6 +74,14 @@ def sidecar_poll_interval() -> float:
     return max(0.05, float(_setting("poll_interval_ms", "AIGATE_OPENCODE_POLL_MS", 600)) / 1000.0)
 
 
+def stall_grace_seconds() -> float:
+    """本轮多久没有新进展即判停滞（随后 interrupt 收尾）。"""
+    try:
+        return max(5.0, float(_setting("stall_grace_seconds", "AIGATE_OPENCODE_STALL", 20)))
+    except Exception:
+        return 20.0
+
+
 def auto_reject_tools() -> bool:
     return bool(_setting("auto_reject_tools", "AIGATE_OPENCODE_AUTO_REJECT", True))
 
@@ -298,27 +306,69 @@ def _merge_turn(st: dict) -> dict:
     return merged
 
 
+async def interrupt_session(client: httpx.AsyncClient, sid: str) -> bool:
+    """中断该会话正在进行的生成，返回是否被接受。
+
+    为什么需要：模型被诱导调用工具而 CLI 权限流程卡住时，该条 assistant 永远不写
+    `time.completed`（`reply: reject` 只清掉挂起请求、**并不会**让生成继续）。
+    实测 `POST .../interrupt` 能让 CLI 立刻收尾该腿（`finish=tool-calls` + 工具标 error），
+    于是我们至少能拿到「已生成的思考/正文」而不是干等到 deadline。
+    """
+    try:
+        r = await client.post(f"{sidecar_base()}/api/session/{sid}/interrupt", json={})
+        return r.status_code < 400
+    except Exception as e:
+        logger.debug("opencode sidecar interrupt 失败: %s", e)
+        return False
+
+
+def _turn_signature(st: dict) -> str:
+    """整轮「有没有进展」的指纹：腿的数量 + 各腿完成/失败状态 + 正文思考长度。
+
+    用于判定停滞：指纹长时间不变 = CLI 不会再产出新内容，应尽早收尾而不是空等。
+    """
+    if not st or not st.get("turn"):
+        return ""
+    parts = []
+    for it in st["turn"]:
+        tm = it.get("time") or {}
+        text, reason = _content_to_text(it.get("content"))
+        tools = ",".join(
+            "%s:%s" % (c.get("name"), ((c.get("state") or {}).get("status")))
+            for c in (it.get("content") or []) if isinstance(c, dict) and c.get("type") == "tool")
+        parts.append("%s|%s|%s|%d|%d|%s|%s" % (
+            it.get("id"), tm.get("created"), tm.get("completed"),
+            len(text), len(reason), it.get("finish"), tools))
+    return ";".join(parts)
+
+
 async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_ms: int,
                                  poll_interval: float = None, deadline_s: float = None) -> dict:
     """轮询到「本轮回复彻底结束」，返回整轮状态 dict（见 _turn_state）。
 
-    实测坑（三条，缺一条就会出问题）：
+    实测坑（四条，缺一条就会出问题）：
     1) assistant 消息**逐步填充**——先出现 time.created 与空的 reasoning part，随后才补
        text 并写入 time.completed。只判「消息存在」会拿到空回复。
     2) 偶发把**历史会话内容**带出（首轮实测见过返回无关的 "## Intuition ... linked list"），
        故 assistant 必须 created ≥ 本次提问时间。
-    3) **工具调用会占满整轮**：客户端 system prompt 若是编码 agent 模板，模型会去调 bash/glob，
-       CLI 默认 permission=ask 则请求永久挂起（无人批准）→ 消息永不 completed →
-       网关只能等到超时（实测 180s 报「等待回复超时」）。这里按轮次自动拒绝挂起权限，
-       让它立刻收到工具错误并转入文本作答。
+    3) **工具调用会占满整轮**：客户端 system prompt 若是编码 agent 模板，模型会去调工具。
+       agent 已把工具权限全 deny（减少发生），但一旦发生，腿会停在 `finish=tool-calls`
+       且正文为空——CLI 会继续产出下一条腿，需要整轮归并（见 _merge_turn）。
+    4) **权限挂起是最坏情况**：腿永远缺 time.completed。实测 `reply: reject` 只清掉挂起请求、
+       **并不会让生成继续**；只有 `interrupt` 能让它收尾。故这里用「停滞检测 + interrupt
+       收尾」，确保任何情况下都能在有限时间内返回，而不是干等到 deadline。
     """
     interval = poll_interval if poll_interval is not None else sidecar_poll_interval()
     timeout = deadline_s if deadline_s is not None else sidecar_timeout()
     deadline = time.monotonic() + timeout
     reject_on = auto_reject_tools()
     best = None
-    stall_since = None          # 用于「卡在 tool-calls 且无新动静」的兜底
-    stall_grace = min(15.0, max(6.0, interval * 10))
+    last_sig = None
+    last_change = time.monotonic()
+    interrupted = False
+    # 停滞容忍：默认 20s（可用 opencode_bridge.stall_grace_seconds 调）；
+    # 轮询极快（测试场景）时按间隔缩放但不低于 1s，避免测试要等 20s。
+    stall_grace = stall_grace_seconds() if interval >= 0.2 else min(2.0, max(0.2, interval * 15))
     _STOP_FINISH = {"stop", "length", "content_filter", "error", "aborted", "cancelled"}
     while time.monotonic() < deadline:
         try:
@@ -327,32 +377,35 @@ async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_m
                 st = _turn_state((r.json() or {}).get("data") or [], since_ms)
                 if st["turn"]:
                     best = st
-                # 无人值守：拒绝挂起的工具权限（每轮可能连续出现多次）
+                # 无人值守：先尝试清掉挂起的工具权限（有些版本会让生成继续）
                 if reject_on and st["turn"]:
-                    n = await reject_pending_permissions(client, sid)
-                    if n:
-                        stall_since = None      # 权限刚解挂，重新计时
-                if st["turn"] and not st["pending"]:
-                    if st["error"]:
-                        return st
-                    if st["finish"] in _STOP_FINISH:
-                        return st               # 正常收尾
-                    # finish == tool-calls 等中间态：CLI 会继续产出下一条，等它；
-                    # 但若长时间毫无动静（无权限待批也无新消息），不再空等到 deadline。
-                    if stall_since is None:
-                        stall_since = time.monotonic()
-                    elif time.monotonic() - stall_since > stall_grace:
-                        logger.info(
-                            "opencode sidecar: 本轮停在 finish=%s 且 %ss 无进展，返回已有内容",
-                            st["finish"], int(stall_grace))
-                        return st
-                else:
-                    stall_since = None
+                    await reject_pending_permissions(client, sid)
+                if st["turn"]:
+                    sig = _turn_signature(st)
+                    if sig != last_sig:
+                        last_sig = sig
+                        last_change = time.monotonic()
+                    elif not st["pending"] and st["finish"] in _STOP_FINISH:
+                        return st               # 正常收尾（含 error）
+                    elif time.monotonic() - last_change > stall_grace:
+                        # 停滞：先 interrupt 收尾，拿回已有内容
+                        if not interrupted and await interrupt_session(client, sid):
+                            interrupted = True
+                            last_change = time.monotonic()
+                            logger.info("opencode sidecar: 本轮停滞，已 interrupt 收尾")
+                        else:
+                            # interrupt 也没进展（或已被拒）→ 不再空等
+                            logger.info(
+                                "opencode sidecar: 本轮停在 finish=%s 且 %ss 无进展，返回已有内容",
+                                st.get("finish"), int(stall_grace))
+                            return st
+                if not st["pending"] and st["finish"] in _STOP_FINISH and st["turn"]:
+                    return st
         except Exception as e:      # 轮询期瞬时错误不致命
             logger.debug("opencode sidecar poll: %s", e)
         await asyncio.sleep(interval)
     if best is not None and best.get("turn"):
-        # 超时但已有内容：返回已拿到的（调用方按 finish 判定完整性）
+        # 超时但已有内容：返回已拿到的（调用方按 finish/正文判定完整性）
         logger.warning("opencode sidecar: 等待回复超时（%.0fs），返回已完成的部分内容", timeout)
         return best
     raise TimeoutError(f"opencode sidecar 等待回复超时（{timeout:.0f}s）")
@@ -409,11 +462,25 @@ async def chat_completion(messages: list, model_id: str, provider_id: str = "ope
         # 用 sidecar 分配的用户消息 id 的时间戳做归属基线（比本地 t0 更贴近服务端时钟）
         since = await _user_msg_created_at(c, sid, user_msg_id) or t0
         msg, err = await _await_turn(c, sid, since_ms=since)
-        if err:
-            raise RuntimeError(f"opencode sidecar 上游报错: {json.dumps(err, ensure_ascii=False)[:300]}")
-        resp = _to_openai_response(msg, model_id, prompt_text)
-        await _close_session(c, sid)
-        return resp
+        _close = True
+        try:
+            if err:
+                raise RuntimeError(
+                    f"opencode sidecar 上游报错: {json.dumps(err, ensure_ascii=False)[:300]}")
+            text, reasoning = _content_to_text(msg.get("content"))
+            if not text.strip() and not reasoning.strip():
+                # 空结果必须显式失败：走到这里说明整轮只有工具调用/空壳，
+                # 若按 200 返回空内容，combo/auto 会把它当成「成功但没话说」而锁定该候选。
+                turn_finish = msg.get("_turn_finish")
+                why = ("整轮只发起工具调用、模型未给出任何文本"
+                       if turn_finish == "tool-calls" else "侧车未返回任何文本")
+                raise RuntimeError(
+                    f"opencode sidecar 空回复（{why}，finish={turn_finish}，"
+                    f"腿数={msg.get('_turn_count')}）")
+            return _to_openai_response(msg, model_id, prompt_text)
+        finally:
+            if _close:
+                await _close_session(c, sid)
     finally:
         if own:
             await c.aclose()
@@ -535,20 +602,25 @@ _BRIDGE_PROMPT = (
     "as text and never wait for tool output."
 )
 
-# 已知工具名（CLI 1.18.32 的 /experimental/tool/ids 实测值）+ 兜底通配
+# 已知工具名（CLI 1.18.32 的 /experimental/tool/ids 实测值）
 _BRIDGE_TOOLS = ("bash", "read", "glob", "grep", "edit", "write", "task", "webfetch",
                  "websearch", "todowrite", "skill", "apply_patch", "question")
 
 
 def bridge_agent_config(agent_name: str = None) -> dict:
-    """生成网关专用 agent 的 CLI 配置（权限全 deny + 直出人格）。"""
+    """生成网关专用 agent 的 CLI 配置。
+
+    工具权限用**单字符串 "deny"**（覆盖所有工具，含未来新增），而不是逐个工具名的对象：
+    实测两者都能消除「权限挂起」，但字符串形式不依赖工具名清单，上游加工具也不会漏。
+    注意**不要**用 `tools: {x: false}`——实测那样 CLI 会返回**空回复**。
+    """
     name = agent_name or sidecar_agent() or "aigate"
     return {
         name: {
             "description": "AIGate gateway chat-only agent",
             "mode": "primary",
             "prompt": _BRIDGE_PROMPT,
-            "permission": {t: "deny" for t in _BRIDGE_TOOLS},
+            "permission": "deny",
         }
     }
 
@@ -567,10 +639,15 @@ def _cli_config_problem(cfg: dict, agent_name: str) -> str:
     if a.get("mode") != "primary":
         return "mode 非 primary"
     perm = a.get("permission")
-    if not isinstance(perm, dict) or any(perm.get(t) != "deny" for t in _BRIDGE_TOOLS):
-        return "工具权限未全部 deny"
+    # 期望：单字符串 deny，或「所有已声明工具都 deny」的对象形式
+    if perm != "deny":
+        if not isinstance(perm, dict) or any(v != "deny" for v in perm.values()):
+            return "工具权限未全部 deny"
     if (a.get("prompt") or "").strip() != _BRIDGE_PROMPT:
         return "提示词已过期"
+    if a.get("tools"):
+        # tools 显式关闭会导致空回复，必须清掉
+        return "存在 tools 开关（会导致空回复）"
     return ""
 
 

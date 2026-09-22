@@ -317,30 +317,150 @@ def test_merge_turn_outputs_single_message_with_summed_usage():
 
 @pytest.mark.asyncio
 async def test_await_assistant_returns_last_text_when_stuck_on_tool_calls(monkeypatch):
-    """卡在 tool-calls 且无进展时，不再空等到 deadline：返回已有内容而非超时。"""
+    """卡在 tool-calls 且无进展时，不再空等到 deadline：interrupt 收尾并返回已有内容。
+
+    现场：reply:reject 只清掉挂起请求、**不会**让生成继续（实测该腿此后永远缺
+    time.completed）；只有 interrupt 能让 CLI 收尾。故停滞时必须走 interrupt。
+    """
     monkeypatch.setattr(sc, "auto_reject_tools", lambda: False)
     monkeypatch.setattr(sc, "sidecar_poll_interval", lambda: 0.01)
+    interrupted = {"n": 0}
 
     class FakeResp:
         status_code = 200
+        def __init__(self, payload=None):
+            self._p = payload or {}
         def json(self):
-            return {"data": [
-                {"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
-                 "finish": "tool-calls",
-                 "content": [{"type": "text", "text": "无法执行命令"}, {"type": "tool", "name": "bash"}]},
-            ]}
+            return self._p
 
     class FakeClient:
         async def get(self, url):
+            if "/permission" in url:
+                return FakeResp({"data": []})
+            return FakeResp({"data": [
+                {"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
+                 "finish": "tool-calls",
+                 "content": [{"type": "text", "text": "无法执行命令"}, {"type": "tool", "name": "bash"}]},
+            ]})
+        async def post(self, url, json=None):
+            if url.endswith("/interrupt"):
+                interrupted["n"] += 1
             return FakeResp()
 
     import time as _t
     t0 = _t.monotonic()
     st = await sc._await_assistant_state(FakeClient(), "sid", since_ms=1000,
-                                         poll_interval=0.01, deadline_s=30)
-    assert _t.monotonic() - t0 < 25, "应提前返回，而不是等到 deadline"
+                                         poll_interval=0.01, deadline_s=60)
+    assert _t.monotonic() - t0 < 40, "应提前返回，而不是等到 deadline"
+    assert interrupted["n"] >= 1, "停滞时必须 interrupt 收尾（reject 不会让生成继续）"
     assert st["finish"] == "tool-calls"
     assert sc._pick_text(st)[0] == "无法执行命令"
+
+
+@pytest.mark.asyncio
+async def test_await_assistant_returns_immediately_on_pending_permission_when_stalled(monkeypatch):
+    """权限挂起（腿缺 completed）也必须能收尾——这是 180s 超时的原始现场。"""
+    monkeypatch.setattr(sc, "auto_reject_tools", lambda: True)
+    monkeypatch.setattr(sc, "sidecar_poll_interval", lambda: 0.01)
+    state = {"rejected": False, "interrupted": False}
+
+    class FakeResp:
+        status_code = 200
+        def __init__(self, payload=None):
+            self._p = payload or {}
+        def json(self):
+            return self._p
+
+    class FakeClient:
+        async def get(self, url):
+            if "/permission" in url:
+                if state["rejected"]:
+                    return FakeResp({"data": []})
+                return FakeResp({"data": [{"id": "per_1", "action": "bash", "resources": ["ls"]}]})
+            # 挂起腿：只有 reasoning + tool，永远不 completed；interrupt 后才收尾
+            done = state["interrupted"]
+            leg = {"type": "assistant", "id": "a1",
+                   "time": {"created": 2100, **({"completed": 2200} if done else {})},
+                   "finish": "tool-calls" if done else None,
+                   "content": [{"type": "reasoning", "text": "让我跑一下"},
+                               {"type": "tool", "name": "bash"}]}
+            return FakeResp({"data": [leg]})
+        async def post(self, url, json=None):
+            if "/permission/" in url:
+                state["rejected"] = True
+            elif url.endswith("/interrupt"):
+                state["interrupted"] = True
+            return FakeResp()
+
+    import time as _t
+    t0 = _t.monotonic()
+    st = await sc._await_assistant_state(FakeClient(), "sid", since_ms=1000,
+                                         poll_interval=0.01, deadline_s=60)
+    assert _t.monotonic() - t0 < 40, "必须在有限时间内收尾，而不是干等到 deadline"
+    assert st["turn"], "应带回整轮状态"
+    assert sc._pick_text(st)[1] == "让我跑一下", "至少要把已生成的思考带回来"
+
+
+def test_merge_turn_preserves_reasoning_when_no_text():
+    """整轮无正文时，思考内容不能丢（否则只能回空壳）。"""
+    items = [{"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
+              "finish": "tool-calls",
+              "content": [{"type": "reasoning", "text": "想了"},
+                          {"type": "tool", "name": "bash"}]}]
+    merged = sc._merge_turn(sc._turn_state(items, since_ms=1000))
+    text, reason = sc._content_to_text(merged["content"])
+    assert text == "" and reason == "想了"
+
+
+def test_turn_signature_changes_with_progress():
+    """指纹必须能识别「有进展」与「停滞」。"""
+    base = [{"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
+             "finish": "tool-calls", "content": [{"type": "reasoning", "text": "abc"}]}]
+    s1 = sc._turn_signature(sc._turn_state(base, since_ms=1000))
+    # 思考变长 → 指纹变化（视为有进展）
+    grown = [dict(base[0], content=[{"type": "reasoning", "text": "abcd"}])]
+    s2 = sc._turn_signature(sc._turn_state(grown, since_ms=1000))
+    assert s1 != s2
+    # 完全相同 → 指纹相同（视为停滞）
+    assert sc._turn_signature(sc._turn_state(base, since_ms=1000)) == s1
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_raises_on_empty_turn(monkeypatch):
+    """空结果必须显式失败（否则 combo/auto 会把空壳当成功锁定该候选）。"""
+    monkeypatch.setattr(sc, "sidecar_poll_interval", lambda: 0.01)
+    monkeypatch.setattr(sc, "auto_reject_tools", lambda: False)
+
+    async def fake_create(client, pid, mid, title=""):
+        return "ses_x"
+
+    async def fake_post(client, sid, text, files=None):
+        return "msg_u"
+
+    async def fake_created(client, sid, mid):
+        return 1000
+
+    async def fake_wait_turn(client, sid, *, since_ms, poll_interval=None, deadline_s=None):
+        merged = sc._merge_turn(sc._turn_state([{
+            "type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
+            "finish": "tool-calls",
+            "content": [{"type": "tool", "name": "bash"}]}], since_ms=1000))
+        return merged, None
+
+    async def fake_close(client, sid):
+        return None
+
+    monkeypatch.setattr(sc, "_create_session", fake_create)
+    monkeypatch.setattr(sc, "_post_prompt", fake_post)
+    monkeypatch.setattr(sc, "_user_msg_created_at", fake_created)
+    monkeypatch.setattr(sc, "_await_turn", fake_wait_turn)
+    monkeypatch.setattr(sc, "_close_session", fake_close)
+
+    with pytest.raises(RuntimeError) as ei:
+        await sc.chat_completion([{"role": "user", "content": "hi"}], "m-x", client=object())
+    msg = str(ei.value)
+    assert "空回复" in msg
+    assert "工具调用" in msg
 
 
 @pytest.mark.asyncio
@@ -446,13 +566,34 @@ async def test_close_session_uses_unprefixed_path(monkeypatch):
 
 
 def test_bridge_agent_config_denies_all_tools():
-    """CLI agent 定义：工具全部 deny（不能靠 tools:false，那会返回空回复）。"""
+    """CLI agent 定义：权限用单字符串 deny（覆盖所有工具，含未来新增）。
+
+    实测要点：
+    - 对象形式 {工具名: "deny"} 也能消除挂起，但依赖工具名清单；
+    - 单字符串 "deny" 覆盖面更全，故采用它；
+    - **不能**用 tools:{x:false}——实测那样 CLI 会返回空回复。
+    """
     cfg = sc.bridge_agent_config("aigate")
     a = cfg["aigate"]
     assert a["mode"] == "primary"
-    assert all(v == "deny" for v in a["permission"].values())
-    assert {"bash", "read", "glob", "grep", "edit", "write"} <= set(a["permission"])
-    assert "tools" not in a
+    assert a["permission"] == "deny"
+    assert "tools" not in a, "tools 开关会导致空回复"
+
+
+def test_cli_config_problem_detects_tools_switch():
+    """tools 显式开关必须被判为「需要修正」（它会让回复变空）。"""
+    cfg = {"agent": {"aigate": {
+        "mode": "primary", "prompt": sc._BRIDGE_PROMPT,
+        "permission": "deny", "tools": {"bash": False}}}}
+    assert "tools" in sc._cli_config_problem(cfg, "aigate")
+
+
+def test_cli_config_problem_accepts_object_deny():
+    """对象形式全 deny 视为合规（用户手写的等价配置不该被反复改写）。"""
+    cfg = {"agent": {"aigate": {
+        "mode": "primary", "prompt": sc._BRIDGE_PROMPT,
+        "permission": {"bash": "deny", "read": "deny"}}}}
+    assert sc._cli_config_problem(cfg, "aigate") == ""
 
 
 def test_ensure_bridge_agent_config_writes_and_is_idempotent(tmp_path):
@@ -463,18 +604,23 @@ def test_ensure_bridge_agent_config_writes_and_is_idempotent(tmp_path):
     assert ok, note
     cfg = _json.loads(p.read_text(encoding="utf-8"))
     assert cfg["agent"]["aigate"]["mode"] == "primary"
-    assert all(v == "deny" for v in cfg["agent"]["aigate"]["permission"].values())
+    assert cfg["agent"]["aigate"]["permission"] == "deny"
     # ② 再跑一次 → 保持就绪且不重复写
     before = p.read_text(encoding="utf-8")
     ok2, note2 = sc.ensure_bridge_agent_config("aigate", path=str(p))
     assert ok2 and "已就绪" in note2
     assert p.read_text(encoding="utf-8") == before
     # ③ 工具权限被改坏 → 自动修回
-    cfg["agent"]["aigate"]["permission"]["bash"] = "ask"
+    cfg["agent"]["aigate"]["permission"] = {"bash": "ask"}
     p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     ok3, _ = sc.ensure_bridge_agent_config("aigate", path=str(p))
     assert ok3
-    assert _json.loads(p.read_text(encoding="utf-8"))["agent"]["aigate"]["permission"]["bash"] == "deny"
+    assert _json.loads(p.read_text(encoding="utf-8"))["agent"]["aigate"]["permission"] == "deny"
+    # ④ 被塞进 tools 开关（会导致空回复）→ 也要修掉
+    cfg["agent"]["aigate"]["tools"] = {"bash": False}
+    p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    sc.ensure_bridge_agent_config("aigate", path=str(p))
+    assert "tools" not in _json.loads(p.read_text(encoding="utf-8"))["agent"]["aigate"]
 
 
 def test_ensure_bridge_agent_config_preserves_other_agents(tmp_path):

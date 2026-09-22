@@ -364,6 +364,7 @@ class OpenCodeBridgeModel(BaseModel):
     enabled: Optional[bool] = None
     timeout_seconds: Optional[int] = None
     poll_interval_ms: Optional[int] = None
+    stall_grace_seconds: Optional[int] = None
     agent: Optional[str] = None
     base_url: Optional[str] = None
     port: Optional[int] = None
@@ -402,6 +403,7 @@ async def get_opencode_bridge():
                 "base_url": sc.sidecar_base(),
                 "timeout_seconds": sc.sidecar_timeout(),
                 "poll_interval_ms": int(sc.sidecar_poll_interval() * 1000),
+                "stall_grace_seconds": int(sc.stall_grace_seconds()),
                 "agent": sc.sidecar_agent(),
                 "auto_reject_tools": sc.auto_reject_tools(),
             },
@@ -427,6 +429,8 @@ async def put_opencode_bridge(body: OpenCodeBridgeModel):
         patch["timeout_seconds"] = max(10, min(1800, int(patch["timeout_seconds"])))
     if "poll_interval_ms" in patch:
         patch["poll_interval_ms"] = max(50, min(5000, int(patch["poll_interval_ms"])))
+    if "stall_grace_seconds" in patch:
+        patch["stall_grace_seconds"] = max(5, min(300, int(patch["stall_grace_seconds"])))
     if "port" in patch:
         patch["port"] = max(1, min(65535, int(patch["port"])))
     if "agent" in patch:

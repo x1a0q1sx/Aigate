@@ -77,20 +77,21 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
       "description": "AIGate gateway chat-only agent",
       "mode": "primary",
       "prompt": "You are a direct assistant behind an API gateway. ...",
-      "permission": {"bash": "deny", "read": "deny", "...": "deny"}
+      "permission": "deny"
     }
   }
 }
 ```
-（`permission` 全部 deny 是 2.1 的根治点；这份定义由网关在启动与保存设置时
+（`permission: "deny"` 是 2.1 的根治点；这份定义由网关在启动与保存设置时
 **幂等写入**——`opencode_sidecar.ensure_bridge_agent_config()`，只增改网关 agent，
-不碰用户其它配置。）
+不碰用户其它配置。改了定义要重启 CLI 才生效，见 2.1 末尾。）
 
 实测效果（同一问题「用一句话说明什么是 HTTP 404」）：
 - 默认 agent：`Hi! I'm ready to help with your workspace at ...`
 - `aigate` agent：`HTTP 404 是"未找到"状态码，表示服务器无法在指定地址上找到请求的资源。` ✅
 
-两个坑：① **禁用全部 tools 会让回复变空**（tools 全 false → 空回复），只保留提示词约束即可；
+两个坑：① **禁用全部 tools 会让回复变空**（`tools:{x:false}` → 空回复，且长 system 下会直接
+`finish=error`），所以工具必须靠 `permission` 关闭、而不是 `tools` 开关；
 ② agent 名可用环境变量 `AIGATE_OPENCODE_AGENT` 覆盖，未配置时自动回退 CLI 默认 agent
 （不致命，只是带人格）。
 
@@ -106,7 +107,7 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
 ```
 模型发起工具调用 → CLI 写 permission 请求 → 无人批准
   → 该条 assistant 消息永远缺 time.completed
-  → 网关只认 completed（见下条实现坑）→ 一直等到 deadline → 超时
+  → 网关只认 completed → 一直等到 deadline → 超时
 ```
 
 服务器现场（`GET /api/session/{sid}/message`）看得一清二楚：
@@ -116,22 +117,37 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
  "time":{"created":...}}          ← 没有 completed
 ```
 同时 `GET /api/session/{sid}/permission` 挂着一个 `{"action":"bash","resources":["ls -la"]}`。
-（顺带取证：`POST .../interrupt` 能让它收尾为 `finish=tool-calls`，但那时已经没有正文，
-所以 interrupt 不是解法。）
 
-**三重修复**（任一层单独都不够稳）：
-1. **CLI agent 定义里把工具全部 deny**（`permission: {bash:"deny",...}`）：模型调用工具时
-   立刻收到「工具执行失败」，转而用文本作答——实测 3~6s 正常 `finish=stop`。
-2. **运行时兜底**：轮询发现 `GET .../permission` 有待批请求就自动
-   `POST .../permission/{id}/reply {"reply":"reject"}`，即使 agent 配置被外部改坏也不会挂死。
-3. **整轮归并**：一轮提问可能产生**多条** assistant（先 `finish=tool-calls` 后 `finish=stop`），
-   旧实现只看第一条 → 拿到空正文。现在按轮次归并、**取最后一条有正文的**作为答案
-   （用量 = 各腿 output 之和 + 最大 input）；若停在中间态且长时间无进展，返回已有内容
-   而非空等到 deadline。
+**关键取证**：`reply: {"reply":"reject"}` 只清掉挂起请求，**并不会让生成继续**——实测拒绝后
+该腿此后永远缺 `time.completed`（pending 归零但腿不动）。真正能让它收尾的是
+`POST .../interrupt`（腿立刻补上 `completed`，`finish=tool-calls`、工具标 error）。
+所以「自动 reject」必须与「停滞检测 + interrupt」配合，单靠 reject 只是把挂起换成静默停滞。
+
+**四重修复**（逐层兜底）：
+1. **CLI agent 里把工具权限全 deny**：`permission: "deny"`（单字符串，覆盖所有工具含未来新增；
+   逐工具名的对象形式等价但依赖清单）。模型调用工具时立刻收到「工具执行失败」，
+   转而用文本作答——实测 3~10s 正常 `finish=stop`。
+   **不能**用 `tools:{x:false}`：实测那样会返回空回复（长 system 下直接 `finish=error`）。
+2. **运行时兜底**：轮询发现待批权限就自动 `reply: reject`（有些版本会让生成继续）。
+3. **停滞检测 + interrupt**：整轮指纹（腿数/完成状态/正文思考长度）长时间不变即判停滞，
+   先 `interrupt` 收尾拿回已生成内容，再不行就直接返回，绝不干等到 deadline。
+4. **整轮归并**：一轮提问可能产生**多条** assistant（先 `finish=tool-calls` 后 `finish=stop`），
+   旧实现只看第一条 → 拿到空正文。现在归并整轮、**取最后一条有正文的**作为答案
+   （用量 = 各腿 output 之和 + 最大 input），整轮无正文时把思考内容带回来。
+5. **空结果显式失败**：整轮只有工具调用、正文思考皆空时抛错，而不是回一个 200 空壳
+   （否则 combo/auto 会把空壳当「成功但没话说」而锁定该候选）。
 
 **配置化**：新增 `config.yaml` 的 `opencode_bridge` 段 + 设置页「OpenCode 免费层桥接」卡片，
 超时/轮询间隔/agent 名/sidecar 地址/端口/CLI 路径/自动拉起/自动拒绝工具都可在界面改，
 保存即生效（请求时读取），改端口后可用卡片上的「重启 sidecar」一键应用。
+
+**注意（重要）**：CLI 在**启动时**读取 agent 配置文件并快照，运行中改文件不会生效；
+改 agent 定义后必须重启 `opencode serve`（网关守护任务在启动时会幂等修正定义，
+也可用设置页的「重启 sidecar」按钮）。
+
+**限流提醒**：连续高频试探（本次取证打了上百次）会触发上游临时 403 `FreeTierError`，
+表现为**所有**模型/请求一律 403、且与 agent 配置无关；静置数分钟后自行恢复，
+不要误判为配置出错。
 
 **产品级差异**：CLI 的 `prompt` API 只收 `text`，网关的 `messages[]` 会被压平成一段文本
 （`[system]` / `[assistant]` / `[tool]` 标签保留角色语义）。这是与原生 Chat Completions 的

@@ -194,6 +194,7 @@
       <div class="notify-fields">
         <label>请求超时（秒）<input v-model.number="oc.timeout_seconds" type="number" min="10" max="1800" /></label>
         <label>轮询间隔（毫秒）<input v-model.number="oc.poll_interval_ms" type="number" min="50" max="5000" /></label>
+        <label>停滞判定（秒）<input v-model.number="oc.stall_grace_seconds" type="number" min="5" max="300" /></label>
         <label>CLI agent 名<input v-model.trim="oc.agent" placeholder="aigate" /></label>
         <label>sidecar 地址<input v-model.trim="oc.base_url" placeholder="http://127.0.0.1:4096" /></label>
         <label>监听端口<input v-model.number="oc.port" type="number" min="1" max="65535" /></label>
@@ -283,8 +284,8 @@ export default {
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
       oc: {
-        enabled: true, timeout_seconds: 180, poll_interval_ms: 600, agent: 'aigate',
-        base_url: 'http://127.0.0.1:4096', port: 4096, bin_path: '',
+        enabled: true, timeout_seconds: 180, poll_interval_ms: 600, stall_grace_seconds: 20,
+        agent: 'aigate', base_url: 'http://127.0.0.1:4096', port: 4096, bin_path: '',
         auto_start: true, manage_agent_config: true, auto_reject_tools: true,
       },
       ocStatus: null,
