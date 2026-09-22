@@ -128,6 +128,58 @@ async def test_await_assistant_surfaces_error():
 
 
 @pytest.mark.asyncio
+async def test_await_assistant_ignores_stale_history():
+    """回归：sidecar 偶发把历史会话内容带出（首轮见过返回无关的 "## Intuition ..."）。
+    必须只认 created >= 本次提问时间 且已 completed 的 assistant。"""
+    class FakeResp:
+        def __init__(self, items):
+            self.status_code = 200
+            self._items = items
+        def json(self):
+            return {"data": self._items}
+
+    class FakeClient:
+        async def get(self, url):
+            return FakeResp([
+                # 历史残留（created 早于本次提问）——不得采纳
+                {"type": "assistant", "id": "old",
+                 "time": {"created": 500, "completed": 600},
+                 "content": [{"type": "text", "text": "## Intuition ... linked list"}]},
+                # 本轮，已完成
+                {"type": "assistant", "id": "new",
+                 "time": {"created": 2000, "completed": 2100},
+                 "finish": "stop",
+                 "content": [{"type": "text", "text": "正确答案"}]},
+            ])
+
+    msg, err = await sc._await_assistant(FakeClient(), "sid", since_ms=1000,
+                                         poll_interval=0.01, deadline_s=2)
+    assert err is None
+    assert msg["id"] == "new"
+    assert sc._content_to_text(msg["content"])[0] == "正确答案"
+
+
+@pytest.mark.asyncio
+async def test_user_msg_created_at_lookup():
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"data": [
+                {"id": "msg_a", "type": "user", "time": {"created": 1234}},
+                {"id": "msg_b", "type": "user", "time": {"created": 5678}},
+            ]}
+
+    class FakeClient:
+        async def get(self, url):
+            return FakeResp()
+
+    c = FakeClient()
+    assert await sc._user_msg_created_at(c, "sid", "msg_b") == 5678
+    assert await sc._user_msg_created_at(c, "sid", "missing") is None
+    assert await sc._user_msg_created_at(c, "sid", "") is None
+
+
+@pytest.mark.asyncio
 async def test_free_executor_opencode_uses_sidecar(monkeypatch):
     """opencode 免费执行器必须走 sidecar（纯 HTTP 已被上游封锁）"""
     from server.core import free_providers as fp

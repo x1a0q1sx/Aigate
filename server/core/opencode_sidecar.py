@@ -58,7 +58,10 @@ async def sidecar_alive(client: Optional[httpx.AsyncClient] = None) -> bool:
 
 
 async def _create_session(client: httpx.AsyncClient, provider_id: str, model_id: str,
-                          title: str = "aigate-bridge") -> str:
+                          title: str = "") -> str:
+    # 唯一标题：便于排查「回复串到别的会话」这类问题（实测 CLI 偶发把历史会话内容带出）
+    if not title:
+        title = f"aigate-{os.urandom(4).hex()}"
     payload = {
         "title": title,
         "model": {"id": model_id, "providerID": provider_id},
@@ -80,13 +83,33 @@ async def _create_session(client: httpx.AsyncClient, provider_id: str, model_id:
 
 
 async def _post_prompt(client: httpx.AsyncClient, sid: str, text: str,
-                       files: Optional[list] = None) -> None:
+                       files: Optional[list] = None) -> str:
+    """发 prompt，返回 sidecar 分配的用户消息 id（`msg_...`）——用于把回复精确关联到本次提问。"""
     payload = {"prompt": {"text": text}}
     if files:
         payload["prompt"]["files"] = files
     r = await client.post(f"{SIDECAR_BASE}/api/session/{sid}/prompt", json=payload)
     if r.status_code >= 400:
         raise RuntimeError(f"opencode sidecar 发 prompt 失败 HTTP {r.status_code}: {r.text[:200]}")
+    data = (r.json() or {}).get("data") or {}
+    return str(data.get("id") or "")
+
+
+async def _user_msg_created_at(client: httpx.AsyncClient, sid: str,
+                               user_msg_id: str) -> Optional[int]:
+    """取本次用户消息的 created 时间戳（作为「本轮回复」的归属基线）。"""
+    if not user_msg_id:
+        return None
+    try:
+        r = await client.get(f"{SIDECAR_BASE}/api/session/{sid}/message")
+        if r.status_code >= 400:
+            return None
+        for it in (r.json() or {}).get("data") or []:
+            if isinstance(it, dict) and it.get("id") == user_msg_id:
+                return int(((it.get("time") or {}).get("created") or 0)) or None
+    except Exception:
+        return None
+    return None
 
 
 def _content_to_text(content) -> tuple[str, str]:
@@ -113,9 +136,12 @@ async def _await_assistant(client: httpx.AsyncClient, sid: str, *, since_ms: int
                            poll_interval: float = 0.6, deadline_s: float = None):
     """轮询消息列表直到出现「本轮的 assistant 消息且已生成完毕」；返回 (消息 dict, 错误 dict|None)。
 
-    注意（实测坑）：assistant 消息是**逐步填充**的——先出现 time.created 与空的
-    reasoning part，随后才补 text 并写入 time.completed。若只判「消息存在」会拿到空回复，
-    故必须等 time.completed（或 finish 字段）出现才算就绪。
+    两个实测坑：
+    1) assistant 消息**逐步填充**——先出现 time.created 与空的 reasoning part，随后才补
+       text 并写入 time.completed。若只判「消息存在」会拿到空回复。
+    2) 偶发把**历史会话内容**带出（首轮实测见过返回无关的 "## Intuition ... linked list"）。
+       故这里对 assistant 做双重过滤：① created 必须 ≥ 本次提问时间；② 必须已 completed/finish。
+       只有同时满足才认。
     """
     deadline = time.monotonic() + (deadline_s if deadline_s is not None else _SIDECAR_TIMEOUT)
     latest = None
@@ -129,13 +155,14 @@ async def _await_assistant(client: httpx.AsyncClient, sid: str, *, since_ms: int
                         continue
                     created = ((it.get("time") or {}).get("created") or 0)
                     if created and created < since_ms:
-                        continue
-                    latest = it
+                        continue        # 属于更早的对话，不认
+                    tm = it.get("time") or {}
+                    done = bool(tm.get("completed") or it.get("finish"))
+                    if not done:
+                        continue        # 仍在流式填充中，等下一轮
                     if it.get("error"):
                         return it, it.get("error")
-                    tm = it.get("time") or {}
-                    if tm.get("completed") or it.get("finish"):
-                        return it, None     # 生成完毕
+                    return it, None     # 本轮且已完成
         except Exception as e:      # 轮询期瞬时错误不致命
             logger.debug("opencode sidecar poll: %s", e)
         await asyncio.sleep(poll_interval)
@@ -187,8 +214,10 @@ async def chat_completion(messages: list, model_id: str, provider_id: str = "ope
     try:
         sid = await _create_session(c, provider_id, model_id)
         t0 = int(time.time() * 1000)
-        await _post_prompt(c, sid, prompt_text, files=files)
-        msg, err = await _await_assistant(c, sid, since_ms=t0)
+        user_msg_id = await _post_prompt(c, sid, prompt_text, files=files)
+        # 用 sidecar 分配的用户消息 id 的时间戳做归属基线（比本地 t0 更贴近服务端时钟）
+        since = await _user_msg_created_at(c, sid, user_msg_id) or t0
+        msg, err = await _await_assistant(c, sid, since_ms=since)
         if err:
             raise RuntimeError(f"opencode sidecar 上游报错: {json.dumps(err, ensure_ascii=False)[:300]}")
         resp = _to_openai_response(msg, model_id, prompt_text)
