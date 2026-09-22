@@ -1824,21 +1824,20 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 },
             )
         elif cred_type == "oauth":
-            # OAuth 订阅 provider — 用 oauth_client.pick_access_token，未连接报 503
-            from server.core.oauth_client import get_oauth_client
+            # OAuth 订阅 provider — v4.1：走统一凭证解析器（与 /v1 直连/combo 一致）。
+            # 裸 pick_access_token 会把 u1s1 设备凭证当 Bearer 发出 → 缺 DPoP → 403「仅填写账号 API Key 不受支持」。
+            from server.core.credential_resolver import resolve_credential_async
             oauth_code = getattr(provider, "oauth_code", None) or provider.name
-            try:
-                api_key = await get_oauth_client().pick_access_token(oauth_code, db)
-            except Exception:
-                api_key = None
-            if not api_key:
+            _rc_p = await resolve_credential_async(provider, model, db)
+            if not _rc_p.ok or not _rc_p.api_key:
                 raise HTTPException(status_code=503, detail=f"OAuth provider '{oauth_code}' not connected")
             from server.core.model_catalog import create_adapter_for_provider
             from server.core.auto_router import RouteResult
             adapter = create_adapter_for_provider(provider.api_type)
             route_result = RouteResult(
                 success=True, model=model, provider=provider,
-                api_key=api_key, adapter=adapter, fallback_count=0
+                api_key=_rc_p.api_key, adapter=adapter, fallback_count=0,
+                extra_headers=_rc_p.extra_headers,   # __dpop 标记随行
             )
         elif cred_type == "atomcode":
             # AtomCode — 本地 daemon 自鉴权，无需 API key（playground / 模型页测试也走此分支）
@@ -1896,6 +1895,8 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     model_id_full = f"{route_result.provider.name}/{route_result.model.model_id}"
     upstream_request = request.model_copy(update={"model": route_result.model.model_id})
     extra_headers = route_result.provider.headers if route_result.provider.headers else None
+    if getattr(route_result, "extra_headers", None):
+        extra_headers = {**(extra_headers or {}), **route_result.extra_headers}
 
     if data.stream:
         async def wrap_stream():

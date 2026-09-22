@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- **u1s1 直连/Playground 仍 403「仅填写账号 API Key 不受支持」**：`/v1` 主入口按 `服务商/模型` 前缀直连、以及后台 Playground 测试按钮的 OAuth 分支，此前仍用裸 `pick_access_token` 拿设备 token 当 `Authorization: Bearer` 发出，绕过统一凭证解析器 → 不带 `__dpop` 标记 → openai_compat 不现签 DPoP proof。与 combo/auto 路径一致改走 `resolve_credential_async`，把解析器返回的 `extra_headers`（含 `__dpop`）接入 `RouteResult` 并在发送处合并。
+- **combo 冷启动 403「检测到请求来自非 u1s1 客户端」**：u1s1 推理必须附 `x-u1s1-attestation`（仅 DPoP 不够，实测无 attestation 时 `/v1/models` 200 但 `chat/completions` 403）。服务重启后该缓存是冷的，首个命中 u1s1 的请求要现拉（阻塞 ≤4s，慢则冷却 30s，整条 combo 的 u1s1 候选一起 403）。现于 lifespan 启动即后台预热 attestation（token 有效期 7 天、临期自动续），消除冷启动窗口。
+
 ### Added
 - 模型刷新日志：每次刷新模型列表（手动或定时）落一行 `model_refresh_logs`（服务商、触发方式、耗时、增/删/改计数、定价/指标更新数、定价来源、新增与移除的模型清单、错误信息）；分析页请求日志区新增「日志类型」筛选（请求日志/模型刷新）+「日志类型」列，刷新行点详情可看增删模型明细；配套补齐此前缺失的**定时刷新**能力（`config.yaml` `model_refresh.scheduled_enabled=false` + `interval_minutes=720`，默认关闭；开启后覆盖全部启用服务商，含 free_tier/oauth/无密钥者，每次同样入日志）
 - u1s1 客户端信号（DPoP + 归因 UA）：u1s1 平台把赠送额度的 API 推理收紧为「官方客户端专属」，逐层排查实测出完整判据：① 普通 Bearer api_key → 403；② 加 x-u1s1-* 归因头仍 403（缺 DPoP）；③ 补 RFC9449 DPoP（`DPoP <u1s1d-…>` + 逐请求现签 proof，签名材料来自设备登录时持久化的密钥对，官方 CLI device-auth.js 同协议）→ 错误码变 `client_integrity_review`；④ 最终判据 = `user-agent: u1s1-cli`（官方 tools.js 同源），补上后 200。DPoP 与 UA 缺一仍被拦，二者皆必需；另按官方 CLI 行为附带客户端证明 `x-u1s1-attestation`（GET /v1/models 响应体领 7 天 token，`server/core/u1s1_attestation.py` 缓存：临期 24h 后台刷、失败冷却 30s、无 token 首拉阻塞 ≤4s），作协议保真（实测当前判据不含它，但官方客户端会发，u1s1 后续可能启用）。需到「OAuth 连接」页重新登录一次 u1s1 以签发设备密钥

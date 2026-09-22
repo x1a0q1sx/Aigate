@@ -2148,22 +2148,23 @@ async def _chat_completions_impl(
             # Free Tier / OAuth providers — key 可空（无需密钥直发 / OAuth token 走 OAuth client）
             api_key = None
             _kid = None
+            _direct_extra = None
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                 _diag(conversation_id, "direct_key_skipped_" + provider.credential_type, _diag_start, provider=provider.name)
                 if provider.credential_type == "oauth":
-                    # 通过 OAuth client pick_access_token（自动刷新）
-                    from server.core.oauth_client import get_oauth_client
-                    from server.core.oauth_registry import get_oauth_provider as _get_oauth_p
-                    # v3.1：优先用 provider.oauth_code 字段，显式指向 OAuthRegistry code
-                    # 兼容老数据：若 oauth_code 为空，回退尝试 provider.name
+                    # v4.1：直连同样必须走统一凭证解析器（combo/auto/health 已统一）。
+                    # 之前用裸 pick_access_token 拿设备 token 当 Bearer 发出 → u1s1 判「仅填写账号
+                    # API Key 不受支持」403；解析器会为 u1s1 注入 __dpop 标记，openai_compat 出站前
+                    # 现签 DPoP proof（Authorization: DPoP <u1s1d-…>），赠送额度才放行。
+                    from server.core.credential_resolver import resolve_credential_async
+                    _rc_d = await resolve_credential_async(provider, model, db)
                     oauth_code = getattr(provider, "oauth_code", None) or provider.name
-                    oauth_p = _get_oauth_p(oauth_code)
-                    if oauth_p:
-                        api_key = await get_oauth_client().pick_access_token(oauth_code, db)
-                    if not api_key:
+                    if not _rc_d.ok or not _rc_d.api_key:
                         await _decision_finish(conversation_id, status="error", failure_reason=f"OAuth provider '{oauth_code}' not connected")
                         await _early_error_log(conversation_id, request, raw_request, f"OAuth provider '{oauth_code}' not connected")
                         return JSONResponse(status_code=503, content=_api_error(f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)", status=503))
+                    api_key = _rc_d.api_key
+                    _direct_extra = _rc_d.extra_headers
                 else:
                     api_key = ""   # free_tier：decoder 时 adapter 用空字符串鉴权头
             else:
@@ -2193,7 +2194,8 @@ async def _chat_completions_impl(
             adapter = create_adapter_for_provider(provider.api_type)
             route_result = RouteResult(
                 success=True, model=model, provider=provider, api_key=api_key, key_id=_kid,
-                adapter=adapter, fallback_count=0
+                adapter=adapter, fallback_count=0,
+                extra_headers=_direct_extra,   # oauth 的 __dpop/__oauth 标记随行（直连不再裸发设备凭证）
             )
             _decision_candidates(conversation_id, [{
                 "rank": 1,

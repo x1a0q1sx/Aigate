@@ -203,6 +203,28 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("oauth provider backfill failed: %s", e)
     _backfill_task = _aio.ensure_future(_backfill_oauth_providers())
+    # u1s1 客户端证明（x-u1s1-attestation）启动预热：推理请求缺它必 403「非 u1s1 客户端」。
+    # 进程级缓存冷启动时首个 combo/auto 请求要现拉（阻塞 ≤4s，慢则冷却 30s 让整条链的 u1s1
+    # 候选全 403）。启动即后台拉一次填缓存（有效期 7 天，临期自动续），把冷启动窗口消掉。
+    async def _warm_u1s1_attestation():
+        try:
+            from sqlalchemy import select as _sel
+            from server.db import AsyncSessionLocal
+            from server.models.provider import Provider as _P
+            async with AsyncSessionLocal() as db:
+                hit = (await db.execute(
+                    _sel(_P.id).where(_P.credential_type == "oauth",
+                                      _P.oauth_code == "u1s1",
+                                      _P.enabled.is_(True)).limit(1)
+                )).first()
+            if not hit:
+                return
+            from server.core.u1s1_attestation import get_attestation
+            att = await get_attestation("https://api.u1s1.io/v1")
+            print("✓ u1s1 attestation 预热完成" if att else "⚠️ u1s1 attestation 预热未获 token（首次推理会重试）")
+        except Exception as e:
+            logger.warning("u1s1 attestation 预热失败: %s", e)
+    _warm_att_task = _aio.ensure_future(_warm_u1s1_attestation())
     # P0-3: 日志写入队列（请求路径零落库，后台批量 commit + WAL 周期 checkpoint）
     from server.core.log_queue import start_log_queue
     start_log_queue()
