@@ -390,7 +390,9 @@ class ModelCatalog:
             oauth_p = _gop(oauth_code)
             token = None
             try:
-                token = await _goc().pick_access_token(oauth_code, session)
+                # v4.2: 与路由侧一致，按 provider.oauth_owner 点名取号
+                _owner = (getattr(provider, "oauth_owner", None) or "").strip() or "__default"
+                token = await _goc().pick_access_token(oauth_code, session, owner=_owner)
             except Exception as e:
                 logger.warning(f"oauth pick_access_token failed for {provider.name}: {e}")
             if token:

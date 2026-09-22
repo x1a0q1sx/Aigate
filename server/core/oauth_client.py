@@ -512,6 +512,9 @@ class OAuthClient:
         """u1s1 DPoP 签名材料：{bearer, priv_jwk, pub_jwk}；未随设备密钥登录过则 None。"""
         try:
             row = await self._get_token_record(db, provider_code, owner)
+            if (not row or not row.is_active) and owner == "__default":
+                # 与 pick_access_token 同款兜底：主账号改名/停用后仍能取到签名材料
+                row = await self._get_any_active_token_record(db, provider_code)
             if not row or not row.device_key_enc or not row.refresh_token_enc:
                 return None
             import json as _json
@@ -813,8 +816,17 @@ class OAuthClient:
         db: AsyncSession,
         owner: str = "__default",
     ) -> Optional[str]:
-        """供 v1_router 使用：返回有效 access_token；必要时主动刷新"""
+        """供 v1_router 使用：返回有效 access_token；必要时主动刷新。
+
+        owner=__default（自动模式）时，主账号被改名/停用/删除后回退该服务商
+        任一 active 连接（id 最早）——否则路由会报"未连接"（实测踩坑：连接
+        改名成手机号后 codebuddy_cn 全部候选失效）。显式指定 owner 查不到
+        时返回 None：用户点名要这个账号，不能悄悄换号。"""
         existing = await self._get_token_record(db, provider_code, owner)
+        if (not existing or not existing.is_active) and owner == "__default":
+            existing = await self._get_any_active_token_record(db, provider_code)
+            if existing:
+                owner = existing.owner
         if not existing or not existing.is_active:
             return None
         # 解密
@@ -847,6 +859,20 @@ class OAuthClient:
             return r.scalar_one_or_none()
         except Exception as e:
             logger.warning("get oauth token failed: %s", e)
+            return None
+
+    async def _get_any_active_token_record(self, db: AsyncSession, provider_code: str) -> Optional[OAuthToken]:
+        """自动模式兜底：该服务商任一 active 连接（id 最早 = 最先接入的账号）。"""
+        try:
+            r = await db.execute(
+                select(OAuthToken).where(
+                    OAuthToken.provider_code == provider_code,
+                    OAuthToken.is_active == True,  # noqa: E712
+                ).order_by(OAuthToken.id).limit(1)
+            )
+            return r.scalar_one_or_none()
+        except Exception as e:
+            logger.warning("get any active oauth token failed: %s", e)
             return None
 
     async def _save_token(

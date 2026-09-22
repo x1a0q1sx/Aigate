@@ -216,6 +216,10 @@
             <div><dt>创建时间</dt><dd class="text-xs">{{ fmtTime(detailProvider.created_at) }}</dd></div>
             <div><dt>更新时间</dt><dd class="text-xs">{{ fmtTime(detailProvider.updated_at) }}</dd></div>
             <div><dt>代理池</dt><dd class="text-xs">{{ detailProvider.proxy_enabled ? '强制走代理池' : '跟随全局开关' }}</dd></div>
+            <div><dt>定时刷新</dt><dd class="text-xs">{{ detailProvider.model_refresh_enabled
+              ? `每 ${detailProvider.model_refresh_interval_minutes || 60} 分钟` + (detailProvider.model_refresh_next_at ? ` · 下次 ${fmtTime(detailProvider.model_refresh_next_at)}` : '')
+              : '未启用（可编辑勾选）' }}</dd></div>
+            <div v-if="(detailProvider.credential_type || 'api_key') === 'oauth'"><dt>OAuth 账号</dt><dd class="text-xs">{{ detailProvider.oauth_owner || '自动' }}</dd></div>
           </dl>
           <!-- ② 状态标签 -->
           <div v-if="statusLabels(detailProvider).length" class="detail-tags">
@@ -475,6 +479,25 @@
             <input v-model="form.proxy_enabled" type="checkbox" />
             <span>强制使用代理池（开启后不受全局代理开关影响）</span>
           </label>
+        </div>
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input v-model="form.model_refresh_enabled" type="checkbox" />
+            <span>定时刷新模型（自动同步上游模型清单与定价）</span>
+          </label>
+        </div>
+        <div v-if="form.model_refresh_enabled" class="form-group">
+          <label class="form-label">刷新频率（分钟）</label>
+          <input v-model.number="form.model_refresh_interval_minutes" type="number" min="5" max="43200" step="5" />
+          <div class="form-hint">每 N 分钟到点拉取一次（≥5）；已单独设频的服务商不再参与全局定时批量</div>
+        </div>
+        <div v-if="isEditing && form.credential_type === 'oauth'" class="form-group">
+          <label class="form-label">OAuth 路由账号</label>
+          <select v-model="form.oauth_owner">
+            <option value="">自动（主账号优先，缺失时任一已连接账号）</option>
+            <option v-for="o in oauthAccountOptions" :key="o" :value="o">{{ o }}</option>
+          </select>
+          <div class="form-hint">同一服务商有多个账号时，点名本服务商走哪个账号</div>
         </div>
         <div class="form-group">
           <label class="form-label">API 类型</label>
@@ -805,7 +828,7 @@ export default {
       isEditing: false,
       editingId: null,
       activeTab: 'basic',
-      form: { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, description: '' },
+      form: { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, oauth_owner: '', model_refresh_enabled: false, model_refresh_interval_minutes: 60, description: '' },
       modalKeys: [],
       keyForm: { key: '', label: '' },
       keySaving: false,
@@ -903,6 +926,17 @@ export default {
       return this.oauthConnections.filter(
         (c) => c.provider_code === p.oauth_code || c.provider_code === p.name
       )
+    },
+    // 编辑弹窗：当前服务商可点名的 OAuth 账号（owner）列表
+    oauthAccountOptions() {
+      const code = this.form.oauth_code || this.form.name
+      const owners = this.oauthConnections
+        .filter((c) => c.provider_code === code)
+        .map((c) => c.owner)
+        .filter(Boolean)
+      const cur = this.form.oauth_owner
+      if (cur && !owners.includes(cur)) owners.unshift(cur)
+      return [...new Set(owners)]
     },
     detailCombos() {
       const names = new Set()
@@ -1006,6 +1040,7 @@ export default {
       if (type === 'oauth' && this.oauthConnectionCount(p) === 0) labels.push('OAuth 未连接')
       if (!/^https?:\/\//i.test(p.base_url || '') && type !== 'free_tier') labels.push('URL 异常')
       if (p.proxy_enabled) labels.push('代理')
+      if (p.model_refresh_enabled) labels.push(`定时刷新 ${p.model_refresh_interval_minutes || 60}m`)
       if (this.failCount(p.id) > 0) labels.push(`失败 ${this.failCount(p.id)}`)
       return labels
     },
@@ -1077,8 +1112,11 @@ export default {
         api_type: p.api_type,
         credential_type: p.credential_type || 'api_key',
         oauth_code: p.oauth_code || null,
+        oauth_owner: p.oauth_owner || '',
         proxy_enabled: !!p.proxy_enabled,
         description: p.description || '',
+        model_refresh_enabled: !!p.model_refresh_enabled,
+        model_refresh_interval_minutes: p.model_refresh_interval_minutes || 60,
       }
       this.isEditing = true
       this.editingId = p.id
@@ -1091,7 +1129,7 @@ export default {
       this.activeTab = 'keys'
     },
     resetForm() {
-      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, proxy_enabled: false, description: '' }
+      this.form = { name: '', base_url: '', api_type: 'openai_compat', credential_type: 'api_key', oauth_code: null, oauth_owner: '', proxy_enabled: false, description: '', model_refresh_enabled: false, model_refresh_interval_minutes: 60 }
       this.isEditing = false
       this.editingId = null
       this.activeTab = 'basic'
@@ -1112,6 +1150,12 @@ export default {
           api_type: this.form.api_type,
           proxy_enabled: !!this.form.proxy_enabled,
           description: this.form.description || '',
+          model_refresh_enabled: !!this.form.model_refresh_enabled,
+          model_refresh_interval_minutes: Math.max(5, parseInt(this.form.model_refresh_interval_minutes, 10) || 60),
+        }
+        // OAuth 路由账号：空串=自动（后端会把 '' 清成 None）；null 会被视为"不修改"
+        if (this.isEditing && (this.form.credential_type === 'oauth')) {
+          base.oauth_owner = this.form.oauth_owner || ''
         }
         if (this.isEditing) {
           await api.updateProvider(this.editingId, base)

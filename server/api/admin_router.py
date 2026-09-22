@@ -895,6 +895,18 @@ async def import_providers(payload: ProviderImportRequest, db: AsyncSession = De
 
     await db.commit()
     return {"ok": True, "conflict": conflict, "stats": stats, "results": results}
+def _apply_model_refresh_fields(provider, *, enabled, minutes, touch_schedule: bool) -> None:
+    """写服务商定时刷新字段。间隔钳到 [5, 43200] 分钟；
+    touch_schedule=True（启用或改频率）时把 next_at 拨到 now+间隔，立即生效；
+    仅关闭时不动 next_at（tick 只扫 enabled=True 的行，残留值无害）。"""
+    from datetime import datetime, timedelta
+    provider.model_refresh_enabled = bool(enabled)
+    provider.model_refresh_interval_minutes = max(5, min(43200, int(minutes or 60) or 60))
+    if provider.model_refresh_enabled and touch_schedule:
+        provider.model_refresh_next_at = datetime.utcnow() + timedelta(
+            minutes=provider.model_refresh_interval_minutes)
+
+
 @router.post("/providers")
 async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_db)):
     provider = Provider(
@@ -903,12 +915,16 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         api_type=data.api_type,
         credential_type=data.credential_type,
         oauth_code=data.oauth_code,
+        oauth_owner=(data.oauth_owner or "").strip() or None,
         enabled=data.enabled,
         headers=data.headers or {},
         proxy_url=data.proxy_url,
         proxy_enabled=data.proxy_enabled,
         description=data.description or ""
     )
+    _apply_model_refresh_fields(
+        provider, enabled=data.model_refresh_enabled,
+        minutes=data.model_refresh_interval_minutes, touch_schedule=True)
     db.add(provider)
     await db.commit()
     await db.refresh(provider)
@@ -928,6 +944,8 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.credential_type = data.credential_type
     if data.oauth_code is not None:
         provider.oauth_code = data.oauth_code
+    if data.oauth_owner is not None:
+        provider.oauth_owner = (data.oauth_owner or "").strip() or None
     if data.enabled is not None:
         provider.enabled = data.enabled
     if data.headers is not None:
@@ -938,6 +956,17 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.proxy_enabled = data.proxy_enabled
     if data.description is not None:
         provider.description = data.description
+    # v4.2 定时模型刷新：启用状态或频率有变化时重拨 next_at（立即生效）
+    if (data.model_refresh_enabled is not None
+            or data.model_refresh_interval_minutes is not None):
+        _apply_model_refresh_fields(
+            provider,
+            enabled=(provider.model_refresh_enabled if data.model_refresh_enabled is None
+                     else data.model_refresh_enabled),
+            minutes=(provider.model_refresh_interval_minutes
+                     if data.model_refresh_interval_minutes is None
+                     else data.model_refresh_interval_minutes),
+            touch_schedule=True)
     await db.commit()
     await db.refresh(provider)
     return ProviderResponse.model_validate(provider)
@@ -1249,9 +1278,15 @@ async def refresh_models(
             raise HTTPException(status_code=404, detail="Provider not found")
         providers = [provider]
     elif _trig == "scheduled":
-        # 定时刷新覆盖所有启用服务商（含 free_tier / oauth / 无密钥者）
+        # 定时刷新覆盖所有启用服务商（含 free_tier / oauth / 无密钥者）。
+        # v4.2: 已单独勾选"定时刷新"的服务商除外——它们由每分钟 tick 按各自频率执行
+        from sqlalchemy import or_
         result = await db.execute(
-            select(Provider).where(Provider.enabled.is_(True)).order_by(Provider.id)
+            select(Provider).where(
+                Provider.enabled.is_(True),
+                or_(Provider.model_refresh_enabled.is_(False),
+                    Provider.model_refresh_enabled.is_(None)),
+            ).order_by(Provider.id)
         )
         providers = list(result.scalars().all())
     else:

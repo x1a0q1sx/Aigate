@@ -102,3 +102,36 @@
 - 赠包名 `Bonus Pack N` 原按上游数组顺序编号，出口按到期重排后会显示成
   2,3,…,10,1,11…（看着像漏号，实测 33 个赠包时很显眼）
 - 处置：`_codebuddy_usage` 内先按 `CycleEndTime` 升序再编号，编号与到期顺序一致
+
+## F12 cline 候选连续失败（2026-09-22 用户报错，非网关 bug）
+- 现象：combo 918 cline 候选近 29 次全挂，
+  `upstream_stream_error: stream_initialization_failed ... failed to invoke model 'z-ai/…' from OpenRouter`
+- 实测取证（生产服务器直连 cline API，带 workos: 前缀 + cline 专属头）：
+  1) `qwen/qwen3.8-27b:free` / `z-ai/glm-5.2:free` → OpenRouter **429
+     "temporarily rate-limited"**（免费层限流，非配置问题）；
+     且 cline 把上游错误**包在 200 SSE 首块里**发回（`{"error":{...}}` + `[DONE]`），
+     网关按终态错误识别并记 `_FailAttempt` 回退——行为正确（缺陷 G 的成果）。
+  2) 付费模型（z-ai/glm-4.6 等）→ **402 insufficient_credits**：该 Cline 账号
+     Credits 余额 $0.004，付费线全部不可用。
+- 结论：账号额度问题+上游限流，网关无需改码；候选已进自动罚时冷却。
+  处置建议：充值 Cline Credits 或只保留 :free 候选（接受间歇 429）。
+
+## F13 OAuth 多账号改名后"not connected" + 按服务商定时刷新（v4.2）
+- 现象（2026-09-22 用户）：codebuddy_cn 加了两个账号（改名成手机号）后
+  路由报 `OAuth provider 'codebuddy_cn' not connected`
+- 根因：连接记录的 owner 是路由寻址键，凭证拾取写死 `__default`；
+  用户把主账号改名（或删除 __default 重连）后 __default 行不存在 → 拾取失败。
+  实测生产库：两条 codebuddy_cn token 的 owner 均为手机号，无 __default。
+- 处置：
+  1) `pick_access_token` 自动模式（owner=__default）缺行/已停用时，兜底取该
+     服务商**任一 active 连接**（id 最早）；点名模式下不兜底（用户显式选的号，
+     找不到就该报错，不能悄悄换号）。u1s1 设备签名材料同样兜底。
+  2) Provider 新增 `oauth_owner`：服务商编辑页可**点名**多账号中的路由账号
+     （两个账号可建两个服务商条目分别寻址，进 combo 互为冗余）；
+     错误文案带账号名。resolver / model_catalog（OAuth 服务商刷新模型）统一传 owner。
+  3) 附带：服务商编辑页新增「定时刷新模型」开关+自定义频率（分钟，≥5）；
+     调度器每分钟 tick 扫到点服务商（先拨 next_at 再执行，失败不重复排队；
+     重入保护）；已单独设频的服务商从 config.yaml 全局 scheduled 批量中排除，
+     避免双刷。next_at/last_at 落库，详情浮窗可见下次时间。
+- 证据：tests/test_provider_scheduled_refresh.py（6 项：CRUD 钳制/拨钟、
+  全局批量互斥、点名精确、__default 优先、兜底、resolver 透传 owner）

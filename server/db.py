@@ -149,6 +149,12 @@ async def init_db():
         "ALTER TABLE combos ADD COLUMN fusion_config JSON",
         # u1s1 DPoP 设备私钥（加密 JSON {priv, pub}），登录时持久化
         "ALTER TABLE oauth_tokens ADD COLUMN device_key_enc TEXT DEFAULT NULL",
+        # v4.2: OAuth 多账号路由寻址 + 按服务商定时模型刷新
+        "ALTER TABLE providers ADD COLUMN oauth_owner VARCHAR(100) DEFAULT NULL",
+        "ALTER TABLE providers ADD COLUMN model_refresh_enabled BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE providers ADD COLUMN model_refresh_interval_minutes INTEGER NOT NULL DEFAULT 60",
+        "ALTER TABLE providers ADD COLUMN model_refresh_next_at TIMESTAMP DEFAULT NULL",
+        "ALTER TABLE providers ADD COLUMN model_refresh_last_at TIMESTAMP DEFAULT NULL",
     ]
     for sql in _migrations:
         try:

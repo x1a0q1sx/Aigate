@@ -112,7 +112,57 @@ def _schedule_maintenance():
             _run_model_refresh, "interval",
             minutes=int(mrc.interval_minutes), id="model_refresh_scheduled",
         )
-        print(f"✓ 定时模型刷新已排程（每 {mrc.interval_minutes} 分钟，覆盖全部启用服务商）")
+        print(f"✓ 定时模型刷新已排程（每 {mrc.interval_minutes} 分钟，"
+              f"覆盖未单独设频的启用服务商）")
+
+    # v4.2 按服务商的定时模型刷新：服务商编辑页勾选"定时刷新"并自定义频率后，
+    # 由每分钟 tick 扫到点者执行（这些服务商从上面全局批量中排除，互不重复刷）。
+    async def _run_model_refresh_tick():
+        # 重入保护：一次刷新（尤其免费层定价抓取）可能跨分钟，避免同一 tick 叠加
+        if getattr(_run_model_refresh_tick, "_busy", False):
+            return
+        _run_model_refresh_tick._busy = True
+        try:
+            from datetime import datetime, timedelta
+            from sqlalchemy import or_, select
+            from .models.provider import Provider
+            from .api.admin_router import refresh_models as _rm
+            now = datetime.utcnow()
+            async with AsyncSessionLocal() as db:
+                rows = (await db.execute(
+                    select(Provider).where(
+                        Provider.enabled.is_(True),
+                        Provider.model_refresh_enabled.is_(True),
+                        or_(Provider.model_refresh_next_at.is_(None),
+                            Provider.model_refresh_next_at <= now),
+                    ).order_by(Provider.id)
+                )).scalars().all()
+                due = [(p.id, p.name,
+                        max(5, min(43200, int(p.model_refresh_interval_minutes or 60))))
+                       for p in rows]
+            for pid, pname, mins in due:
+                # 先拨钟再执行：刷新慢/失败也不会在下个 tick 被重复排队
+                async with AsyncSessionLocal() as db:
+                    p = await db.get(Provider, pid)
+                    if p is not None:
+                        p.model_refresh_last_at = datetime.utcnow()
+                        p.model_refresh_next_at = datetime.utcnow() + timedelta(minutes=mins)
+                        await db.commit()
+                try:
+                    async with AsyncSessionLocal() as db:
+                        r = await _rm(pid, "scheduled", db)
+                    print(f"✓ 定时模型刷新[{pname} 每{mins}m]: 新增 {r.added} · 删除 {r.removed}"
+                          f" · 定价 {r.pricing_updated}（详情见分析页·模型刷新）")
+                except Exception as e:
+                    print(f"⚠️ 定时模型刷新[{pname}]失败: {e}")
+        except Exception as e:
+            print(f"⚠️ 定时模型刷新 tick 失败: {e}")
+        finally:
+            _run_model_refresh_tick._busy = False
+    _archive_scheduler.add_job(
+        _run_model_refresh_tick, "interval",
+        minutes=1, id="model_refresh_per_provider", coalesce=True, max_instances=1,
+    )
 
     _archive_scheduler.start()
 # 内置服务商模板，首次启动（空数据库）自动创建。

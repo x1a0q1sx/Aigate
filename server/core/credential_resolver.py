@@ -61,9 +61,15 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             # 优先 provider.oauth_code 显式指向 OAuthRegistry；老数据回退 provider.name
             oauth_code = getattr(provider, "oauth_code", None) or provider.name
             oauth_p = _get_oauth_p(oauth_code)
-            token = await get_oauth_client().pick_access_token(oauth_code, db) if oauth_p else None
+            # v4.2: 多账号连接时按 provider.oauth_owner 点名取号；
+            # 空=自动（pick_access_token 内部 __default→任一 active 兜底）
+            owner = (getattr(provider, "oauth_owner", None) or "").strip() or "__default"
+            token = (await get_oauth_client().pick_access_token(oauth_code, db, owner=owner)
+                     if oauth_p else None)
             if not token:
-                rc.error = f"OAuth provider '{oauth_code}' not connected"
+                rc.error = (f"OAuth provider '{oauth_code}' not connected"
+                            if owner == "__default"
+                            else f"OAuth provider '{oauth_code}' account '{owner}' not connected")
                 return rc
             rc.api_key = token
             # oauth 请求需要 __oauth 标记（adapter 侧据此用 Bearer token 并处理专属头）
@@ -73,7 +79,8 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             #（Authorization: DPoP <u1s1d-…> + 逐请求 dpop proof），赠送额度才放行
             if oauth_code == "u1s1":
                 try:
-                    material = await get_oauth_client().get_device_signing_material(oauth_code, db)
+                    material = await get_oauth_client().get_device_signing_material(
+                        oauth_code, db, owner=owner)
                 except Exception:
                     material = None
                 if material:

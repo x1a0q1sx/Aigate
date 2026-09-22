@@ -19,6 +19,16 @@ class Provider(Base):
     #（如 "claude_code"/"codex"/"codebuddy_cn"）。若为空，路由层会回退尝试用 provider.name 匹配 registry code。
     # 避免歧义：用户可以给 OAuth 类型的 provider 起任意名字（如 "ClaudeCode 迷你"），不会影响 OAuth 凭证拾取。
     oauth_code = Column(String(50), nullable=True, default=None)
+    # OAuth 路由账号：同一 oauth_code 下多条连接（多账号）时，指定本服务商走哪个 owner。
+    # 空 = 自动：优先 __default，缺失时回退该服务商任一 active 连接
+    #（连接可被改名/删除，写死 __default 会让路由直接报"未连接"）。
+    oauth_owner = Column(String(100), nullable=True, default=None)
+    # 按服务商的定时模型刷新：独立于 config.yaml 全局开关。勾选者从全局 scheduled
+    # 批量中排除，由调度器每分钟的 tick 按各自频率到点触发。
+    model_refresh_enabled = Column(Boolean, nullable=False, default=False)
+    model_refresh_interval_minutes = Column(Integer, nullable=False, default=60)
+    model_refresh_next_at = Column(DateTime, nullable=True, default=None)
+    model_refresh_last_at = Column(DateTime, nullable=True, default=None)
     headers = Column(JSON, nullable=True, default=dict)
     proxy_url = Column(String(500), nullable=True, default=None)
     # Kept briefly for import compatibility; new configurations use proxy_enabled only.

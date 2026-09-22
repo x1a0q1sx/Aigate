@@ -11,22 +11,29 @@ class ProviderCreate(BaseModel):
     api_type: str = "openai_compat"
     credential_type: str = "api_key"  # api_key / free_tier / oauth
     oauth_code: Optional[str] = None   # 当 credential_type=oauth 时填 OAuthRegistry code（如 "claude_code"）
+    oauth_owner: Optional[str] = None  # v4.2: 多账号连接时指定路由账号（owner）；空=自动
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     proxy_url: Optional[str] = None
     proxy_enabled: bool = False
     description: Optional[str] = None
+    # v4.2: 按服务商的定时模型刷新（自定义频率，分钟）
+    model_refresh_enabled: bool = False
+    model_refresh_interval_minutes: int = 60
 class ProviderUpdate(BaseModel):
     name: Optional[str] = None
     base_url: Optional[str] = None
     api_type: Optional[str] = None
     credential_type: Optional[str] = None
     oauth_code: Optional[str] = None
+    oauth_owner: Optional[str] = None
     enabled: Optional[bool] = None     # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]] = None
     proxy_url: Optional[str] = None
     proxy_enabled: Optional[bool] = None
     description: Optional[str] = None
+    model_refresh_enabled: Optional[bool] = None
+    model_refresh_interval_minutes: Optional[int] = None
 class ProviderResponse(BaseModel):
     id: int
     name: str
@@ -34,11 +41,17 @@ class ProviderResponse(BaseModel):
     api_type: str
     credential_type: str = "api_key"
     oauth_code: Optional[str] = None
+    oauth_owner: Optional[str] = None  # v4.2: 指定路由账号；空=自动（__default→任一 active）
     enabled: bool = True               # v4.0: 服务商启用/禁用开关
     headers: Optional[Dict[str, str]]
     proxy_url: Optional[str] = None
     proxy_enabled: bool = False
     description: Optional[str]
+    # v4.2: 按服务商定时模型刷新
+    model_refresh_enabled: bool = False
+    model_refresh_interval_minutes: int = 60
+    model_refresh_next_at: Optional[datetime] = None
+    model_refresh_last_at: Optional[datetime] = None
     # 详情浮窗只读展示
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
