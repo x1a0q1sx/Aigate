@@ -39,6 +39,9 @@ class ProviderResponse(BaseModel):
     proxy_url: Optional[str] = None
     proxy_enabled: bool = False
     description: Optional[str]
+    # 详情浮窗只读展示
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     class Config:
         from_attributes = True
 class ApiKeyCreate(BaseModel):

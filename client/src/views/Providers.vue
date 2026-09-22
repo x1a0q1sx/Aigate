@@ -1314,13 +1314,21 @@ export default {
         const t = Math.round(Number(q.total) || 0)
         text = `${u.toLocaleString()}/${t.toLocaleString()}` + (q.unit ? ` ${q.unit}` : '')
       }
-      if (q.reset_at) text += ` · 重置 ${this.fmtTime(q.reset_at)}`
+      if (q.reset_at) {
+        const ts = new Date(q.reset_at).getTime()
+        const yearsOut = Number.isFinite(ts) ? (ts - Date.now()) / 31536000000 : 0
+        // 上游用 9999-12-31 表示「无限期/不重置」时不必展示
+        if (yearsOut > 0 && yearsOut < 10) text += ` · 重置 ${this.fmtTime(q.reset_at)}`
+      }
       return text
     },
     fmtTime(v) {
       if (!v) return '-'
       try {
-        const d = new Date(v)
+        // 后端 naive UTC 序列化（无时区标记）→ 补 Z 按 UTC 解析，避免被当本地时间偏移
+        let s = String(v)
+        if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s) && !/[Zz]|[+-]\d{2}:?\d{2}$/.test(s)) s += 'Z'
+        const d = new Date(s)
         if (Number.isNaN(d.getTime())) return String(v)
         const p2 = (n) => String(n).padStart(2, '0')
         return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`
