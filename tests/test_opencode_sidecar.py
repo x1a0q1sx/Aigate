@@ -34,6 +34,28 @@ def test_flatten_messages_typed_blocks():
     assert "AB" in out
 
 
+def test_flatten_messages_accepts_pydantic_chatmessage():
+    """关键回归：executor 传的是 pydantic ChatMessage 对象，不是 dict。
+    早先只判 isinstance(dict) 会静默跳过全部消息 → 空 prompt → CLI 回寒暄/无关内容。"""
+    from server.schemas.chat import ChatMessage
+    msgs = [
+        ChatMessage(role="system", content="你是助手"),
+        ChatMessage(role="user", content="HTTP 404 是什么"),
+    ]
+    out = sc.flatten_messages(msgs)
+    assert "[system]\n你是助手" in out
+    assert "HTTP 404 是什么" in out
+
+
+def test_empty_prompt_is_rejected():
+    """空 prompt 必须显式失败（否则 CLI 自由发挥，产生无关回复）"""
+    import asyncio
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError) as ei:
+        asyncio.run(sc.chat_completion([], "mimo-v2.6-flash-free"))
+    assert "无法从 messages 提取任何文本" in str(ei.value)
+
+
 def test_flatten_messages_empty():
     assert sc.flatten_messages([]) == ""
     assert sc.flatten_messages([{"role": "user", "content": ""}]) == ""

@@ -209,6 +209,11 @@ async def chat_completion(messages: list, model_id: str, provider_id: str = "ope
     对网关用途（combo 里当免费候选）足够；system 消息以标签包裹附在前部以保留语义。
     """
     prompt_text = flatten_messages(messages)
+    if not prompt_text.strip():
+        # 空 prompt 会让 CLI 自由发挥（实测回寒暄/无关内容），必须显式失败而非静默发出
+        raise RuntimeError(
+            "opencode sidecar: 无法从 messages 提取任何文本（检查消息格式："
+            "支持 dict 与 pydantic ChatMessage）")
     own = client is None
     c = client or httpx.AsyncClient(timeout=_SIDECAR_TIMEOUT)
     try:
@@ -246,19 +251,41 @@ def flatten_messages(messages: list) -> str:
     return _flatten_body(messages)
 
 
+def _as_dict(m):
+    """兼容 dict 与 Pydantic 模型（ChatMessage）。
+
+    踩坑：executor 传入的是 pydantic `ChatMessage` 对象，不是 dict；
+    早先只判 isinstance(dict) 会把**所有消息静默跳过** → 空 prompt → CLI 自由发挥
+    （实测表现为回复寒暄或完全无关内容，极难定位）。
+    """
+    if isinstance(m, dict):
+        return m
+    dump = getattr(m, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(exclude_none=True)
+        except Exception:
+            return {}
+    # 兜底：按属性取
+    return {"role": getattr(m, "role", None), "content": getattr(m, "content", None)}
+
+
 def _flatten_body(messages: list) -> str:
     chunks = []
-    for m in messages or []:
-        if not isinstance(m, dict):
+    for raw in messages or []:
+        m = _as_dict(raw)
+        if not m:
             continue
         role = m.get("role") or "user"
         content = m.get("content")
         if isinstance(content, list):
-            # typed blocks → 拼接文本
-            text = "".join(
-                str(p.get("text") or "") for p in content
-                if isinstance(p, dict) and p.get("type") in ("text", "input_text")
-            )
+            # typed blocks → 拼接文本（元素也可能是 pydantic 对象）
+            parts = []
+            for p in content:
+                pd = _as_dict(p) if not isinstance(p, str) else {"type": "text", "text": p}
+                if pd.get("type") in ("text", "input_text") or "text" in pd:
+                    parts.append(str(pd.get("text") or ""))
+            text = "".join(parts)
         else:
             text = str(content or "")
         if not text:
