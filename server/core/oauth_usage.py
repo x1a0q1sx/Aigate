@@ -453,6 +453,9 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
             "total": _num(acc.get("CycleCapacitySizePrecise", acc.get("CycleCapacitySize"))),
             "reset_at": _cycle_end(acc), "unlimited": False, "recurring": True,
         }
+    # 赠包按**到期先后**编号：出口会统一按到期排序，若编号沿用上游数组顺序，
+    # 排完就会出现 2,3,…,10,1,11… 这种看着像漏号的错觉（实测 33 个赠包时很显眼）。
+    bonuses.sort(key=lambda a: (_cycle_end(a) or "9999"))
     for i, acc in enumerate(bonuses):
         quotas[f"Bonus Pack {i + 1}"] = {
             "used": _num(acc.get("CapacityUsedPrecise", acc.get("CapacityUsed"))),

@@ -337,3 +337,35 @@ def test_get_connection_usage_sorts_quotas(monkeypatch):
     q1 = r["quotas"]["Bonus Pack 1"]["reset_at"]
     q2 = r["quotas"]["Bonus Pack 2"]["reset_at"]
     assert q1 < q2
+
+
+def test_codebuddy_bonus_numbering_follows_expiry(monkeypatch):
+    """赠包编号应跟随**到期先后**，而不是上游数组顺序。
+
+    出口会按到期排序，若编号沿用数组顺序，排完就是 2,3,…,10,1,11… 这种
+    看着像漏号的错觉（实测 33 个赠包时很显眼）。
+    """
+    calls = []
+    day = 86400000
+    now_ms = 1789000000000
+    _patch(monkeypatch, calls, [(200, {"code": 0, "data": {"Response": {"Data": {
+        "Accounts": [
+            # 数组顺序刻意与到期顺序相反
+            {"PackageName": "X", "CapacityUsedPrecise": "1", "CapacitySizePrecise": "10",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 30 * day,
+             "DeductionEndTime": now_ms + 30 * day},
+            {"PackageName": "X", "CapacityUsedPrecise": "2", "CapacitySizePrecise": "20",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 10 * day,
+             "DeductionEndTime": now_ms + 10 * day},
+            {"PackageName": "X", "CapacityUsedPrecise": "3", "CapacitySizePrecise": "30",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 20 * day,
+             "DeductionEndTime": now_ms + 20 * day},
+        ]}}}})])
+    r = asyncio.run(_codebuddy_usage(
+        "tok", "https://copilot.tencent.com/v2/chat/completions"))
+    q = r["quotas"]
+    # 编号 1/2/3 应对应 10/20/30 天到期（升序），而非数组顺序的 30/10/20
+    assert q["Bonus Pack 1"]["reset_at"] < q["Bonus Pack 2"]["reset_at"] < q["Bonus Pack 3"]["reset_at"]
+    assert list(q) == ["Bonus Pack 1", "Bonus Pack 2", "Bonus Pack 3"]
+    assert q["Bonus Pack 1"]["total"] == 20     # 10 天到期的那个
+    assert q["Bonus Pack 3"]["total"] == 10     # 30 天到期的那个
