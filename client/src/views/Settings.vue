@@ -177,6 +177,45 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>OpenCode 免费层桥接</h2>
+          <p>上游把免费层锁在「官方 CLI 进程建立的会话」里，纯 HTTP 一律 403；网关经服务器上常驻的
+            <code class="mono">opencode serve</code> 转发。这里可调超时与无人值守策略，无需登服务器。</p>
+        </div>
+        <span class="status-pill" :class="ocStatus?.sidecar_alive ? 'ok' : 'muted'">
+          {{ ocStatus?.sidecar_alive ? 'sidecar 在线' : 'sidecar 离线' }}
+        </span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="oc.enabled" /> 启用该免费候选</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="oc.auto_start" /> sidecar 掉线时自动拉起</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="oc.auto_reject_tools" /> 自动拒绝挂起的工具权限</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="oc.manage_agent_config" /> 自动维护 CLI 侧 agent 定义</label>
+      </div>
+      <div class="notify-fields">
+        <label>请求超时（秒）<input v-model.number="oc.timeout_seconds" type="number" min="10" max="1800" /></label>
+        <label>轮询间隔（毫秒）<input v-model.number="oc.poll_interval_ms" type="number" min="50" max="5000" /></label>
+        <label>CLI agent 名<input v-model.trim="oc.agent" placeholder="aigate" /></label>
+        <label>sidecar 地址<input v-model.trim="oc.base_url" placeholder="http://127.0.0.1:4096" /></label>
+        <label>监听端口<input v-model.number="oc.port" type="number" min="1" max="65535" /></label>
+        <label>CLI 路径（留空自动探测）<input v-model.trim="oc.bin_path" placeholder="~/opencode/bin/opencode" /></label>
+      </div>
+      <p class="field-hint" style="margin-top: 4px;">
+        「自动拒绝挂起的工具权限」= 客户端把编码 agent 的 system prompt 发过来时，模型会去调 bash/glob，
+        而 CLI 默认要人工批准 → 无人值守会一直等到超时（表现为 180s 后报「等待回复超时」）。
+        开启后网关自动拒绝，模型立刻改用文本作答。
+      </p>
+      <p class="field-hint" v-if="ocStatus?.agent_note">
+        CLI agent：{{ ocStatus.agent_note }}
+      </p>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveOpenCode" :disabled="ocSaving">{{ ocSaving ? '保存中...' : '保存' }}</button>
+        <button class="btn btn-outline btn-sm" @click="restartOpenCode" :disabled="ocRestarting">{{ ocRestarting ? '重启中...' : '重启 sidecar' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>响应缓存</h2>
           <p>config.yaml 的 response_cache.enabled 开启后，相同请求指纹的非流式响应在 TTL 内直接复用。</p>
         </div>
@@ -243,6 +282,14 @@ export default {
       droolSaving: false,
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
+      oc: {
+        enabled: true, timeout_seconds: 180, poll_interval_ms: 600, agent: 'aigate',
+        base_url: 'http://127.0.0.1:4096', port: 4096, bin_path: '',
+        auto_start: true, manage_agent_config: true, auto_reject_tools: true,
+      },
+      ocStatus: null,
+      ocSaving: false,
+      ocRestarting: false,
       testing: false,
       testResults: null,
       testOk: false,
@@ -282,7 +329,7 @@ export default {
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadOpenCode()])
       } finally {
         this.loading = false
       }
@@ -406,6 +453,34 @@ export default {
       } catch (e) {
         toast.error('保存失败: ' + e.message)
       } finally { this.raceSaving = false }
+    },
+    async loadOpenCode() {
+      try {
+        const r = await api.getOpenCodeBridge()
+        this.ocStatus = r.status
+        if (r.config) this.oc = { ...this.oc, ...r.config }
+      } catch (e) { /* ignore */ }
+    },
+    async saveOpenCode() {
+      this.ocSaving = true
+      try {
+        const r = await api.updateOpenCodeBridge(this.oc)
+        if (r.config) this.oc = { ...this.oc, ...r.config }
+        toast.success('OpenCode 桥接配置已保存')
+        await this.loadOpenCode()
+      } catch (e) {
+        toast.error('保存失败: ' + (e.response?.data?.detail || e.message))
+      } finally { this.ocSaving = false }
+    },
+    async restartOpenCode() {
+      this.ocRestarting = true
+      try {
+        const r = await api.restartOpenCodeBridge()
+        toast.success(r.detail || (r.ok ? 'sidecar 已重启' : '重启后仍不可用'))
+        await this.loadOpenCode()
+      } catch (e) {
+        toast.error('重启失败: ' + (e.response?.data?.detail || e.message))
+      } finally { this.ocRestarting = false }
     },
     async saveNotify() {
       this.notifySaving = true
@@ -531,6 +606,12 @@ export default {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.field-hint {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: var(--text-xs, 0.75rem);
+  line-height: 1.5;
 }
 .update-actions {
   display: flex;

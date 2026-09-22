@@ -160,6 +160,27 @@ class RaceConfig(BaseModel):
     enabled: bool = True
     no_content_seconds: int = 15
 
+class OpenCodeBridgeConfig(BaseModel):
+    """OpenCode 免费层的官方 CLI 桥接（sidecar）。
+
+    上游把免费层入口锁在「官方 CLI 进程建立的会话」里，纯 HTTP 转发一律 403，
+    故网关经服务器上常驻的 `opencode serve` 转发（见 core/opencode_sidecar.py）。
+    环境变量仍可覆盖（AIGATE_OPENCODE_*），本配置段优先。
+    """
+    enabled: bool = True
+    timeout_seconds: int = 180          # 单次请求最长等待（CLI 生成完成为止）
+    poll_interval_ms: int = 600         # 轮询 sidecar 消息列表的间隔
+    agent: str = "aigate"               # CLI 侧 agent 名（决定人格与工具权限）
+    base_url: str = "http://127.0.0.1:4096"   # sidecar 地址（仅本机可达）
+    port: int = 4096                    # 守护任务拉起 CLI 时监听的端口
+    bin_path: str = ""                  # CLI 可执行文件路径；留空 = 自动探测
+    auto_start: bool = True             # sidecar 掉线时自动拉起
+    manage_agent_config: bool = True    # 启动时写入/修正 CLI 的 agent 定义
+    # 无人值守护栏：客户端 system prompt（如编码 agent 模板）会诱导模型调用工具，
+    # 而 CLI 默认 permission=ask 会无限期等待人工批准 → 消息永不 completed → 网关超时。
+    # 开启后自动拒绝挂起的权限请求，CLI 立刻收到工具错误并继续把答案写完。
+    auto_reject_tools: bool = True
+
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -183,6 +204,7 @@ class Config(BaseModel):
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
     drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
     race: RaceConfig = Field(default_factory=RaceConfig)
+    opencode_bridge: OpenCodeBridgeConfig = Field(default_factory=OpenCodeBridgeConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""
     path = Path(config_path)

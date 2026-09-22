@@ -358,6 +358,132 @@ async def put_race_config(body: RaceModel):
     return cfg.model_dump()
 
 
+# ─────────────────────────── OpenCode 桥接（官方 CLI sidecar） ───────────────────────────
+
+class OpenCodeBridgeModel(BaseModel):
+    enabled: Optional[bool] = None
+    timeout_seconds: Optional[int] = None
+    poll_interval_ms: Optional[int] = None
+    agent: Optional[str] = None
+    base_url: Optional[str] = None
+    port: Optional[int] = None
+    bin_path: Optional[str] = None
+    auto_start: Optional[bool] = None
+    manage_agent_config: Optional[bool] = None
+    auto_reject_tools: Optional[bool] = None
+
+
+@router.get("/opencode")
+async def get_opencode_bridge():
+    """OpenCode 桥接配置 + 实时状态（sidecar 是否在线、CLI agent 是否就绪）。"""
+    from server.config import get_config
+    from server.core import opencode_sidecar as sc
+    cfg = get_config()
+    bridge = getattr(cfg, "opencode_bridge", None)
+    data = bridge.model_dump() if bridge is not None else {}
+    alive = False
+    try:
+        alive = await sc.sidecar_alive()
+    except Exception:
+        alive = False
+    agent_ok, agent_note = False, "未检查"
+    if getattr(bridge, "manage_agent_config", True):
+        try:
+            agent_ok, agent_note = sc.ensure_bridge_agent_config()
+        except Exception as e:
+            agent_note = f"检查失败: {e}"
+    return {
+        "config": data,
+        "status": {
+            "sidecar_alive": alive,
+            "agent_ok": agent_ok,
+            "agent_note": agent_note,
+            "effective": {
+                "base_url": sc.sidecar_base(),
+                "timeout_seconds": sc.sidecar_timeout(),
+                "poll_interval_ms": int(sc.sidecar_poll_interval() * 1000),
+                "agent": sc.sidecar_agent(),
+                "auto_reject_tools": sc.auto_reject_tools(),
+            },
+        },
+    }
+
+
+@router.put("/opencode")
+async def put_opencode_bridge(body: OpenCodeBridgeModel):
+    """保存桥接配置（立即生效：超时/轮询/agent/自动拒绝工具都按请求时读取）。
+
+    数值做边界收敛，避免把网关自己配成永远等不到结果：
+    timeout 10–1800s、轮询 50–5000ms、端口 1–65535。
+    """
+    from server.config import get_config, save_config
+    cfg = get_config()
+    if getattr(cfg, "opencode_bridge", None) is None:
+        from server.config import OpenCodeBridgeConfig
+        cfg.opencode_bridge = OpenCodeBridgeConfig()
+    bridge = cfg.opencode_bridge
+    patch = body.model_dump(exclude_unset=True)
+    if "timeout_seconds" in patch:
+        patch["timeout_seconds"] = max(10, min(1800, int(patch["timeout_seconds"])))
+    if "poll_interval_ms" in patch:
+        patch["poll_interval_ms"] = max(50, min(5000, int(patch["poll_interval_ms"])))
+    if "port" in patch:
+        patch["port"] = max(1, min(65535, int(patch["port"])))
+    if "agent" in patch:
+        patch["agent"] = (patch["agent"] or "").strip()
+    if "base_url" in patch:
+        patch["base_url"] = (patch["base_url"] or "").strip()
+    for k, v in patch.items():
+        setattr(bridge, k, v)
+    save_config()
+    # agent 名/权限开关变了 → 立刻把 CLI 侧定义同步过去（否则要等下一轮守护）
+    note = ""
+    try:
+        from server.core import opencode_sidecar as sc
+        if bridge.manage_agent_config:
+            _, note = sc.ensure_bridge_agent_config()
+    except Exception as e:
+        note = f"同步 CLI agent 失败: {e}"
+    return {"config": bridge.model_dump(), "agent_note": note}
+
+
+@router.post("/opencode/restart")
+async def restart_opencode_bridge():
+    """重启 sidecar（改端口/换 CLI 路径后无需登服务器）。"""
+    import asyncio as _aio
+    from server.config import get_config
+    from server.core import opencode_sidecar as sc
+    cfg = get_config()
+    bridge = getattr(cfg, "opencode_bridge", None)
+    if bridge is None:
+        raise HTTPException(status_code=400, detail="配置缺失")
+    if not bridge.auto_start:
+        raise HTTPException(status_code=400, detail="auto_start=false，网关不会拉起 sidecar")
+    # 先停掉旧进程（按端口 + 名字匹配，避免误杀别的进程）
+    stop = await _aio.create_subprocess_exec(
+        "pkill", "-f", f"opencode serve --port {int(bridge.port)}",
+        stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL)
+    await stop.wait()
+    await _aio.sleep(1)
+    import shutil as _shutil
+    import os as _os
+    bin_path = (bridge.bin_path or "").strip() or _os.environ.get("AIGATE_OPENCODE_BIN") or _os.path.join(
+        _os.path.expanduser("~"), "opencode", "bin", "opencode")
+    exe = bin_path if _os.path.exists(bin_path) else _shutil.which("opencode")
+    if not exe:
+        raise HTTPException(status_code=400, detail="未找到 opencode 可执行文件（可设置 bin_path）")
+    if bridge.manage_agent_config:
+        sc.ensure_bridge_agent_config()
+    await _aio.create_subprocess_exec(
+        exe, "serve", "--port", str(int(bridge.port)), "--hostname", "127.0.0.1",
+        stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+        start_new_session=True)
+    await _aio.sleep(8)
+    alive = await sc.sidecar_alive()
+    return {"ok": alive, "sidecar_alive": alive,
+            "detail": "sidecar 已重启" if alive else "启动后仍不可用，请检查 CLI 是否可执行"}
+
+
 @router.post("/notify/test")
 async def notify_test():
     from server.core.notifier import send_test

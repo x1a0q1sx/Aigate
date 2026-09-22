@@ -318,6 +318,10 @@ export default {
   updateDroolGuard: (data) => apiPut('/admin/api/drool-guard', data),
   getRace: () => apiGet('/admin/api/race'),
   updateRace: (data) => apiPut('/admin/api/race', data),
+  // OpenCode 桥接（官方 CLI sidecar）
+  getOpenCodeBridge: () => apiGet('/admin/api/opencode'),
+  updateOpenCodeBridge: (data) => apiPut('/admin/api/opencode', data),
+  restartOpenCodeBridge: () => apiPost('/admin/api/opencode/restart', {}),
   // D4 价格健康
   getPriceHealth: () => apiGet('/admin/api/price-health'),
   // C3 数据库备份文件

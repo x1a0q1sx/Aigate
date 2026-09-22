@@ -25,13 +25,62 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# sidecar 基址（可用环境变量覆盖，便于测试与多实例）
+# ─────────────────────────── 配置解析：config.yaml > 环境变量 > 内置默认 ───────────────────────────
+# config.yaml 的 opencode_bridge 段可热改（设置页保存即生效），环境变量作为兼容旧部署的兜底。
+
+def _cfg():
+    """取配置段；未初始化 / 旧配置无该段时回退内置默认（绝不抛异常）。"""
+    try:
+        from server.config import get_config
+        c = getattr(get_config(), "opencode_bridge", None)
+        if c is not None:
+            return c
+    except Exception:
+        pass
+    return None
+
+
+def _setting(name: str, env: str, default):
+    """读取一项配置：config.yaml 优先，其次环境变量，最后内置默认。"""
+    c = _cfg()
+    if c is not None:
+        v = getattr(c, name, None)
+        if v is not None and v != "":
+            return v
+    v = os.environ.get(env)
+    if v is not None and v != "":
+        return v
+    return default
+
+
+def sidecar_base() -> str:
+    return str(_setting("base_url", "AIGATE_OPENCODE_SIDECAR", "http://127.0.0.1:4096"))
+
+
+def bridge_enabled() -> bool:
+    """桥接总开关（config.yaml 的 opencode_bridge.enabled）。"""
+    return bool(_setting("enabled", "AIGATE_OPENCODE_ENABLED", True))
+
+
+def sidecar_timeout() -> float:
+    return float(_setting("timeout_seconds", "AIGATE_OPENCODE_TIMEOUT", 180))
+
+
+def sidecar_agent() -> str:
+    return str(_setting("agent", "AIGATE_OPENCODE_AGENT", "aigate"))
+
+
+def sidecar_poll_interval() -> float:
+    return max(0.05, float(_setting("poll_interval_ms", "AIGATE_OPENCODE_POLL_MS", 600)) / 1000.0)
+
+
+def auto_reject_tools() -> bool:
+    return bool(_setting("auto_reject_tools", "AIGATE_OPENCODE_AUTO_REJECT", True))
+
+
+# 兼容旧引用（模块级常量语义已变为「启动时快照」，运行期请用上面的函数）
 SIDECAR_BASE = os.environ.get("AIGATE_OPENCODE_SIDECAR", "http://127.0.0.1:4096")
 _SIDECAR_TIMEOUT = float(os.environ.get("AIGATE_OPENCODE_TIMEOUT", "180"))
-# 网关专用 agent：CLI 默认 agent 带「编码助手」人格（实测会回 "Hi! I'm ready to help with
-# your workspace at ..."），与 chat completions 的直出语义不符。用 CLI 的 agent 配置能力
-# 定义 aigate 纯对话 agent（提示词约束直接作答、不寒暄/不自述/不追问），建 session 时指定。
-# 未配置该 agent 时自动回退 CLI 默认（不影响可用性，只是回复带人格）。
 SIDECAR_AGENT = os.environ.get("AIGATE_OPENCODE_AGENT", "aigate")
 
 
@@ -46,7 +95,7 @@ async def sidecar_alive(client: Optional[httpx.AsyncClient] = None) -> bool:
     try:
         for path in ("/api/health", "/global/health", "/api/model"):
             try:
-                r = await c.get(SIDECAR_BASE + path)
+                r = await c.get(sidecar_base() + path)
                 if r.status_code < 500:
                     return True
             except Exception:
@@ -66,13 +115,14 @@ async def _create_session(client: httpx.AsyncClient, provider_id: str, model_id:
         "title": title,
         "model": {"id": model_id, "providerID": provider_id},
     }
-    if SIDECAR_AGENT:
-        payload["agent"] = SIDECAR_AGENT
-    r = await client.post(f"{SIDECAR_BASE}/api/session", json=payload)
-    if r.status_code >= 400 and SIDECAR_AGENT:
+    agent = sidecar_agent()
+    if agent:
+        payload["agent"] = agent
+    r = await client.post(f"{sidecar_base()}/api/session", json=payload)
+    if r.status_code >= 400 and agent:
         # agent 未配置/不被接受时回退默认 agent，不让整个请求失败
         payload.pop("agent", None)
-        r = await client.post(f"{SIDECAR_BASE}/api/session", json=payload)
+        r = await client.post(f"{sidecar_base()}/api/session", json=payload)
     if r.status_code >= 400:
         raise RuntimeError(f"opencode sidecar 建 session 失败 HTTP {r.status_code}: {r.text[:200]}")
     data = (r.json() or {}).get("data") or {}
@@ -88,7 +138,7 @@ async def _post_prompt(client: httpx.AsyncClient, sid: str, text: str,
     payload = {"prompt": {"text": text}}
     if files:
         payload["prompt"]["files"] = files
-    r = await client.post(f"{SIDECAR_BASE}/api/session/{sid}/prompt", json=payload)
+    r = await client.post(f"{sidecar_base()}/api/session/{sid}/prompt", json=payload)
     if r.status_code >= 400:
         raise RuntimeError(f"opencode sidecar 发 prompt 失败 HTTP {r.status_code}: {r.text[:200]}")
     data = (r.json() or {}).get("data") or {}
@@ -101,7 +151,7 @@ async def _user_msg_created_at(client: httpx.AsyncClient, sid: str,
     if not user_msg_id:
         return None
     try:
-        r = await client.get(f"{SIDECAR_BASE}/api/session/{sid}/message")
+        r = await client.get(f"{sidecar_base()}/api/session/{sid}/message")
         if r.status_code >= 400:
             return None
         for it in (r.json() or {}).get("data") or []:
@@ -110,6 +160,39 @@ async def _user_msg_created_at(client: httpx.AsyncClient, sid: str,
     except Exception:
         return None
     return None
+
+
+async def reject_pending_permissions(client: httpx.AsyncClient, sid: str) -> int:
+    """拒绝该会话下所有挂起的工具权限请求，返回处理条数。
+
+    为什么需要：CLI 默认 `permission=ask`，而客户端 system prompt（编码 agent 模板等）
+    会诱导模型调用 bash/glob 等工具。无人值守时权限请求永远无人批准 → 该条 assistant
+    消息停在 `time.completed` 缺失的状态 → 网关侧只能等到超时（实测 180s 后报
+    "opencode sidecar 等待回复超时"）。主动 reject 后 CLI 立刻收到工具错误，
+    模型转而用文本作答并正常 finish，请求回到秒级。
+    """
+    n = 0
+    try:
+        r = await client.get(f"{sidecar_base()}/api/session/{sid}/permission")
+        if r.status_code >= 400:
+            return 0
+        for p in (r.json() or {}).get("data") or []:
+            pid = (p or {}).get("id") if isinstance(p, dict) else None
+            if not pid:
+                continue
+            try:
+                rr = await client.post(
+                    f"{sidecar_base()}/api/session/{sid}/permission/{pid}/reply",
+                    json={"reply": "reject"})
+                if rr.status_code < 400:
+                    n += 1
+                    logger.info("opencode sidecar: 已拒绝挂起权限 %s (%s %s)",
+                                pid, p.get("action"), p.get("resources"))
+            except Exception as e:
+                logger.debug("opencode sidecar 拒绝权限失败 %s: %s", pid, e)
+    except Exception as e:
+        logger.debug("opencode sidecar 查权限失败: %s", e)
+    return n
 
 
 def _content_to_text(content) -> tuple[str, str]:
@@ -132,44 +215,147 @@ def _content_to_text(content) -> tuple[str, str]:
     return "".join(text_parts), "".join(reason_parts)
 
 
-async def _await_assistant(client: httpx.AsyncClient, sid: str, *, since_ms: int,
-                           poll_interval: float = 0.6, deadline_s: float = None):
-    """轮询消息列表直到出现「本轮的 assistant 消息且已生成完毕」；返回 (消息 dict, 错误 dict|None)。
+def _turn_state(items: list, since_ms: int) -> dict:
+    """归纳「本轮」assistant 消息的状态。
 
-    两个实测坑：
-    1) assistant 消息**逐步填充**——先出现 time.created 与空的 reasoning part，随后才补
-       text 并写入 time.completed。若只判「消息存在」会拿到空回复。
-    2) 偶发把**历史会话内容**带出（首轮实测见过返回无关的 "## Intuition ... linked list"）。
-       故这里对 assistant 做双重过滤：① created 必须 ≥ 本次提问时间；② 必须已 completed/finish。
-       只有同时满足才认。
+    一轮提问可能产生**多条** assistant 消息：模型先调工具（finish=tool-calls，正文可能为空），
+    CLI 执行/拒绝后模型再产出最终作答（finish=stop）。所以不能只看第一条，必须整轮归并。
     """
-    deadline = time.monotonic() + (deadline_s if deadline_s is not None else _SIDECAR_TIMEOUT)
-    latest = None
+    turn = []
+    for it in items or []:
+        if not isinstance(it, dict) or it.get("type") != "assistant":
+            continue
+        created = ((it.get("time") or {}).get("created") or 0)
+        if created and created < since_ms:
+            continue        # 属于更早的对话，不认
+        turn.append(it)
+    pending = [it for it in turn if not ((it.get("time") or {}).get("completed"))]
+    last = turn[-1] if turn else None
+    # 逐条取「该条是否有正文」，末尾优先
+    texts = []
+    for it in turn:
+        t, _ = _content_to_text(it.get("content"))
+        if t:
+            texts.append(t)
+    return {
+        "turn": turn,
+        "pending": pending,       # 仍在流式填充的（缺 time.completed）
+        "last": last,
+        "finish": (last or {}).get("finish"),
+        "texts": texts,
+        "error": next((it.get("error") for it in turn if it.get("error")), None),
+    }
+
+
+def _pick_text(st: dict) -> tuple[str, str]:
+    """从整轮里挑出正文与思考内容。
+
+    优先用**最后一条有正文的**消息（模型收尾的作答才是用户要的答案）；
+    整轮都没有正文时回退到拼接（例如全部被工具调用占满的失败轮）。
+    """
+    turn = st.get("turn") or []
+    for it in reversed(turn):
+        t, r = _content_to_text(it.get("content"))
+        if t:
+            return t, r
+    # 没有正文：把所有 reasoning 拼起来（至少能给出可诊断的内容）
+    r_all = []
+    for it in turn:
+        _, r = _content_to_text(it.get("content"))
+        if r:
+            r_all.append(r)
+    return "", "\n".join(r_all)
+
+
+def _merge_turn(st: dict) -> dict:
+    """把整轮 assistant 消息合并成一条「虚拟 assistant 消息」。
+
+    一轮提问可能产出多条 assistant（先 tool-calls 后 stop），网关只能回一条，
+    故正文取最后一条有正文的（收尾作答），用量取「各腿 output 之和 + 最大 input」。
+    """
+    turn = st.get("turn") or []
+    if not turn:
+        return {}
+    text, reasoning = _pick_text(st)
+    merged = dict(turn[-1])
+    content = []
+    if reasoning:
+        content.append({"type": "reasoning", "text": reasoning})
+    if text:
+        content.append({"type": "text", "text": text})
+    merged["content"] = content
+    merged["_turn_count"] = len(turn)
+    merged["_turn_finish"] = st.get("finish")
+    out_sum = 0
+    in_max = 0
+    for it in turn:
+        tk = it.get("tokens") or {}
+        out_sum += int(tk.get("output") or 0)
+        in_max = max(in_max, int(tk.get("input") or 0))
+    merged["tokens"] = {"input": in_max, "output": out_sum}
+    # 已收尾（stop）才算 stop；退回中间态时按 stop 报给客户端，避免下游误判为未完成
+    merged["finish"] = "stop"
+    return merged
+
+
+async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_ms: int,
+                                 poll_interval: float = None, deadline_s: float = None) -> dict:
+    """轮询到「本轮回复彻底结束」，返回整轮状态 dict（见 _turn_state）。
+
+    实测坑（三条，缺一条就会出问题）：
+    1) assistant 消息**逐步填充**——先出现 time.created 与空的 reasoning part，随后才补
+       text 并写入 time.completed。只判「消息存在」会拿到空回复。
+    2) 偶发把**历史会话内容**带出（首轮实测见过返回无关的 "## Intuition ... linked list"），
+       故 assistant 必须 created ≥ 本次提问时间。
+    3) **工具调用会占满整轮**：客户端 system prompt 若是编码 agent 模板，模型会去调 bash/glob，
+       CLI 默认 permission=ask 则请求永久挂起（无人批准）→ 消息永不 completed →
+       网关只能等到超时（实测 180s 报「等待回复超时」）。这里按轮次自动拒绝挂起权限，
+       让它立刻收到工具错误并转入文本作答。
+    """
+    interval = poll_interval if poll_interval is not None else sidecar_poll_interval()
+    timeout = deadline_s if deadline_s is not None else sidecar_timeout()
+    deadline = time.monotonic() + timeout
+    reject_on = auto_reject_tools()
+    best = None
+    stall_since = None          # 用于「卡在 tool-calls 且无新动静」的兜底
+    stall_grace = min(15.0, max(6.0, interval * 10))
+    _STOP_FINISH = {"stop", "length", "content_filter", "error", "aborted", "cancelled"}
     while time.monotonic() < deadline:
         try:
-            r = await client.get(f"{SIDECAR_BASE}/api/session/{sid}/message")
+            r = await client.get(f"{sidecar_base()}/api/session/{sid}/message")
             if r.status_code < 400:
-                items = (r.json() or {}).get("data") or []
-                for it in items:
-                    if not isinstance(it, dict) or it.get("type") != "assistant":
-                        continue
-                    created = ((it.get("time") or {}).get("created") or 0)
-                    if created and created < since_ms:
-                        continue        # 属于更早的对话，不认
-                    tm = it.get("time") or {}
-                    done = bool(tm.get("completed") or it.get("finish"))
-                    if not done:
-                        continue        # 仍在流式填充中，等下一轮
-                    if it.get("error"):
-                        return it, it.get("error")
-                    return it, None     # 本轮且已完成
+                st = _turn_state((r.json() or {}).get("data") or [], since_ms)
+                if st["turn"]:
+                    best = st
+                # 无人值守：拒绝挂起的工具权限（每轮可能连续出现多次）
+                if reject_on and st["turn"]:
+                    n = await reject_pending_permissions(client, sid)
+                    if n:
+                        stall_since = None      # 权限刚解挂，重新计时
+                if st["turn"] and not st["pending"]:
+                    if st["error"]:
+                        return st
+                    if st["finish"] in _STOP_FINISH:
+                        return st               # 正常收尾
+                    # finish == tool-calls 等中间态：CLI 会继续产出下一条，等它；
+                    # 但若长时间毫无动静（无权限待批也无新消息），不再空等到 deadline。
+                    if stall_since is None:
+                        stall_since = time.monotonic()
+                    elif time.monotonic() - stall_since > stall_grace:
+                        logger.info(
+                            "opencode sidecar: 本轮停在 finish=%s 且 %ss 无进展，返回已有内容",
+                            st["finish"], int(stall_grace))
+                        return st
+                else:
+                    stall_since = None
         except Exception as e:      # 轮询期瞬时错误不致命
             logger.debug("opencode sidecar poll: %s", e)
-        await asyncio.sleep(poll_interval)
-    if latest is not None:
-        # 超时但已有部分内容：返回已拿到的（调用方按 finish 判定完整性）
-        return latest, latest.get("error")
-    raise TimeoutError(f"opencode sidecar 等待回复超时（{_SIDECAR_TIMEOUT}s）")
+        await asyncio.sleep(interval)
+    if best is not None and best.get("turn"):
+        # 超时但已有内容：返回已拿到的（调用方按 finish 判定完整性）
+        logger.warning("opencode sidecar: 等待回复超时（%.0fs），返回已完成的部分内容", timeout)
+        return best
+    raise TimeoutError(f"opencode sidecar 等待回复超时（{timeout:.0f}s）")
 
 
 def _to_openai_response(msg: dict, model_id: str, prompt_text: str) -> dict:
@@ -215,14 +401,14 @@ async def chat_completion(messages: list, model_id: str, provider_id: str = "ope
             "opencode sidecar: 无法从 messages 提取任何文本（检查消息格式："
             "支持 dict 与 pydantic ChatMessage）")
     own = client is None
-    c = client or httpx.AsyncClient(timeout=_SIDECAR_TIMEOUT)
+    c = client or httpx.AsyncClient(timeout=sidecar_timeout())
     try:
         sid = await _create_session(c, provider_id, model_id)
         t0 = int(time.time() * 1000)
         user_msg_id = await _post_prompt(c, sid, prompt_text, files=files)
         # 用 sidecar 分配的用户消息 id 的时间戳做归属基线（比本地 t0 更贴近服务端时钟）
         since = await _user_msg_created_at(c, sid, user_msg_id) or t0
-        msg, err = await _await_assistant(c, sid, since_ms=since)
+        msg, err = await _await_turn(c, sid, since_ms=since)
         if err:
             raise RuntimeError(f"opencode sidecar 上游报错: {json.dumps(err, ensure_ascii=False)[:300]}")
         resp = _to_openai_response(msg, model_id, prompt_text)
@@ -233,12 +419,41 @@ async def chat_completion(messages: list, model_id: str, provider_id: str = "ope
             await c.aclose()
 
 
+async def _await_turn(client: httpx.AsyncClient, sid: str, *, since_ms: int,
+                      poll_interval: float = None, deadline_s: float = None):
+    """等整轮结束，并把多腿 assistant 合并成一条可回给客户端的结果。"""
+    interval = poll_interval if poll_interval is not None else sidecar_poll_interval()
+    deadline = time.monotonic() + (deadline_s if deadline_s is not None else sidecar_timeout())
+    st = await _await_assistant_state(client, sid, since_ms=since_ms,
+                                      poll_interval=interval, deadline_s=deadline - time.monotonic())
+    return _merge_turn(st), st.get("error")
+
+
+async def _await_assistant(client: httpx.AsyncClient, sid: str, *, since_ms: int,
+                           poll_interval: float = None, deadline_s: float = None):
+    """兼容旧签名：返回 (合并后的消息, 错误)。"""
+    interval = poll_interval if poll_interval is not None else sidecar_poll_interval()
+    st = await _await_assistant_state(client, sid, since_ms=since_ms,
+                                      poll_interval=interval, deadline_s=deadline_s)
+    return _merge_turn(st), st.get("error")
+
+
 async def _close_session(client: httpx.AsyncClient, sid: str) -> None:
-    """尽力关闭 session（避免 sidecar 里会话堆积）；失败不影响结果。"""
-    try:
-        await client.delete(f"{SIDECAR_BASE}/api/session/{sid}")
-    except Exception:
-        pass
+    """尽力关闭 session（避免 sidecar 里会话堆积）；失败不影响结果。
+
+    实测坑：删除接口**只挂在无 `/api` 前缀的路径**上（`DELETE /session/{sid}`）。
+    带 `/api` 的 `/api/session/{sid}` 会被 Web UI 兜底路由吃掉并回 200 HTML，
+    看起来「成功」但会话其实还在（50 个会话删完仍是 50 个）。故此处必须用无前缀路径。
+    """
+    for path in (f"/session/{sid}", f"/api/session/{sid}"):
+        try:
+            r = await client.delete(sidecar_base() + path)
+            if r.status_code < 400 and "json" in (r.headers.get("content-type") or ""):
+                return
+            if r.status_code < 400 and not (r.text or "").lstrip().startswith("<"):
+                return
+        except Exception:
+            continue
 
 
 def flatten_messages(messages: list) -> str:
@@ -299,6 +514,100 @@ def _flatten_body(messages: list) -> str:
         else:
             chunks.append(text)
     return "\n\n".join(chunks)
+
+
+# ─────────────────────────── CLI agent 定义：网关无人值守形态 ───────────────────────────
+# 为什么必须写这份配置：
+#   1) CLI 默认 agent 是「编码助手」人格，直出语义不符（实测回 "Hi! I'm ready to help
+#      with your workspace at ..."）；
+#   2) 更致命的是默认 permission=ask —— 客户端 system prompt 诱导模型调工具时，
+#      权限请求在无人值守场景永远无人批准，消息永久挂起 → 网关只能等到超时。
+# 这里把工具一律 deny（模型立刻收到工具错误，转而用文本作答），并约束人格。
+#
+# 注：不能改成「tools 全 false」——实测那样 CLI 会返回**空回复**（工具列表为空时
+# 模型行为异常）。permission=deny 则保留工具声明、执行被拒，回复正常。
+_BRIDGE_PROMPT = (
+    "You are a direct assistant behind an API gateway. Answer the user's request "
+    "directly and completely in the same language they used. Do not greet. Do not "
+    "describe yourself. Do not mention tools, workspaces, or files. Do not ask "
+    "clarifying questions unless the request is truly impossible to answer. "
+    "Tools are unavailable in this environment; always answer from your own knowledge "
+    "as text and never wait for tool output."
+)
+
+# 已知工具名（CLI 1.18.32 的 /experimental/tool/ids 实测值）+ 兜底通配
+_BRIDGE_TOOLS = ("bash", "read", "glob", "grep", "edit", "write", "task", "webfetch",
+                 "websearch", "todowrite", "skill", "apply_patch", "question")
+
+
+def bridge_agent_config(agent_name: str = None) -> dict:
+    """生成网关专用 agent 的 CLI 配置（权限全 deny + 直出人格）。"""
+    name = agent_name or sidecar_agent() or "aigate"
+    return {
+        name: {
+            "description": "AIGate gateway chat-only agent",
+            "mode": "primary",
+            "prompt": _BRIDGE_PROMPT,
+            "permission": {t: "deny" for t in _BRIDGE_TOOLS},
+        }
+    }
+
+
+def _cli_config_path() -> str:
+    """CLI 全局配置路径（XDG 规范；与 CLI 自己解析的位置一致）。"""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "opencode", "opencode.json")
+
+
+def _cli_config_problem(cfg: dict, agent_name: str) -> str:
+    """返回需要修正的原因；已正确时返回空串。"""
+    a = ((cfg.get("agent") or {}).get(agent_name) or {}) if isinstance(cfg, dict) else {}
+    if not a:
+        return "agent 未定义"
+    if a.get("mode") != "primary":
+        return "mode 非 primary"
+    perm = a.get("permission")
+    if not isinstance(perm, dict) or any(perm.get(t) != "deny" for t in _BRIDGE_TOOLS):
+        return "工具权限未全部 deny"
+    if (a.get("prompt") or "").strip() != _BRIDGE_PROMPT:
+        return "提示词已过期"
+    return ""
+
+
+def ensure_bridge_agent_config(agent_name: str = None, path: str = None) -> tuple[bool, str]:
+    """确保 CLI 侧存在网关专用 agent（幂等；只增改该 agent，不动其它配置）。
+
+    返回 (是否已就绪, 说明)。任何异常都吞掉并返回说明——启动流程不应因此失败。
+    """
+    name = agent_name or sidecar_agent() or "aigate"
+    p = path or _cli_config_path()
+    try:
+        cfg = {}
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw:
+                try:
+                    cfg = json.loads(raw)
+                except Exception:
+                    return False, f"{p} 不是合法 JSON，未改动（请手工检查）"
+        if not isinstance(cfg, dict):
+            return False, f"{p} 顶层不是对象，未改动"
+        problem = _cli_config_problem(cfg, name)
+        if not problem:
+            return True, f"agent '{name}' 已就绪"
+        agent = dict(cfg.get("agent") or {})
+        agent[name] = bridge_agent_config(name)[name]
+        cfg["agent"] = agent
+        cfg.setdefault("$schema", "https://opencode.ai/config.json")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+        return True, f"已写入 agent '{name}'（{problem}）"
+    except Exception as e:
+        return False, f"写入 CLI 配置失败: {e}"
 
 
 async def stream_chat_completion(messages: list, model_id: str, provider_id: str = "opencode",

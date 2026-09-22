@@ -303,6 +303,8 @@ class FreeProviderExecutor:
         # 走常驻 CLI sidecar（9router 同款架构：让真 CLI 当上游客户端）。
         if self.provider_code == "opencode":
             from server.core import opencode_sidecar as _sidecar
+            if not _sidecar.bridge_enabled():
+                raise RuntimeError("opencode 桥接已停用（设置页 → OpenCode 免费层桥接）")
             if not await _sidecar.sidecar_alive():
                 raise RuntimeError(
                     "opencode sidecar 未运行（官方 CLI 桥接）：请在服务器启动 "
@@ -327,6 +329,8 @@ class FreeProviderExecutor:
         # API 非流式，由 opencode_sidecar.stream_chat_completion 切块模拟流式）
         if self.provider_code == "opencode":
             from server.core import opencode_sidecar as _sidecar
+            if not _sidecar.bridge_enabled():
+                raise RuntimeError("opencode 桥接已停用（设置页 → OpenCode 免费层桥接）")
             if not await _sidecar.sidecar_alive():
                 raise RuntimeError(
                     "opencode sidecar 未运行（官方 CLI 桥接）：请在服务器启动 "

@@ -53,11 +53,14 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
 **部署步骤**：
 1. 取官方二进制：`npm pack opencode-linux-x64@<version>`（真实二进制在该可选依赖里，
    `opencode-ai` 主包只是下载器），解包后放到 `$HOME/opencode/bin/opencode`（约 177MB）
-2. 常驻：`opencode serve --port 4096 --hostname 127.0.0.1`（仅本机可达；
-   可用环境变量 `AIGATE_OPENCODE_SIDECAR` / `AIGATE_OPENCODE_BIN` / `AIGATE_OPENCODE_PORT` 覆盖）
+2. 常驻：`opencode serve --port 4096 --hostname 127.0.0.1`（仅本机可达）。
+   端口/地址/CLI 路径等见 `config.yaml` 的 `opencode_bridge` 段（设置页可改）；
+   环境变量 `AIGATE_OPENCODE_SIDECAR` / `AIGATE_OPENCODE_BIN` / `AIGATE_OPENCODE_PORT`
+   仍作为兜底，配置段优先。
 3. AIGate：`free_providers.FreeProviderExecutor` 对 `provider_code == "opencode"` 走 sidecar
    （非流式直取；流式「一次取全 + 切块」，combo/auto 的实质锁定、race、drool guard 无需改动）
-4. `main.py` lifespan 起守护任务：120s 探活，崩了自动拉起；未装 CLI 则静默跳过
+4. `main.py` lifespan 起守护任务：120s 探活，崩了自动拉起（可关），并**每次启动时幂等修正
+   CLI 侧的 agent 定义**（工具权限全部 deny，见 2.1）；未装 CLI 则静默跳过
 5. 服务商记录须为 `credential_type='free_tier'` 且 `oauth_code='opencode'`（否则走普通 adapter，
    仍是纯 HTTP 403——这是上线时踩到的第一个坑）
 
@@ -73,11 +76,15 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
     "aigate": {
       "description": "AIGate gateway chat-only agent",
       "mode": "primary",
-      "prompt": "You are a direct assistant behind an API gateway. Answer the user's request directly and completely in the same language they used. Do not greet. Do not describe yourself. Do not mention tools, workspaces, or files. Do not ask clarifying questions unless the request is truly impossible to answer."
+      "prompt": "You are a direct assistant behind an API gateway. ...",
+      "permission": {"bash": "deny", "read": "deny", "...": "deny"}
     }
   }
 }
 ```
+（`permission` 全部 deny 是 2.1 的根治点；这份定义由网关在启动与保存设置时
+**幂等写入**——`opencode_sidecar.ensure_bridge_agent_config()`，只增改网关 agent，
+不碰用户其它配置。）
 
 实测效果（同一问题「用一句话说明什么是 HTTP 404」）：
 - 默认 agent：`Hi! I'm ready to help with your workspace at ...`
@@ -86,6 +93,49 @@ AIGate 请求 ──> server/core/opencode_sidecar.py ──HTTP──> opencode
 两个坑：① **禁用全部 tools 会让回复变空**（tools 全 false → 空回复），只保留提示词约束即可；
 ② agent 名可用环境变量 `AIGATE_OPENCODE_AGENT` 覆盖，未配置时自动回退 CLI 默认 agent
 （不致命，只是带人格）。
+
+### 2.1 致命坑：工具权限挂起 → 180s 超时（2026-09-22 二次修复）
+
+**现象**：生产报 `TimeoutError: opencode sidecar 等待回复超时（180.0s）`，且该超时值原先只能靠
+环境变量调、要登服务器重启，界面上改不了。
+
+**根因**：不是模型慢，是**权限请求无人批准**。请求来自编码 agent 类客户端（system prompt 里
+写着「用 bash 工具执行」），模型于是去调 `bash`；而 CLI 默认 `permission=ask`，权限请求需要
+一个**真人**在 TUI 里点同意——网关无人值守，于是：
+
+```
+模型发起工具调用 → CLI 写 permission 请求 → 无人批准
+  → 该条 assistant 消息永远缺 time.completed
+  → 网关只认 completed（见下条实现坑）→ 一直等到 deadline → 超时
+```
+
+服务器现场（`GET /api/session/{sid}/message`）看得一清二楚：
+```json
+{"type":"assistant","content":[{"type":"reasoning","text":"..."},
+                               {"type":"tool","name":"bash","state":{"status":"running"}}],
+ "time":{"created":...}}          ← 没有 completed
+```
+同时 `GET /api/session/{sid}/permission` 挂着一个 `{"action":"bash","resources":["ls -la"]}`。
+（顺带取证：`POST .../interrupt` 能让它收尾为 `finish=tool-calls`，但那时已经没有正文，
+所以 interrupt 不是解法。）
+
+**三重修复**（任一层单独都不够稳）：
+1. **CLI agent 定义里把工具全部 deny**（`permission: {bash:"deny",...}`）：模型调用工具时
+   立刻收到「工具执行失败」，转而用文本作答——实测 3~6s 正常 `finish=stop`。
+2. **运行时兜底**：轮询发现 `GET .../permission` 有待批请求就自动
+   `POST .../permission/{id}/reply {"reply":"reject"}`，即使 agent 配置被外部改坏也不会挂死。
+3. **整轮归并**：一轮提问可能产生**多条** assistant（先 `finish=tool-calls` 后 `finish=stop`），
+   旧实现只看第一条 → 拿到空正文。现在按轮次归并、**取最后一条有正文的**作为答案
+   （用量 = 各腿 output 之和 + 最大 input）；若停在中间态且长时间无进展，返回已有内容
+   而非空等到 deadline。
+
+**配置化**：新增 `config.yaml` 的 `opencode_bridge` 段 + 设置页「OpenCode 免费层桥接」卡片，
+超时/轮询间隔/agent 名/sidecar 地址/端口/CLI 路径/自动拉起/自动拒绝工具都可在界面改，
+保存即生效（请求时读取），改端口后可用卡片上的「重启 sidecar」一键应用。
+
+**产品级差异**：CLI 的 `prompt` API 只收 `text`，网关的 `messages[]` 会被压平成一段文本
+（`[system]` / `[assistant]` / `[tool]` 标签保留角色语义）。这是与原生 Chat Completions 的
+固有差异，多轮语义靠模型自行理解，**不保证**与付费 API 服务商同等保真。
 
 **实现坑（CLI API 特性）**：assistant 消息是**逐步填充**的——先出现 `time.created` 与空的
 reasoning part，之后才补 `content[].text` 并写入 `time.completed`。只判「消息存在」会拿到
