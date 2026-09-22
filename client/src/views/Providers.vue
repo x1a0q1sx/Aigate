@@ -108,7 +108,7 @@
               </button>
               </td>
               <td class="cell-name">
-                <strong :title="p.description || p.name">{{ p.name }}</strong>
+                <strong class="name-link" :title="(p.description ? p.description + ' — ' : '') + '点击查看详情'" @click="openDetail(p)">{{ p.name }}</strong>
                 <span class="badge" :class="credBadgeClass(p.credential_type)">{{ credLabel(p.credential_type) }}</span>
               </td>
               <td class="mono text-xs text-muted col-url"><span class="url-text" :title="p.base_url">{{ p.base_url }}</span></td>
@@ -136,6 +136,7 @@
               </td>
               <td class="col-actions">
                 <div class="action-stack">
+                  <button class="icon-btn" @click="openDetail(p)" title="详情" aria-label="详情"><AppIcon name="eye" :size="13" /></button>
                   <button class="icon-btn" @click="refreshProviderModels(p)" :disabled="busy.refreshModels" title="刷新模型" aria-label="刷新模型"><AppIcon name="refresh" :size="13" /></button>
                   <button class="icon-btn" @click="editProvider(p)" title="编辑" aria-label="编辑"><AppIcon name="edit" :size="13" /></button>
                   <button v-if="(p.credential_type || 'api_key') === 'api_key'" class="icon-btn" @click="editProviderKeys(p)" title="密钥" aria-label="密钥"><AppIcon name="key" :size="13" /></button>
@@ -193,6 +194,155 @@
         </article>
       </div>
     </section>
+
+    <!-- 服务商详情浮窗（纯展示；OAuth 服务商附多账号额度） -->
+    <AppModal v-model="showDetailModal" :title="detailProvider ? detailProvider.name + ' · 详情' : '服务商详情'" icon="server" size="lg">
+      <div v-if="detailProvider" class="detail-body">
+        <!-- ① 身份 -->
+        <section class="detail-sec">
+          <div class="detail-head-row">
+            <div class="detail-head-left">
+              <strong class="detail-name">{{ detailProvider.name }}</strong>
+              <span class="badge" :class="credBadgeClass(detailProvider.credential_type)">{{ credLabel(detailProvider.credential_type) }}</span>
+              <StatusBadge :status="providerStatus(detailProvider).level" :label="providerStatus(detailProvider).text" />
+            </div>
+            <span v-if="detailProvider.description" class="text-xs text-muted">{{ detailProvider.description }}</span>
+          </div>
+          <dl class="detail-kv">
+            <div><dt>Base URL</dt><dd class="mono text-xs">{{ detailProvider.base_url }}</dd></div>
+            <div><dt>接口类型</dt><dd><code class="text-xs">{{ detailProvider.api_type }}</code></dd></div>
+            <div><dt>凭证类型</dt><dd class="text-xs">{{ credLabel(detailProvider.credential_type) }}
+              <span v-if="detailProvider.oauth_code" class="mono">（{{ detailProvider.oauth_code }}）</span></dd></div>
+            <div><dt>创建时间</dt><dd class="text-xs">{{ fmtTime(detailProvider.created_at) }}</dd></div>
+            <div><dt>更新时间</dt><dd class="text-xs">{{ fmtTime(detailProvider.updated_at) }}</dd></div>
+            <div><dt>代理池</dt><dd class="text-xs">{{ detailProvider.proxy_enabled ? '强制走代理池' : '跟随全局开关' }}</dd></div>
+          </dl>
+          <!-- ② 状态标签 -->
+          <div v-if="statusLabels(detailProvider).length" class="detail-tags">
+            <span v-for="s in statusLabels(detailProvider)" :key="s" class="badge badge-warning badge-sm">{{ s }}</span>
+          </div>
+        </section>
+
+        <!-- ③ 规模与路由 -->
+        <section class="detail-sec">
+          <h4 class="detail-sec-title">规模与路由</h4>
+          <div class="detail-stats">
+            <div class="detail-stat"><span class="text-xs text-muted">模型</span><strong>{{ detailModels.length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">启用模型</span><strong>{{ detailModels.filter(m => m.enabled).length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">Auto 参与</span><strong>{{ detailModels.filter(m => m.auto_enabled).length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">{{ detailProvider.credential_type === 'oauth' ? 'OAuth 账号' : (detailProvider.credential_type === 'free_tier' ? '免密钥' : (detailProvider.api_type === 'atomcode' ? '本地反代' : '密钥')) }}</span>
+              <strong>{{ (detailProvider.credential_type === 'oauth') ? detailConnections.length : detailKeys.length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">所属组合</span><strong>{{ detailCombos.length }}</strong></div>
+          </div>
+          <div v-if="detailCombos.length" class="detail-inline">
+            <span class="text-xs text-muted">供量组合：</span>
+            <span v-for="c in detailCombos" :key="c" class="badge badge-neutral badge-sm">{{ c }}</span>
+          </div>
+          <!-- API Key 明细（api_key 类） -->
+          <div v-if="detailProvider.credential_type === 'api_key' && detailKeys.length" class="detail-list">
+            <div v-for="k in detailKeys" :key="k.id" class="detail-list-row">
+              <span class="mono text-xs">{{ k.key_prefix }}…</span>
+              <span class="text-xs">{{ k.label || '（无标签）' }}</span>
+              <span class="badge badge-sm" :class="k.is_active ? 'badge-success' : 'badge-neutral'">{{ k.is_active ? '启用' : '停用' }}</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- ⑦ OAuth 多账号额度（仅 oauth 服务商） -->
+        <section v-if="detailProvider.credential_type === 'oauth'" class="detail-sec">
+          <h4 class="detail-sec-title">账号额度（{{ detailConnections.length }} 个账号）</h4>
+          <div v-if="!detailConnections.length" class="empty-hint text-xs">该服务商暂无 OAuth 连接（可到 /providers/oauth 连接）</div>
+          <div v-for="c in detailConnections" :key="c.id" class="acct-block">
+            <div class="acct-head">
+              <strong class="text-sm">{{ c.owner }}</strong>
+              <span class="badge badge-sm" :class="connStatusOf(c).cls">{{ connStatusOf(c).label }}</span>
+              <span class="text-xs text-muted">{{ expireTextOf(c) }}</span>
+              <button class="btn btn-ghost btn-xs" @click="loadDetailUsage(c, true)" :disabled="detailUsage[c.id] && detailUsage[c.id].loading">
+                {{ (detailUsage[c.id] && detailUsage[c.id].loading) ? '查询中…' : '强刷额度' }}
+              </button>
+              <span v-if="detailUsage[c.id] && detailUsage[c.id].data && detailUsage[c.id].data.cached" class="text-xs text-muted">缓存 5 分钟</span>
+            </div>
+            <div v-if="c.last_error" class="text-xs detail-err" :title="c.last_error">最后错误：{{ c.last_error.slice(0, 120) }}</div>
+            <template v-if="detailUsage[c.id]">
+              <div v-if="detailUsage[c.id].loading && !(detailUsage[c.id].data)" class="text-xs text-muted">额度查询中…</div>
+              <div v-else-if="detailUsage[c.id].error" class="text-xs detail-err">{{ detailUsage[c.id].error }}</div>
+              <template v-else-if="detailUsage[c.id].data">
+                <div class="text-xs text-muted" style="margin-bottom:4px">{{ detailUsage[c.id].data.plan || c.provider_code }}</div>
+                <div v-for="(q, name) in detailUsage[c.id].data.quotas || {}" :key="name" class="quota-row">
+                  <span class="quota-name" :title="name">{{ name }}<template v-if="q.display_name && q.display_name !== name"> · {{ q.display_name }}</template></span>
+                  <div class="quota-bar"><i :class="{ warn: quotaPct(q) > 85, hot: quotaPct(q) >= 100 }" :style="{ width: quotaPct(q) + '%' }"></i></div>
+                  <span class="quota-val">{{ quotaText(q) }}</span>
+                </div>
+                <div v-if="detailUsage[c.id].data.message" class="text-xs text-muted">{{ detailUsage[c.id].data.message }}</div>
+              </template>
+            </template>
+          </div>
+        </section>
+
+        <!-- ④ 今日用量 -->
+        <section class="detail-sec">
+          <h4 class="detail-sec-title">今日用量</h4>
+          <div v-if="detailToday" class="detail-stats">
+            <div class="detail-stat"><span class="text-xs text-muted">请求</span><strong>{{ detailToday.requests }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">Tokens</span><strong>{{ detailToday.tokens.toLocaleString() }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">估算成本</span><strong>${{ (detailToday.cost_usd || 0).toFixed(4) }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">全站占比</span><strong>{{ detailToday.share_pct }}%</strong></div>
+          </div>
+          <div v-else class="text-xs text-muted">今日暂无流量</div>
+        </section>
+
+        <!-- ⑤ 近期健康 -->
+        <section class="detail-sec">
+          <h4 class="detail-sec-title">健康与冷却</h4>
+          <div class="detail-stats">
+            <div class="detail-stat"><span class="text-xs text-muted">冷却中模型</span><strong :class="{ 'detail-bad': detailCoolingModels.length }">{{ detailCoolingModels.length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">冷却中密钥</span><strong :class="{ 'detail-bad': detailCoolingKeys.length }">{{ detailCoolingKeys.length }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">历史成功</span><strong>{{ detailHealth.ok.toLocaleString() }}</strong></div>
+            <div class="detail-stat"><span class="text-xs text-muted">历史失败</span><strong :class="{ 'detail-bad': detailHealth.err }">{{ detailHealth.err.toLocaleString() }}</strong></div>
+          </div>
+          <div v-if="detailCoolingModels.length" class="detail-list">
+            <div v-for="m in detailCoolingModels" :key="m.model_id" class="detail-list-row">
+              <span class="text-xs mono">{{ m.model_full_id }}</span>
+              <span class="text-xs">失败 {{ m.fail_count }} 次</span>
+              <span class="text-xs text-muted">{{ m.remaining_sec > 0 ? '冷却剩 ' + Math.ceil(m.remaining_sec / 60) + ' 分' : '已恢复' }}</span>
+            </div>
+          </div>
+          <div v-if="detailCoolingKeys.length" class="detail-list">
+            <div v-for="k in detailCoolingKeys" :key="k.api_key_id" class="detail-list-row">
+              <span class="text-xs">密钥 #{{ k.api_key_id }}</span>
+              <span class="text-xs">失败 {{ k.fail_count }} 次</span>
+              <span class="text-xs" :class="k.hard_disabled ? 'detail-err' : 'text-muted'">
+                {{ k.hard_disabled ? '已熔断（401/403 永久停用）' : (k.remaining_sec > 0 ? '冷却剩 ' + Math.ceil(k.remaining_sec / 60) + ' 分' : '已恢复') }}
+              </span>
+            </div>
+          </div>
+          <div v-if="detailLastOk || detailLastErr" class="text-xs text-muted" style="margin-top:6px">
+            <div v-if="detailLastOk">最近成功：{{ fmtTime(detailLastOk.created_at) }} · {{ detailLastOk.routed_model }}
+              <span v-if="detailLastOk.latency_ms"> · {{ detailLastOk.latency_ms }}ms</span></div>
+            <div v-if="detailLastErr" class="detail-err">最近失败：{{ fmtTime(detailLastErr.created_at) }} · {{ detailLastErr.routed_model }}
+              · {{ (detailLastErr.error_msg || '').slice(0, 80) }}</div>
+          </div>
+        </section>
+
+        <!-- ⑥ 模型刷新记录 -->
+        <section class="detail-sec">
+          <h4 class="detail-sec-title">最近模型刷新</h4>
+          <div v-if="!detailRefreshLogs.length" class="text-xs text-muted">暂无刷新记录</div>
+          <div v-else class="detail-list">
+            <div v-for="r in detailRefreshLogs" :key="r.id" class="detail-list-row">
+              <span class="text-xs text-muted">{{ fmtTime(r.created_at) }}</span>
+              <span class="badge badge-sm" :class="r.status === 'success' ? 'badge-success' : 'badge-error'">{{ r.status === 'success' ? '成功' : '失败' }}</span>
+              <span class="text-xs">{{ r.trigger === 'scheduled' ? '定时' : '手动' }}</span>
+              <span class="text-xs">+{{ r.added }} ~{{ r.removed }}（共 {{ r.total_models }}）</span>
+              <span class="text-xs text-muted">{{ r.duration_ms }}ms</span>
+            </div>
+          </div>
+        </section>
+      </div>
+      <template #footer>
+        <button class="btn btn-outline" @click="showDetailModal = false">关闭</button>
+      </template>
+    </AppModal>
 
     <!-- 导出模态框 -->
     <AppModal v-model="showExportModal" title="导出服务商配置" icon="download" size="md">
@@ -634,6 +784,20 @@ export default {
       pinnedIds: [],
       highlightProviderId: null,
 
+      // 服务商详情浮窗（纯展示）
+      showDetailModal: false,
+      detailProvider: null,
+      detailModels: [],
+      detailLoading: false,
+      detailToday: null,            // { requests, tokens, cost_usd, share_pct }
+      detailHealth: { ok: 0, err: 0 },   // 历史累计（日志端点无时间窗）
+      detailLastOk: null,
+      detailLastErr: null,
+      detailCoolingModels: [],
+      detailCoolingKeys: [],
+      detailRefreshLogs: [],
+      detailUsage: {},              // oauth connectionId -> { loading, data?, error? }
+
       // 编辑/添加服务商
       showModal: false,
       saving: false,
@@ -726,6 +890,25 @@ export default {
         if (this.providerStatus(p).level === 'error') s.error++
       }
       return s
+    },
+    // 详情浮窗：该服务商的密钥 / OAuth 多账号连接 / 所属组合
+    detailKeys() {
+      if (!this.detailProvider) return []
+      return this.getProviderKeys(this.detailProvider.id)
+    },
+    detailConnections() {
+      const p = this.detailProvider
+      if (!p || (p.credential_type || 'api_key') !== 'oauth') return []
+      return this.oauthConnections.filter(
+        (c) => c.provider_code === p.oauth_code || c.provider_code === p.name
+      )
+    },
+    detailCombos() {
+      const names = new Set()
+      for (const m of this.detailModels) {
+        for (const c of m.combos || []) names.add(c)
+      }
+      return [...names]
     },
     filteredProviders() {
       let rows = [...this.providers]
@@ -1035,6 +1218,114 @@ export default {
         toast.success('已删除')
       } catch (e) {
         toast.error('删除失败: ' + e.message)
+      }
+    },
+
+    // ── 服务商详情浮窗（纯展示；OAuth 附多账号额度） ──
+    async openDetail(p) {
+      this.detailProvider = p
+      this.showDetailModal = true
+      // 重置本服务商的详情状态
+      this.detailModels = []
+      this.detailToday = null
+      this.detailHealth = { ok: 0, err: 0 }
+      this.detailLastOk = null
+      this.detailLastErr = null
+      this.detailCoolingModels = []
+      this.detailCoolingKeys = []
+      this.detailRefreshLogs = []
+      this.detailUsage = {}
+      this.detailLoading = true
+      try {
+        // 并行取数：模型（含 combos 归属）/ 今日用量 / 冷却 / 刷新日志 / 近 24h 成败 + 最近调用
+        const [models, byProv, cooling, refreshLogs, okLogs, errLogs] = await Promise.all([
+          api.getModels({ provider_id: p.id }).catch(() => []),
+          api.getAnalyticsByProvider().catch(() => null),
+          api.getCooling().catch(() => null),
+          api.getLogs({ log_type: 'refresh', provider: p.name, page_size: 5 }).catch(() => null),
+          api.getLogs({ status: 'success', provider: p.name, page_size: 1 }).catch(() => null),
+          api.getLogs({ status: 'error', provider: p.name, page_size: 1 }).catch(() => null),
+        ])
+        this.detailModels = models || []
+        const row = byProv && (byProv.providers || []).find((x) => x.provider_id === p.id)
+        this.detailToday = row || null
+        if (cooling) {
+          this.detailCoolingModels = (cooling.model_cooling || []).filter(
+            (m) => m.provider === p.name && m.cooling
+          )
+          this.detailCoolingKeys = (cooling.key_cooling || []).filter((k) => k.provider === p.name)
+        }
+        this.detailRefreshLogs = (refreshLogs && refreshLogs.items) || []
+        this.detailHealth = {
+          ok: (okLogs && okLogs.total) || 0,
+          err: (errLogs && errLogs.total) || 0,
+        }
+        this.detailLastOk = (okLogs && okLogs.items && okLogs.items[0]) || null
+        this.detailLastErr = (errLogs && errLogs.items && errLogs.items[0]) || null
+      } finally {
+        this.detailLoading = false
+      }
+      // OAuth：打开即并发查全部账号额度（上游 5 分钟缓存命中不重复打）
+      for (const c of this.detailConnections) {
+        this.loadDetailUsage(c, false)
+      }
+    },
+    async loadDetailUsage(c, force) {
+      this.detailUsage = { ...this.detailUsage, [c.id]: { loading: true, data: (this.detailUsage[c.id] || {}).data || null } }
+      try {
+        const data = await api.getOAuthConnectionUsage(c.id, !!force)
+        this.detailUsage = { ...this.detailUsage, [c.id]: { loading: false, data } }
+      } catch (e) {
+        this.detailUsage = { ...this.detailUsage, [c.id]: { loading: false, data: null, error: '查询失败：' + e.message } }
+      }
+    },
+    connStatusOf(c) {
+      if (!c.is_active) return { label: '已停用', cls: 'badge-error' }
+      if (c.expires_at && new Date(c.expires_at).getTime() < Date.now()) return { label: '已过期', cls: 'badge-warning' }
+      return { label: '正常', cls: 'badge-success' }
+    },
+    expireTextOf(c) {
+      if (!c.expires_at) return '长效'
+      const ms = new Date(c.expires_at).getTime() - Date.now()
+      if (ms < 0) return '已过期'
+      const d = Math.floor(ms / 86400000)
+      const h = Math.floor((ms % 86400000) / 3600000)
+      if (d > 0) return '剩余 ' + d + ' 天 ' + h + ' 时'
+      return '剩余 ' + h + ' 时 ' + Math.floor((ms % 3600000) / 60000) + ' 分'
+    },
+    quotaPct(q) {
+      if (q.unlimited) return 0
+      const total = Number(q.total) || 0
+      if (!total) return 0
+      return Math.max(0, Math.min(100, (Number(q.used) || 0) / total * 100))
+    },
+    quotaText(q) {
+      if (q.unlimited) return '不限量'
+      const money = (v) => '$' + (Number(v) || 0).toFixed(2)
+      if (q.unit === 'USD') {
+        const bal = q.remaining != null ? q.remaining : q.total
+        return `剩 ${money(bal)}` + (q.display_name ? `（${q.display_name}）` : '')
+      }
+      const isPct = Math.round(Number(q.total) || 0) === 100 && !q.unit
+      let text
+      if (isPct) text = `已用 ${Math.round(Number(q.used) || 0)}%`
+      else {
+        const u = Math.round(Number(q.used) || 0)
+        const t = Math.round(Number(q.total) || 0)
+        text = `${u.toLocaleString()}/${t.toLocaleString()}` + (q.unit ? ` ${q.unit}` : '')
+      }
+      if (q.reset_at) text += ` · 重置 ${this.fmtTime(q.reset_at)}`
+      return text
+    },
+    fmtTime(v) {
+      if (!v) return '-'
+      try {
+        const d = new Date(v)
+        if (Number.isNaN(d.getTime())) return String(v)
+        const p2 = (n) => String(n).padStart(2, '0')
+        return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`
+      } catch (e) {
+        return String(v)
       }
     },
 
@@ -1935,6 +2226,71 @@ export default {
 .btn-warning:hover {
   filter: brightness(1.1);
 }
+
+/* 详情浮窗：名称可点提示 */
+.name-link {
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+  transition: border-color 0.15s, color 0.15s;
+}
+.name-link:hover {
+  color: var(--primary, #5b8dff);
+  border-bottom-color: var(--primary, #5b8dff);
+}
+
+/* 服务商详情浮窗 */
+.detail-body { display: flex; flex-direction: column; gap: 14px; }
+.detail-sec {
+  border: 1px solid var(--border-base, #1c2839);
+  border-radius: var(--radius-md, 8px);
+  padding: 10px 12px;
+  background: var(--surface-1, transparent);
+}
+.detail-sec-title { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+.detail-head-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.detail-head-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.detail-name { font-size: 15px; }
+.detail-kv { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; margin: 0; }
+.detail-kv > div { display: flex; gap: 8px; min-width: 0; }
+.detail-kv dt { color: var(--text-muted, #7e8ea9); font-size: 12px; flex: 0 0 64px; margin: 0; }
+.detail-kv dd { margin: 0; min-width: 0; word-break: break-all; }
+.detail-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.detail-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px; }
+.detail-stat {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 8px; border-radius: var(--radius-sm, 6px);
+  background: var(--surface-2, rgba(126, 142, 169, 0.08));
+}
+.detail-stat strong { font-size: 15px; }
+.detail-bad { color: #f87171; }
+.detail-inline { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.detail-list { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.detail-list-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 4px 0; border-top: 1px dashed var(--border-base, #1c2839);
+}
+.detail-list-row:first-child { border-top: none; }
+.detail-err { color: #f87171; word-break: break-all; }
+/* OAuth 多账号额度块 */
+.acct-block {
+  border-top: 1px dashed var(--border-base, #1c2839);
+  padding-top: 8px; margin-top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.acct-block:first-of-type { border-top: none; margin-top: 4px; }
+.acct-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 额度进度条（对齐 OAuth 连接页样式） */
+.quota-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 1.4fr) 1fr minmax(120px, auto);
+  align-items: center; gap: 8px; font-size: 12px;
+}
+.quota-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted, #a9b7cd); }
+.quota-bar { height: 6px; border-radius: 3px; background: rgba(126, 142, 169, 0.18); overflow: hidden; }
+.quota-bar i { display: block; height: 100%; background: var(--primary, #5b8dff); border-radius: 3px; transition: width 0.25s; }
+.quota-bar i.warn { background: #fbbf24; }
+.quota-bar i.hot { background: #f87171; }
+.quota-val { text-align: right; white-space: nowrap; }
 
 @media (max-width: 900px) {
   .catalog-grid {

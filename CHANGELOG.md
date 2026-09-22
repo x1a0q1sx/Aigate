@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- 服务商详情浮窗：服务商管理页点服务商名称（或操作列「详情」眼睛按钮）弹出纯展示浮窗——身份区（名称/凭证类型/Base URL/接口类型/创建更新时间/代理）+ 状态标签 + 规模与路由（模型数/启用数/Auto 参与数、密钥数或 OAuth 账号数、供量组合列表、API Key 前缀与启用态明细）+ **OAuth 专属多账号额度区**（打开即并发查全部账号额度、逐账号进度条、可单账号强刷，复用 5 分钟缓存与限流冷却）+ 今日用量（请求/Token/成本/占比）+ 健康与冷却（冷却中模型与密钥、历史成功失败、最近一次成功与失败明细）+ 最近模型刷新记录（触发方式/增删/耗时）。零后端改动，全部复用既有端点
+
 ### Fixed
 - **u1s1 直连/Playground 仍 403「仅填写账号 API Key 不受支持」**：`/v1` 主入口按 `服务商/模型` 前缀直连、以及后台 Playground 测试按钮的 OAuth 分支，此前仍用裸 `pick_access_token` 拿设备 token 当 `Authorization: Bearer` 发出，绕过统一凭证解析器 → 不带 `__dpop` 标记 → openai_compat 不现签 DPoP proof。与 combo/auto 路径一致改走 `resolve_credential_async`，把解析器返回的 `extra_headers`（含 `__dpop`）接入 `RouteResult` 并在发送处合并。
 - **combo 冷启动 403「检测到请求来自非 u1s1 客户端」**：u1s1 推理必须附 `x-u1s1-attestation`（仅 DPoP 不够，实测无 attestation 时 `/v1/models` 200 但 `chat/completions` 403）。服务重启后该缓存是冷的，首个命中 u1s1 的请求要现拉（阻塞 ≤4s，慢则冷却 30s，整条 combo 的 u1s1 候选一起 403）。现于 lifespan 启动即后台预热 attestation（token 有效期 7 天、临期自动续），消除冷启动窗口。
