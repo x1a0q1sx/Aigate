@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 # sidecar 基址（可用环境变量覆盖，便于测试与多实例）
 SIDECAR_BASE = os.environ.get("AIGATE_OPENCODE_SIDECAR", "http://127.0.0.1:4096")
 _SIDECAR_TIMEOUT = float(os.environ.get("AIGATE_OPENCODE_TIMEOUT", "180"))
+# 网关专用 agent：CLI 默认 agent 带「编码助手」人格（实测会回 "Hi! I'm ready to help with
+# your workspace at ..."），与 chat completions 的直出语义不符。用 CLI 的 agent 配置能力
+# 定义 aigate 纯对话 agent（提示词约束直接作答、不寒暄/不自述/不追问），建 session 时指定。
+# 未配置该 agent 时自动回退 CLI 默认（不影响可用性，只是回复带人格）。
+SIDECAR_AGENT = os.environ.get("AIGATE_OPENCODE_AGENT", "aigate")
 
 
 class SidecarUnavailable(RuntimeError):
@@ -54,10 +59,17 @@ async def sidecar_alive(client: Optional[httpx.AsyncClient] = None) -> bool:
 
 async def _create_session(client: httpx.AsyncClient, provider_id: str, model_id: str,
                           title: str = "aigate-bridge") -> str:
-    r = await client.post(f"{SIDECAR_BASE}/api/session", json={
+    payload = {
         "title": title,
         "model": {"id": model_id, "providerID": provider_id},
-    })
+    }
+    if SIDECAR_AGENT:
+        payload["agent"] = SIDECAR_AGENT
+    r = await client.post(f"{SIDECAR_BASE}/api/session", json=payload)
+    if r.status_code >= 400 and SIDECAR_AGENT:
+        # agent 未配置/不被接受时回退默认 agent，不让整个请求失败
+        payload.pop("agent", None)
+        r = await client.post(f"{SIDECAR_BASE}/api/session", json=payload)
     if r.status_code >= 400:
         raise RuntimeError(f"opencode sidecar 建 session 失败 HTTP {r.status_code}: {r.text[:200]}")
     data = (r.json() or {}).get("data") or {}
@@ -198,21 +210,11 @@ async def _close_session(client: httpx.AsyncClient, sid: str) -> None:
 def flatten_messages(messages: list) -> str:
     """OpenAI messages → 单段文本（保留角色语义，供 CLI prompt 使用）。
 
-    **语义差异（如实告知）**：sidecar 走的是官方 CLI 的 prompt API，它面向「给 agent
-    派任务」，因此回复带 agent 人格（会寒暄、可能追问、按 agent 方式作答），并非
-    严格复刻 chat completions 的「直出」行为。实测在前置纠偏指令（"answer directly,
-    do not greet..."）下仍会保留人格——这是 CLI 的固有特性，纯 HTTP 层无法消除。
-    定位：可用作 combo/auto 里的**免费候选**（尤其开放型任务），但不要期望它与
-    普通 API 服务商在指令跟随上完全一致。
+    行为语义由 sidecar 的 `aigate` agent（SIDECAR_AGENT）负责——那里定义了
+    「直接作答、不寒暄/不自述/不追问」的系统提示词。这里只做消息拼接，
+    不再叠加前置指令（避免与 agent 提示词重复、互相干扰）。
     """
-    body = _flatten_body(messages)
-    if not body:
-        return ""
-    return (
-        "You are the assistant in the following conversation. "
-        "Respond with your reply to the latest user message.\n\n"
-        "--- conversation ---\n" + body
-    )
+    return _flatten_body(messages)
 
 
 def _flatten_body(messages: list) -> str:

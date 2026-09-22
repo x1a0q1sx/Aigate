@@ -19,8 +19,8 @@ def test_flatten_messages_preserves_roles():
     ])
     assert "[system]\nSYS" in out
     assert "你好" in out and "在" in out and "继续" in out
-    # 前置了对话角色说明，提示 CLI 以 assistant 身份作答
-    assert "assistant in the following conversation" in out
+    # 行为语义由 sidecar 的 aigate agent 提示词承担，这里不再叠加前置指令
+    assert not out.startswith("You are the assistant")
 
 
 def test_flatten_messages_typed_blocks():
