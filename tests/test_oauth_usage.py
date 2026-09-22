@@ -262,3 +262,78 @@ def test_u1s1_me_balance(monkeypatch):
 def test_dispatch_unknown_provider_message():
     r = asyncio.run(get_connection_usage("kimchi", "tok"))
     assert "额度接口" in r["message"] or "没有" in r["message"]
+
+
+# ── 额度按到期顺序排序（用户需求 2026-09-22） ─────────────────────
+def test_sort_quotas_by_expiry():
+    """最早到期的排最前；上游返回顺序无意义，需按 reset_at 升序。"""
+    q = {
+        "Bonus Pack 1": {"reset_at": "2026-10-05T00:00:00+00:00"},
+        "Monthly":      {"reset_at": "2026-10-12T00:00:00+00:00"},
+        "Bonus Pack 2": {"reset_at": "2026-09-25T00:00:00+00:00"},
+    }
+    assert list(ou.sort_quotas(q)) == ["Bonus Pack 2", "Bonus Pack 1", "Monthly"]
+
+
+def test_sort_quotas_no_expiry_last():
+    """无到期时间 / 不限量 / 9999 哨兵 一律排最后。"""
+    q = {
+        "永久余额": {"reset_at": None, "unit": "USD"},
+        "今日免费": {"reset_at": "2026-09-23T00:00:00+00:00"},
+        "不限量包": {"unlimited": True},
+        "哨兵":     {"reset_at": "9999-12-31T00:00:00+00:00"},
+    }
+    assert list(ou.sort_quotas(q)) == ["今日免费", "不限量包", "哨兵", "永久余额"]
+
+    q2 = {"b": {"reset_at": "2026-01-02T00:00:00+00:00"}, "a": {}}
+    assert list(ou.sort_quotas(q2)) == ["b", "a"]
+
+
+def test_sort_quotas_tie_break_and_degenerate():
+    """同到期按名称稳定；空/单元素/None/坏值 不抛异常。"""
+    same = {
+        "organization": {"reset_at": "2026-10-01T00:00:00+00:00"},
+        "user":         {"reset_at": "2026-10-01T00:00:00+00:00"},
+    }
+    assert list(ou.sort_quotas(same)) == ["organization", "user"]
+    assert ou.sort_quotas({}) == {}
+    assert ou.sort_quotas(None) == {}
+    assert list(ou.sort_quotas({"a": {}})) == ["a"]
+    bad = {"x": {"reset_at": "not-a-date"},
+           "y": {"reset_at": "2026-01-01T00:00:00Z"}}
+    assert list(ou.sort_quotas(bad)) == ["y", "x"]
+
+
+def test_reset_key_handles_naive_and_zulu():
+    """naive 时间按 UTC 解析；Z 结尾同样可用（_parse_reset 产出的就是这种）。"""
+    a = ou._reset_key({"reset_at": "2026-05-01T00:00:00"})
+    b = ou._reset_key({"reset_at": "2026-05-01T00:00:00+00:00"})
+    c = ou._reset_key({"reset_at": "2026-05-01T00:00:00Z"})
+    assert a == b == c
+    assert a[0] == 0, "有到期时间的应归入第一组"
+
+
+def test_get_connection_usage_sorts_quotas(monkeypatch):
+    """端到端：上游乱序返回 → get_connection_usage 出口已排好序。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"code": 0, "data": {"Response": {"Data": {
+        "Accounts": [
+            {"PackageName": "A", "CapacityUsedPrecise": "1", "CapacitySizePrecise": "10",
+             "CycleStartTime": 1789000000000, "CycleEndTime": 1791500000000,
+             "DeductionEndTime": 1791500000000},          # 赠包1：更早到期
+            {"PackageName": "B", "CapacityUsedPrecise": "2", "CapacitySizePrecise": "20",
+             "CycleStartTime": 1789000000000, "CycleEndTime": 1794000000000,
+             "DeductionEndTime": 1794000000000},          # 赠包2：更晚到期
+        ]}}}})])
+
+    async def _no_cache():
+        ou._CACHE.clear()
+        ou._INFLIGHT.clear()
+        ou._COOLDOWN.clear()
+    asyncio.run(_no_cache())
+    r = asyncio.run(get_connection_usage("codebuddy_cn", "tok-sort"))
+    names = list(r["quotas"])
+    assert names == ["Bonus Pack 1", "Bonus Pack 2"], "应按到期升序：%s" % names
+    q1 = r["quotas"]["Bonus Pack 1"]["reset_at"]
+    q2 = r["quotas"]["Bonus Pack 2"]["reset_at"]
+    assert q1 < q2

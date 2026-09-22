@@ -86,3 +86,14 @@
   ③ 清掉因此变成死变量的 `reasoning_flushed`
 - 证据：`tests/test_stream_consolidation.py`（7 项，含空 tool_calls 等价性、
   真工具调用仍即时透传、reasoning 内容不丢、drop 模式、chunk_size=1 直通、元数据块保留）
+
+## F11 OAuth 额度展示顺序（按到期先后）
+- 需求（2026-09-22 用户）：oauth 服务商的额度按到期顺序排序
+- 位置：`server/core/oauth_usage.py` 新增 `sort_quotas()`，在 `get_connection_usage` 出口收口
+- 背景：同一账号常有多个额度包（CodeBuddy 的续包 + 多个赠包、Qoder 的 user/org、
+  u1s1 的永久余额 + 今日免费），各家上游返回顺序无语义，界面按 dict 插入顺序渲染 → 看着乱
+- 口径：`reset_at` 升序（最早到期的排最前）；无 reset_at / 不限量 / `9999-12-31` 哨兵
+  一律排最后；同到期按名称稳定排序；坏值当无到期处理，排序异常绝不冒穿到额度查询
+- 收口点选择：放在 `get_connection_usage` 出口（而非前端或各家 handler），
+  缓存命中也带上已排序结果，两个界面（服务商详情浮窗 / OAuth 连接页）自动一致
+- 证据：tests/test_oauth_usage.py 新增 5 项（排序、无到期末尾、同到期稳定、naive/Z 时间等价、端到端出口已排序）

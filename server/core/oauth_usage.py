@@ -69,6 +69,56 @@ def _pct_quota(used_pct, reset_at=None, name_hint=""):
     }
 
 
+# ── 额度排序：按到期先后 ─────────────────────────────────────
+# 同一账号下常有多个额度包（CodeBuddy 的续包 + 多个赠包、Qoder 的 user/org、
+# u1s1 的永久余额 + 今日免费），上游返回顺序没有语义。统一按「最早到期的排最前」
+# 展示——先消耗/先过期的包最需要关注。
+#
+# 排序键（升序）：有 reset_at 的按时间先后在前；无 reset_at（不限量、永久余额、
+# 上游没给到期时间）的排最后，同类按名称稳定排序。
+
+_SENTINEL_TS = "9999-12-31"      # 上游表示「无限期/不重置」的哨兵值，等同无到期
+
+
+def _reset_key(q: dict):
+    """额度 → 排序键 (是否无到期, 到期时间戳, 名称)。无到期排最后。"""
+    raw = (q or {}).get("reset_at")
+    if not raw:
+        return (1, 0.0)
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ts = dt.timestamp()
+    except (ValueError, TypeError, OSError):
+        return (1, 0.0)
+    # 9999-12-31 这类「无限期」哨兵值按无到期处理（模型页/连接页都不展示它）
+    if ts >= datetime(9000, 1, 1, tzinfo=timezone.utc).timestamp():
+        return (1, 0.0)
+    return (0, ts)
+
+
+def sort_quotas(quotas: dict) -> dict:
+    """按到期先后重排额度字典（保持 dict 形态，Python 3.7+ 保序）。
+
+    无到期时间的额度（不限量 / 永久余额 / 上游未给）一律排在末尾。
+    """
+    if not isinstance(quotas, dict) or len(quotas) <= 1:
+        return quotas or {}
+    items = list(quotas.items())
+
+    def key(item):
+        name, q = item
+        no_expiry, ts = _reset_key(q)
+        return (no_expiry, ts, str(name))
+
+    try:
+        items.sort(key=key)
+    except Exception:      # 排序永不应让额度查询失败
+        return quotas
+    return dict(items)
+
+
 async def _get_json(url: str, headers: dict, params: dict = None):
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.get(url, headers=headers, params=params)
@@ -545,6 +595,9 @@ async def get_connection_usage(provider_code: str, access_token: str,
         except Exception as e:  # 防御：任何解析异常都不冒穿
             logger.warning("oauth usage error for %s: %s", provider_code, e)
             result = {"plan": None, "quotas": {}, "message": f"额度查询失败：{type(e).__name__}: {e}"}
+        # 统一按到期先后排序（在此收口：缓存/合流/各 provider 分支都经这里出去）
+        if result.get("quotas"):
+            result["quotas"] = sort_quotas(result["quotas"])
         if result.get("quotas"):  # 只缓存有真实数据的结果
             _CACHE[key] = (time.monotonic() + USAGE_TTL_SECONDS, result)
         return dict(result, provider_code=provider_code)
