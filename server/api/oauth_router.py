@@ -68,12 +68,39 @@ async def list_connections(db: AsyncSession = Depends(get_db)):
 
 # ── 触发授权 ──────────────────────────────────────────
 
+async def _next_owner_for_provider(db: AsyncSession, provider_code: str) -> str:
+    """给「新增账号」分配一个不与现有连接冲突的账号名。
+
+    约定：该服务商第一条连接叫 __default（主账号，路由默认取它）；
+    之后新增依次 account-2 / account-3 …。已有 account-N 时跳过，绝不覆盖。"""
+    rows = (await db.execute(
+        select(OAuthToken.owner).where(OAuthToken.provider_code == provider_code)
+    )).scalars().all()
+    existing = {r for r in rows if r}
+    if "__default" not in existing:
+        return "__default"
+    n = 2
+    while f"account-{n}" in existing:
+        n += 1
+    return f"account-{n}"
+
+
 @router.post("/authorize/{provider_code}")
-async def start_oauth_authorize(provider_code: str, request: Request, owner: str = "__default"):
-    """生成 authorize_url + state + PKCE verifier（device_poll 走另一组响应）"""
+async def start_oauth_authorize(provider_code: str, request: Request,
+                                owner: Optional[str] = None, new_account: bool = False):
+    """生成 authorize_url + state + PKCE verifier（device_poll 走另一组响应）
+
+    owner 未显式指定时自动分配：首次连接 → __default；已有账号 → account-N。
+    因此「一键连接」在已连接状态下是**新增账号**而不是静默覆盖主账号凭证
+    （此前固定写 __default，第二次登录会覆盖第一个账号 —— 用户实测踩到）。"""
     provider = get_oauth_provider(provider_code)
     if not provider:
         raise HTTPException(status_code=404, detail=f"Unknown OAuth provider: {provider_code}")
+    if not owner or not str(owner).strip():
+        async with AsyncSessionLocal() as _db:
+            owner = await _next_owner_for_provider(_db, provider_code)
+    else:
+        owner = str(owner).strip()
     # ── device_poll 流程（如 CodeBuddy CN / 国际服）────
     if (provider.extra_params or {}).get("auth_mode") == "device_poll":
         async with AsyncSessionLocal() as db:
@@ -236,6 +263,49 @@ async def delete_connection(connection_id: int, db: AsyncSession = Depends(get_d
     await db.delete(row)
     await db.commit()
     return {"ok": True}
+
+class ConnectionUpdate(BaseModel):
+    owner: Optional[str] = None      # 账号显示名（同服务商下唯一，用于区分多账号）
+    is_active: Optional[bool] = None
+
+@router.patch("/connections/{connection_id}")
+async def update_connection(connection_id: int, payload: ConnectionUpdate,
+                            db: AsyncSession = Depends(get_db)):
+    """编辑 OAuth 连接：改账号名（owner）/ 启用停用。
+
+    多账号场景下 owner 既是展示名也是路由寻址键（pick_access_token 按 owner 取 token），
+    故同 provider_code 下不得重名——重名会让两条连接互相覆盖。"""
+    row = await db.get(OAuthToken, connection_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="connection not found")
+    if payload.owner is not None:
+        new_owner = (payload.owner or "").strip()
+        if not new_owner:
+            raise HTTPException(status_code=400, detail="账号名不能为空")
+        if len(new_owner) > 100:
+            raise HTTPException(status_code=400, detail="账号名过长（≤100 字符）")
+        if new_owner != row.owner:
+            dup = (await db.execute(
+                select(OAuthToken).where(
+                    OAuthToken.provider_code == row.provider_code,
+                    OAuthToken.owner == new_owner,
+                    OAuthToken.id != connection_id,
+                ).limit(1)
+            )).scalars().first()
+            if dup:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"该服务商下已存在账号「{new_owner}」，请换一个名字")
+            row.owner = new_owner
+    if payload.is_active is not None:
+        row.is_active = bool(payload.is_active)
+    await db.commit()
+    # 改名影响凭证拾取（owner 是寻址键），清掉 in-flight 锁避免旧键残留
+    try:
+        get_oauth_client()._flight_locks.pop(f"{row.provider_code}::{row.owner}", None)
+    except Exception:
+        pass
+    return {"ok": True, "id": row.id, "owner": row.owner, "is_active": row.is_active}
 
 
 # ── 调度器：主动刷新即将到期的 token ──────────────────────────────

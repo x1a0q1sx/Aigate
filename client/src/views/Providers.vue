@@ -257,6 +257,7 @@
               <strong class="text-sm">{{ c.owner }}</strong>
               <span class="badge badge-sm" :class="connStatusOf(c).cls">{{ connStatusOf(c).label }}</span>
               <span class="text-xs text-muted">{{ expireTextOf(c) }}</span>
+              <span class="text-xs text-muted" title="账号名即路由寻址键（pick_access_token 按 owner 取 token）">改名请到 OAuth 连接页</span>
               <button class="btn btn-ghost btn-xs" @click="loadDetailUsage(c, true)" :disabled="detailUsage[c.id] && detailUsage[c.id].loading">
                 {{ (detailUsage[c.id] && detailUsage[c.id].loading) ? '查询中…' : '强刷额度' }}
               </button>

@@ -266,9 +266,17 @@ export default {
   // ── OAuth 接入 ──
   getOAuthProviders: () => apiGet('/admin/oauth/providers'),
   getOAuthConnections: () => apiGet('/admin/oauth/connections'),
-  startOAuthAuthorize: (code) => apiPost(`/admin/oauth/authorize/${code}`, {}),
+  startOAuthAuthorize: (code, opts = {}) => {
+    const qs = new URLSearchParams()
+    if (opts.owner) qs.append('owner', opts.owner)
+    if (opts.newAccount) qs.append('new_account', 'true')
+    const q = qs.toString()
+    return apiPost(`/admin/oauth/authorize/${code}${q ? '?' + q : ''}`, {})
+  },
   refreshOAuthConnection: (id) => apiPost(`/admin/oauth/refresh/${id}`),
   deleteOAuthConnection: (id) => apiDelete(`/admin/oauth/connections/${id}`),
+  // 编辑连接（账号名 / 启用停用）；owner 同服务商下唯一，重名返回 409
+  updateOAuthConnection: (id, data) => apiPatch(`/admin/oauth/connections/${id}`, data),
   importOAuthToken: (data) => apiPost('/admin/oauth/import-token', data),
   // 额度/余额查询（usage 端点缓存 5 分钟，force=true 强刷）
   getOAuthConnectionUsage: (id, force = false) =>

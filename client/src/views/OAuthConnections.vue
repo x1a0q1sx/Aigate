@@ -30,14 +30,24 @@
         <div v-if="p.notes" class="oauth-notes text-xs">{{ p.notes }}</div>
 
         <div v-for="c in connectionsOf(p.code)" :key="c.id" class="conn-row">
-          <span class="conn-owner">{{ c.owner }}</span>
-          <span class="badge" :class="connStatus(c).cls">{{ connStatus(c).label }}</span>
-          <span class="conn-expire text-xs" :title="'到期 ' + (c.expires_at || '未知')">{{ expireText(c) }}</span>
-          <span class="conn-actions">
-            <button class="btn btn-ghost btn-xs" @click="loadUsage(c, false)">查询余额</button>
-            <button class="btn btn-ghost btn-xs" @click="refreshConn(c)" :disabled="busyConn === c.id">强制刷新</button>
-            <button class="btn btn-ghost btn-xs danger-text" @click="removeConn(c)">断开</button>
-          </span>
+          <template v-if="renamingId === c.id">
+            <input v-model.trim="renameValue" class="rename-input" maxlength="100"
+                   placeholder="账号名（同服务商内唯一）" @keyup.enter="submitRename(c)"
+                   @keyup.esc="renamingId = null" />
+            <button class="btn btn-ghost btn-xs" @click="submitRename(c)" :disabled="!!renaming">保存</button>
+            <button class="btn btn-ghost btn-xs" @click="renamingId = null">取消</button>
+          </template>
+          <template v-else>
+            <span class="conn-owner" :title="'连接 id ' + c.id + '，可改名区分多账号'">{{ c.owner }}</span>
+            <span class="badge" :class="connStatus(c).cls">{{ connStatus(c).label }}</span>
+            <span class="conn-expire text-xs" :title="'到期 ' + (c.expires_at || '未知')">{{ expireText(c) }}</span>
+            <span class="conn-actions">
+              <button class="btn btn-ghost btn-xs" @click="loadUsage(c, false)">查询余额</button>
+              <button class="btn btn-ghost btn-xs" @click="startRename(c)">改名</button>
+              <button class="btn btn-ghost btn-xs" @click="refreshConn(c)" :disabled="busyConn === c.id">强制刷新</button>
+              <button class="btn btn-ghost btn-xs danger-text" @click="removeConn(c)">断开</button>
+            </span>
+          </template>
           <div v-if="c.last_error" class="conn-error text-xs" :title="c.last_error">最后错误：{{ c.last_error.slice(0, 120) }}</div>
           <div v-if="usage[c.id]" class="usage-panel">
             <div v-if="usage[c.id].loading" class="text-xs muted">额度查询中...</div>
@@ -60,7 +70,12 @@
 
         <div class="oauth-card-actions">
           <button class="btn btn-primary btn-xs" @click="connect(p)" :disabled="busyCode === p.code">
-            {{ busyCode === p.code ? '处理中...' : (flowOf(p).label === '导入' ? '获取引导' : '一键连接') }}
+            {{ busyCode === p.code ? '处理中...' : (flowOf(p).label === '导入' ? '获取引导' : (connectionsOf(p.code).length ? '新增账号' : '一键连接')) }}
+          </button>
+          <button v-if="connectionsOf(p.code).length" class="btn btn-outline btn-xs"
+                  @click="connectAsNew(p)" :disabled="busyCode === p.code"
+                  title="强制新建一个账号连接（保留现有账号不覆盖）">
+            <AppIcon name="plus" :size="11" />强制新增
           </button>
           <button class="btn btn-outline btn-xs" @click="openImportTokenModal(p.code)">导入 Token</button>
         </div>
@@ -109,10 +124,11 @@ import api from '../api.js'
 import toast from '../toast.js'
 import PageHeader from '../components/PageHeader.vue'
 import AppModal from '../components/AppModal.vue'
+import AppIcon from '../components/AppIcon.vue'
 
 export default {
   name: 'OAuthConnections',
-  components: { PageHeader, AppModal },
+  components: { PageHeader, AppModal, AppIcon },
   data() {
     return {
       providers: [],
@@ -124,6 +140,9 @@ export default {
       busyConn: null,
       importModal: { show: false, provider_code: '', access_token: '', refresh_token: '', expires_in: 3600, owner: '__default', busy: false, error: '' },
       usage: {},          // connectionId -> { loading, data?, error? }
+      renamingId: null,   // 正在改名的连接 id
+      renameValue: '',
+      renaming: false,
       _deviceWatcher: null,
     }
   },
@@ -218,6 +237,48 @@ export default {
         toast.error('发起授权失败：' + e.message)
       } finally {
         this.busyCode = null
+      }
+    },
+    // 强制新建账号（已有账号时，不覆盖现有连接）
+    async connectAsNew(p) {
+      this.busyCode = p.code
+      try {
+        const r = await api.startOAuthAuthorize(p.code, { newAccount: true })
+        if (r.device_poll && r.login_url) {
+          window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          toast.info('请在新窗口登录【另一个账号】，成功后自动新增一条连接')
+          this.watchDeviceFlow(p.code)
+        } else if (r.authorize_url) {
+          window.open(r.authorize_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          toast.info('请在新窗口用【另一个账号】授权，授权后返回本页')
+        } else {
+          toast.error('该服务商没有可用的授权入口，请使用「导入 Token」方式')
+        }
+      } catch (e) {
+        toast.error('发起授权失败：' + e.message)
+      } finally {
+        this.busyCode = null
+      }
+    },
+    // 账号改名
+    startRename(c) {
+      this.renamingId = c.id
+      this.renameValue = c.owner
+    },
+    async submitRename(c) {
+      const name = (this.renameValue || '').trim()
+      if (!name) { toast.error('账号名不能为空'); return }
+      if (name === c.owner) { this.renamingId = null; return }
+      this.renaming = true
+      try {
+        await api.updateOAuthConnection(c.id, { owner: name })
+        this.renamingId = null
+        await this.load()
+        toast.success('已改名为「' + name + '」')
+      } catch (e) {
+        toast.error('改名失败：' + e.message)
+      } finally {
+        this.renaming = false
       }
     },
     // 设备流：后端在轮询上游，前端只需盯连接数变化
@@ -415,6 +476,16 @@ export default {
   padding-top: 10px;
 }
 .danger-text { color: #f87171; }
+.rename-input {
+  flex: 1 1 140px;
+  min-width: 120px;
+  padding: 3px 8px;
+  font-size: 12px;
+  border: 1px solid var(--border-color, #1c2839);
+  border-radius: 4px;
+  background: var(--bg-input, var(--bg-card, #0f1623));
+  color: inherit;
+}
 .foot-tip { margin-top: 18px; color: var(--text-muted, #7e8ea9); line-height: 1.7; }
 .muted { color: var(--text-muted, #7e8ea9); font-weight: 400; }
 .usage-panel {
