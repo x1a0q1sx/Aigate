@@ -225,6 +225,42 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("u1s1 attestation 预热失败: %s", e)
     _warm_att_task = _aio.ensure_future(_warm_u1s1_attestation())
+    # OpenCode 免费层 CLI sidecar 守护：上游只认「官方 CLI 会话」，AIGate 经其 HTTP API
+    # 转发（见 core/opencode_sidecar.py）。sidecar 崩了本任务自动拉起；未安装 CLI 时
+    # 静默跳过（该免费候选自然不可用，不影响其它路由）。
+    async def _guard_opencode_sidecar():
+        import shutil as _shutil
+        from server.core import opencode_sidecar as _sc
+        # CLI 位置：环境变量 AIGATE_OPENCODE_BIN > PATH 中的 opencode > ~/opencode/bin/opencode
+        # （不硬编码绝对路径：换机/换用户目录都能工作，也避免提交钩子拦路径）
+        bin_path = os.environ.get("AIGATE_OPENCODE_BIN") or os.path.join(
+            os.path.expanduser("~"), "opencode", "bin", "opencode")
+        port = os.environ.get("AIGATE_OPENCODE_PORT", "4096")
+        first = True
+        while True:
+            try:
+                if not await _sc.sidecar_alive():
+                    exe = bin_path if os.path.exists(bin_path) else _shutil.which("opencode")
+                    if exe:
+                        if first:
+                            print(f"… OpenCode sidecar 未运行，尝试启动：{exe}")
+                        _aio.create_subprocess_exec(
+                            exe, "serve", "--port", port, "--hostname", "127.0.0.1",
+                            stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
+                            start_new_session=True)
+                        await _aio.sleep(8)
+                        alive = await _sc.sidecar_alive()
+                        print("✓ OpenCode sidecar 已就绪" if alive
+                              else "⚠️ OpenCode sidecar 启动后仍不可用（该免费候选将跳过）")
+                    elif first:
+                        print("⏭️ 未发现 opencode CLI，跳过 sidecar（见 docs/findings-opencode-free-tier.md）")
+                elif first:
+                    print("✓ OpenCode sidecar 已在运行（CLI 桥接就绪）")
+            except Exception as e:
+                logger.warning("opencode sidecar 守护异常: %s", e)
+            first = False
+            await _aio.sleep(120)
+    _sidecar_guard_task = _aio.ensure_future(_guard_opencode_sidecar())
     # P0-3: 日志写入队列（请求路径零落库，后台批量 commit + WAL 周期 checkpoint）
     from server.core.log_queue import start_log_queue
     start_log_queue()

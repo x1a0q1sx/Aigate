@@ -298,6 +298,17 @@ class FreeProviderExecutor:
         return payload
 
     async def execute_non_stream(self, request: ChatCompletionRequest) -> dict:
+        # opencode 免费层：上游只认「官方 CLI 建立的会话」，纯 HTTP 一律 403
+        # （2026-09-22 取证：见 core/opencode_sidecar.py 与 docs/findings-opencode-free-tier.md）。
+        # 走常驻 CLI sidecar（9router 同款架构：让真 CLI 当上游客户端）。
+        if self.provider_code == "opencode":
+            from server.core import opencode_sidecar as _sidecar
+            if not await _sidecar.sidecar_alive():
+                raise RuntimeError(
+                    "opencode sidecar 未运行（官方 CLI 桥接）：请在服务器启动 "
+                    "`opencode serve --port 4096`（见 docs/findings-opencode-free-tier.md）")
+            return await _sidecar.chat_completion(
+                request.messages, request.model, provider_id="opencode")
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
             headers = await self._build_headers(client)
             payload = self._prepare_payload(request, stream=False)
@@ -312,6 +323,18 @@ class FreeProviderExecutor:
             return resp.json()
 
     async def execute_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[dict, None]:
+        # opencode 免费层：同样走 CLI sidecar（上游只认官方 CLI 会话；sidecar 的 message
+        # API 非流式，由 opencode_sidecar.stream_chat_completion 切块模拟流式）
+        if self.provider_code == "opencode":
+            from server.core import opencode_sidecar as _sidecar
+            if not await _sidecar.sidecar_alive():
+                raise RuntimeError(
+                    "opencode sidecar 未运行（官方 CLI 桥接）：请在服务器启动 "
+                    "`opencode serve --port 4096`（见 docs/findings-opencode-free-tier.md）")
+            async for ck in _sidecar.stream_chat_completion(
+                    request.messages, request.model, provider_id="opencode"):
+                yield ck
+            return
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy()) as client:
             headers = await self._build_headers(client)
             headers["Accept"] = "text/event-stream"

@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- **OpenCode 免费层接入官方 CLI sidecar（复刻 9router 架构）**：上游把免费层锁在「官方 CLI 进程建立的会话」里（纯 HTTP 复刻请求头/body/运行时实测全 403），9router 的真实做法是**让本机官方 CLI 当上游客户端**、自己只透传。现同样在服务器常驻官方 CLI（`opencode serve`，127.0.0.1:4096），AIGate 经其 HTTP API 转发 OpenCode Free 请求（`server/core/opencode_sidecar.py`）：建 session → 发 prompt → 轮询取回复（注意 assistant 消息是**逐步填充**的，必须等 `time.completed` 才算就绪）→ 转成 OpenAI 兼容响应；流式由「一次取全 + 切块」模拟，combo/auto 的实质锁定、race、drool guard 等既有逻辑无需改动。启动脚本含 sidecar 守护（崩了自动拉起，未装 CLI 则静默跳过）。**语义差异如实说明**：sidecar 走 CLI 的 prompt API（面向 agent 派任务），回复带 agent 人格，指令跟随不如普通 API 服务商严格，适合开放型任务；`docs/findings-opencode-free-tier.md` 有完整取证
+
 ### Fixed
 - **u1s1 间歇性 403「检测到请求来自非 u1s1 客户端」根因找到并修复**：u1s1 会扫描**请求体全文**，按**大小写精确**匹配竞品客户端名——命中 `Claude Code` / `Windsurf` / `Gemini CLI` / `Codex CLI` 即 403（赠送额度限官方客户端）；而全小写 `claude code`、全大写 `CLAUDE CODE`、单词 `codex` 均放行（实测边界）。下游用 Claude Code / Windsurf 等客户端时，其 system prompt 恰好含这些精确串 → 命中拦截，这解释了「同样模型有时通有时不通」。现于 u1s1 方言档案加 `neutralize_competitor_tokens`：出站前对**整份请求体**（messages 的 system/user/typed-blocks、tools 描述等任意嵌套位置）做**语义等价改写**（`Claude Code`→`Claude  Code`、`Windsurf`→`WindSurf`、`Gemini CLI`→`Gemini  CLI`、`Codex CLI`→`Codex  CLI`），不删内容、不改语义。端到端实测：带触发词的 system prompt 消毒前 403、消毒后 200（5/5）
 
