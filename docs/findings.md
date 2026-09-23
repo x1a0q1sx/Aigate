@@ -164,3 +164,20 @@
   分析页刷新行以「种子」角标透出，不再伪装在线拉取。
 - 证据：生产刷新日志 `('CodeBuddy (International)', 1, 23, 6, 7, 'seed', '静态种子兜底（29个）')`；
   tests/test_model_refresh_log.py 新增 3 项（种子内容回归 + seed 标记落库 + 序列化透出）。
+
+## F15 u1s1 403 真凶：tools[].function.name 黑名单（v4.3）
+- 背景：f058bfe 的竞品词消毒上线后，combo:918 的 u1s1 候选仍持续 403（09-22 07:29 之后零成功）。
+- 生产 A/B（真实凭证 DPoP+UA，单变量，2026-09-23）：
+  - 18 个候选「客户端名词」（含 ZCode/WorkBuddy/CodeBuddy/Qoder/Trae/iFlow 等）**任何位置都不拦**；
+    `Claude Code`/`Windsurf`/`Gemini CLI`/`Codex CLI` **仅在 system 位置**拦（同词放 user 放行）
+    → f058bfe 结论对一半：词真存在，但拦的是 system 注入，且不是 combo 主因。
+  - **唯一必拦项：`tools[].function.name ∈ {apply_patch, update_plan}`**。30 个常见工具名
+    （shell/exec_command/Bash/Edit/Write/Read/Task/TodoWrite/…）全放行；描述/参数 schema 随便改都拦，
+    改名即放行（applyPatch / apply_patch_2 / plan_update / local_shell 实测 200）。
+    **只扫 tools 字段**：正文含 apply_patch、历史 tool_calls 含该名 → 200。
+  - UA 仍是硬判据（覆盖成 codex_cli_rs → 403）；`originator`/`x-codex-*`/`OpenAI-Beta` 不拦。
+  - `/v1/models` 现 404（attestation 拿不到），chat/completions 带 DPoP+UA 仍 200 → attestation 非必需再证。
+- 相关性：09-22 生产 37 条 u1s1 请求，带 apply_patch 的 **19 条 100% 403**，无 tools 的小请求 10 条全成功。
+- 修复：`ProviderQuirks.blocked_tool_names`（u1s1 启用）→ transform_payload 改 tools/tool_choice 名，
+  响应（message/delta/聚合）还原原名；服务商级 `fingerprint_filter_enabled`（默认开，UI 详情页开关，
+  经 `__fg` 标记传递）统一控竞品词消毒 + 工具名改写两件事。

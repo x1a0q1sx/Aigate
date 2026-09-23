@@ -20,6 +20,8 @@ class ProviderCreate(BaseModel):
     # v4.2: 按服务商的定时模型刷新（自定义频率，分钟）
     model_refresh_enabled: bool = False
     model_refresh_interval_minutes: int = 60
+    # v4.3: 指纹过滤（u1s1 竞品名/工具名遮蔽），默认开
+    fingerprint_filter_enabled: bool = True
 class ProviderUpdate(BaseModel):
     name: Optional[str] = None
     base_url: Optional[str] = None
@@ -34,6 +36,7 @@ class ProviderUpdate(BaseModel):
     description: Optional[str] = None
     model_refresh_enabled: Optional[bool] = None
     model_refresh_interval_minutes: Optional[int] = None
+    fingerprint_filter_enabled: Optional[bool] = None
 class ProviderResponse(BaseModel):
     id: int
     name: str
@@ -52,6 +55,8 @@ class ProviderResponse(BaseModel):
     model_refresh_interval_minutes: int = 60
     model_refresh_next_at: Optional[datetime] = None
     model_refresh_last_at: Optional[datetime] = None
+    # v4.3: 指纹过滤开关（详情浮窗可切换，默认开）
+    fingerprint_filter_enabled: bool = True
     # 详情浮窗只读展示
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

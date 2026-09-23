@@ -351,6 +351,11 @@ def _merge_oauth_headers(provider, base_headers=None):
     if provider and getattr(provider, "proxy_enabled", False):
         eh = eh or {}
         eh["__proxy_force"] = True
+    # v4.3 指纹过滤开关：服务商关闭后，adapter 跳过 u1s1 的竞品名/工具名遮蔽改写。
+    # 默认开（属性缺失或为 True 都不写标记，保持旧调用零改动）。
+    if provider and getattr(provider, "fingerprint_filter_enabled", True) is False:
+        eh = eh or {}
+        eh["__fg"] = "0"
     return eh
 
 config = get_config()

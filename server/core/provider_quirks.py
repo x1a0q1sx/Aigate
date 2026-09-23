@@ -85,6 +85,17 @@ def neutralize_u1s1_fingerprint(text: str) -> str:
     return out
 
 
+# u1s1 工具名黑名单（2026-09-23 生产 A/B 实证）：出站请求体 tools[].function.name
+# 精确等于下表左侧名字即 403「检测到请求来自非 u1s1 客户端」（Codex CLI 特征工具）。
+# 只扫 tools 字段的名字：描述/参数 schema 任意改都仍拦；改名即放行
+# （applyPatch / apply_patch_2 / plan_update 实测 200），消息正文与历史 tool_calls 不拦。
+# 规避 = 出站等价改名 + 响应回写原名（客户端按名分发工具结果，必须还原）。
+_U1S1_TOOL_NAME_ALIASES = {
+    "apply_patch": "applyPatch",
+    "update_plan": "updatePlan",
+}
+
+
 @dataclass
 class ProviderQuirks:
     name: str
@@ -94,6 +105,7 @@ class ProviderQuirks:
     workos_token: bool = False          # JWT token 出站前补 "workos:" 前缀
     unwrap_envelope: bool = False       # 非流式响应 {success,data} 解包
     neutralize_competitor_tokens: bool = False  # 出站前等价改写竞品客户端名（u1s1 指纹黑名单）
+    blocked_tool_names: dict = field(default_factory=dict)  # 上游按工具名拦截：原名→出站别名
     default_headers: dict = field(default_factory=dict)
 
 
@@ -146,6 +158,9 @@ _U1S1 = ProviderQuirks(
     # 竞品客户端名消毒：下游 IDE/CLI 的 system prompt 常含 "Claude Code"/"Windsurf"
     # 等精确串，u1s1 扫描 body 命中即 403（赠送额度限官方客户端）；出站前等价改写规避
     neutralize_competitor_tokens=True,
+    # 工具名黑名单改写（apply_patch/update_plan → 别名；响应侧还原）。
+    # 2026-09-23 生产实测：这是 combo 里 u1s1 候选持续 403 的真正主因。
+    blocked_tool_names=dict(_U1S1_TOOL_NAME_ALIASES),
     default_headers={
         "user-agent": "u1s1-cli",
         "x-u1s1-client": "terminal",
@@ -214,13 +229,85 @@ def _neutralize_payload_tokens(payload: dict) -> dict:
     return walk(payload)
 
 
-def transform_payload(payload: dict, q: Optional[ProviderQuirks]) -> dict:
-    """按档案改写出站请求体（就地语义由返回新 dict 承载）。"""
+def _rename_tool_names_in_request(payload: dict, aliases: dict) -> dict:
+    """把 tools[].function.name / tool_choice 里命中上游黑名单的工具名改为别名。
+
+    只动结构字段（name/tool_choice），不改消息正文——实测上游正文里的
+    apply_patch 字样不触发拦截（只有 tools 字段的名字会）。
+    """
+    p = dict(payload)
+    tools = p.get("tools")
+    if isinstance(tools, list):
+        new_tools = []
+        for t in tools:
+            if isinstance(t, dict) and isinstance(t.get("function"), dict) \
+                    and t["function"].get("name") in aliases:
+                t = dict(t)
+                fn = dict(t["function"])
+                fn["name"] = aliases[fn["name"]]
+                t["function"] = fn
+            new_tools.append(t)
+        p["tools"] = new_tools
+    tc = p.get("tool_choice")
+    if isinstance(tc, dict) and isinstance(tc.get("function"), dict) \
+            and tc["function"].get("name") in aliases:
+        tc = dict(tc)
+        fn = dict(tc["function"])
+        fn["name"] = aliases[fn["name"]]
+        tc["function"] = fn
+        p["tool_choice"] = tc
+    return p
+
+
+def restore_tool_names_in_response(data, aliases: dict):
+    """把响应里被改名的工具调用还原为客户端侧的原名（含流式 delta 与非流式 message）。
+
+    别名表反查；不命中的名字原样返回。data 为 OpenAI chat.completion / chunk dict。
+    """
+    if not aliases or not isinstance(data, dict):
+        return data
+    rev = {v: k for k, v in aliases.items()}
+    for ch in (data.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        for key in ("message", "delta"):
+            node = ch.get(key)
+            if not isinstance(node, dict):
+                continue
+            calls = node.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            new_calls = []
+            changed = False
+            for c in calls:
+                if isinstance(c, dict) and isinstance(c.get("function"), dict) \
+                        and c["function"].get("name") in rev:
+                    c = dict(c)
+                    fn = dict(c["function"])
+                    fn["name"] = rev[fn["name"]]
+                    c["function"] = fn
+                    changed = True
+                new_calls.append(c)
+            if changed:
+                node["tool_calls"] = new_calls
+    return data
+
+
+def transform_payload(payload: dict, q: Optional[ProviderQuirks],
+                      tool_guard_enabled: bool = True) -> dict:
+    """按档案改写出站请求体（就地语义由返回新 dict 承载）。
+
+    tool_guard_enabled=False（服务商面板关掉「指纹过滤」）时跳过 u1s1 的
+    竞品客户端名消毒与工具名黑名单改写；协议保真（UA/DPoP/归因头）不受影响。
+    """
     if not q:
         return payload
     p = dict(payload)
     if q.force_stream:
         p["stream"] = True
+    # 工具名黑名单改写（u1s1）：必须在 messages 早退之前——只动 tools/tool_choice 结构字段
+    if q.blocked_tool_names and tool_guard_enabled:
+        p = _rename_tool_names_in_request(p, q.blocked_tool_names)
     # reasoning_effort 镜像（两家 CodeBuddy 行为一致）：none/off 网关不认，直接删；
     # 有 effort 时补 reasoning_summary 才会透出思考内容
     if q.name.startswith("codebuddy"):
@@ -234,8 +321,8 @@ def transform_payload(payload: dict, q: Optional[ProviderQuirks]) -> dict:
         return p
     # 竞品客户端名消毒（u1s1）：扫描**整份 body 的文本**做等价改写。
     # 放这里而不是只改 system：下游可能把身份声明写进 user/tool 消息或 tools 描述里，
-    # 上游是按全文精确匹配的（实测 2026-09-22）。
-    if q.neutralize_competitor_tokens:
+    # 上游是按全文精确匹配的（实测 2026-09-22）。与工具名改写同受「指纹过滤」开关控制。
+    if q.neutralize_competitor_tokens and tool_guard_enabled:
         p = _neutralize_payload_tokens(p)
         messages = p.get("messages")
     if q.sanitize_system_prompt:

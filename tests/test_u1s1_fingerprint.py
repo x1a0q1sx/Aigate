@@ -78,3 +78,86 @@ def test_transform_payload_applies_for_u1s1_only():
     assert "Claude Code" not in fixed["messages"][0]["content"]
     # 无关域名（无 quirks）原样返回
     assert transform_payload(body, None) is body
+
+
+# ── v4.3 工具名黑名单改写（apply_patch/update_plan 才是 combo 持续 403 的主因）──
+from server.core.provider_quirks import restore_tool_names_in_response
+
+
+def _u1s1_q():
+    return quirks_for("https://api.u1s1.io/v1/chat/completions")
+
+
+def _payload_with_tools():
+    return {
+        "model": "glm-5.3-flash",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [
+            {"type": "function", "function": {"name": "apply_patch",
+                                              "description": "edit files",
+                                              "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "update_plan",
+                                              "description": "plan",
+                                              "parameters": {"type": "object", "properties": {}}}},
+            {"type": "function", "function": {"name": "exec_command",
+                                              "description": "shell",
+                                              "parameters": {"type": "object", "properties": {}}}},
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "apply_patch"}},
+    }
+
+
+def test_blocked_tool_names_are_aliased_outbound():
+    """出站前：命中黑名单的工具名→别名；未命中（exec_command）与描述里的 apply_patch 字样不动"""
+    out = transform_payload(_payload_with_tools(), _u1s1_q())
+    names = [t["function"]["name"] for t in out["tools"]]
+    assert names == ["applyPatch", "updatePlan", "exec_command"]
+    # 描述里引用旧名不拦截（实测），保持原样
+    assert out["tools"][0]["function"]["description"] == "edit files"
+    assert out["tool_choice"]["function"]["name"] == "applyPatch"
+    # 原 payload 不被就地改
+    assert _payload_with_tools()["tools"][0]["function"]["name"] == "apply_patch"
+
+
+def test_tool_guard_disabled_passes_through():
+    """服务商详情关掉「指纹过滤」→ 工具名与竞品词都不改写"""
+    q = _u1s1_q()
+    p = {"model": "m", "messages": [{"role": "system", "content": "You are Claude Code."}],
+         "tools": [{"function": {"name": "apply_patch", "description": "d"}}]}
+    out = transform_payload(p, q, tool_guard_enabled=False)
+    assert out["tools"][0]["function"]["name"] == "apply_patch"
+    assert "Claude Code" in out["messages"][0]["content"]
+
+
+def test_restore_maps_alias_back_in_response_and_stream():
+    aliases = _u1s1_q().blocked_tool_names
+    nonstream = {"choices": [{"message": {"tool_calls": [
+        {"id": "c1", "function": {"name": "applyPatch", "arguments": "{}"}},
+        {"id": "c2", "function": {"name": "exec_command", "arguments": "{}"}},
+    ]}}]}
+    restore_tool_names_in_response(nonstream, aliases)
+    calls = nonstream["choices"][0]["message"]["tool_calls"]
+    assert calls[0]["function"]["name"] == "apply_patch"
+    assert calls[1]["function"]["name"] == "exec_command"
+    chunk = {"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "function": {"name": "updatePlan"}}]}}]}
+    restore_tool_names_in_response(chunk, aliases)
+    assert chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] == "update_plan"
+
+
+def test_restore_noop_without_aliases():
+    data = {"choices": [{"message": {"tool_calls": [{"function": {"name": "apply_patch"}}]}}]}
+    out = restore_tool_names_in_response(data, None)
+    assert out["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "apply_patch"
+
+
+def test_provider_flag_marks_extra_headers():
+    """Provider.fingerprint_filter_enabled=False → _merge_oauth_headers 打 __fg=0"""
+    from types import SimpleNamespace
+    from server.api.v1_router import _merge_oauth_headers
+    on = SimpleNamespace(credential_type="api_key", proxy_enabled=False,
+                         fingerprint_filter_enabled=True)
+    off = SimpleNamespace(credential_type="api_key", proxy_enabled=False,
+                          fingerprint_filter_enabled=False)
+    assert "__fg" not in (_merge_oauth_headers(on, {}) or {})
+    assert _merge_oauth_headers(off, {})["__fg"] == "0"

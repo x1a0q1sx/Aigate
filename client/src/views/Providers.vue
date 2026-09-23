@@ -220,6 +220,16 @@
               ? `每 ${detailProvider.model_refresh_interval_minutes || 60} 分钟` + (detailProvider.model_refresh_next_at ? ` · 下次 ${fmtTime(detailProvider.model_refresh_next_at)}` : '')
               : '未启用（可编辑勾选）' }}</dd></div>
             <div v-if="(detailProvider.credential_type || 'api_key') === 'oauth'"><dt>OAuth 账号</dt><dd class="text-xs">{{ detailProvider.oauth_owner || '自动' }}</dd></div>
+            <div v-if="isU1s1Provider(detailProvider)">
+              <dt>指纹过滤</dt>
+              <dd class="text-xs">
+                <label class="checkbox-label" style="gap:6px;">
+                  <input type="checkbox" :checked="detailProvider.fingerprint_filter_enabled !== false"
+                         @change="toggleFingerprintFilter(detailProvider, $event.target.checked)" />
+                  <span>遮蔽 agent 客户端特征（竞品名 + apply_patch/update_plan 工具名改写）</span>
+                </label>
+              </dd>
+            </div>
           </dl>
           <!-- ② 状态标签 -->
           <div v-if="statusLabels(detailProvider).length" class="detail-tags">
@@ -1075,6 +1085,21 @@ export default {
         toast.success(proxyEnabled ? `服务商「${p.name}」已强制走代理池` : `服务商「${p.name}」已恢复跟随全局代理开关`)
       } catch (e) {
         toast.error(e.response?.data?.detail || '代理开关更新失败')
+      }
+    },
+    isU1s1Provider(p) {
+      return !!p && /u1s1\.io/i.test(p.base_url || '')
+    },
+    async toggleFingerprintFilter(p, on) {
+      if (!p) return
+      try {
+        await api.updateProvider(p.id, { fingerprint_filter_enabled: on })
+        p.fingerprint_filter_enabled = on
+        toast.success(on
+          ? `服务商「${p.name}」已开启指纹过滤（agent 客户端特征出站前遮蔽）`
+          : `服务商「${p.name}」已关闭指纹过滤——带 apply_patch/update_plan 等工具名的请求可能被 u1s1 拦截（403）`)
+      } catch (e) {
+        toast.error(e.response?.data?.detail || '指纹过滤开关更新失败')
       }
     },
     credLabel(t) {

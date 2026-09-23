@@ -29,6 +29,10 @@ class Provider(Base):
     model_refresh_interval_minutes = Column(Integer, nullable=False, default=60)
     model_refresh_next_at = Column(DateTime, nullable=True, default=None)
     model_refresh_last_at = Column(DateTime, nullable=True, default=None)
+    # 指纹过滤（v4.3）：上游按「AI agent 客户端指纹」拦截时（u1s1：竞品客户端名 +
+    # apply_patch/update_plan 工具名），出站前做语义等价改写、响应侧还原。
+    # 仅对档案里带 blocked_tool_names/neutralize_competitor_tokens 的域名生效。默认开。
+    fingerprint_filter_enabled = Column(Boolean, nullable=False, default=True)
     headers = Column(JSON, nullable=True, default=dict)
     proxy_url = Column(String(500), nullable=True, default=None)
     # Kept briefly for import compatibility; new configurations use proxy_enabled only.

@@ -920,7 +920,8 @@ async def create_provider(data: ProviderCreate, db: AsyncSession = Depends(get_d
         headers=data.headers or {},
         proxy_url=data.proxy_url,
         proxy_enabled=data.proxy_enabled,
-        description=data.description or ""
+        description=data.description or "",
+        fingerprint_filter_enabled=data.fingerprint_filter_enabled,
     )
     _apply_model_refresh_fields(
         provider, enabled=data.model_refresh_enabled,
@@ -956,6 +957,8 @@ async def update_provider(provider_id: int, data: ProviderUpdate, db: AsyncSessi
         provider.proxy_enabled = data.proxy_enabled
     if data.description is not None:
         provider.description = data.description
+    if data.fingerprint_filter_enabled is not None:
+        provider.fingerprint_filter_enabled = bool(data.fingerprint_filter_enabled)
     # v4.2 定时模型刷新：启用状态或频率有变化时重拨 next_at（立即生效）
     if (data.model_refresh_enabled is not None
             or data.model_refresh_interval_minutes is not None):

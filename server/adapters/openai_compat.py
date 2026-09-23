@@ -13,6 +13,7 @@ from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.core.provider_quirks import (
     quirks_for, transform_payload, unwrap_response, auth_token_for,
+    restore_tool_names_in_response,
 )
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
@@ -164,11 +165,11 @@ class OpenAICompatAdapter(BaseAdapter):
         # provider 级自定义头优先覆盖
         if q and q.default_headers:
             headers.update(q.default_headers)
-        # 网关内部路由标记（__proxy_* / __oauth / __dpop）不是上游协议的一部分，绝不出站；
+        # 网关内部路由标记（__proxy_* / __oauth / __dpop / __fg）不是上游协议的一部分，绝不出站；
         # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支
         if extra_headers:
             headers.update({k: v for k, v in extra_headers.items()
-                            if k not in ("__proxy_force", "__proxy_url", "__oauth", "__dpop")})
+                            if k not in ("__proxy_force", "__proxy_url", "__oauth", "__dpop", "__fg")})
         headers["Content-Type"] = "application/json"
         # u1s1 设备凭证：官方「客户端信号」= RFC9449 DPoP，逐请求现签（htm/htu 绑定目标 URL）；
         # x-u1s1-attestation 为平台完整性审查的客户端证明（/v1/models 领取，见 u1s1_attestation）
@@ -187,6 +188,8 @@ class OpenAICompatAdapter(BaseAdapter):
         extra_headers: dict = None
     ) -> ChatCompletionResponse:
         q = quirks_for(base_url)
+        tg_on = (extra_headers or {}).get("__fg", "1") != "0"
+        aliases = (q.blocked_tool_names if q and tg_on else None)
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
@@ -195,10 +198,11 @@ class OpenAICompatAdapter(BaseAdapter):
         # 只认 reasoning_effort，透传非标字段有被严格上游 400 的风险
         payload.pop("reasoning", None)
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
-        payload = transform_payload(payload, q)
+        payload = transform_payload(payload, q, tool_guard_enabled=tg_on)
         if q and q.force_stream:
             # 流式专属上游（CodeBuddy 拒绝非流式，11101）：走 SSE 聚合成 JSON 回包
-            return await self._collect_stream(payload, url, headers, force_proxy)
+            return restore_tool_names_in_response(
+                await self._collect_stream(payload, url, headers, force_proxy), aliases)
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
@@ -209,6 +213,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 )
             data = resp.json()
             data = unwrap_response(data, q)  # Cline 信封 {"success":true,"data":{...}}
+            data = restore_tool_names_in_response(data, aliases)  # 工具名黑名单还原
             try:
                 from server.config import get_config
                 if get_config().adapters.openai_compat.reasoning == "drop":
@@ -309,13 +314,15 @@ class OpenAICompatAdapter(BaseAdapter):
         extra_headers: dict = None
     ) -> AsyncGenerator[dict, None]:
         q = quirks_for(base_url)
+        tg_on = (extra_headers or {}).get("__fg", "1") != "0"
+        aliases = (q.blocked_tool_names if q and tg_on else None)
         url = self._build_url(base_url)
         headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
-        payload = transform_payload(payload, q)  # 流式专属/请求体形态方言
+        payload = transform_payload(payload, q, tool_guard_enabled=tg_on)  # 流式专属/请求体形态方言
         timeout_error = None
         try:
             async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
@@ -347,7 +354,7 @@ class OpenAICompatAdapter(BaseAdapter):
                                 except json.JSONDecodeError:
                                     continue
                         async for c in _consolidate_openai_stream(_parse_lines(), _drop_reasoning, _chunk_size):
-                            yield c
+                            yield restore_tool_names_in_response(c, aliases)
                     except (httpx.ReadTimeout, httpx.ReadError) as _te:
                         # 捕获超时/读取错误，先让 async for 和 resp 正常清理完毕，
                         # 再重新抛出，避免 aclose() 竞态。
