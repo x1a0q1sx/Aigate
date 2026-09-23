@@ -135,3 +135,32 @@
      避免双刷。next_at/last_at 落库，详情浮窗可见下次时间。
 - 证据：tests/test_provider_scheduled_refresh.py（6 项：CRUD 钳制/拨钟、
   全局批量互斥、点名精确、__default 优先、兜底、resolver 透传 owner）
+
+## F14 CodeBuddy/WorkBuddy 模型列表过期：无在线端点 + 种子回退不可见（v4.3）
+- 现象（2026-09-23 用户）：「workbuddy 国际版获取到的模型列表不对吧？群友说有 deepseek V4.1 flash」
+  生产库 provider 87 确实没有 deepseek-v4.1-flash。
+- 根因链：
+  1) copilot.tencent.com / www.codebuddy.ai / www.workbuddy.ai 均**无模型列表端点**：
+     /v2/models、/v1/models、/v2/plugin/models、/console/enterprises/personal/models 等
+     40+ 候选路径实测 404/403/500；`/v2/plugin/login/account?state=` 能通（证明鉴权正确）。
+     逆向项目同样佐证：模型列表从桌面端 product.json 读或干脆硬编码。
+  2) 刷新逻辑因此静默回退静态种子表，且日志记 `ok=1` 无任何来源标注 →
+     种子过期完全不可见。provider 87 的 13 个种子中 7 个已下架
+     （deepseek-v4-flash / deepseek-v4-pro / deepseek-v3-2-volc / glm-4.7 / glm-5.0 /
+     hy3-preview / minimax-m2.7），且缺 deepseek-v4.1-flash + gpt-6-astra/gpt-5.6-*/
+     gpt-5.5/gpt-5.4/gpt-5.3-codex/gemini-3.5-flash。
+- **可用性探测法**（CodeBuddy 类唯一可行的列表来源）：stream 请求 + system 首条
+  （`"You are CodeBuddy Code."`，否则 11128 安全策略拦截），max_tokens 给足（太小
+  gpt-5.x 报 11133 integer_below_min_value）；按响应码判：200=可用、
+  11102 "service info not found"=已下架/不存在、11102 "only available for
+  authorized users"=存在但本账号无权限、14003=限流（改期间隔重试探）。
+  实测 60+ 候选：intl 可用 28 个，CN 可用 27 个，两版独有模型差异显著
+  （gpt/gemini 仅 intl；deepseek-v4-flash/pro/v3-2-volc/kimi-k3-1 仅 CN）。
+- 附带结论：**www.workbuddy.ai 与 www.codebuddy.ai 是同一后端**（同 token、同端点、
+  同结果，2026-09-23 实测）——「WorkBuddy 国际版」= 网关里的 CodeBuddy (International)，
+  不需要新增服务商。
+- 处置（commit fe4aa89）：两版种子表按探测结果重建；
+  model_refresh_logs 新增 list_source / list_note 两列（online/seed/pricing），
+  分析页刷新行以「种子」角标透出，不再伪装在线拉取。
+- 证据：生产刷新日志 `('CodeBuddy (International)', 1, 23, 6, 7, 'seed', '静态种子兜底（29个）')`；
+  tests/test_model_refresh_log.py 新增 3 项（种子内容回归 + seed 标记落库 + 序列化透出）。
