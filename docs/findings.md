@@ -216,6 +216,9 @@
      生产账号实测 15 条：qfmodel 0.0（免费）/ gfmodel 0.1 / dfmodel 0.1 / mmodel 0.2 /
      efficient 0.3 / auto 0.5 / qmodel_38max 0.5 / dmodel 0.5 / kmodel 0.8 / gmodel 0.8 /
      kmodel_latest 1.4 / performance 1.1 / ultimate 2.0。**这是唯一可靠的动态源**。
+     注：`price_factor` 会随**促销活动**浮动（同日复测 qmodel_38max 由 0.5 变 0.2，
+     对应 promotion「错峰 4 折」active=true；`original_price_factor` 保留原价），
+     因此必须走在线目录而非静态表——每次刷新拿到的是当时有效倍率。
   2) **CodeBuddy 无服务端倍率**：40+ 候选端点（含 /v2/config、/v3/config、
      /v2/plugin/model/list、/v2/billing/meter/get-model-resource、/v2/update、
      /v2/plugin/versions、CDN download.codebuddy.cn 等）全部 404/500/无倍率字段；

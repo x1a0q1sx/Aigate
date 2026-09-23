@@ -576,8 +576,14 @@ class ModelCatalog:
                 _rsrc = (existing_model.price_ratio_source or "")
                 if model_info.price_ratio is not None and _rsrc != "manual":
                     existing_model.price_ratio = model_info.price_ratio
-                    existing_model.price_ratio_source = (
-                        "qoder" if provider.api_type == "qoder" else "provider")
+                    # 来源标注：Qoder 在线目录 / CodeBuddy 静态表 / 其它上游自声明
+                    if provider.api_type == "qoder":
+                        _new_src = "qoder"
+                    elif str(getattr(provider, "oauth_code", "") or "").startswith("codebuddy"):
+                        _new_src = "codebuddy"
+                    else:
+                        _new_src = "provider"
+                    existing_model.price_ratio_source = _new_src
                     if model_info.price_ratio == 0.0:
                         existing_model.is_free = True
                 if remote_metadata:
@@ -653,7 +659,9 @@ class ModelCatalog:
                     # v4.4 倍率（订阅制上游）
                     price_ratio=model_info.price_ratio,
                     price_ratio_source=(
-                        ("qoder" if provider.api_type == "qoder" else "provider")
+                        ("qoder" if provider.api_type == "qoder" else
+                         "codebuddy" if str(getattr(provider, "oauth_code", "") or "").startswith("codebuddy")
+                         else "provider")
                         if model_info.price_ratio is not None else ""),
                     priority_boost=0,
                     auto_excluded=False
