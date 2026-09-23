@@ -181,3 +181,28 @@
 - 修复：`ProviderQuirks.blocked_tool_names`（u1s1 启用）→ transform_payload 改 tools/tool_choice 名，
   响应（message/delta/聚合）还原原名；服务商级 `fingerprint_filter_enabled`（默认开，UI 详情页开关，
   经 `__fg` 标记传递）统一控竞品词消毒 + 工具名改写两件事。
+
+## F16 能力感知路由（多模态/长上下文自动选模型）（v4.3）
+- 需求：多模态请求自动走 vision 模型、长上下文请求自动走大窗口模型 → 需要逐模型的
+  「上下文窗口 / 输入模态 / 最大输出」元数据与路由闸。
+- 现状盘点：`context_length` 链路早已完整（估算→动态系数→observed 收紧→4 处预检跳过），
+  长上下文的「装不下就跳过」事实上已成立；缺的是**模态数据与能力闸**。
+  生产库 2560 模型：`supports_vision=1` 仅 2 行、`context_length=0`（未知）1653 行、
+  capabilities JSON 是死字段——vision 维度当时完全不可用，先修数据才谈路由。
+- 落地（数据层→来源→闸→偏好→可见性）：
+  1) Model 新列 `input_modalities`(JSON, **NULL=未知**) + `max_output_tokens`；
+     `capability_source` 承载可信度 openrouter/provider/manual/inferred。
+  2) 来源三层：OpenRouter `architecture.input_modalities`+`top_provider.max_completion_tokens`
+     （此前被丢弃，全仓唯一现成数据源）；openai_compat /models 若上游声明则解析（provider 可信）；
+     名称启发式 `infer_modalities`（仅正向提示 inferred）。manual 永不覆盖。
+  3) **硬闸安全边界**：只有可信来源的闭合模态集合参与拦截（未知一律放行）——
+     按「未知即不支持」会误杀 65% 模型。inferred 不算可信。
+  4) 请求画像 `analyze_request()`：est_tokens + has_image/has_audio（OpenAI+Anthropic 部件形态都认）。
+  5) 闸接点：auto `_filter_candidates`/sticky（含 relaxed 模式不放松能力闸）；
+     combo 流式/非流式/fusion/auto-stream 预检点 `_SkipAttempt/_NSkip/_ASkip` 带 reason。
+  6) 排序偏好（非硬闸）：多模态请求 +10/模态，长上下文按窗口档位 +2..+14；
+     上限 ~24 分，不压过智力/稳定性量级差。combo 顺序不偏好（用户显式配置）。
+  7) 前端：模型页「窗口/能力」列（含来源 tooltip）+ 编辑表单窗口/最大输出/模态勾选
+     （保存即 capability_source=manual）；/v1/models capabilities 输出扩展。
+- 遗留（如实说明）：模态覆盖率取决于 OpenRouter 命中与服务商自声明；
+  长尾私有站模型仍会是「未知→放行」，手动编辑兜底；max_output 暂不参与预检 reserve。

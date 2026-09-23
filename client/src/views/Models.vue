@@ -89,6 +89,7 @@
               <th>免费</th>
               <th>分组</th>
               <th>思考</th>
+              <th>窗口/能力</th>
               <th>延迟/TPS</th>
               <th>干预</th>
               <th>操作</th>
@@ -96,7 +97,7 @@
           </thead>
           <tbody>
             <tr v-if="models.length === 0">
-                <td colspan="12">
+                <td colspan="13">
                 <EmptyState icon="cpu" title="没有匹配的模型" small />
               </td>
             </tr>
@@ -167,6 +168,14 @@
                 <span class="badge" :class="reasoningBadgeClass(m.supports_reasoning_effort)">
                   {{ reasoningLabel(m.supports_reasoning_effort) }}
                 </span>
+              </td>
+              <td :title="capSourceTip(m)">
+                <span class="mono text-xs" :style="{ color: ctxColor(m) }">{{ ctxLabel(m) }}</span>
+                <div class="text-xs" style="margin-top: 2px;">
+                  <span v-for="md in (m.input_modalities || [])" :key="md" class="badge badge-neutral" style="font-size: 10px; margin-right: 2px;">{{ md }}</span>
+                  <span v-if="!(m.input_modalities || []).length && m.supports_vision" class="badge badge-neutral" style="font-size: 10px;">image?</span>
+                  <span v-if="!(m.input_modalities || []).length && !m.supports_vision" class="text-muted">模态未知</span>
+                </div>
               </td>
               <td>
                 <div class="action-row">
@@ -260,6 +269,28 @@
           <option :value="true">支持</option>
           <option :value="false">不支持</option>
         </select>
+      </div>
+      <div class="form-divider">能力（多模态 / 长上下文自动选路依据）</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label class="form-label">上下文窗口 (tokens)</label>
+          <input v-model.number="editForm.context_length" type="number" min="0" step="1024" :placeholder="'0=未知'" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">最大输出 (tokens)</label>
+          <input v-model.number="editForm.max_output_tokens" type="number" min="0" step="256" :placeholder="'0=未知'" />
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">输入模态</label>
+        <div class="form-row">
+          <label v-for="md in ['text','image','audio','pdf','video']" :key="md" class="checkbox-label">
+            <input type="checkbox" :value="md" v-model="editForm.input_modalities" /> {{ md }}
+          </label>
+        </div>
+        <div class="text-xs text-muted" style="margin-top: 4px;">
+          当前来源：{{ editForm.capability_source || '未知（不参与多模态硬拦截）' }}；勾选保存后标记为 manual，刷新/同步不再覆盖
+        </div>
       </div>
       <div class="form-group">
         <label class="form-label">优先级加成 (-100 ~ 100)</label>
@@ -575,6 +606,26 @@ export default {
     statusLabel(s) {
       return { healthy: '健康', degraded: '延迟', rate_limited: '限流', unhealthy: '故障' }[s] || s
     },
+    ctxLabel(m) {
+      const w = Number(m.context_length) || 0
+      if (w <= 0) return '窗口未知'
+      if (w >= 1000000) return (w / 1000000).toFixed(w % 1000000 ? 2 : 0) + 'M'
+      if (w >= 1000) return Math.round(w / 1000) + 'K'
+      return String(w)
+    },
+    ctxColor(m) {
+      const w = Number(m.context_length) || 0
+      if (w >= 256000) return 'var(--success, #2f9e44)'
+      if (w >= 64000) return '#2b8aef'
+      return ''
+    },
+    capSourceTip(m) {
+      const src = { openrouter: '来源: OpenRouter 同步', provider: '来源: 服务商在线声明',
+        manual: '来源: 手动编辑（刷新不覆盖）', inferred: '来源: 模型名推断（仅正向提示）' }[m.capability_source] || '来源: 未知'
+      const obs = m.observed_context_limit ? `；实测窗口 ${(m.observed_context_limit / 1000).toFixed(0)}K` : ''
+      const gate = ['openrouter', 'provider', 'manual'].includes(m.capability_source) ? '（参与多模态硬拦截）' : '（不参与硬拦截）'
+      return src + obs + gate
+    },
     reasoningLabel(value) {
       return { true: '支持', false: '不支持' }[String(value)] || '未知'
     },
@@ -690,6 +741,10 @@ export default {
         priority_boost: m.priority_boost || 0,
         auto_excluded: m.auto_excluded || false,
         supports_reasoning_effort: m.supports_reasoning_effort === true || m.supports_reasoning_effort === false ? m.supports_reasoning_effort : '',
+        context_length: m.context_length || null,
+        max_output_tokens: m.max_output_tokens || null,
+        input_modalities: Array.isArray(m.input_modalities) ? [...m.input_modalities] : [],
+        capability_source: m.capability_source || '',
         model_alias: overrides.model_alias || '',
       }
       this.overrideHeadersText = overrides.headers ? JSON.stringify(overrides.headers, null, 2) : ''
@@ -704,9 +759,13 @@ export default {
         const payload = {
           ...this.editForm,
           supports_reasoning_effort: capability === true || capability === false ? capability : null,
+          context_length: this.editForm.context_length || null,
+          max_output_tokens: this.editForm.max_output_tokens || null,
+          input_modalities: this.editForm.input_modalities || [],
           request_overrides: requestOverrides,
         }
         delete payload.model_alias
+        delete payload.capability_source
         await api.updateModel(this.editForm.id, payload)
         this.showEditModal = false
         await this.load()

@@ -35,6 +35,8 @@ from server.core.usage_normalize import normalize_usage as _normalize_usage
 from server.core.client_ip import real_client_ip as _real_client_ip
 from server.core.context_guard import (
     estimate_request_tokens,
+    analyze_request,
+    media_mismatch_reason,
     is_context_error,
     context_overflows,
     get_estimate_factor,
@@ -809,7 +811,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
     tried_ids = set()
     last_result = None
     diag_start_ts = diag_start_ts or time.time()
-    est_tokens = estimate_request_tokens(request)
+    profile = analyze_request(request)
+    est_tokens = profile.est_tokens
     _diag(conversation_id, "auto_cascade_start", diag_start_ts, max_retries=max_retries, combo=bool(combo_targets), est_tokens=est_tokens)
     
     # 预先解析 combo 候选（如果有），避免在循环内重复查 DB
@@ -939,7 +942,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                     raise NoMoreCandidates()
                 candidate = combo_candidates[attempt]
             else:
-                candidate = await ar.get_best_candidate(db, conversation_id, exclude_model_ids=tried_ids)
+                candidate = await ar.get_best_candidate(db, conversation_id, exclude_model_ids=tried_ids, profile=profile)
             _diag(conversation_id, "auto_candidate_done", diag_start_ts, attempt=attempt,
                   success=candidate.success if candidate else None)
             last_result = candidate
@@ -952,6 +955,17 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 raise NoMoreCandidates()
             if candidate.model:
                 tried_ids.add(candidate.model.id)
+            # v4.3 能力闸：combo_targets 直接迭代（不经选举过滤）也要过模态检查
+            if candidate.model:
+                _mmr = media_mismatch_reason(candidate.model, profile)
+                if _mmr:
+                    attempt_errors.append({"attempt": attempt,
+                                           "model": _cand_full(candidate),
+                                           "error": f"skip: {_mmr}"})
+                    _decision_skip(conversation_id, model_pk=candidate.model.id,
+                                   provider=candidate.provider.name,
+                                   model=candidate.model.model_id, reason=_mmr)
+                    raise _ASkip(_mmr)
             # 上下文预检：估算输入装不进窗口的候选直接跳过（不打上游、不进冷却）
             # P1-5: 按该服务商+模型的历史估算系数校准；observed_context_limit 收紧标称窗口
             if candidate.model:
@@ -1449,8 +1463,10 @@ async def _chat_completions_impl(
             _diag(conversation_id, "alias_applied", _diag_start,
                   alias=_alias_name, target=_alias_target)
 
-    # 上下文窗口预检的请求体量估算（跳过装不下的候选，避免 400 + 误冷却）
-    est_req_tokens = estimate_request_tokens(request)
+    # 上下文窗口预检的请求体量估算（跳过装不下的候选，避免 400 + 误冷却）；
+    # v4.3：一次画像同时产出 est_tokens 与多模态需求（能力感知路由）
+    _profile = analyze_request(request)
+    est_req_tokens = _profile.est_tokens
     _decision_begin(
         conversation_id,
         request.model,
@@ -1522,6 +1538,9 @@ async def _chat_completions_impl(
                 import json as _fj
 
                 async def _f_precheck(_p, _m):
+                    _mmr = media_mismatch_reason(_m, _profile)
+                    if _mmr:
+                        return _mmr
                     _pf = await get_estimate_factor(db, _p.id, _m.model_id)
                     _obs = int(getattr(_m, "observed_context_limit", 0) or 0)
                     if context_overflows(_m, int(est_req_tokens * _pf), observed_limit=_obs):
@@ -1693,6 +1712,10 @@ async def _chat_completions_impl(
                             raise _SkipAttempt(f"combo target {full_id} not found",
                                                full_id=full_id, prov=prov_name, model=m_id)
                         # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
+                        _mmr = media_mismatch_reason(_mdl, _profile)
+                        if _mmr:
+                            raise _SkipAttempt(f"skip ({_mmr}): {full_id}",
+                                               full_id=full_id, prov=_prov.name, model=_mdl.model_id, pk=_mdl.id)
                         _pf = await get_estimate_factor(cdb, _prov.id, _mdl.model_id)
                         _est_adj = int(est_req_tokens * _pf)
                         _obs = int(getattr(_mdl, "observed_context_limit", 0) or 0)
@@ -1966,6 +1989,9 @@ async def _chat_completions_impl(
                 if not provider or not model:
                     raise _NSkip("provider or model not found", prov=prov_name, model=m_id)
                 # 上下文预检：装不下的候选直接跳过（动态因子 + observed 窗口）
+                _mmr = media_mismatch_reason(model, _profile)
+                if _mmr:
+                    raise _NSkip(_mmr, pk=model.id, prov=provider.name, model=model.model_id)
                 _pf = await get_estimate_factor(db, provider.id, model.model_id)
                 _est_adj = int(est_req_tokens * _pf)
                 _obs = int(getattr(model, "observed_context_limit", 0) or 0)
@@ -2369,7 +2395,8 @@ async def _chat_completions_impl(
                         _prov_obj, _mdl_obj = _prov, _mdl
                         _sel_reason = None
                     else:
-                        cand = await ar.get_best_candidate(cascade_db, conversation_id, exclude_model_ids=tried_sids)
+                        cand = await ar.get_best_candidate(cascade_db, conversation_id,
+                                                           exclude_model_ids=tried_sids, profile=_profile)
                         _diag(conversation_id, "auto_stream_candidate_done", _diag_start,
                               attempt=st_attempt, success=cand.success if cand else None)
                         if not cand.success or (cand.model and cand.model.id in tried_sids):
@@ -2378,9 +2405,17 @@ async def _chat_completions_impl(
                         _sel_reason = getattr(cand, "selection_reason", None)
                     try:
                         await cascade_db.refresh(_prov_obj, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_enabled"])
-                        await cascade_db.refresh(_mdl_obj, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort", "observed_context_limit"])
+                        await cascade_db.refresh(_mdl_obj, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort", "observed_context_limit", "input_modalities", "capability_source", "supports_vision"])
                     except Exception:
                         pass
+                    # v4.3 能力闸：combo 显式目标也过模态检查（auto 分支已在选举内过滤）
+                    _mmr = media_mismatch_reason(_mdl_obj, _profile)
+                    if _mmr:
+                        stream_errs.append({"attempt": st_attempt, "error": f"skip ({_mmr})"})
+                        _decision_skip(conversation_id, model_pk=_mdl_obj.id,
+                                       provider=_prov_obj.name, model=_mdl_obj.model_id,
+                                       reason=_mmr)
+                        raise _ASkip(_mmr)
                     _mdl_ns = _NS(model_id=_mdl_obj.model_id, id=_mdl_obj.id,
                                   supports_reasoning_effort=getattr(_mdl_obj, "supports_reasoning_effort", None),
                                   context_length=int(getattr(_mdl_obj, "context_length", 0) or 0),
@@ -3100,6 +3135,8 @@ async def list_models(
                     "vision": _m.supports_vision,
                     "reasoning_effort": getattr(_m, "supports_reasoning_effort", None),
                     "context_length": _m.context_length,
+                    "input_modalities": getattr(_m, "input_modalities", None),
+                    "max_output_tokens": getattr(_m, "max_output_tokens", None),
                 },
             })
         return {"object": "list", "data": _data}
@@ -3129,7 +3166,9 @@ async def list_models(
                 "streaming": model.supports_streaming,
                 "vision": model.supports_vision,
                 "reasoning_effort": getattr(model, "supports_reasoning_effort", None),
-                "context_length": model.context_length
+                "context_length": model.context_length,
+                "input_modalities": getattr(model, "input_modalities", None),
+                "max_output_tokens": getattr(model, "max_output_tokens", None),
             }
         })
     # A2: 组合路由伪模型（combo:名称 与请求入口的解析约定一致）

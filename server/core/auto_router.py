@@ -102,8 +102,9 @@ class AutoRouter:
         candidates: List[Model],
         session: AsyncSession,
         conversation_id: Optional[str] = None,
+        profile=None,
     ) -> List:
-        """v0.2: 用 RankingService 打分排序"""
+        """v0.2: 用 RankingService 打分排序。v4.3: profile 非空时叠加能力偏好加分。"""
         providers = {}
         for m in candidates:
             p = await session.get(Provider, m.provider_id)
@@ -124,6 +125,17 @@ class AutoRouter:
         scores = await self.ranking_service.rank_all(
             session, candidates, prov_by_pid, cooling
         )
+        # v4.3 能力偏好：多模态请求 +分给支持该模态的候选；长上下文请求 +分给大窗口候选。
+        # 上限 ~24 分（context_guard.capability_preference），不压过智力/稳定性量级差。
+        if profile is not None and (profile.has_image or profile.has_audio or profile.is_long):
+            from .context_guard import capability_preference
+            by_id = {m.id: m for m in candidates}
+            for s in scores:
+                if s.excluded_reason:
+                    continue
+                m = by_id.get(s.model_id)
+                if m is not None:
+                    s.final_score = round(s.final_score + capability_preference(m, profile), 2)
         # 把 ModelScore 按 model_id 映射回 Model 对象
         score_map = {s.model_id: s for s in scores}
         def sort_key(m: Model):
@@ -161,9 +173,16 @@ class AutoRouter:
             capture_candidates(conversation_id, snapshots)
         return ordered
 
-    def _candidate_skip_reason(self, model: Model) -> Optional[str]:
+    def _candidate_skip_reason(self, model: Model, profile=None) -> Optional[str]:
         if model.auto_excluded:
             return "manually excluded from Auto"
+        # v4.3 能力闸：请求含图片/音频时，跳过「已知模态不含该媒体」的候选
+        # （未知模态不参与拦截，见 context_guard.media_mismatch_reason 的安全边界）
+        if profile is not None:
+            from .context_guard import media_mismatch_reason
+            mr = media_mismatch_reason(model, profile)
+            if mr:
+                return mr
         if self.health_checker and self.health_checker.is_cooling(model.id):
             return "model is cooling down"
         cached = self.health_checker.get_cached_status(model.id) if self.health_checker else None
@@ -172,15 +191,18 @@ class AutoRouter:
         return None
     def _filter_candidates(
         self,
-        candidates: List[Model]
+        candidates: List[Model],
+        profile=None,
     ) -> List[Model]:
-        """过滤掉不健康的、冷却中的、以及被用户排除的"""
+        """过滤掉不健康的、冷却中的、被用户排除的、以及能力不匹配的"""
         if not self.health_checker:
-            # 即使没有 health_checker，也要过滤 auto_excluded
-            return [m for m in candidates if not m.auto_excluded]
+            # 即使没有 health_checker，也要过滤 auto_excluded + 能力闸
+            return [m for m in candidates
+                    if not m.auto_excluded
+                    and not (profile is not None and self._candidate_skip_reason(m, profile))]
         filtered = []
         for model in candidates:
-            if self._candidate_skip_reason(model):
+            if self._candidate_skip_reason(model, profile):
                 continue
             filtered.append(model)
         return filtered
@@ -188,9 +210,11 @@ class AutoRouter:
         self,
         session: AsyncSession,
         conversation_id: Optional[str] = None,
-        exclude_model_ids: Optional[Set[int]] = None
+        exclude_model_ids: Optional[Set[int]] = None,
+        profile=None,
     ) -> Optional[RouteResult]:
-        """获取当前最优候选"""
+        """获取当前最优候选。profile（v4.3 能力画像）非空时：
+        sticky 与候选过滤叠加模态硬闸，排序叠加能力偏好加分。"""
         exclude_model_ids = exclude_model_ids or set()
         # session sticky
         if conversation_id:
@@ -198,6 +222,10 @@ class AutoRouter:
             if sticky_model_id:
                 sticky_model = await self.model_catalog.get_by_id(session, sticky_model_id)
                 if sticky_model and sticky_model.id not in exclude_model_ids and sticky_model.enabled and sticky_model.auto_enabled and not sticky_model.auto_excluded:
+                    # v4.3: 请求含图片/音频而 sticky 模型模态已知不支持 → 放走 sticky
+                    from .context_guard import media_mismatch_reason
+                    if media_mismatch_reason(sticky_model, profile):
+                        return None
                     # 仍然有效，直接用
                     if not self.health_checker or not self.health_checker.is_cooling(sticky_model.id):
                         cached = self.health_checker.get_cached_status(sticky_model.id)
@@ -292,24 +320,26 @@ class AutoRouter:
                     "model_pk": model.id,
                     "model": model.model_id,
                     "eligible": False,
-                    "skip_reason": self._candidate_skip_reason(model),
+                    "skip_reason": self._candidate_skip_reason(model, profile),
                 }
                 for model in candidates
-                if self._candidate_skip_reason(model)
+                if self._candidate_skip_reason(model, profile)
             ])
         # 过滤（严格模式：跳过冷却/不健康的）
-        strict = self._filter_candidates(candidates)
+        strict = self._filter_candidates(candidates, profile)
         # 如果严格过滤后没有候选，且是在级联回退中，放松限制再用冷却中模型
         if not strict and exclude_model_ids:
-            # 仅排除 auto_excluded，不再排除冷却/健康状态
-            candidates = [m for m in candidates if not m.auto_excluded]
+            # 仅排除 auto_excluded，不再排除冷却/健康状态；能力闸不放松（模型能力是固有属性）
+            from .context_guard import media_mismatch_reason
+            candidates = [m for m in candidates
+                          if not m.auto_excluded and not media_mismatch_reason(m, profile)]
             print(f"[AUTO] relaxed filter: strict=0, relaxed={len(candidates)} candidates")
         else:
             candidates = strict
         if not candidates:
             return RouteResult(success=False, error="All candidates are unhealthy/rate-limited/excluded. Wait for refresh or add more models.")
         # v0.2: 用 RankingService 综合打分排序
-        candidates = await self._rank_candidates(candidates, session, conversation_id)
+        candidates = await self._rank_candidates(candidates, session, conversation_id, profile)
         # FIX: 移除并发轮转(_rr_counter)。轮转会把人工 priority_boost 权重高的候选
         # 整体旋转到后面，导致 fallback 先尝试低权重/已冷却模型而错过可用渠道。
         # priority_boost 是人工干预权重，应严格按排序降序尝试。

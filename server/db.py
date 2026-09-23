@@ -155,8 +155,11 @@ async def init_db():
         "ALTER TABLE providers ADD COLUMN model_refresh_interval_minutes INTEGER NOT NULL DEFAULT 60",
         "ALTER TABLE providers ADD COLUMN model_refresh_next_at TIMESTAMP DEFAULT NULL",
         "ALTER TABLE providers ADD COLUMN model_refresh_last_at TIMESTAMP DEFAULT NULL",
-        # v4.3: 指纹过滤开关（u1s1 竞品名/工具名遮蔽，默认开）+ 模型刷新来源
+        # v4.3: 指纹过滤开关（u1s1 竞品名/工具名遮蔽，默认开）
         "ALTER TABLE providers ADD COLUMN fingerprint_filter_enabled BOOLEAN NOT NULL DEFAULT 1",
+        # v4.3 能力感知路由：输入模态（NULL=未知）+ 最大输出 tokens
+        "ALTER TABLE models ADD COLUMN input_modalities JSON DEFAULT NULL",
+        "ALTER TABLE models ADD COLUMN max_output_tokens INTEGER DEFAULT NULL",
         # v4.3: 模型刷新来源追踪（online=上游列表 / seed=静态种子兜底）
         "ALTER TABLE model_refresh_logs ADD COLUMN list_source VARCHAR(20) DEFAULT 'unknown'",
         "ALTER TABLE model_refresh_logs ADD COLUMN list_note TEXT DEFAULT NULL",

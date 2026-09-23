@@ -392,14 +392,26 @@ class OpenAICompatAdapter(BaseAdapter):
                 if not model_id:
                     continue
                 is_free = 'free' in model_id.lower()
+                # v4.3：部分上游 /models 条目自带能力字段（context_length /
+                # architecture.input_modalities / max_completion_tokens，如 OpenRouter
+                # 转售系公益站），有则解析（capability_source=provider，可信）
+                arch = item.get("architecture") or {}
+                _im = arch.get("input_modalities")
+                mods = ([x for x in _im if isinstance(x, str)]
+                        if isinstance(_im, list) and _im else None)
+                _ctx = int(item.get("context_length") or 0)
+                _mo = int(item.get("max_completion_tokens") or 0)
                 models.append(ModelInfo(
                     model_id=model_id,
-                    display_name=model_id,
+                    display_name=item.get("name") or model_id,
                     is_free=is_free,
                     input_price=0.0,
                     output_price=0.0,
                     supports_streaming=True,
-                    context_length=0,
+                    context_length=_ctx,
+                    input_modalities=mods,
+                    max_output_tokens=_mo or None,
+                    supports_vision=bool(mods and "image" in mods) or bool(item.get("supports_vision")),
                     supports_reasoning_effort=infer_reasoning_effort_support("openai_compat", model_id)
                 ))
             return models

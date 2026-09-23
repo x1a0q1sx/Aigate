@@ -19,6 +19,9 @@ class ModelInfo:
     supports_vision: bool = False
     supports_reasoning_effort: Optional[bool] = None
     context_length: int = 4096
+    # v4.3 能力感知路由：上游声明的输入模态（None=未知）与最大输出 tokens
+    input_modalities: Optional[list] = None
+    max_output_tokens: Optional[int] = None
 @dataclass
 class HealthResult:
     status: str  # healthy / degraded / rate_limited / unhealthy

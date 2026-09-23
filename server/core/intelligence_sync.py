@@ -205,7 +205,13 @@ async def fetch_lmarena_scores() -> List[dict]:
 
 
 async def fetch_openrouter_models() -> Dict[str, dict]:
-    """拉取 OpenRouter 模型元数据，返回 {norm_id: {id, name, context_length, supports_reasoning}}。"""
+    """拉取 OpenRouter 模型元数据。
+
+    返回 {norm_id: {id, name, context_length, supports_reasoning,
+                    input_modalities, max_output_tokens}}。
+    v4.3：上游本就返回 architecture.input_modalities 与 top_provider.max_completion_tokens，
+    此前被丢弃——这是全仓唯一现成的「模态/输出容量」数据源，能力感知路由靠它回灌。
+    """
     data = await _http_get_json(OPENROUTER_MODELS_URL)
     if not data:
         return {}
@@ -215,11 +221,19 @@ async def fetch_openrouter_models() -> Dict[str, dict]:
         if not mid:
             continue
         sp = m.get("supported_parameters") or []
+        arch = m.get("architecture") or {}
+        im = arch.get("input_modalities")
+        top = m.get("top_provider") or {}
+        max_out = int(top.get("max_completion_tokens") or m.get("max_completion_tokens") or 0)
         result[_norm_name(mid)] = {
             "id": mid,
             "name": m.get("name") or "",
             "context_length": int(m.get("context_length") or 0),
             "supports_reasoning": any(p in sp for p in ("reasoning_effort", "reasoning")),
+            # 只保留有意义的模态集合（裸 ["text"] 与未知无区别，不写）
+            "input_modalities": ([x for x in im if isinstance(x, str)]
+                                 if isinstance(im, list) and len(im) > 1 else None),
+            "max_output_tokens": max_out or None,
         }
     logger.info("Fetched %d models from OpenRouter", len(result))
     return result
@@ -254,6 +268,17 @@ async def sync_intelligence(db: AsyncSession) -> int:
                 m.supports_reasoning_effort = True
                 m.capability_source = "openrouter"
                 metadata_filled += 1
+            # v4.3 能力回灌：模态 / 最大输出（capability_source=manual 的手动编辑永不覆盖）
+            if (getattr(m, "capability_source", "") or "") != "manual":
+                if or_entry.get("input_modalities") and not (getattr(m, "input_modalities", None) or []):
+                    im = or_entry["input_modalities"]
+                    m.input_modalities = im
+                    m.supports_vision = "image" in [x.lower() for x in im]
+                    m.capability_source = "openrouter"
+                    metadata_filled += 1
+                if or_entry.get("max_output_tokens") and not getattr(m, "max_output_tokens", None):
+                    m.max_output_tokens = int(or_entry["max_output_tokens"])
+                    metadata_filled += 1
 
         matched = _match_entry(m.model_id, entries)
         bridged = False

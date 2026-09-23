@@ -199,7 +199,10 @@ class ModelCatalog:
         auto_excluded: Optional[bool] = None,
         supports_reasoning_effort: Optional[bool] = None,
         request_overrides: Optional[dict] = None,
-        context_length: Optional[int] = None
+        context_length: Optional[int] = None,
+        supports_vision: Optional[bool] = None,
+        input_modalities: Optional[list] = None,
+        max_output_tokens: Optional[int] = None
     ) -> Optional[Model]:
         """更新模型配置"""
         model = await self.get_by_id(session, model_id)
@@ -239,6 +242,26 @@ class ModelCatalog:
             # P1-6: 手动改窗口 → 标记 manual，刷新/回填永不覆盖
             model.context_length = int(context_length)
             model.context_source = "manual"
+        # v4.3 手动能力编辑：写入即 capability_source=manual（刷新/回填不覆盖）
+        _cap_touched = False
+        if input_modalities is not None:
+            im = [str(x).strip().lower() for x in input_modalities if str(x).strip()]
+            model.input_modalities = im or None
+            _cap_touched = True
+        if supports_vision is not None:
+            model.supports_vision = bool(supports_vision)
+            # 正向声明 image 能力；False 不写模态集合（False≠已知仅文本）
+            if supports_vision:
+                im = list(model.input_modalities or ["text"])
+                if "image" not in im:
+                    im.append("image")
+                model.input_modalities = im
+            _cap_touched = True
+        if max_output_tokens is not None:
+            model.max_output_tokens = int(max_output_tokens) if max_output_tokens > 0 else None
+            _cap_touched = True
+        if _cap_touched:
+            model.capability_source = "manual"
         if request_overrides is not None:
             model.request_overrides = request_overrides
         await session.commit()
@@ -515,6 +538,16 @@ class ModelCatalog:
                 # 窗口只在仍为默认（4096 且无来源标记）时补齐，用户手动改过的窗口不动
                 if existing_model.context_length == 4096 and model_info.context_length != 4096                         and not (existing_model.context_source or ""):
                     existing_model.context_length = model_info.context_length
+                    existing_model.context_source = "provider"
+                # v4.3 能力感知：模态/最大输出（capability_source=manual 的手动编辑永不覆盖）
+                if (existing_model.capability_source or "") != "manual":
+                    if model_info.input_modalities and not (existing_model.input_modalities or []):
+                        existing_model.input_modalities = model_info.input_modalities
+                        existing_model.supports_vision = "image" in [
+                            str(x).lower() for x in model_info.input_modalities]
+                        existing_model.capability_source = "provider"
+                    if model_info.max_output_tokens and not existing_model.max_output_tokens:
+                        existing_model.max_output_tokens = int(model_info.max_output_tokens)
                 if remote_metadata:
                     existing_model.success_rate = remote_metadata.get("success_rate")
                     existing_model.avg_latency_ms = remote_metadata.get("avg_latency_ms")
@@ -538,6 +571,16 @@ class ModelCatalog:
                         # 不再自动开启 auto；免费模型需用户手动参与选举
                 updated += 1
             else:
+                # v4.3 能力入库：上游声明 > 名称推断（仅作正向提示，不参与硬拦截）> 未知
+                from server.core.model_capabilities import infer_modalities
+                _mods = model_info.input_modalities
+                _cap_src = "provider" if _mods else ""
+                if not _mods:
+                    _mods = infer_modalities(model_info.model_id)
+                    if _mods:
+                        _cap_src = "inferred"
+                _vision = bool(_mods and "image" in [str(x).lower() for x in _mods]) \
+                    or bool(model_info.supports_vision)
                 new_model = Model(
                     provider_id=provider.id,
                     model_id=model_info.model_id,
@@ -556,10 +599,13 @@ class ModelCatalog:
                     auto_enabled=auto_enabled,
                     enabled=True,
                     supports_streaming=model_info.supports_streaming,
-                    supports_vision=model_info.supports_vision,
+                    supports_vision=_vision,
                     supports_reasoning_effort=model_info.supports_reasoning_effort,
                     context_length=model_info.context_length,
                     context_source="default" if model_info.context_length == 4096 else "provider",
+                    input_modalities=_mods,
+                    max_output_tokens=model_info.max_output_tokens,
+                    capability_source=_cap_src,
                     priority_boost=0,
                     auto_excluded=False
                 )

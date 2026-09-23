@@ -129,6 +129,134 @@ def is_context_error(err_text: Any) -> bool:
     return any(p in t for p in _CONTEXT_ERROR_PATTERNS)
 
 
+# ── v4.3 能力感知路由：请求画像 + 模态闸 ──
+
+# 长上下文判定：估算输入超过该值即视为「长上下文请求」，排序偏向大窗口模型
+LONG_CONTEXT_THRESHOLD_TOKENS = 32768
+
+
+class RequestProfile:
+    """一次请求的能力需求画像（由 analyze_request 产出，全程只算一次）。"""
+    __slots__ = ("est_tokens", "has_image", "has_audio")
+
+    def __init__(self, est_tokens: int, has_image: bool = False, has_audio: bool = False):
+        self.est_tokens = est_tokens
+        self.has_image = has_image
+        self.has_audio = has_audio
+
+    @property
+    def is_long(self) -> bool:
+        return self.est_tokens >= LONG_CONTEXT_THRESHOLD_TOKENS
+
+
+def _part_media(p: Any) -> str:
+    """OpenAI/Anthropic 消息部件 → 媒体类型（""=纯文本）。"""
+    if not isinstance(p, dict):
+        return ""
+    t = (p.get("type") or "").lower()
+    if t in ("image_url", "image"):
+        return "image"
+    if t in ("input_audio", "audio"):
+        return "audio"
+    return ""
+
+
+def analyze_request(request: Any) -> RequestProfile:
+    """估算 token 的同时产出能力需求：是否含图片/音频部件。"""
+    est = estimate_request_tokens(request)
+    has_image = False
+    has_audio = False
+    for m in (getattr(request, "messages", None) or []):
+        content = getattr(m, "content", None)
+        if isinstance(content, list):
+            for p in content:
+                mt = _part_media(p)
+                if mt == "image":
+                    has_image = True
+                elif mt == "audio":
+                    has_audio = True
+    return RequestProfile(est, has_image, has_audio)
+
+
+def media_known_modalities(model: Any):
+    """模型的**可信**已知输入模态集合；None = 未知（不参与拦截判断）。
+
+    可信 = openrouter / provider / manual 来源的 input_modalities 列表。
+    "inferred"（名称启发式）不算可信：它只能证明「支持某模态」（用于排序加分），
+    不能证明「不支持另一模态」——拿它做硬拦截会把误判变成事故。
+    supports_vision=True 同理只是正向证据，不构成闭合集合。
+    """
+    if (getattr(model, "capability_source", "") or "") == "inferred":
+        return None
+    im = getattr(model, "input_modalities", None)
+    if isinstance(im, list) and im:
+        return {str(x).lower() for x in im}
+    return None
+
+
+def media_mismatch_reason(model: Any, profile: RequestProfile) -> str:
+    """返回拦截原因（非空=跳过该候选），空串=放行。
+
+    安全边界：只有「可信来源的闭合模态集合」（media_known_modalities）才参与拦截——
+    生产近 2/3 模型无模态标注，按「未知即不支持」拦截会造成大面积不可用。
+    真打错了由上游 4xx/5xx 兜底（context 类错误不进冷却）。
+    """
+    if not profile or (not profile.has_image and not profile.has_audio):
+        return ""
+    known = media_known_modalities(model)
+    if known is None:
+        return ""
+    if profile.has_image and "image" not in known:
+        return "需要图片输入，模型模态已知不含 image"
+    if profile.has_audio and "audio" not in known:
+        return "需要音频输入，模型模态已知不含 audio"
+    return ""
+
+
+def _positive_modalities(model: Any) -> set:
+    """模型「支持某模态」的正向证据（可信集合 + inferred + supports_vision 布尔）。"""
+    pos = set()
+    im = getattr(model, "input_modalities", None)
+    if isinstance(im, list):
+        pos |= {str(x).lower() for x in im}
+    if getattr(model, "supports_vision", False):
+        pos.add("image")
+    return pos
+
+
+def capability_preference(model: Any, profile: RequestProfile) -> float:
+    """排序偏好加分（非硬闸）：能力匹配的候选排前面。
+
+    - 多模态请求：已知/推断支持对应模态的模型 +10；
+    - 长上下文请求：窗口档位递进加分（≥1M +14，≥256K +10，≥128K +6，≥32K +2）；
+      未知窗口（context_length<=0）不加分也不惩罚（1653/2560 模型窗口未标定）。
+    上限 ~24 分，小于智力分/稳定性分的量级差，只影响"同档内"的相对顺序。
+    """
+    if not profile:
+        return 0.0
+    bonus = 0.0
+    if profile.has_image and "image" in _positive_modalities(model):
+        bonus += 10.0
+    if profile.has_audio and "audio" in _positive_modalities(model):
+        bonus += 10.0
+    if profile.is_long:
+        w = int(getattr(model, "context_length", 0) or 0)
+        obs = int(getattr(model, "observed_context_limit", 0) or 0)
+        if w > 0 and obs > 0:
+            w = min(w, obs)
+        elif w <= 0 and obs > 0:
+            w = obs
+        if w >= 1_000_000:
+            bonus += 14.0
+        elif w >= 256_000:
+            bonus += 10.0
+        elif w >= 128_000:
+            bonus += 6.0
+        elif w >= 32_000:
+            bonus += 2.0
+    return bonus
+
+
 _OUTPUT_RESERVE_TOKENS = 1024
 
 

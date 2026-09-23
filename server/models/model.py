@@ -35,6 +35,11 @@ class Model(Base):
     context_source = Column(String(50), nullable=True, default="")     # manual | openrouter | "" (default)
     capability_source = Column(String(50), nullable=True, default="")  # openrouter | "" (inferred)
     capabilities = Column(JSON, nullable=True, default=dict)
+    # v4.3 能力感知路由：输入模态列表（text/image/audio/pdf…）。
+    # NULL = 未知（绝不据此拦截请求——1653/2560 模型无模态信息，按拦截会造成大面积不可用）；
+    # 非空 = 已知支持集合，含 "image" 即 supports_vision。
+    input_modalities = Column(JSON, nullable=True, default=None)
+    max_output_tokens = Column(Integer, nullable=True, default=None)
     # v0.2 新增：人工手动冷却截止时间
     manual_cooldown_until = Column(DateTime, nullable=True)
     # 自动失败冷却（真实请求失败触发）：持久化，重启后继续保留

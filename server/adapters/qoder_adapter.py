@@ -660,12 +660,15 @@ class QoderAdapter(BaseAdapter):
             raise RuntimeError("qoder 模型目录拉取失败（检查连接/网络）")
         out = []
         for entry in cat["models"]:
+            _vl = bool(entry.get("is_vl"))
             out.append(ModelInfo(
                 model_id=entry["key"],
                 display_name=entry.get("display_name") or entry["key"],
                 is_free=False, input_price=0.0, output_price=0.0,
                 supports_streaming=True,
-                supports_vision=bool(entry.get("is_vl")),
+                supports_vision=_vl,
+                # provider 显式声明视觉能力 → 可信模态（能力感知路由据此拦截）
+                input_modalities=(["text", "image"] if _vl else None),
                 context_length=int(entry.get("max_input_tokens") or 131072),
             ))
         return out

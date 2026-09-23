@@ -603,6 +603,7 @@ _MODEL_FIELDS = (
     "enabled", "auto_enabled", "auto_excluded", "supports_streaming",
     "supports_vision", "context_length", "priority_boost", "is_manual",
     "supports_reasoning_effort",
+    "input_modalities", "max_output_tokens",   # v4.3 能力（换机迁移不丢）
     "request_overrides", "pricing_source",
 )
 
@@ -1194,7 +1195,10 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         auto_excluded=data.auto_excluded,
         supports_reasoning_effort=data.supports_reasoning_effort,
         request_overrides=data.request_overrides,
-        context_length=data.context_length
+        context_length=data.context_length,
+        supports_vision=data.supports_vision,
+        input_modalities=data.input_modalities,
+        max_output_tokens=data.max_output_tokens
     )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")

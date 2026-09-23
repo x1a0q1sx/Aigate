@@ -101,6 +101,10 @@ class ModelInfoResponse(BaseModel):
     context_length: int
     context_source: Optional[str] = ""
     capability_source: Optional[str] = ""
+    # v4.3 能力感知路由：模态/输出容量/实测窗口（None=未知）
+    input_modalities: Optional[list] = None
+    max_output_tokens: Optional[int] = None
+    observed_context_limit: Optional[int] = None
     full_id: str
     provider_name: str = ""
     # v2.0 新增
@@ -142,6 +146,12 @@ class ModelInfoResponse(BaseModel):
             supports_vision=model.supports_vision,
             supports_reasoning_effort=getattr(model, "supports_reasoning_effort", None),
             context_length=model.context_length,
+            # P1-6 声明了却从未透传的来源标记 / v4.3 能力字段——一并补上
+            context_source=getattr(model, "context_source", "") or "",
+            capability_source=getattr(model, "capability_source", "") or "",
+            input_modalities=getattr(model, "input_modalities", None),
+            max_output_tokens=getattr(model, "max_output_tokens", None),
+            observed_context_limit=getattr(model, "observed_context_limit", None),
             full_id=model.full_id,
             provider_name=model.provider.name if hasattr(model, 'provider') and model.provider else "",
             priority_boost=getattr(model, 'priority_boost', 0),
@@ -163,6 +173,10 @@ class ModelUpdate(BaseModel):
     auto_excluded: Optional[bool] = None
     supports_reasoning_effort: Optional[bool] = None
     context_length: Optional[int] = None  # P1-6: 手动改窗口 → context_source=manual（刷新不覆盖）
+    # v4.3: 手动能力编辑（写入即 capability_source=manual，刷新/同步永不覆盖）
+    supports_vision: Optional[bool] = None
+    input_modalities: Optional[List[str]] = None
+    max_output_tokens: Optional[int] = None
     # v3.4: per-model request overrides (headers/body_patch/model_alias)
     request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):
