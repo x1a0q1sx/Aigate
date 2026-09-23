@@ -111,7 +111,12 @@
                 <span v-if="r.removed" style="color: var(--danger);"> -{{ r.removed }}</span>
                 <span v-if="!r.added && !r.removed && r.status === 'success'" style="color: var(--gray-500);">无变化</span>
               </td>
-              <td style="font-family: monospace; font-size: 12px;">{{ r.pricing_updated ? '价' + r.pricing_updated : '-' }}</td>
+              <td style="font-family: monospace; font-size: 12px;">
+                {{ r.pricing_updated ? '价' + r.pricing_updated : '-' }}
+                <!-- 来源：seed=上游无模型列表端点，回退内置种子；pricing=定价接口兜底建模。非真实拉取，标警告色 -->
+                <span v-if="r.list_source === 'seed'" class="badge badge-warning" style="font-size: 10px; margin-left: 4px;" :title="r.list_note || '静态种子兜底'">种子</span>
+                <span v-else-if="r.list_source === 'pricing'" class="badge badge-warning" style="font-size: 10px; margin-left: 4px;" :title="r.list_note || '定价兜底'">定价</span>
+              </td>
               <td></td>
               <td><button class="btn btn-outline btn-sm" @click="showDetail(r)">详情</button></td>
             </tr>
@@ -421,6 +426,15 @@
             </tr>
             <tr v-if="detailRow.pricing_source">
               <td class="k">定价来源</td><td class="v" colspan="3" style="font-family: monospace; font-size: 12px; word-break: break-all;">{{ detailRow.pricing_source }}</td>
+            </tr>
+            <tr v-if="detailRow.list_source && detailRow.list_source !== 'unknown'">
+              <td class="k">列表来源</td>
+              <td class="v" colspan="3">
+                <span :class="['badge', detailRow.list_source === 'online' ? 'badge-success' : 'badge-warning']" style="font-size: 11px;">
+                  {{ detailRow.list_source === 'online' ? '在线拉取' : (detailRow.list_source === 'seed' ? '静态种子兜底' : '定价兜底') }}
+                </span>
+                <span v-if="detailRow.list_note" style="color: var(--gray-500); font-size: 12px; margin-left: 8px;">{{ detailRow.list_note }}</span>
+              </td>
             </tr>
             <tr v-if="detailRow.error">
               <td class="k">错误</td><td class="v" colspan="3" style="color: var(--danger); word-break: break-all;">{{ detailRow.error }}</td>

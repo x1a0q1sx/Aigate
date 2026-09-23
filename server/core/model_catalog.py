@@ -285,6 +285,8 @@ class ModelCatalog:
                        (f"定价源: {str(pricing_err)[:300]}" if pricing_err else None)),
                 added_models=json.dumps(result.get("added_models") or [], ensure_ascii=False)[:4000],
                 removed_models=json.dumps(result.get("removed_models") or [], ensure_ascii=False)[:4000],
+                list_source=result.get("list_source") or "unknown",
+                list_note=(result.get("list_note") or "")[:500] or None,
             )
             session.add(row)
             await session.commit()
@@ -370,6 +372,10 @@ class ModelCatalog:
         key_models: Dict[int, set] = {}            # api_key_id -> {model_id, ...}
         all_model_infos: Dict[str, ModelInfo] = {} # model_id -> ModelInfo（并集，保留首个）
         any_success = False
+        # 列表数据来源：online=上游真实返回；seed=OAuth 静态种子兜底（非真实拉取）；
+        # pricing=定价接口兜底建模。落 model_refresh_logs 供分析页辨别「看起来没变其实没拉到」。
+        list_source = "online"
+        list_note = ""
         atomcode_no_key = (provider.api_type == "atomcode")
 
         if atomcode_no_key:
@@ -407,6 +413,8 @@ class ModelCatalog:
                 except Exception as e:
                     logger.warning(f"oauth list_models failed for {provider.name}: {e}")
             if not any_success and oauth_p and oauth_p.static_models:
+                list_source = "seed"  # 在线列表失败，改用静态种子兜底
+                list_note = f"静态种子兜底（{len(oauth_p.static_models)}个）"
                 any_success = True
                 for sm in oauth_p.static_models:
                     all_model_infos.setdefault(sm["model_id"], ModelInfo(
@@ -653,5 +661,9 @@ class ModelCatalog:
             "pricing_updated": pricing_updated,
             "metric_updated": metric_updated,
             "pricing_source": pricing_result.source_url,
+            "list_source": list_source if any_success else None,  # online/seed/pricing
+            "list_note": list_note if list_note else (
+                "在线列表成功" if list_ok else ("上游不可用（种子兜底）" if list_source=="seed" else None)
+            ),
             "pricing_error": pricing_result.error,
         }

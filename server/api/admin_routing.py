@@ -481,6 +481,8 @@ async def list_request_logs(
                 "metric_updated": r.metric_updated or 0,
                 "pricing_source": r.pricing_source,
                 "error": r.error,
+                "list_source": getattr(r, "list_source", None) or "unknown",
+                "list_note": getattr(r, "list_note", None),
                 "added_models": _jarr(r.added_models),
                 "removed_models": _jarr(r.removed_models),
                 "created_at": r.created_at.isoformat() if r.created_at else None,

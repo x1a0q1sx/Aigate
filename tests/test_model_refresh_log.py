@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 
 from server.models.base import Base
 from server.models.provider import Provider
+from server.models.model import Model
 from server.models.model_refresh_log import ModelRefreshLog
 from server.models.request_log import RequestLog
 from server.core.model_catalog import ModelCatalog
@@ -18,7 +19,8 @@ async def _setup(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/r.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all,
-                            tables=[Provider.__table__, ModelRefreshLog.__table__, RequestLog.__table__])
+                            tables=[Provider.__table__, Model.__table__,
+                                    ModelRefreshLog.__table__, RequestLog.__table__])
     Session = async_sessionmaker(engine, expire_on_commit=False)
     async with Session() as db:
         p = Provider(name="p1", base_url="https://x/v1", enabled=True)
@@ -112,6 +114,8 @@ async def test_logs_endpoint_refresh_type(tmp_path):
         # 默认仍是请求日志（向后兼容），且带 log_type 标记
         d2 = await list_request_logs(page=1, page_size=10, status=None, provider=None, db=db)
         assert d2["total"] == 1 and d2["items"][0]["log_type"] == "request"
+        # 来源追踪字段透出（v4.3）：老数据无值 → "unknown"
+        assert it["list_source"] == "unknown" and it["list_note"] is None
         # 状态筛选在 refresh 类型下映射 ok
         d3 = await list_request_logs(page=1, page_size=10, status="error", provider=None,
                                      log_type="refresh", db=db)
@@ -121,3 +125,75 @@ async def test_logs_endpoint_refresh_type(tmp_path):
                                      log_type="refresh", db=db)
         assert d4["total"] == 0
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_seed_fallback_is_labeled(tmp_path, monkeypatch):
+    """v4.3: OAuth 在线列表失败 → 静态种子兜底时，日志必须标 list_source=seed（不再伪装在线拉取）。
+
+    这正是 CodeBuddy 类服务商的处境：无 /v2/models 端点，永远走种子回退。
+    """
+    engine, Session, pid = await _setup(tmp_path)
+    async with Session() as db:
+        p = await db.get(Provider, pid)
+        p.credential_type = "oauth"
+        p.oauth_code = "codebuddy_intl"
+        await db.commit()
+
+    from server.core import oauth_client as oc_mod
+
+    class _NoTokenClient:
+        async def pick_access_token(self, code, session, owner="__default"):
+            return None  # 无 token → 直接走种子兜底
+
+    monkeypatch.setattr(oc_mod, "get_oauth_client", lambda: _NoTokenClient())
+
+    async def _no_pricing(base_url, timeout=None):
+        class _R:
+            pricing = {}
+            source_url = ""
+            error = ""
+        return _R()
+
+    from server.core import model_catalog as mc
+    monkeypatch.setattr(mc, "fetch_provider_pricing", _no_pricing)
+
+    cat = ModelCatalog()
+    async with Session() as db:
+        p = await db.get(Provider, pid)
+        r = await cat.refresh_models_from_provider(db, p, None)
+        assert "error" not in r, r
+        assert r["list_source"] == "seed"
+        assert "种子" in (r["list_note"] or "")
+    async with Session() as db:
+        row = (await db.execute(select(ModelRefreshLog))).scalars().first()
+        assert row.ok is True
+        assert row.list_source == "seed"
+        assert "种子" in (row.list_note or "")
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_codebuddy_intl_seed_has_deepseek_v41_flash(tmp_path, monkeypatch):
+    """回归：国际版种子必须含群友反馈的 deepseek-v4.1-flash，且剔除已下架的旧名。
+
+    2026-09-23 实测：codebuddy_intl 在线列表不可用（404 无该端点），
+    种子是唯一兜底来源——种子错了就表现为「模型列表不对」。
+    """
+    from server.core.oauth_registry import get_oauth_provider
+
+    intl = get_oauth_provider("codebuddy_intl")
+    assert intl is not None
+    ids = {m["model_id"] for m in intl.static_models}
+    assert "deepseek-v4.1-flash" in ids, "国际版种子缺 deepseek-v4.1-flash"
+    assert "gpt-6-astra" in ids and "gemini-3.5-flash" in ids, "国际版独有模型未入种子"
+    # 已下架（11102 model service info not found）不得残留
+    for gone in ("deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v3-2-volc",
+                 "glm-4.7", "minimax-m2.7"):
+        assert gone not in ids, f"{gone} 已从上游下架，不应留在国际种子"
+
+    cn = get_oauth_provider("codebuddy_cn")
+    cn_ids = {m["model_id"] for m in cn.static_models}
+    assert "deepseek-v4.1-flash" in cn_ids and "deepseek-v4-pro" in cn_ids
+    assert "glm-5.0" not in cn_ids  # CN 已下架
+
