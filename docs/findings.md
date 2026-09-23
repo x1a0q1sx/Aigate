@@ -303,3 +303,35 @@
   codex `function_call_arguments.delta` 按 item_id 建槽/别名（此前按 call_id 查恒落空，
   逐片参数静默丢弃）；force_stream 注入 `stream_options.include_usage`（否则聚合 usage 恒 0）；
   内置价表改最长前缀匹配（此前 `gpt-4o-mini-*` 命中 `gpt-4o` 档，高估 30 倍）。
+
+## F19 模态覆盖率：现状量化与下一步（v4.4 收尾）
+- 生产基线（v4.3 交付时）：总 2590 模型，模态已知 1178（45%），未知 1412（55%）。
+- **先把"影响面"量化清楚**（避免过度投入）：模态硬闸只在 **Auto 选举**与 **combo 预检**生效；
+  combo 目标由用户显式配置（不参与自动选路），直连请求根本不走闸。生产 Auto 参与仅 40 个
+  模型（其中未知 25 个）——所以"55% 未知"听起来吓人，**真实暴露面是 25 个 Auto 候选**。
+- 未知模型的 provider 分布（Top）：openrouter官方 165 / 哈吉米付费 164 / Cline 158 /
+  huggingface 102 / 星见雅 90 / imagic 75 / NVIDIA NIM 71 …（多为公益站与聚合站）。
+- **已落地的快速见效**（本轮完成，无需改代码）：`openrouter官方` 那 165 个是**本地行未刷新**
+  （v4.3 才加的解析代码，这些行建于代码之前）。执行一次 provider 刷新：
+  added=26 / updated=432 / removed=13，该 provider 未知 **165 → 0**；
+  全库覆盖率 **45% → 52%**（已知 1178 → 1358），`capability_source='provider'` 0 → 180。
+- **下一步（按性价比排序，均未实施）**：
+  1) **补第二数据源 models.dev**（实测可行，收益最大）：`https://models.dev/api.json`
+     （4.9MB，3666 个去重模型，带 `modalities.input`；含 image 1998 / 纯 text 1578）。
+     对当前 1410 个未知模型实测覆盖 **758 个（54%）**，其中**可补多模态 239 个**
+     （正是视觉请求路由最需要的）、可补纯文本 519 个、未覆盖 621 个。
+     接入方式与 OpenRouter 同构（`intelligence_sync` 加一个 fetcher + 回填分支，
+     `capability_source='models.dev'`，manual 仍不覆盖）。注意它按 provider 组织，
+     同一 model_id 多 provider 出现 → 取模态并集（宽松侧）。
+  2) **刷新全部聚合站/公益站 provider**：凡是上游 /models 自带
+     `architecture.input_modalities` 的（NewAPI 系转售 OpenRouter 的站），刷新即自动补齐
+     （openai_compat 适配器已支持解析）。可在模型页逐个刷新，或后续加"批量刷新全部服务商"。
+  3) **名称启发式扩容**：当前 `infer_modalities` 只覆盖有限 tag；生产有 248 个未知模型的
+     名称带视觉系特征（vl / vision / claude-opus|sonnet / gpt-4o / gemini / llava / pixtral…）。
+     **注意安全边界**：inferred 只做正向提示、不参与硬闸（这是刻意设计——inferred 能证明
+     "支持 X"，永远不能证明"不支持 Y"）。扩容可提升排序偏好命中率，但不该放宽闸门。
+  4) 剩余 ~620 个（私有站自研模型名）无公开数据源可查 → 只能手动标注或维持"未知→放行"。
+- 结论：**不建议为覆盖率做激进改造**。当前"未知→放行"是安全侧默认（漏拦 ≠ 误杀），
+  真实损失是"含图请求可能仍选到不支持图片的模型"——而这仅影响 Auto 的 25 个候选，
+  且候选排序已对视觉请求加偏好分。优先做第 1 项（models.dev）即可把可补的多模态
+  239 个补上，性价比最高。

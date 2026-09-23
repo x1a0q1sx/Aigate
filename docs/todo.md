@@ -69,6 +69,14 @@
 - [x] P2-16 force_stream 聚合 usage 恒 0 → 注入 `stream_options.include_usage`
 - [x] P2-17 内置价表子串匹配错档（gpt-4o-mini 命中 gpt-4o）→ 最长前缀匹配
 
+### P1-10 模态覆盖率提升（🔍 已完成量化与快赢，下一步待排期，findings §F19）
+- [x] 量化影响面：硬闸只作用于 Auto 选举（40 候选，未知 25）+ combo 预检；直连不走闸 → 暴露面有限
+- [x] 快赢：刷新 `openrouter官方` provider（本地行建于解析代码之前）→ 该站未知 165→0，全库 45%→52%
+- [ ] **补 models.dev 第二数据源**（实测可补 758/1410，含多模态 239）——性价比最高，待排期
+- [ ] 批量刷新聚合站/公益站（上游自带 modalities 的站刷新即补）
+- [ ] 名称启发式扩容（248 个视觉系名称；仅正向提示，不放宽硬闸）
+- 剩余 ~620 私有站模型无公开源，维持"未知→放行"（安全侧默认）
+
 ## P2 — 体验与扩展
 
 - [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）
