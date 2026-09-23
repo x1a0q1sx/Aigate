@@ -36,6 +36,9 @@ class AutoRouterConfig(BaseModel):
 class RateLimitConfig(BaseModel):
     default_rpm: int = 60
     default_tpm: int = 100000
+    # P2: 日限（0 = 不限）。此前 rpd/tpd 只增不减也从不检查，等于永不生效。
+    default_rpd: int = 0
+    default_tpd: int = 0
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     file: Optional[str] = None

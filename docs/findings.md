@@ -206,3 +206,97 @@
      （保存即 capability_source=manual）；/v1/models capabilities 输出扩展。
 - 遗留（如实说明）：模态覆盖率取决于 OpenRouter 命中与服务商自声明；
   长尾私有站模型仍会是「未知→放行」，手动编辑兜底；max_output 暂不参与预检 reserve。
+
+## F17 订阅制上游"倍率"（credit multiplier）数据源与落地（v4.4）
+- 背景（用户）：「codebuddy、qoder 获取到的都是倍率吧，他们的价格可以改成倍率吗？
+  这样比较好分辨哪个是免费的」——订阅制上游没有 USD 单价，价格列恒显 $0，无法分辨贵贱。
+- 数据源调研（实测，非推测）：
+  1) **Qoder 有官方字段**：模型目录 `/algo/api/v2/model/list`（COSY 签名）每条带
+     `price_factor`（0.0 / 0.1 / 0.5 / 2.0…）+ `original_price_factor` + `is_free`。
+     生产账号实测 15 条：qfmodel 0.0（免费）/ gfmodel 0.1 / dfmodel 0.1 / mmodel 0.2 /
+     efficient 0.3 / auto 0.5 / qmodel_38max 0.5 / dmodel 0.5 / kmodel 0.8 / gmodel 0.8 /
+     kmodel_latest 1.4 / performance 1.1 / ultimate 2.0。**这是唯一可靠的动态源**。
+  2) **CodeBuddy 无服务端倍率**：40+ 候选端点（含 /v2/config、/v3/config、
+     /v2/plugin/model/list、/v2/billing/meter/get-model-resource、/v2/update、
+     /v2/plugin/versions、CDN download.codebuddy.cn 等）全部 404/500/无倍率字段；
+     chat 响应只带 token usage。倍率只存在于**官方客户端**：
+     - WorkBuddy 桌面端 `resources/app.asar.unpacked/cli/product.json` 的 models 数组
+       带 `credits: "x0.16 credits"` 形态（endpoint=copilot.tencent.com → CN SaaS 版）；
+     - CodeBuddy IDE 客户端日志（CraftInvokableAgent 的 model: 行）带完整模型元数据，
+       含 `credits`——**带时间戳**，可解冲突（deepseek-v4-flash 2026-08-20 为 x0.17、
+       08-21 起改 x0.08）。
+- 落地（v4.4）：
+  1) Model 新列 `price_ratio`（NULL=未知 / 0.0=免费）+ `price_ratio_source`
+     （qoder | codebuddy | provider | manual）。**与 input_price/output_price 完全分离**
+     ——倍率不参与 USD 成本核算（订阅制没有美元口径，混算会污染账单）。
+  2) Qoder 适配器 `list_models` 解析 `price_factor`（异常值降级 None；0.0 同时标 is_free）。
+  3) CodeBuddy 静态表 `STATIC_PRICE_RATIOS`（oauth_registry）：只收录**有直接证据**的值
+     （product.json + 客户端日志），未列出的留 NULL 不猜；按 provider 分别维护
+     （国际版种子已剔除 deepseek 系，倍率表也同步剔除——由测试守住）。
+  4) 刷新写入：在线值优先；`manual` 永不覆盖（与 USD 价格同规则）；种子兜底路径也带倍率。
+  5) 前端：模型页价格列在 `price_ratio` 非空时**改显倍率**（免费绿标 / ≤0.3 蓝标 /
+     ≥1.5 黄标 + 来源 tooltip），编辑弹窗新增倍率输入（含清空开关 → 回到未知）。
+     `/v1/models` 输出 `price_ratio`。
+- 遗留（如实说明）：CodeBuddy 倍率随客户端版本变化，静态表会过期（未列出的模型显"未知"）；
+  客户端升级后需重新从 product.json / 日志提取。Qoder 走在线目录不受影响。
+
+## F18 隐藏 bug 审计第二批（P1 × 13 + P2 × 5，v4.4）
+- 基线：docs/findings-bughunt-2026-09-18.md（HEAD=469e6b2 审计）。第一批（89e5b2a）清了
+  P0 与 10 项 P1；本批修复剩余 13 项 P1 + 5 项 P2。全部先回读源码核实再改，新增 51 项测试。
+- P1-4 session sticky 三重失效：① `v1_router` 每请求 `uuid4()` 当 key → 永不可命中
+  （`session_sticky_minutes` 形同虚设）；② 缓存只增不清（无界增长）；③ 用 naive
+  `datetime.utcnow().timestamp()` 比较（按本地时区折算，UTC+8 下刚写入即"过期"）。
+  另 `get_best_candidate` 的 3 处 `return None` 违反调用方 `.success` 契约 → AttributeError。
+  修法：新增 `client_ip.derive_conversation_id()`（优先客户端 `x-conversation-id`/
+  `x-session-id` 头，否则按「客户端 IP + system + 首条 user」派生稳定哈希）；
+  sticky 改用 `time.monotonic()` + 容量上限（4096，超限淘汰最旧到半量）；
+  深层嵌套重构为 `_try_sticky_candidate()`，所有失败分支统一 `return None` 由调用方回落选举。
+  注意：日志/route_decision trace 仍用**每请求 uuid4**（并发安全），sticky 用独立键。
+- P1-5 auto 非流式级联丢内部头：`v1_router` 直接 `candidate.provider.headers`，未合
+  `__oauth/__proxy_force/__fg` → 强制代理/指纹过滤开关静默失效。修法：统一走
+  `_merge_oauth_headers` 并叠加 `candidate.extra_headers`。
+- P1-6 request_overrides 路径不一致：仅「直连」与「combo 非流式」生效，combo 流式与
+  auto 级联（流式/非流式）缺 model_alias/body_patch。修法：抽出
+  `_apply_request_overrides(request, model, extra_headers)`，5 条出站路径统一调用。
+- P1-7 fusion judge 决策被吞：`fusion.py` 写 `attempt="judge"`（str）→ `route_decision`
+  `int()` ValueError → 同 try 的 select+finish 一起跳过（明细永久丢失 + `_active` 泄漏）。
+  修法：`add_attempt` 对非数字 attempt 降级为字符串（不再抛）。
+- P1-10 rate_limiter upsert 死代码：通用 `sqlalchemy.insert` 没有 `.on_conflict_do_nothing`
+  → 恒 AttributeError 静默落 except；降级路径裸 `add+commit` 并发首建抛 IntegrityError
+  冒穿请求路径。修法：按 `IS_SQLITE` 选方言版 insert；兜底 commit 包 IntegrityError →
+  rollback + re-query。
+- P1-12 headroom 从未接线：`is_in_headroom_cooling` 全仓零调用（额度保留只是展示）。
+  修法：`get_best_candidate` 一次性取 provider 级已用量，循环内跳过触达阈值者；
+  统计失败不拦（安全默认，绝不因统计故障饿死候选）。
+- P1-14 OAuth single-flight 假成功 + InvalidStateError：合并方丢弃 leader 结果无条件
+  `return True`；且 `wait_for` 超时会 **cancel 共享 Future** → leader `set_result` 抛
+  InvalidStateError 穿透到请求路径（500）。修法：合并方 `shield` 等待并回传真实结果；
+  set 前判 `fut.done()`。
+- P1-15 刷新失败一律永久下线：任意 ≥400 都 `is_active=False` → 上游一次 429/502/超时
+  就把连接判死刑（调度器只扫 active → 须人工重登）。修法：新增
+  `_refresh_credential_dead(status, text)`——401 恒失效、400/403/404 需带
+  invalid_grant 类标记、429/5xx 一律临时；三处刷新分支（通用/codebuddy×2/cline×2）全部接入。
+- P1-17 手改价格标记被刷新抹掉：`manual_priced` 算出来后，`pricing_source = source_url`
+  在 remote 分支内**无守卫** → 标记丢失，下轮刷新直接覆盖用户价格；另 success_rate 等
+  指标远程缺字段时以 None 抹掉旧值。修法：source 写入移入 `not manual_priced`；
+  四项指标加 `is not None` 守卫。
+- P1-18 智力分手工校准永不生效：面板 upsert 不传 `source`（默认 "arena"），而同步侧
+  免覆盖要求 `source=="manual"` → 手调分数每周被覆盖。修法：两个分支都写 `source="manual"`。
+- P1-20 delete_provider 清理是死代码：先 DELETE 再 SELECT model ids → 查询恒空，
+  HC 内存清理成死代码；HealthCheck/RateLimitState/ModelApiKey 留孤儿行。
+  `delete_key` 不清 KeyRotator 进程内状态（SQLite rowid 复用 → 新 key 继承旧冷却）。
+  修法：SELECT 前移；补三张关联表清理；新增 `KeyRotator.forget_key()`（清熔断+游标）
+  并在 `delete_key` 调用。
+- P1-21 明文密钥无二次鉴权：`/providers/export?include_keys=true`（明文上游密钥+refresh
+  token）、`/keys/{id}/reveal`、`/aigate-key?reveal=true` 仅靠会话 Cookie——被盗会话
+  一个 fetch 拖走全部明文密钥。修法：三处挂 `_require_admin_reauth`；前端配套
+  `prompt()` 询问密码（Dashboard 明文密钥改为按需揭示，掩码走新 `masked` 字段）。
+- P1-22 Gemini 流式名不副实：`gemini_to_chat` 硬编码 `stream=False` →
+  streamGenerateContent 实际等全文完成；`chunk_to_gemini` 丢弃 tool_calls、吞网关
+  终态 error；SSE 生成器无 finally aclose。修法：stream 参数由 action 传入；
+  chunk 转 functionCall 分片 + 错误事件透出；生成器加 finally aclose。
+- P2 数项：`_raw_response` 返回前 pop（此前随错误体泄漏上游原始报文）；
+  RPD/TPD 日窗口重置 + 纳入 check_limit（此前只增不减、从不检查，日限永不生效）；
+  codex `function_call_arguments.delta` 按 item_id 建槽/别名（此前按 call_id 查恒落空，
+  逐片参数静默丢弃）；force_stream 注入 `stream_options.include_usage`（否则聚合 usage 恒 0）；
+  内置价表改最长前缀匹配（此前 `gpt-4o-mini-*` 命中 `gpt-4o` 档，高估 30 倍）。

@@ -24,6 +24,9 @@ from .key_manager import KeyManager
 from .rate_limiter import RateLimiter
 from .ranking_service import RankingService
 config = get_config()
+
+# P1-4: sticky 缓存容量上限（超过则先清过期、再按写入时间淘汰最旧）
+_STICKY_CACHE_MAX = 4096
 @dataclass
 class RouteResult:
     success: bool
@@ -51,14 +54,16 @@ class AutoRouter:
         self.key_manager = key_manager
         self.rate_limiter = rate_limiter or RateLimiter(
             default_rpm=config.rate_limit.default_rpm,
-            default_tpm=config.rate_limit.default_tpm
+            default_tpm=config.rate_limit.default_tpm,
+            default_rpd=getattr(config.rate_limit, "default_rpd", 0) or 0,
+            default_tpd=getattr(config.rate_limit, "default_tpd", 0) or 0,
         )
         self.config = config.auto_router
         self.ranking_service = RankingService()
 
 
-        # session sticky 缓存: conversation_id -> (model_id, timestamp)
-        self._sticky_cache: Dict[str, tuple[int, datetime]] = {}
+        # session sticky 缓存: conversation_id -> (model_id, time.monotonic())
+        self._sticky_cache: Dict[str, tuple[int, float]] = {}
     def _sort_candidates(
         self,
         candidates: List[Model],
@@ -216,97 +221,13 @@ class AutoRouter:
         """获取当前最优候选。profile（v4.3 能力画像）非空时：
         sticky 与候选过滤叠加模态硬闸，排序叠加能力偏好加分。"""
         exclude_model_ids = exclude_model_ids or set()
-        # session sticky
+        # session sticky（P1-4：内部任何一步不成立都**回落到正常选举**，
+        # 不再 return None——调用方无条件读 .success，None 会炸 AttributeError）
         if conversation_id:
-            sticky_model_id = self._get_sticky_model(conversation_id)
-            if sticky_model_id:
-                sticky_model = await self.model_catalog.get_by_id(session, sticky_model_id)
-                if sticky_model and sticky_model.id not in exclude_model_ids and sticky_model.enabled and sticky_model.auto_enabled and not sticky_model.auto_excluded:
-                    # v4.3: 请求含图片/音频而 sticky 模型模态已知不支持 → 放走 sticky
-                    from .context_guard import media_mismatch_reason
-                    if media_mismatch_reason(sticky_model, profile):
-                        return None
-                    # 仍然有效，直接用
-                    if not self.health_checker or not self.health_checker.is_cooling(sticky_model.id):
-                        cached = self.health_checker.get_cached_status(sticky_model.id)
-                        if not cached or cached.status not in ["unhealthy", "rate_limited"]:
-                            # 可用
-                            provider = await session.get(Provider, sticky_model.provider_id)
-                            # v4.0: 服务商被禁用 → sticky 失效，走正常候选选举
-                            if provider is not None and getattr(provider, "enabled", True):
-                                # Free Tier / OAuth — key 可空
-                                api_key = None
-                                key_id_for_rate = None
-                                _sticky_extra = None
-                                if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
-                                    if provider.credential_type == "oauth":
-                                        # 走统一解析器：u1s1 需在附加头里带 __dpop 标记，
-                                        # 裸 pick_access_token 会把设备凭证当 Bearer 发出去
-                                        try:
-                                            from server.core.credential_resolver import resolve_credential_async
-                                            _rc_s = await resolve_credential_async(provider, sticky_model, session)
-                                        except Exception:
-                                            _rc_s = None
-                                        if _rc_s is None or not _rc_s.ok:
-                                            return None   # OAuth 未连接，放走
-                                        api_key = _rc_s.api_key
-                                        _sticky_extra = _rc_s.extra_headers
-                                    else:
-                                        api_key = ""
-                                else:
-                                    # 获取 key（v3.5：按模型归属 key 集合选）
-                                    try:
-                                        from server.core.key_rotator import get_key_rotator
-                                        _picked = await get_key_rotator().pick_key_for_model(session, sticky_model)
-                                    except Exception:
-                                        _picked = None
-                                    if _picked and _picked[0] is not None:
-                                        key_id_for_rate, api_key = _picked
-                                    else:
-                                        return None
-                                if not api_key and api_key != "":
-                                    return None
-                                # 防 MissingGreenlet：provider 属性可能已过期
-                                try:
-                                    await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
-                                except Exception:
-                                    pass
-                                adapter = create_adapter_for_provider(provider.api_type)
-                                # resolver 附加头已含 __oauth/provider 头（u1s1 另含 __dpop 标记）；
-                                # 非 oauth 保持原语义 None
-                                _extra = None
-                                if getattr(provider, "credential_type", "") == "oauth":
-                                    _extra = dict(_sticky_extra or {"__oauth": True})
-                                if getattr(provider, "proxy_enabled", False):
-                                    _extra = {**(_extra or {}), "__proxy_force": True}
-                                from .route_decision import capture_candidates, mark_selected
-                                capture_candidates(conversation_id, [{
-                                    "rank": 1,
-                                    "model_pk": sticky_model.id,
-                                    "provider": provider.name,
-                                    "model": sticky_model.model_id,
-                                    "eligible": True,
-                                    "selected": True,
-                                    "selection_reason": "session sticky",
-                                }])
-                                mark_selected(
-                                    conversation_id,
-                                    provider=provider.name,
-                                    model=sticky_model.model_id,
-                                    model_pk=sticky_model.id,
-                                    reason="session sticky",
-                                )
-                                return RouteResult(
-                                    success=True,
-                                    model=sticky_model,
-                                    provider=provider,
-                                    api_key=api_key,
-                                    key_id=key_id_for_rate,
-                                    adapter=adapter,
-                                    fallback_count=0,
-                                    extra_headers=_extra,
-                                    selection_reason="session sticky",
-                                )
+            sticky_result = await self._try_sticky_candidate(
+                session, conversation_id, exclude_model_ids, profile)
+            if sticky_result is not None:
+                return sticky_result
         # 获取所有候选
         candidates = await self.model_catalog.get_auto_candidates(session)
         if not candidates:
@@ -340,11 +261,36 @@ class AutoRouter:
             return RouteResult(success=False, error="All candidates are unhealthy/rate-limited/excluded. Wait for refresh or add more models.")
         # v0.2: 用 RankingService 综合打分排序
         candidates = await self._rank_candidates(candidates, session, conversation_id, profile)
+        # P1-12: headroom（额度保留）此前只是展示，从未参与路由。这里一次性
+        # 取出「今日已用 ≥ 阈值的 provider 集合」，循环内跳过其候选。
+        # 取不到数据时不拦（安全默认：绝不因统计失败而饿死候选）。
+        _headroom_blocked: Set[int] = set()
+        try:
+            from .headroom_manager import get_provider_breakdown, get_headroom_for
+            _bd = await get_provider_breakdown(session)
+            for _row in _bd:
+                _pid = _row.get("provider_id")
+                _lim = get_headroom_for(_pid) if _pid else 0
+                if _lim and int(_row.get("tokens", 0)) >= _lim:
+                    _headroom_blocked.add(_pid)
+        except Exception as _e:
+            print(f"[AUTO] headroom check skipped: {_e}")
         # FIX: 移除并发轮转(_rr_counter)。轮转会把人工 priority_boost 权重高的候选
         # 整体旋转到后面，导致 fallback 先尝试低权重/已冷却模型而错过可用渠道。
         # priority_boost 是人工干预权重，应严格按排序降序尝试。
         # 遍历找第一个可用的
         for candidate in candidates:
+            # P1-12: 该 provider 今日额度已触达 headroom 保留线 → 跳过
+            if candidate.provider_id in _headroom_blocked:
+                if conversation_id:
+                    from .route_decision import mark_candidate_skipped
+                    mark_candidate_skipped(
+                        conversation_id,
+                        model_pk=candidate.id,
+                        model=candidate.model_id,
+                        reason="provider headroom reserved",
+                    )
+                continue
             # 防 MissingGreenlet：rate_limiter.check_limit 撞库锁时会走 session.rollback()，
             # rollback 无视 expire_on_commit=False 强制过期 session 内所有 ORM 对象（含本轮/后续
             # candidate）。若此处不先 greenlet-safe 刷新，后续同步访问 candidate.provider_id /
@@ -496,20 +442,148 @@ class AutoRouter:
             )
         print(f"[AUTO] get_best_candidate exhausted all candidates (rate-limited or no key)")
         return RouteResult(success=False, error="All candidates are rate-limited. Try again later.")
+    async def _try_sticky_candidate(
+        self,
+        session: AsyncSession,
+        conversation_id: str,
+        exclude_model_ids: Set[int],
+        profile=None,
+    ) -> Optional[RouteResult]:
+        """尝试复用会话粘滞模型。返回 None 表示"不可用，请走正常选举"。
+
+        P1-4：所有失败分支一律返回 None（由调用方回落选举），不再让
+        None 冒到调用方的 `.success` 上。
+        """
+        sticky_model_id = self._get_sticky_model(conversation_id)
+        if not sticky_model_id:
+            return None
+        sticky_model = await self.model_catalog.get_by_id(session, sticky_model_id)
+        if not sticky_model or sticky_model.id in exclude_model_ids:
+            return None
+        if not (sticky_model.enabled and sticky_model.auto_enabled and not sticky_model.auto_excluded):
+            return None
+        # v4.3: 请求含图片/音频而 sticky 模型模态已知不支持 → 放走 sticky
+        from .context_guard import media_mismatch_reason
+        if media_mismatch_reason(sticky_model, profile):
+            return None
+        # 健康检查：冷却中或不健康 → 放走
+        if self.health_checker:
+            if self.health_checker.is_cooling(sticky_model.id):
+                return None
+            cached = self.health_checker.get_cached_status(sticky_model.id)
+            if cached and cached.status in ["unhealthy", "rate_limited"]:
+                return None
+        provider = await session.get(Provider, sticky_model.provider_id)
+        # v4.0: 服务商被禁用 → sticky 失效，走正常候选选举
+        if provider is None or not getattr(provider, "enabled", True):
+            return None
+        # Free Tier / OAuth — key 可空
+        api_key = None
+        key_id_for_rate = None
+        _sticky_extra = None
+        if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
+            if provider.credential_type == "oauth":
+                # 走统一解析器：u1s1 需在附加头里带 __dpop 标记，
+                # 裸 pick_access_token 会把设备凭证当 Bearer 发出去
+                try:
+                    from server.core.credential_resolver import resolve_credential_async
+                    _rc_s = await resolve_credential_async(provider, sticky_model, session)
+                except Exception:
+                    _rc_s = None
+                if _rc_s is None or not _rc_s.ok:
+                    return None   # OAuth 未连接，放走
+                api_key = _rc_s.api_key
+                _sticky_extra = _rc_s.extra_headers
+            else:
+                api_key = ""
+        else:
+            # 获取 key（v3.5：按模型归属 key 集合选）
+            try:
+                from server.core.key_rotator import get_key_rotator
+                _picked = await get_key_rotator().pick_key_for_model(session, sticky_model)
+            except Exception:
+                _picked = None
+            if _picked and _picked[0] is not None:
+                key_id_for_rate, api_key = _picked
+            else:
+                return None
+        if not api_key and api_key != "":
+            return None
+        # 防 MissingGreenlet：provider 属性可能已过期
+        try:
+            await session.refresh(provider, attribute_names=["api_type", "credential_type", "name", "base_url", "headers", "oauth_code"])
+        except Exception:
+            pass
+        adapter = create_adapter_for_provider(provider.api_type)
+        # resolver 附加头已含 __oauth/provider 头（u1s1 另含 __dpop 标记）；
+        # 非 oauth 保持原语义 None
+        _extra = None
+        if getattr(provider, "credential_type", "") == "oauth":
+            _extra = dict(_sticky_extra or {"__oauth": True})
+        if getattr(provider, "proxy_enabled", False):
+            _extra = {**(_extra or {}), "__proxy_force": True}
+        from .route_decision import capture_candidates, mark_selected
+        capture_candidates(conversation_id, [{
+            "rank": 1,
+            "model_pk": sticky_model.id,
+            "provider": provider.name,
+            "model": sticky_model.model_id,
+            "eligible": True,
+            "selected": True,
+            "selection_reason": "session sticky",
+        }])
+        mark_selected(
+            conversation_id,
+            provider=provider.name,
+            model=sticky_model.model_id,
+            model_pk=sticky_model.id,
+            reason="session sticky",
+        )
+        return RouteResult(
+            success=True,
+            model=sticky_model,
+            provider=provider,
+            api_key=api_key,
+            key_id=key_id_for_rate,
+            adapter=adapter,
+            fallback_count=0,
+            extra_headers=_extra,
+            selection_reason="session sticky",
+        )
+
     def _get_sticky_model(self, conversation_id: str) -> Optional[int]:
         """返回会话粘滞模型，过期则清理。"""
         cached = self._sticky_cache.get(conversation_id)
         if not cached:
             return None
         model_id, created_at = cached
-        if time.time() - created_at.timestamp() > self.config.session_sticky_minutes * 60:
+        # P1-4: 用 monotonic 秒数比较，避免 naive datetime 被按本地时区折算
+        if time.monotonic() - created_at > self.config.session_sticky_minutes * 60:
             self._sticky_cache.pop(conversation_id, None)
             return None
         return model_id
 
     def _set_sticky(self, conversation_id: str, model_id: int):
         """记录会话粘滞模型。"""
-        self._sticky_cache[conversation_id] = (model_id, datetime.utcnow())
+        # P1-4: 存 monotonic（不受系统时间/时区影响）；超容量时清理过期项
+        if len(self._sticky_cache) >= _STICKY_CACHE_MAX:
+            self._prune_sticky_cache()
+        self._sticky_cache[conversation_id] = (model_id, time.monotonic())
+
+    def _prune_sticky_cache(self):
+        """清掉过期条目；仍超容量则按写入时间淘汰最旧的（防无界增长）。
+
+        淘汰到半量而非刚好卡在上限：否则到达上限后每次写入都要全量排序，
+        变成 O(n log n) 的每次调用开销。
+        """
+        ttl = self.config.session_sticky_minutes * 60
+        now = time.monotonic()
+        for key in [k for k, (_, ts) in self._sticky_cache.items() if now - ts > ttl]:
+            self._sticky_cache.pop(key, None)
+        if len(self._sticky_cache) >= _STICKY_CACHE_MAX:
+            keep_n = _STICKY_CACHE_MAX // 2
+            keep = sorted(self._sticky_cache.items(), key=lambda kv: kv[1][1])[-keep_n:]
+            self._sticky_cache = dict(keep)
 
     def _get_latency(self, model) -> float:
         """从健康缓存读取延迟；返回极大值表示未知"""

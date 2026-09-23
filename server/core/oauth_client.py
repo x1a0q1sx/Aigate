@@ -37,6 +37,34 @@ def _now_utc() -> datetime:
     return datetime.utcnow()
 
 
+# P1-15: 判定"凭证真的失效"（该永久下线）vs "上游抖动"（只记错误，保留 active）。
+# 此前任意 >=400 都 is_active=False，上游一次 429/502/超时就把连接判死刑，
+# 调度器只扫 active 连接 → 须人工重新登录才能恢复。
+_DEAD_CREDENTIAL_MARKERS = (
+    "invalid_grant", "invalid_token", "invalid refresh", "refresh token has expired",
+    "refresh_token expired", "token has been revoked", "unauthorized_client",
+    "refresh token is invalid", "登录已过期", "凭证无效",
+)
+
+
+def _refresh_credential_dead(status_code: int, error_text: str = "") -> bool:
+    """True = refresh token 确实失效（应下线）；False = 临时故障（保留 active 待重试）。
+
+    规则：401 恒为失效；400 需带 invalid_grant 类语义标记；
+    429/5xx/网络错误一律视为临时（保留下线机会）。
+    """
+    text = (error_text or "").lower()
+    if status_code == 401:
+        return True
+    if status_code == 400:
+        return any(m in text for m in _DEAD_CREDENTIAL_MARKERS)
+    if status_code in (403, 404):
+        # 403 可能是风控/权限而非失效；404 端点变更。只有明确标记才下线。
+        return any(m in text for m in _DEAD_CREDENTIAL_MARKERS)
+    # 429 限流、5xx 上游故障、其它 → 临时
+    return False
+
+
 def gen_pkce_pair() -> Tuple[str, str]:
     """生成 (code_verifier, code_challenge) — S256 method"""
     verifier = secrets.token_urlsafe(64)
@@ -289,20 +317,28 @@ class OAuthClient:
         """
         lock_key = self._key(provider_code, owner)
         if lock_key in self._inflight:
+            # P1-14: 必须把 leader 的真实结果回传，不能无条件报成功。
+            # 且 wait_for 超时会 cancel 共享 Future（asyncio 语义）→ leader 的
+            # set_result 抛 InvalidStateError 穿透到请求路径。用 shield 保护。
             try:
-                await asyncio.wait_for(self._inflight[lock_key], timeout=15)
-                return True, "merged into inflight refresh"
+                res = await asyncio.wait_for(asyncio.shield(self._inflight[lock_key]), timeout=15)
+                return res
             except asyncio.TimeoutError:
                 return False, "previous refresh timed out"
+            except Exception as e:
+                return False, str(e)
 
         fut = asyncio.get_event_loop().create_future()
         self._inflight[lock_key] = fut
         try:
             res = await self._do_refresh(db, provider_code, owner)
-            fut.set_result(res)
+            # P1-14: waiter 超时可能已 cancel 该 Future → set 前必须判状态
+            if not fut.done():
+                fut.set_result(res)
             return res
         except Exception as e:
-            fut.set_exception(e)
+            if not fut.done():
+                fut.set_exception(e)
             return False, str(e)
         finally:
             self._inflight.pop(lock_key, None)
@@ -342,9 +378,11 @@ class OAuthClient:
                                       headers={"Accept": "application/json"})
         if resp.status_code >= 400:
             err = resp.text[:300]
-            # refresh_token 失效时标记已有 token 失效
+            # P1-15: 只有「凭证真的失效」才永久下线；5xx/429/网络抖动只记错误，
+            # 否则上游一次抖动就把连接判死刑、须人工重登。
             existing.last_error = err
-            existing.is_active = False
+            if _refresh_credential_dead(resp.status_code, err):
+                existing.is_active = False
             await db.commit()
             return False, f"refresh endpoint HTTP {resp.status_code}: {err}"
         try:
@@ -376,8 +414,10 @@ class OAuthClient:
                 resp = await client.post(provider.refresh_url, headers=headers, content="{}")
             if resp.status_code >= 400:
                 err = resp.text[:300]
+                # P1-15: 同上——仅凭证失效才下线
                 existing.last_error = err
-                existing.is_active = False
+                if _refresh_credential_dead(resp.status_code, err):
+                    existing.is_active = False
                 await db.commit()
                 return False, f"http {resp.status_code}: {err}"
             data = resp.json()
@@ -385,7 +425,9 @@ class OAuthClient:
             if data.get("code") != 0 or not data.get("data", {}).get("accessToken"):
                 err = data.get("msg") or "no accessToken in response"
                 existing.last_error = err
-                existing.is_active = False
+                # P1-15: 业务码非 0 也需甄别（限流/风控不该下线；refresh token 无效才下线）
+                if _refresh_credential_dead(200, f"{data.get('code')} {err}"):
+                    existing.is_active = False
                 await db.commit()
                 return False, f"tencent code={data.get('code')}: {err}"
             tok_inner = data["data"]
@@ -656,8 +698,10 @@ class OAuthClient:
                 }, headers={"Content-Type": "application/json", "Accept": "application/json"})
             if resp.status_code >= 400:
                 err = resp.text[:300]
+                # P1-15: 仅凭证失效才下线（429/5xx 抖动保留下次重试机会）
                 existing.last_error = err
-                existing.is_active = False
+                if _refresh_credential_dead(resp.status_code, err):
+                    existing.is_active = False
                 await db.commit()
                 return False, f"http {resp.status_code}: {err}"
             body = resp.json()
@@ -666,7 +710,8 @@ class OAuthClient:
             if not access:
                 err = body.get("message") or body.get("error") or "no accessToken in response"
                 existing.last_error = str(err)
-                existing.is_active = False
+                if _refresh_credential_dead(200, str(err)):
+                    existing.is_active = False
                 await db.commit()
                 return False, f"cline refresh: {err}"
             tok = {

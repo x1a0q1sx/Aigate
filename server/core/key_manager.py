@@ -52,13 +52,31 @@ class KeyManager:
             return None
         return self._crypto.decrypt(key.key_encrypted)
     async def delete_key(self, session: AsyncSession, key_id: int) -> bool:
-        """删除密钥"""
+        """删除密钥。
+
+        P1-20: 除 DB 行外还要清 ModelApiKey 归属与 KeyRotator 进程内状态
+        （_hard_disabled/_fail_count/_cooldown_until/_cursor）——否则被删 key
+        的熔断/冷却状态会残留，且 SQLite rowid 复用时新 key 直接继承旧状态。
+        """
         result = await session.execute(select(ApiKey).where(ApiKey.id == key_id))
         key = result.scalar_one_or_none()
         if not key:
             return False
+        # 先解绑模型归属（外键语义在 SQLite 下不强制，必须显式删）
+        try:
+            from server.models.model_api_key import ModelApiKey
+            from sqlalchemy import delete as _delete
+            await session.execute(_delete(ModelApiKey).where(ModelApiKey.api_key_id == key_id))
+        except Exception:
+            pass
         await session.delete(key)
         await session.commit()
+        # 清进程内轮转状态
+        try:
+            from server.core.key_rotator import get_key_rotator
+            get_key_rotator().forget_key(key_id)
+        except Exception:
+            pass
         return True
     def mask_key(self, key: str) -> str:
         """脱敏展示"""

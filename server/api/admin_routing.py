@@ -787,9 +787,13 @@ async def upsert_intel(data: IntelIn, db: AsyncSession = Depends(get_db)):
     )).scalar_one_or_none()
     if existing:
         existing.score = data.score; existing.tier = data.tier; existing.notes = data.notes
+        # P1-18: 面板录入 = 人工校准，必须打 manual 标记，
+        # 否则每周 arena 同步会按 source!="manual" 直接覆盖掉。
+        existing.source = "manual"
         await _audit(db, "intel.update", target_id=existing.id, payload=data.model_dump())
     else:
-        new = IntelligenceStatic(pattern=data.pattern, score=data.score, tier=data.tier, notes=data.notes)
+        new = IntelligenceStatic(pattern=data.pattern, score=data.score, tier=data.tier,
+                                 notes=data.notes, source="manual")
         db.add(new)
         await db.flush()
         await _audit(db, "intel.create", target_id=new.id, payload=data.model_dump())

@@ -57,13 +57,18 @@ BUILTIN_PRICING = {
 }
 # fmt: on
 def get_builtin_pricing(model_id: str) -> Optional[dict]:
-    """匹配内置定价表"""
+    """匹配内置定价表。
+
+    P2: 子串匹配必须取**最长**匹配键——此前按 dict 插入序首个命中，
+    如 gpt-4o-mini-2024-xx 先撞上 "gpt-4o"（5.0/15.0）而非 mini 档（0.15/0.6），
+    造成 30 倍高估。
+    """
     if model_id in BUILTIN_PRICING:
         return BUILTIN_PRICING[model_id]
-    for key, pricing in BUILTIN_PRICING.items():
-        if key in model_id:
-            return pricing
-    return None
+    candidates = [k for k in BUILTIN_PRICING if k in model_id]
+    if not candidates:
+        return None
+    return BUILTIN_PRICING[max(candidates, key=len)]
 def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) -> BaseAdapter:
     """根据 api_type 创建适配器。
     timeout 为可选项：传入时覆盖适配器默认超时（用于刷新模型等后台网络请求）。"""
@@ -202,7 +207,9 @@ class ModelCatalog:
         context_length: Optional[int] = None,
         supports_vision: Optional[bool] = None,
         input_modalities: Optional[list] = None,
-        max_output_tokens: Optional[int] = None
+        max_output_tokens: Optional[int] = None,
+        price_ratio: Optional[float] = None,
+        clear_price_ratio: bool = False
     ) -> Optional[Model]:
         """更新模型配置"""
         model = await self.get_by_id(session, model_id)
@@ -262,6 +269,17 @@ class ModelCatalog:
             _cap_touched = True
         if _cap_touched:
             model.capability_source = "manual"
+        # v4.4 手动倍率：写入即 price_ratio_source=manual，刷新/静态表永不覆盖。
+        # 传 0 表示免费（合法值，不能当 None 跳过）。
+        if price_ratio is not None:
+            model.price_ratio = float(price_ratio)
+            model.price_ratio_source = "manual"
+            if model.price_ratio == 0.0:
+                model.is_free = True
+        elif clear_price_ratio:
+            # 显式清空 → 回到"未知"（下次刷新可由上游/静态表重新填充）
+            model.price_ratio = None
+            model.price_ratio_source = ""
         if request_overrides is not None:
             model.request_overrides = request_overrides
         await session.commit()
@@ -439,11 +457,16 @@ class ModelCatalog:
                 list_source = "seed"  # 在线列表失败，改用静态种子兜底
                 list_note = f"静态种子兜底（{len(oauth_p.static_models)}个）"
                 any_success = True
+                # v4.4 倍率静态表（订阅制上游无 USD 单价，按 credit 倍率计费）
+                from server.core.oauth_registry import STATIC_PRICE_RATIOS as _SPR
+                _ratio_map = _SPR.get(oauth_code) or {}
                 for sm in oauth_p.static_models:
+                    _r = _ratio_map.get(sm["model_id"])
                     all_model_infos.setdefault(sm["model_id"], ModelInfo(
                         model_id=sm["model_id"], display_name=sm.get("display_name") or sm["model_id"],
-                        is_free=False, input_price=0.0, output_price=0.0,
+                        is_free=(_r == 0.0), input_price=0.0, output_price=0.0,
                         supports_streaming=True, context_length=4096,
+                        price_ratio=_r,
                     ))
             if not any_success:
                 return {"error": f"OAuth provider '{oauth_code}' 未连接且无静态模型种子，请先在 /providers/oauth 完成连接"}
@@ -548,13 +571,34 @@ class ModelCatalog:
                         existing_model.capability_source = "provider"
                     if model_info.max_output_tokens and not existing_model.max_output_tokens:
                         existing_model.max_output_tokens = int(model_info.max_output_tokens)
+                # v4.4 倍率：在线目录（Qoder price_factor）优先；静态表值仅补空。
+                # manual 手改永不覆盖（与价格同规则）。
+                _rsrc = (existing_model.price_ratio_source or "")
+                if model_info.price_ratio is not None and _rsrc != "manual":
+                    existing_model.price_ratio = model_info.price_ratio
+                    existing_model.price_ratio_source = (
+                        "qoder" if provider.api_type == "qoder" else "provider")
+                    if model_info.price_ratio == 0.0:
+                        existing_model.is_free = True
                 if remote_metadata:
-                    existing_model.success_rate = remote_metadata.get("success_rate")
-                    existing_model.avg_latency_ms = remote_metadata.get("avg_latency_ms")
-                    existing_model.avg_ttft_ms = remote_metadata.get("avg_ttft_ms")
-                    existing_model.avg_tps = remote_metadata.get("avg_tps")
-                    existing_model.pricing_source = pricing_result.source_url
-                    existing_model.pricing_updated_at = datetime.utcnow()
+                    # P1-17: 远程缺字段时不要把本地已有值抹成 None
+                    _sr = remote_metadata.get("success_rate")
+                    if _sr is not None:
+                        existing_model.success_rate = _sr
+                    _lm = remote_metadata.get("avg_latency_ms")
+                    if _lm is not None:
+                        existing_model.avg_latency_ms = _lm
+                    _tt = remote_metadata.get("avg_ttft_ms")
+                    if _tt is not None:
+                        existing_model.avg_ttft_ms = _tt
+                    _tp = remote_metadata.get("avg_tps")
+                    if _tp is not None:
+                        existing_model.avg_tps = _tp
+                    # P1-17: 手改价格标记必须被保护——此前无条件写 source_url，
+                    # 把 manual 标记抹掉，下轮刷新直接覆盖用户价格。
+                    if not manual_priced:
+                        existing_model.pricing_source = pricing_result.source_url
+                        existing_model.pricing_updated_at = datetime.utcnow()
                     if remote_metadata.get("success_rate") is not None:
                         metric_updated += 1
                 if not manual_priced:
@@ -606,6 +650,11 @@ class ModelCatalog:
                     input_modalities=_mods,
                     max_output_tokens=model_info.max_output_tokens,
                     capability_source=_cap_src,
+                    # v4.4 倍率（订阅制上游）
+                    price_ratio=model_info.price_ratio,
+                    price_ratio_source=(
+                        ("qoder" if provider.api_type == "qoder" else "provider")
+                        if model_info.price_ratio is not None else ""),
                     priority_boost=0,
                     auto_excluded=False
                 )

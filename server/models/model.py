@@ -23,6 +23,11 @@ class Model(Base):
     avg_tps = Column(Float, nullable=True)
     pricing_source = Column(String(500), nullable=True, default="")
     pricing_updated_at = Column(DateTime, nullable=True)
+    # v4.4 订阅制上游的"倍率"（credit multiplier）：CodeBuddy/Qoder 等按倍率计费，
+    # 没有 USD 单价。NULL=未知/不适用；0.0=免费；非空时前端价格列优先显示倍率。
+    # 与 input_price/output_price（USD 成本计算用）互不干扰——倍率不参与成本核算。
+    price_ratio = Column(Float, nullable=True, default=None)
+    price_ratio_source = Column(String(50), nullable=True, default="")  # qoder | codebuddy | manual | ""
     is_free = Column(Boolean, nullable=False, default=False)
     auto_enabled = Column(Boolean, nullable=False, default=False)  # 是否参与 auto 选举
     enabled = Column(Boolean, nullable=False, default=True)

@@ -305,6 +305,11 @@ def transform_payload(payload: dict, q: Optional[ProviderQuirks],
     p = dict(payload)
     if q.force_stream:
         p["stream"] = True
+        # P2: 强制流式时上游若不主动发 usage，聚合路径的 usage 恒为 0
+        # （成本/计费全丢）。显式要求上游在末块带 usage。
+        # 用 setdefault 语义：调用方已显式指定时不动。
+        if "stream_options" not in p:
+            p["stream_options"] = {"include_usage": True}
     # 工具名黑名单改写（u1s1）：必须在 messages 早退之前——只动 tools/tool_choice 结构字段
     if q.blocked_tool_names and tool_guard_enabled:
         p = _rename_tool_names_in_request(p, q.blocked_tool_names)

@@ -661,15 +661,24 @@ class QoderAdapter(BaseAdapter):
         out = []
         for entry in cat["models"]:
             _vl = bool(entry.get("is_vl"))
+            # v4.4 倍率：目录原生 price_factor（0.0=免费 / 0.1 / 0.5 / 2.0…）。
+            # 这是 Qoder 唯一的"价格"口径——订阅制没有 USD 单价。
+            _ratio = entry.get("price_factor")
+            try:
+                _ratio = float(_ratio) if _ratio is not None else None
+            except (TypeError, ValueError):
+                _ratio = None
             out.append(ModelInfo(
                 model_id=entry["key"],
                 display_name=entry.get("display_name") or entry["key"],
-                is_free=False, input_price=0.0, output_price=0.0,
+                is_free=(_ratio == 0.0) or bool(entry.get("is_free")),
+                input_price=0.0, output_price=0.0,
                 supports_streaming=True,
                 supports_vision=_vl,
                 # provider 显式声明视觉能力 → 可信模态（能力感知路由据此拦截）
                 input_modalities=(["text", "image"] if _vl else None),
                 context_length=int(entry.get("max_input_tokens") or 131072),
+                price_ratio=_ratio,
             ))
         return out
 

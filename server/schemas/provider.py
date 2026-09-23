@@ -105,6 +105,9 @@ class ModelInfoResponse(BaseModel):
     input_modalities: Optional[list] = None
     max_output_tokens: Optional[int] = None
     observed_context_limit: Optional[int] = None
+    # v4.4 订阅制上游倍率（CodeBuddy/Qoder 按 credit 倍率计费，无 USD 单价）
+    price_ratio: Optional[float] = None
+    price_ratio_source: Optional[str] = ""
     full_id: str
     provider_name: str = ""
     # v2.0 新增
@@ -152,6 +155,8 @@ class ModelInfoResponse(BaseModel):
             input_modalities=getattr(model, "input_modalities", None),
             max_output_tokens=getattr(model, "max_output_tokens", None),
             observed_context_limit=getattr(model, "observed_context_limit", None),
+            price_ratio=getattr(model, "price_ratio", None),
+            price_ratio_source=getattr(model, "price_ratio_source", "") or "",
             full_id=model.full_id,
             provider_name=model.provider.name if hasattr(model, 'provider') and model.provider else "",
             priority_boost=getattr(model, 'priority_boost', 0),
@@ -177,6 +182,10 @@ class ModelUpdate(BaseModel):
     supports_vision: Optional[bool] = None
     input_modalities: Optional[List[str]] = None
     max_output_tokens: Optional[int] = None
+    # v4.4: 手动倍率（订阅制上游；写入即 price_ratio_source=manual，刷新不覆盖）
+    price_ratio: Optional[float] = None
+    # 清空倍率（回到"未知"）：price_ratio 传 null 时无法与"未修改"区分，故单列一个开关
+    clear_price_ratio: bool = False
     # v3.4: per-model request overrides (headers/body_patch/model_alias)
     request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):

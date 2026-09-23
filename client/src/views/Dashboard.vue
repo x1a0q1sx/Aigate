@@ -69,12 +69,12 @@
       <div class="card-header">
         <span class="card-title"><AppIcon name="key" :size="16" />AIGate 连接密钥</span>
         <div class="row">
-          <code class="key-display">{{ showKey ? aigateKey || '未配置' : maskedKey }}</code>
-          <button class="btn btn-outline btn-sm" :disabled="!aigateKey" @click="showKey = !showKey">
+          <code class="key-display">{{ showKey ? (aigateKey || '未配置') : maskedDisplay }}</code>
+          <button class="btn btn-outline btn-sm" :disabled="keyConfigured === false" @click="toggleKey">
             <AppIcon :name="showKey ? 'eyeOff' : 'eye'" :size="13" />
             {{ showKey ? '隐藏' : '显示' }}
           </button>
-          <button class="btn btn-outline btn-sm" :disabled="!aigateKey" @click="copyKey">
+          <button class="btn btn-outline btn-sm" :disabled="keyConfigured === false" @click="copyKey">
             <AppIcon name="copy" :size="13" />复制
           </button>
         </div>
@@ -123,6 +123,7 @@ export default {
       currentModel: null,
       loading: false,
       aigateKey: '',
+      keyMeta: null,
       showKey: false,
       usageCode: `from openai import OpenAI
 
@@ -173,6 +174,16 @@ print(resp.choices[0].message.content)`,
       if (k.length <= 8) return '•'.repeat(k.length)
       return k.slice(0, 4) + '•'.repeat(Math.min(k.length - 8, 12)) + k.slice(-4)
     },
+    // P1-21: 未揭示明文时用后端返回的掩码；揭示后用本地掩码
+    maskedDisplay() {
+      if (this.aigateKey) return this.maskedKey
+      if (this.keyMeta && this.keyMeta.configured === false) return '未配置'
+      return (this.keyMeta && this.keyMeta.masked) || '未配置'
+    },
+    keyConfigured() {
+      if (this.keyMeta) return this.keyMeta.configured !== false
+      return null
+    },
   },
   methods: {
     /** summary 在首次渲染时还是 null，模板里一律走这里取值，避免读 null 属性直接把整页渲染打崩 */
@@ -187,12 +198,36 @@ print(resp.choices[0].message.content)`,
           return null
         }),
         api.getCurrentModel().catch(() => null),
-        api.getAIGateKey(true).catch(() => null),
+        // P1-21: 明文密钥需管理员密码二次校验，改为按需揭示（见 toggleKey）
+        api.getAIGateKey(false).catch(() => null),
       ])
       if (summary) this.summary = summary
       this.currentModel = current
-      this.aigateKey = (key && key.key) || ''
+      this.keyMeta = key || null
       this.loading = false
+    },
+    // P1-21: 显示/隐藏按钮 —— 首次揭示时询问管理员密码
+    async toggleKey() {
+      if (this.showKey) {
+        this.showKey = false
+        return
+      }
+      if (!this.aigateKey) {
+        const pwd = prompt('揭示 AIGate 明文密钥需要管理员密码：')
+        if (pwd === null) return
+        try {
+          const d = await api.getAIGateKey(true, pwd)
+          this.aigateKey = (d && d.key) || ''
+        } catch (e) {
+          toast.error('获取密钥失败: ' + e.message)
+          return
+        }
+      }
+      if (!this.aigateKey) {
+        toast.error('未配置密钥')
+        return
+      }
+      this.showKey = true
     },
     async copy(text) {
       if (!text) return

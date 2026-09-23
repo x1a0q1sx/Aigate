@@ -22,6 +22,8 @@ class ModelInfo:
     # v4.3 能力感知路由：上游声明的输入模态（None=未知）与最大输出 tokens
     input_modalities: Optional[list] = None
     max_output_tokens: Optional[int] = None
+    # v4.4 订阅制上游倍率（credit multiplier，如 Qoder price_factor=0.5 / CodeBuddy x0.16）
+    price_ratio: Optional[float] = None
 @dataclass
 class HealthResult:
     status: str  # healthy / degraded / rate_limited / unhealthy

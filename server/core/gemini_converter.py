@@ -30,8 +30,12 @@ def _parts_to_content(parts: List[dict]) -> Any:
     return "\n".join(texts)
 
 
-def gemini_to_chat(model_name: str, body: dict) -> dict:
-    """Gemini 请求体 → ChatCompletionRequest 构造参数。"""
+def gemini_to_chat(model_name: str, body: dict, stream: bool = False) -> dict:
+    """Gemini 请求体 → ChatCompletionRequest 构造参数。
+
+    P1-22: stream 由调用方按 action 传入（streamGenerateContent → True）。
+    此前硬编码 False，导致"流式"端点实际要等全文完成才返回。
+    """
     messages: List[dict] = []
     sys_inst = body.get("systemInstruction") or body.get("system_instruction")
     if sys_inst:
@@ -76,7 +80,7 @@ def gemini_to_chat(model_name: str, body: dict) -> dict:
     kwargs: dict = {
         "model": model_name,
         "messages": messages,
-        "stream": False,
+        "stream": bool(stream),
     }
     if gen.get("temperature") is not None:
         kwargs["temperature"] = gen["temperature"]
@@ -149,7 +153,14 @@ def chat_json_to_gemini(payload: dict, model_version: str = "") -> dict:
 
 
 def chunk_to_gemini(chunk: dict) -> Optional[dict]:
-    """OpenAI 流式 chunk → Gemini 流式 chunk（无内容返回 None）。"""
+    """OpenAI 流式 chunk → Gemini 流式 chunk（无内容返回 None）。
+
+    P1-22: 补 tool_calls → functionCall 分片（此前整个丢弃，工具调用在
+    streamGenerateContent 下完全不可用）。
+    """
+    # 网关终态错误 chunk（顶层 error）→ 交给调用方处理，不静默吞掉
+    if isinstance(chunk.get("error"), dict):
+        return {"error": chunk["error"]}
     choice = (chunk.get("choices") or [{}])[0]
     delta = choice.get("delta") or {}
     parts: List[dict] = []
@@ -157,6 +168,19 @@ def chunk_to_gemini(chunk: dict) -> Optional[dict]:
         parts.append({"text": delta["reasoning_content"], "thought": True})
     if delta.get("content"):
         parts.append({"text": delta["content"]})
+    for tc in delta.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        raw_args = fn.get("arguments")
+        # 流式工具调用参数是分片拼接的：name 只在首片出现，后续片只有 args 片段。
+        # Gemini 的 functionCall.args 需要对象，故仅在有 name 时输出，
+        # 并把已收到的参数片段尽力解析（解析失败给空对象，由客户端按增量语义合并）。
+        if name:
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            parts.append({"functionCall": {"name": name, "args": args}})
     out: dict = {"candidates": [{"content": {"parts": parts, "role": "model"}, "index": 0}]}
     finish = choice.get("finish_reason")
     if finish:

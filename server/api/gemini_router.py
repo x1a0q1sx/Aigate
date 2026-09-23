@@ -54,48 +54,65 @@ def _gemini_sse(obj: dict) -> bytes:
 
 
 async def _openai_sse_to_gemini_stream(body_iterator: AsyncIterator) -> AsyncIterator[bytes]:
-    """消费 v1 的 OpenAI SSE 字节流 → Gemini SSE 流。"""
+    """消费 v1 的 OpenAI SSE 字节流 → Gemini SSE 流。
+
+    P1-22: 加 finally aclose —— 客户端提前断开时释放上游连接
+    （anthropic_router / responses_router 均已如此，此前本文件漏了）。
+    """
     final_usage = None
     finish = None
-    async for item in body_iterator:
-        if isinstance(item, bytes):
-            text = item.decode("utf-8", errors="replace")
-        elif isinstance(item, str):
-            text = item
-        else:
-            continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith(":"):
-                continue  # keepalive 注释
-            if not line.startswith("data:"):
+    try:
+        async for item in body_iterator:
+            if isinstance(item, bytes):
+                text = item.decode("utf-8", errors="replace")
+            elif isinstance(item, str):
+                text = item
+            else:
                 continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                done = {"candidates": [{"content": {"parts": [], "role": "model"},
-                                        "index": 0}]}
-                if finish:
-                    done["candidates"][0]["finishReason"] = finish
-                if final_usage:
-                    done["usageMetadata"] = final_usage
-                yield _gemini_sse(done)
-                yield b"data: [DONE]\n\n"
-                return
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith(":"):
+                    continue  # keepalive 注释
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    done = {"candidates": [{"content": {"parts": [], "role": "model"},
+                                            "index": 0}]}
+                    if finish:
+                        done["candidates"][0]["finishReason"] = finish
+                    if final_usage:
+                        done["usageMetadata"] = final_usage
+                    yield _gemini_sse(done)
+                    yield b"data: [DONE]\n\n"
+                    return
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                g = chunk_to_gemini(chunk)
+                if not g:
+                    continue
+                # P1-22: 上游终态错误 → 转 Gemini error 事件并终止（不再伪装成正常结束）
+                if isinstance(g.get("error"), dict):
+                    yield _gemini_sse({"error": g["error"]})
+                    yield b"data: [DONE]\n\n"
+                    return
+                c = (g["candidates"] or [{}])[0]
+                if c.get("finishReason"):
+                    finish = c["finishReason"]
+                if g.get("usageMetadata"):
+                    final_usage = g["usageMetadata"]
+                # 有实质内容才发；finish/usage 攒到最后
+                if c.get("content", {}).get("parts"):
+                    yield _gemini_sse(g)
+    finally:
+        aclose = getattr(body_iterator, "aclose", None)
+        if aclose:
             try:
-                chunk = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-            g = chunk_to_gemini(chunk)
-            if not g:
-                continue
-            c = (g["candidates"] or [{}])[0]
-            if c.get("finishReason"):
-                finish = c["finishReason"]
-            if g.get("usageMetadata"):
-                final_usage = g["usageMetadata"]
-            # 有实质内容才发；finish/usage 攒到最后
-            if c.get("content", {}).get("parts"):
-                yield _gemini_sse(g)
+                await aclose()
+            except Exception:
+                pass
 
 
 @router.get("/v1beta/models")
@@ -134,7 +151,9 @@ async def gemini_generate(
     except Exception:
         return JSONResponse(status_code=400, content=gemini_error(400, "invalid_json"))
 
-    kwargs = gemini_to_chat(base, body)
+    # P1-22: streamGenerateContent 必须让上游真流式（此前硬编码 False →
+    # "流式"端点实际等全文完成，首字延迟等于总耗时）
+    kwargs = gemini_to_chat(base, body, stream=(action == "streamGenerateContent"))
     try:
         chat_request = ChatCompletionRequest(**kwargs)
     except Exception as e:

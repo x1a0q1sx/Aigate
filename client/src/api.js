@@ -123,12 +123,13 @@ export default {
   // 一键备份 / 恢复（全系统）
   fullBackup: (adminPassword) => apiGet('/admin/api/backup', { 'X-Admin-Password': adminPassword || '' }),
   fullRestore: (data, adminPassword) => apiPost('/admin/api/restore', data, { 'X-Admin-Password': adminPassword || '' }),
-  // 服务商配置导入 / 导出
+  // 服务商配置导入 / 导出（P1-21：include_keys 含明文密钥，需管理员密码二次校验）
   exportProviders: (params = {}) => {
     const qs = new URLSearchParams()
     if (params.include_keys) qs.append('include_keys', 'true')
     if (params.provider_ids) qs.append('provider_ids', params.provider_ids)
-    return apiGet(`/admin/api/providers/export?${qs.toString()}`)
+    return apiGet(`/admin/api/providers/export?${qs.toString()}`,
+      params.admin_password ? { 'X-Admin-Password': params.admin_password } : {})
   },
   importProviders: (data) => apiPost('/admin/api/providers/import', data),
   // 服务商定价导入（newapi / one-api 的 /api/pricing JSON）
@@ -138,10 +139,13 @@ export default {
   // AtomCode 本地 daemon 可执行文件：状态查询与 UI 配置
   getAtomExeStatus: () => apiGet('/admin/api/atomcode/exe-status'),
   setAtomExePath: (path) => apiPost('/admin/api/atomcode/set-exe-path', { path }),
-  // 密钥
+  // 密钥（P1-21：揭示明文需管理员密码二次校验）
   getKeys: () => apiGet('/admin/api/keys'),
-  revealKey: (id) => apiGet(`/admin/api/keys/${id}/reveal`),
-  getAIGateKey: (reveal = false) => apiGet(`/admin/api/aigate-key${reveal ? '?reveal=true' : ''}`),
+  revealKey: (id, adminPassword) => apiGet(`/admin/api/keys/${id}/reveal`,
+    adminPassword ? { 'X-Admin-Password': adminPassword } : {}),
+  getAIGateKey: (reveal = false, adminPassword) => apiGet(
+    `/admin/api/aigate-key${reveal ? '?reveal=true' : ''}`,
+    adminPassword ? { 'X-Admin-Password': adminPassword } : {}),
   createKey: (data) => apiPost('/admin/api/keys', data),
   deleteKey: (id) => apiDelete(`/admin/api/keys/${id}`),
   toggleKey: (id, isActive) => apiPost(`/admin/api/keys/${id}/toggle`, { is_active: isActive }),

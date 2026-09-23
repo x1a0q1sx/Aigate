@@ -360,6 +360,34 @@ def _merge_oauth_headers(provider, base_headers=None):
         eh["__fg"] = "0"
     return eh
 
+
+def _apply_request_overrides(request, model, extra_headers=None):
+    """应用 per-model request_overrides（v3.4）：model_alias / headers / body_patch。
+
+    P1-6：此前只有「直连」与「combo 非流式」两条路径生效，combo 流式与
+    auto 级联各路径缺失 → 依赖别名的模型按路径不同行为不一致。统一走本函数。
+    返回 (request, extra_headers)；任何字段缺失/非法都安全跳过。
+    """
+    ov = getattr(model, "request_overrides", None) or {}
+    if not isinstance(ov, dict):
+        return request, extra_headers
+    ov_model = ov.get("model_alias")
+    if ov_model:
+        try:
+            request = request.model_copy(update={"model": ov_model})
+        except Exception:
+            pass
+    ov_headers = ov.get("headers")
+    if ov_headers and isinstance(ov_headers, dict):
+        extra_headers = {**(extra_headers or {}), **ov_headers}
+    ov_body = ov.get("body_patch")
+    if ov_body and isinstance(ov_body, dict):
+        try:
+            request = request.model_copy(update=ov_body)
+        except Exception:
+            pass
+    return request, extra_headers
+
 config = get_config()
 router = APIRouter(prefix="/v1")
 async def get_db():
@@ -797,7 +825,7 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
     return last_result, attempt_errors
 
 
-async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, diag_start_ts=None, *, combo_targets=None):
+async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, diag_start_ts=None, *, combo_targets=None, sticky_key=None):
     """
     级联回退：对第一个 auto 候选发起完整业务请求，
     若超时/错误/空返回 → 自动尝试第二个、第三个……
@@ -805,6 +833,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
     返回 (RouteResult, response_dict, list_of_attempts)
     
     如果指定 combo_targets（list of full_id str），直接用它迭代，不调用 ar.get_best_candidate。
+    sticky_key（P1-4）：跨请求稳定的会话键，传给 get_best_candidate 做 sticky 命中。
     """
     max_retries = max(1, ar.config.max_fallbacks)
     attempt_errors = []
@@ -813,6 +842,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
     diag_start_ts = diag_start_ts or time.time()
     profile = analyze_request(request)
     est_tokens = profile.est_tokens
+    # P1-4: 未显式传入时回退到 conversation_id（保持向后兼容）
+    _sticky = sticky_key or conversation_id
     _diag(conversation_id, "auto_cascade_start", diag_start_ts, max_retries=max_retries, combo=bool(combo_targets), est_tokens=est_tokens)
     
     # 预先解析 combo 候选（如果有），避免在循环内重复查 DB
@@ -942,7 +973,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                     raise NoMoreCandidates()
                 candidate = combo_candidates[attempt]
             else:
-                candidate = await ar.get_best_candidate(db, conversation_id, exclude_model_ids=tried_ids, profile=profile)
+                candidate = await ar.get_best_candidate(db, _sticky, exclude_model_ids=tried_ids, profile=profile)
             _diag(conversation_id, "auto_candidate_done", diag_start_ts, attempt=attempt,
                   success=candidate.success if candidate else None)
             last_result = candidate
@@ -999,7 +1030,14 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         upstream_request = _without_unsupported_reasoning(
             request.model_copy(update={"model": candidate.model.model_id}), candidate.model
         )
-        extra_headers = candidate.provider.headers
+        # P1-5/P1-6: 与其它路径一致地合并 __oauth/__proxy_force/__fg 标记，
+        # 并应用该模型的 request_overrides（headers/body_patch/model_alias）。
+        # 此前这里直接用 provider.headers，导致强制代理/指纹过滤开关丢失。
+        extra_headers = _merge_oauth_headers(candidate.provider, candidate.provider.headers)
+        if candidate.extra_headers:
+            extra_headers = {**(extra_headers or {}), **candidate.extra_headers}
+        upstream_request, extra_headers = _apply_request_overrides(
+            upstream_request, candidate.model, extra_headers)
         ctx_by_attempt[attempt] = {"candidate": candidate, "start": time.time()}
         _diag(conversation_id, "upstream_start", diag_start_ts, attempt=attempt,
               provider=candidate.provider.name, model=candidate.model.model_id, stream=False)
@@ -1370,7 +1408,15 @@ async def _chat_completions_impl(
     """OpenAI 兼容聊天补全端点（实现体）"""
     _diag_start = time.time()
     import uuid
+    # 请求级唯一 ID：用于日志归属与 route_decision trace（并发安全，保持原语义）
     conversation_id = str(uuid.uuid4())
+    # P1-4: session sticky 需要**跨请求稳定**的键，否则永不命中。
+    # 单独取一个键（优先客户端显式头，否则按「客户端 + system + 首条 user」派生），
+    # 不改变 conversation_id 的既有语义。
+    from server.core.client_ip import derive_conversation_id as _derive_conv
+    sticky_key, _sticky_explicit = _derive_conv(
+        raw_request, request.messages,
+        _real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)))
     _diag(conversation_id, "request_enter", _diag_start, model=getattr(request, "model", None), stream=getattr(request, "stream", None), client=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)))
     try:
         _diag(conversation_id, "auth_start", _diag_start)
@@ -1742,13 +1788,12 @@ async def _chat_completions_impl(
                         _diag(conversation_id, "upstream_stream_start", _diag_start,
                               attempt=st_attempt, provider=_prov.name, model=_mdl.model_id)
                         _fb_eh = _merge_oauth_headers(_prov, _prov.headers)
-                        _fbmov = getattr(_mdl, "request_overrides", None) or {}
-                        if isinstance(_fbmov, dict) and _fbmov.get("headers"):
-                            _fb_eh = {**(_fb_eh or {}), **_fbmov["headers"]}
                         # 统一解析器的附加头必须随行（oauth 专属头 + __dpop 内部标记；
                         # 丢了标记 = DPoP 设备凭证被当 Bearer 裸发 → u1s1 401 认证方式不支持）
                         if _rc.extra_headers:
                             _fb_eh = {**(_fb_eh or {}), **_rc.extra_headers}
+                        # P1-6: 流式路径此前只并 headers，缺 model_alias/body_patch
+                        up_req, _fb_eh = _apply_request_overrides(up_req, _mdl, _fb_eh)
                         # free_tier 走专用 executor（FORCE_PROXY/裸 model_id 由 resolver 处理）
                         if _rc.kind == "free_tier":
                             # P0-1: stream_via 是协程函数，必须 await 拿到异步生成器
@@ -2012,20 +2057,7 @@ async def _chat_completions_impl(
                 upstream_req = _without_unsupported_reasoning(
                     request.model_copy(update={"model": model.model_id}), model
                 )
-                model_overrides = getattr(model, "request_overrides", None) or {}
-                if isinstance(model_overrides, dict):
-                    ov_headers = model_overrides.get("headers") or {}
-                    ov_body = model_overrides.get("body_patch") or {}
-                    ov_model = model_overrides.get("model_alias")
-                    if ov_model:
-                        upstream_req = upstream_req.model_copy(update={"model": ov_model})
-                    if ov_headers and isinstance(ov_headers, dict):
-                        extra_hdr = {**(extra_hdr or {}), **ov_headers}
-                    if ov_body and isinstance(ov_body, dict):
-                        try:
-                            upstream_req = upstream_req.model_copy(update=ov_body)
-                        except Exception:
-                            pass
+                upstream_req, extra_hdr = _apply_request_overrides(upstream_req, model, extra_hdr)
                 ctx = {"t_idx": t_idx, "full_id": full_id, "provider": provider, "model": model,
                        "start": time.time()}
                 _ns_ctx_by_idx[t_idx] = ctx
@@ -2395,7 +2427,7 @@ async def _chat_completions_impl(
                         _prov_obj, _mdl_obj = _prov, _mdl
                         _sel_reason = None
                     else:
-                        cand = await ar.get_best_candidate(cascade_db, conversation_id,
+                        cand = await ar.get_best_candidate(cascade_db, sticky_key,
                                                            exclude_model_ids=tried_sids, profile=_profile)
                         _diag(conversation_id, "auto_stream_candidate_done", _diag_start,
                               attempt=st_attempt, success=cand.success if cand else None)
@@ -2466,9 +2498,9 @@ async def _chat_completions_impl(
                 _diag(conversation_id, "upstream_stream_start", _diag_start, attempt=st_attempt,
                       provider=_prov_ns.name, model=_mdl_ns.model_id)
                 _cascade_eh = _merge_oauth_headers(_prov_ns, _prov_ns.headers)
-                _cmov = _mdl_ns.request_overrides or {}
-                if isinstance(_cmov, dict) and _cmov.get("headers"):
-                    _cascade_eh = {**(_cascade_eh or {}), **_cmov["headers"]}
+                # P1-6: 流式级联此前只并 headers，缺 model_alias/body_patch
+                up_req, _cascade_eh = _apply_request_overrides(up_req, _mdl_ns, _cascade_eh)
+                ctx["up_req"] = up_req
                 gen = None
                 try:
                     if ctx["is_free_channel"]:
@@ -2643,7 +2675,7 @@ async def _chat_completions_impl(
     else:
         # 非流式级联回退：完整业务请求内置于回退循环
         route_result, response, _attempt_errors = await _auto_request_with_cascade_fallback(
-            ar, db, request, conversation_id, diag_start_ts=_diag_start
+            ar, db, request, conversation_id, diag_start_ts=_diag_start, sticky_key=sticky_key
         )
         if not route_result.success:
             # 写一条失败日志
@@ -2711,18 +2743,8 @@ async def _chat_completions_impl(
             _rt_in_price = _rt_out_price = _rt_cr_price = _rt_cw_price = 0.0
         model_overrides_direct = getattr(route_result.model, "request_overrides", None) or {}
         if isinstance(model_overrides_direct, dict):
-            ov_headers = model_overrides_direct.get("headers") or {}
-            ov_body = model_overrides_direct.get("body_patch") or {}
-            ov_model = model_overrides_direct.get("model_alias")
-            if ov_model:
-                upstream_request = upstream_request.model_copy(update={"model": ov_model})
-            if ov_headers and isinstance(ov_headers, dict):
-                extra_headers = {**(extra_headers or {}), **ov_headers}
-            if ov_body and isinstance(ov_body, dict):
-                try:
-                    upstream_request = upstream_request.model_copy(update=ov_body)
-                except Exception:
-                    pass
+            upstream_request, extra_headers = _apply_request_overrides(
+                upstream_request, route_result.model, extra_headers)
         _send_time = time.time()
         if request.stream:
             _diag(conversation_id, "direct_stream_response_created", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
@@ -3083,6 +3105,10 @@ async def _chat_completions_impl(
 
     # ─── 返回 ───
     _diag(conversation_id, "response_ready", _diag_start, http_status=http_status_code, response_type=type(response).__name__)
+    # P2: _raw_response 只供上面写日志用，绝不能随错误体泄漏给客户端
+    # （内含上游原始报文，可能带内部信息）
+    if isinstance(response, dict):
+        response.pop("_raw_response", None)
     if isinstance(response, dict) and http_status_code != 200:
         json_response = JSONResponse(status_code=http_status_code, content=response)
         json_response.headers["x-routed-via"] = _safe_header(model_id_full)
@@ -3162,6 +3188,8 @@ async def list_models(
             },
             "is_free": model.is_free,
             "auto_enabled": model.auto_enabled,
+            # v4.4 订阅制上游倍率（CodeBuddy/Qoder 无 USD 单价，只有 credit 倍率）
+            "price_ratio": getattr(model, "price_ratio", None),
             "capabilities": {
                 "streaming": model.supports_streaming,
                 "vision": model.supports_vision,

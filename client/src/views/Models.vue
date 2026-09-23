@@ -107,10 +107,20 @@
               <td><strong>{{ m.display_name || m.model_id }}</strong></td>
               <td><strong>{{ getProviderName(m.provider_id) }}</strong></td>
               <td>
-                <div class="mono text-xs">{{ formatPrice(m.input_price) }}/{{ formatPrice(m.output_price) }} /M</div>
-                <div v-if="m.cache_read_input_price || m.cache_write_input_price" class="mono text-xs" style="color: var(--accent, #2b8aef);" title="缓存价 (读/写)">
-                  缓存 {{ formatPrice(m.cache_read_input_price) }}/{{ formatPrice(m.cache_write_input_price) }} /M
+                <!-- v4.4 订阅制上游优先显示倍率（无 USD 单价，只有 credit 倍率） -->
+                <div v-if="m.price_ratio !== null && m.price_ratio !== undefined">
+                  <span class="badge" :class="ratioClass(m)" :title="ratioTitle(m)">{{ formatRatio(m) }}</span>
+                  <span class="text-xs text-muted" style="margin-left: 4px">倍率</span>
+                  <div v-if="m.price_ratio_source" class="text-xs text-muted">
+                    {{ { qoder: '在线目录', codebuddy: '客户端实测', provider: '上游声明', manual: '手动' }[m.price_ratio_source] || m.price_ratio_source }}
+                  </div>
                 </div>
+                <template v-else>
+                  <div class="mono text-xs">{{ formatPrice(m.input_price) }}/{{ formatPrice(m.output_price) }} /M</div>
+                  <div v-if="m.cache_read_input_price || m.cache_write_input_price" class="mono text-xs" style="color: var(--accent, #2b8aef);" title="缓存价 (读/写)">
+                    缓存 {{ formatPrice(m.cache_read_input_price) }}/{{ formatPrice(m.cache_write_input_price) }} /M
+                  </div>
+                </template>
                 <div v-if="m.pricing_source" class="text-xs text-muted" :title="m.pricing_source">
                   {{ pricingSourceHost(m.pricing_source) }}
                 </div>
@@ -295,6 +305,17 @@
       <div class="form-group">
         <label class="form-label">优先级加成 (-100 ~ 100)</label>
         <input v-model.number="editForm.priority_boost" type="number" min="-100" max="100" />
+      </div>
+
+      <div class="form-divider">价格与倍率</div>
+      <div class="form-group">
+        <label class="form-label">倍率（credit multiplier，订阅制上游用）</label>
+        <input v-model.number="editForm.price_ratio" type="number" step="0.01" min="0" placeholder="留空 = 未知（不显示倍率）" />
+        <div class="text-xs text-muted" style="margin-top: 4px;">
+          当前来源：{{ editForm.price_ratio_source || '未设置' }}。
+          CodeBuddy/Qoder 等订阅制上游按 credit 倍率计费、无 USD 单价：0 = 免费，越小越便宜。
+          填写后价格列改显倍率（标记 manual，刷新不再覆盖）；USD 成本核算不受影响。
+        </div>
       </div>
 
       <div class="form-divider">高级：请求覆盖</div>
@@ -582,6 +603,26 @@ export default {
       if (n < 1) return `$${n.toFixed(4)}`
       return `$${n.toFixed(2)}`
     },
+    // v4.4 订阅制倍率展示：x0.08 / 免费(x0) / 未知返回空
+    formatRatio(m) {
+      const r = m.price_ratio
+      if (r === null || r === undefined) return ''
+      if (Number(r) === 0) return '免费'
+      return `x${Number(r).toFixed(2)}`
+    },
+    ratioClass(m) {
+      const r = m.price_ratio
+      if (r === null || r === undefined) return ''
+      if (Number(r) === 0) return 'badge-success'
+      if (Number(r) <= 0.3) return 'badge-info'
+      if (Number(r) >= 1.5) return 'badge-warning'
+      return 'badge-neutral'
+    },
+    ratioTitle(m) {
+      const src = { qoder: 'Qoder 在线目录 price_factor', codebuddy: 'CodeBuddy 客户端实测',
+                    provider: '上游目录声明', manual: '手动设置' }[m.price_ratio_source] || ''
+      return `倍率（credit multiplier）${src ? '· 来源: ' + src : ''}`
+    },
     pricingSourceHost(source) {
       try {
         return new URL(source).host
@@ -745,6 +786,8 @@ export default {
         max_output_tokens: m.max_output_tokens || null,
         input_modalities: Array.isArray(m.input_modalities) ? [...m.input_modalities] : [],
         capability_source: m.capability_source || '',
+        price_ratio: (m.price_ratio === null || m.price_ratio === undefined) ? null : m.price_ratio,
+        price_ratio_source: m.price_ratio_source || '',
         model_alias: overrides.model_alias || '',
       }
       this.overrideHeadersText = overrides.headers ? JSON.stringify(overrides.headers, null, 2) : ''
@@ -756,16 +799,21 @@ export default {
       try {
         const requestOverrides = this.cleanRequestOverrides()
         const capability = this.editForm.supports_reasoning_effort
+        const hasRatio = this.editForm.price_ratio !== null && this.editForm.price_ratio !== undefined && this.editForm.price_ratio !== ''
         const payload = {
           ...this.editForm,
           supports_reasoning_effort: capability === true || capability === false ? capability : null,
           context_length: this.editForm.context_length || null,
           max_output_tokens: this.editForm.max_output_tokens || null,
           input_modalities: this.editForm.input_modalities || [],
+          price_ratio: hasRatio ? Number(this.editForm.price_ratio) : null,
+          // 原值非空、本次清空 → 显式请求清空（回到"未知"）
+          clear_price_ratio: !hasRatio && !!(this.editForm.price_ratio_source),
           request_overrides: requestOverrides,
         }
         delete payload.model_alias
         delete payload.capability_source
+        delete payload.price_ratio_source
         await api.updateModel(this.editForm.id, payload)
         this.showEditModal = false
         await this.load()

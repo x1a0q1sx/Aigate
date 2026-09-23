@@ -61,6 +61,38 @@ def _seed(*pairs):
     return [{"model_id": mid, "display_name": name} for mid, name in pairs]
 
 
+# v4.4 订阅制上游的"倍率"（credit multiplier）静态表。
+# 这类上游没有 USD 单价，按 credit 倍率计费（0.0 = 免费；越小越便宜）。
+#
+# 数据来源（全部为实测值，无推测）：
+#   - WorkBuddy 桌面端 product.json（2026-08-17 版，endpoint=copilot.tencent.com，
+#     即 CN SaaS 版）：deepseek-v4-pro x0.16 / minimax-m3-play x0.25 /
+#     hy3-preview-agent x0.04 / default x2.00
+#   - CodeBuddy IDE 客户端日志实测（2026-08-20~09-05，含时间戳）：
+#     deepseek-v4-flash x0.17→x0.08（08-21 调价）/ hy3 x0.00 / hy4-preview x0.00
+#   - 同一模型在两处冲突时取**更新的实测值**（flash 用 0.08）。
+# 未列出的模型留 NULL（未知），由用户在模型页手动填——不猜。
+# 注意：客户端升级后倍率可能变化；Qoder 走在线目录（price_factor）不受此限。
+STATIC_PRICE_RATIOS: Dict[str, Dict[str, float]] = {
+    # CodeBuddy 两版共用同一后端与模型目录（见 codebuddy_intl 注释）
+    "codebuddy_cn": {
+        "deepseek-v4-pro": 0.16,
+        "deepseek-v4-flash": 0.08,
+        "minimax-m3": 0.25,          # product.json minimax-m3-play 同档
+        "hy3-preview-agent": 0.04,
+        "hy3": 0.00,                 # 免费（客户端日志实测）
+        "hy4-preview": 0.00,         # 免费（客户端日志实测）
+    },
+    "codebuddy_intl": {
+        # 国际版种子已剔除 deepseek-v4-pro/flash 等（11102 下架，见 codebuddy_intl
+        # 注释）——倍率表只列该版真实存在的模型，不给已下架模型留值。
+        "minimax-m3": 0.25,
+        "hy3": 0.00,
+        "hy4-preview": 0.00,
+    },
+}
+
+
 def _env_client_id(code: str, placeholder: str = "CHANGE_ME") -> str:
     """从环境变量读取该 provider 的 OAuth client_id，避免真实凭据硬编码入库。
 

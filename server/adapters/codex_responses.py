@@ -595,6 +595,8 @@ class CodexResponsesAdapter(BaseAdapter):
                                 "index": idx,
                                 "name": item.get("name") or "",
                                 "args": item.get("arguments") or "",
+                                # P2: 记下 item_id，供 delta 事件（只带 item_id）关联回本槽
+                                "item_id": item.get("id") or "",
                             }
                             saw_tool_call = True
                             delta = {
@@ -616,7 +618,25 @@ class CodexResponsesAdapter(BaseAdapter):
                         continue
 
                     if event_type == "response.function_call_arguments.delta":
+                        # P2: delta 事件只带 item_id，而 added 事件按 call_id 建槽 →
+                        # 直接查 call_id 会全部落空、逐片参数静默丢弃（只剩
+                        # output_item.done 的整段补发，实时流式失效）。
+                        # 这里按 item_id 建槽并回填。
                         call_id = data.get("call_id") or data.get("item_id")
+                        _item_id = data.get("item_id")
+                        if call_id not in active_calls and _item_id:
+                            # 别名槽：指向同一 state（call_id 与 item_id 是同一调用的两种 id）
+                            for _cid, _st in list(active_calls.items()):
+                                if _st.get("item_id") == _item_id:
+                                    active_calls[call_id] = _st
+                                    break
+                            else:
+                                active_calls[call_id] = {
+                                    "index": len(active_calls),
+                                    "name": "",
+                                    "args": "",
+                                    "item_id": _item_id,
+                                }
                         if call_id in active_calls:
                             frag = data.get("delta") or ""
                             active_calls[call_id]["args"] += frag
@@ -687,6 +707,7 @@ class CodexResponsesAdapter(BaseAdapter):
                                 "index": idx,
                                 "name": item.get("name") or "",
                                 "args": item.get("arguments") or "",
+                                "item_id": item.get("id") or "",
                             }
                             saw_tool_call = True
                             delta = {

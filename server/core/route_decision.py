@@ -200,7 +200,17 @@ def add_attempt(
     trace = _active.get(conversation_id)
     if not trace or len(trace.attempts) >= _MAX_ATTEMPTS:
         return
-    normalized_attempt = int(attempt if attempt is not None else len(trace.attempts))
+    # P1-7: attempt 允许非数字（fusion 的 judge 轮传字符串 "judge"）。
+    # 此前直接 int() → ValueError 冒到调用方，把同 try 的 select+finish 一起吞掉。
+    if attempt is None:
+        normalized_attempt = len(trace.attempts)
+    elif isinstance(attempt, int):
+        normalized_attempt = attempt
+    else:
+        try:
+            normalized_attempt = int(attempt)
+        except (TypeError, ValueError):
+            normalized_attempt = str(attempt)[:32]
     normalized_error = _short(error)
     for existing in trace.attempts:
         if (

@@ -1249,7 +1249,10 @@ export default {
       }
       this.revealingId = k.id
       try {
-        const d = await api.revealKey(k.id)
+        // P1-21: 揭示明文密钥需管理员密码二次校验
+        const pwd = prompt('揭示明文密钥需要管理员密码：')
+        if (pwd === null) return
+        const d = await api.revealKey(k.id, pwd)
         this.revealedKeys = { ...this.revealedKeys, [k.id]: d.key || d }
       } catch (e) {
         toast.error('查看密钥失败: ' + e.message)
@@ -1602,6 +1605,12 @@ export default {
         const params = { include_keys: this.exportIncludeKeys }
         if (this.exportProviderIds.length > 0) {
           params.provider_ids = this.exportProviderIds.join(',')
+        }
+        // P1-21: 含明文密钥的导出需管理员密码二次校验
+        if (params.include_keys) {
+          const pwd = prompt('导出包含全部上游明文密钥，请输入管理员密码确认：')
+          if (pwd === null) return
+          params.admin_password = pwd
         }
         const bundle = await api.exportProviders(params)
         const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' })

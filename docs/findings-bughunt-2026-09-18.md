@@ -41,33 +41,33 @@
 - [x] **P1-1 `sa_select` 未导入 NameError**：`v1_router.py:1893`（provider 全部 key 停用/删光后的兜底分支）→ 500 裸异常而非 503。改 `select`。
 - [x] **P1-2 combo 清理误删"临时禁用"的模型**：`server/core/combo_router.py:99-110,187-196` 查询带 `Model.enabled==True`，禁用模型查不到 → 判 stale → `combo.model_ids` 改写落库（124-126），与 146 行"跳过不删"注释矛盾；provider 禁用有豁免、模型禁用没有。另 81-85 行旧格式裸 model_id 直接删，注释承诺的回查未实现。
 - [x] **P1-3 401/403 硬熔断永不生效**：`v1_router.py:2585` `getattr(e,"status_code",None)` 在 httpx.HTTPStatusError 上恒 None（状态码在 `.response.status_code`，实测复现）；且 `key_rotator.py:157-176` `_fallback_key` 不查 `_hard_disabled`，拉黑的 key 照样兜底返回。
-- [ ] **P1-4 session sticky 整体失效 + 泄漏 + 时区错**：`auto_router.py:452-465` 以 conversation_id 为键，而 v1_router 每请求新造 uuid4（1244）→ 永不可命中，`session_sticky_minutes` 配置形同虚设；`_sticky_cache` 只增不清（427 写、仅命中时清）→ 慢性内存增长；458 行 naive utcnow.timestamp() 按本地时区折算，偏差 -8h。连锁：修好命中后 `get_best_candidate` 221/234/236 的 `return None` 违反调用方 `.success` 契约（v1_router 718/860/2071）→ AttributeError。
-- [ ] **P1-5 auto 非流式级联丢 `__proxy_force`/extra_headers**：`v1_router.py:893` 直接用 `candidate.provider.headers`，不 `_merge_oauth_headers`（对照 2113/1739/2311 都有）→ 代理池关闭时"强制走代理"的 provider 裸连出站。
-- [ ] **P1-6 request_overrides 流式路径不生效**：combo 流式（1573-75）与 auto 级联（890-91 全无、2114-16 只有 headers）缺 model_alias/body_patch，直连（2329-42）与 combo 非流式（1742-55）齐全 → 依赖 alias 的模型按路径不同行为不一致。
-- [ ] **P1-7 fusion "judge" 决策记录被吞**：`fusion.py:207,219` attempt 写字符串 "judge" → `route_decision.py:203` `int()` ValueError → `v1_router.py:1040` 抛出后被 1065 except 吞掉，同 try 的 select+finish 一并跳过，明细永久丢失且不可见。
+- [x] **P1-4 session sticky 整体失效 + 泄漏 + 时区错**：`auto_router.py:452-465` 以 conversation_id 为键，而 v1_router 每请求新造 uuid4（1244）→ 永不可命中，`session_sticky_minutes` 配置形同虚设；`_sticky_cache` 只增不清（427 写、仅命中时清）→ 慢性内存增长；458 行 naive utcnow.timestamp() 按本地时区折算，偏差 -8h。连锁：修好命中后 `get_best_candidate` 221/234/236 的 `return None` 违反调用方 `.success` 契约（v1_router 718/860/2071）→ AttributeError。
+- [x] **P1-5 auto 非流式级联丢 `__proxy_force`/extra_headers**：`v1_router.py:893` 直接用 `candidate.provider.headers`，不 `_merge_oauth_headers`（对照 2113/1739/2311 都有）→ 代理池关闭时"强制走代理"的 provider 裸连出站。
+- [x] **P1-6 request_overrides 流式路径不生效**：combo 流式（1573-75）与 auto 级联（890-91 全无、2114-16 只有 headers）缺 model_alias/body_patch，直连（2329-42）与 combo 非流式（1742-55）齐全 → 依赖 alias 的模型按路径不同行为不一致。
+- [x] **P1-7 fusion "judge" 决策记录被吞**：`fusion.py:207,219` attempt 写字符串 "judge" → `route_decision.py:203` `int()` ValueError → `v1_router.py:1040` 抛出后被 1065 except 吞掉，同 try 的 select+finish 一并跳过，明细永久丢失且不可见。
 
 ### 日志/计量
 - [x] **P1-8 log_queue 关闭不排空，注释撒谎**：`log_queue.py:185` worker `while not stopped` 退出时不 drain，`254` 注释声称会；`stop_log_queue` 的 `while not q.empty()`（256-258）永不成立 → 每次重启固定白等 8s + 队列里未落库的日志丢失 → pending 行 30 分钟后被 sweep 成 error（虚增错误率、缺 usage）。
 - [x] **P1-9 网关每日 token 预算双倍计缓存 token**：`gateway_keys.py:115` `pt+ct+crt+cwt`，但归一化契约 prompt_tokens 已含缓存（usage_normalize.py:20-22，`_segmented_cost` 的 `max(0,pt-crt-cwt)` 反证）→ 设 daily_token_limit 的 key 预算最快 2 倍速耗尽、误伤 429。修法 `pt+ct`。
-- [ ] **P1-10 rate_limiter "并发安全插入"是死代码**：`rate_limiter.py:72-84` 用通用 `sqlalchemy.insert` 调 `.on_conflict_do_nothing`（仅方言版有）→ 恒 AttributeError 落 except；同 (model,key) 并发首建时 96-106 的裸 add+commit 抛 IntegrityError 冒穿到请求路径（500）且 session 处于失败态。
+- [x] **P1-10 rate_limiter "并发安全插入"是死代码**：`rate_limiter.py:72-84` 用通用 `sqlalchemy.insert` 调 `.on_conflict_do_nothing`（仅方言版有）→ 恒 AttributeError 落 except；同 (model,key) 并发首建时 96-106 的裸 add+commit 抛 IntegrityError 冒穿到请求路径（500）且 session 处于失败态。
 - [x] **P1-11 Anthropic 流式 usage 丢 input/cache**：`anthropic_adapter.py:427-432` message_start 的 usage（官方 input_tokens/cache_* 所在）被忽略，delta 只有 output → prompt_tokens=0 走 chars//4 粗估，缓存费恒 0、成本虚高。（与 P0-4 同文件同函数，一并修。）
-- [ ] **P1-12 headroom 路由保护从未接线**：`headroom_manager.py:5` 声称 auto_router 会跳过，全仓 `is_in_headroom_cooling` 无调用方 → 额度保留只是展示。
+- [x] **P1-12 headroom 路由保护从未接线**：`headroom_manager.py:5` 声称 auto_router 会跳过，全仓 `is_in_headroom_cooling` 无调用方 → 额度保留只是展示。
 - [x] **P1-13 rank_all 缓存永不命中且无界增长**：`auto_router.py:121-123` 冷却占位填 `datetime.utcnow()`（含微秒）→ `ranking_service.py:360-364` 把值 str 进 cache key，任何模型在冷却时每请求 key 不同、命中率归零；`_rank_cache` 无淘汰（345,489）→ 内存随请求线性涨。健康冷却排除（428）也因此恒 False。
 
 ### OAuth/认证
-- [ ] **P1-14 刷新 single-flight 假成功 + InvalidStateError 炸穿**：`oauth_client.py:291-296` 合并方丢弃 leader 结果无条件返回成功；waiter 的 `wait_for(15s)` 超时**会 cancel 共享 Future**（asyncio 语义）→ leader 成功路径 `set_result` 抛 InvalidStateError（302）→ except 内 `set_exception` 再抛（305，cancelled future）→ 穿透 refresh_token 到 `v1_router.py:1873`/`credential_resolver.py:64`（均无 try）→ 用户请求 500。修法：leader 持 Task+结果值，等待方读结果；set 前判 cancelled。
-- [ ] **P1-15 刷新失败一律永久下线**：`oauth_client.py:343-349`（及 codebuddy 377-390、cline 509-522）对任意 ≥400（含 429/502/超时后的网络异常）置 `is_active=False`，调度器只扫 active（oauth_router.py:212）→ 上游一次抖动=连接判死刑，须人工重登。修法：仅 invalid_grant/401 语义才 deactivate，其余记 last_error+退避。
+- [x] **P1-14 刷新 single-flight 假成功 + InvalidStateError 炸穿**：`oauth_client.py:291-296` 合并方丢弃 leader 结果无条件返回成功；waiter 的 `wait_for(15s)` 超时**会 cancel 共享 Future**（asyncio 语义）→ leader 成功路径 `set_result` 抛 InvalidStateError（302）→ except 内 `set_exception` 再抛（305，cancelled future）→ 穿透 refresh_token 到 `v1_router.py:1873`/`credential_resolver.py:64`（均无 try）→ 用户请求 500。修法：leader 持 Task+结果值，等待方读结果；set 前判 cancelled。
+- [x] **P1-15 刷新失败一律永久下线**：`oauth_client.py:343-349`（及 codebuddy 377-390、cline 509-522）对任意 ≥400（含 429/502/超时后的网络异常）置 `is_active=False`，调度器只扫 active（oauth_router.py:212）→ 上游一次抖动=连接判死刑，须人工重登。修法：仅 invalid_grant/401 语义才 deactivate，其余记 last_error+退避。
 - [x] **P1-16 更新检查冻结事件循环**：`update_router.py:137` async 处理函数里同步 `subprocess.run(git fetch)`（81-84，无 timeout）+ `_probe_proxy` 同步 TCP 探测 → 远端不可达时挂 1-3 分钟，期间全部 /v1 流量停摆。
 
 ### 管理端/元数据
-- [ ] **P1-17 手改价格保护标记被刷新抹掉**：`model_catalog.py:406` 算出 manual_priced 后，425 行在 `remote_metadata` 分支内**无条件** `pricing_source = source_url` → 本轮价格没覆盖但标记没了，下轮刷新直接覆盖用户价格。同类：404 行 display_name 无守卫、421 行 success_rate 远程缺字段时以 None 抹掉。
-- [ ] **P1-18 智力分手工校准保护永不生效**：`admin_routing.py:735` 创建 IntelligenceStatic 不传 `source`（模型默认 "arena"），`intelligence_sync.py:275` 免覆盖判定要求 `source=="manual"` → 手调分数周一同步必被覆盖。
+- [x] **P1-17 手改价格保护标记被刷新抹掉**：`model_catalog.py:406` 算出 manual_priced 后，425 行在 `remote_metadata` 分支内**无条件** `pricing_source = source_url` → 本轮价格没覆盖但标记没了，下轮刷新直接覆盖用户价格。同类：404 行 display_name 无守卫、421 行 success_rate 远程缺字段时以 None 抹掉。
+- [x] **P1-18 智力分手工校准保护永不生效**：`admin_routing.py:735` 创建 IntelligenceStatic 不传 `source`（模型默认 "arena"），`intelligence_sync.py:275` 免覆盖判定要求 `source=="manual"` → 手调分数周一同步必被覆盖。
 - [x] **P1-19 Playground 日志路由归属恒 NULL**：`admin_router.py:1665` `_write_log(..., _route_result=route_result)` 默认参数在 def 时冻结为 None，后续对 `route_result` 的赋值不生效（1761/1796/1813）→ routed_provider/model 恒 None、fallback_count 恒 0，ranking 统计丢 playground 归属。
-- [ ] **P1-20 delete_provider 清理是死代码 + 关联表孤儿 + rowid 复用继承脏冷却**：`admin_router.py:953-961` 先 DELETE 再 SELECT model ids → 必空，hc 内存缓存一次不清；不清 HealthCheck/RateLimitState/ModelApiKey；SQLite rowid 复用 → 新模型 id 撞旧冷却条目，上线即被 auto 跳过。delete_key（key_manager.py:54-62 / admin_router 1000-1005）同缺 rotator 内存清理与 ModelApiKey 解绑。
-- [ ] **P1-21 明文密钥导出/揭示绕过二次鉴权**：`admin_router.py:631-696` export（691-95 明文 key）与 975-980 reveal 仅需会话，未挂 `_require_admin_reauth`（155-173 的威胁模型正是"会话被盗"）→ 被盗会话一个 fetch 拖走全部上游明文密钥（含 refresh token）。
+- [x] **P1-20 delete_provider 清理是死代码 + 关联表孤儿 + rowid 复用继承脏冷却**：`admin_router.py:953-961` 先 DELETE 再 SELECT model ids → 必空，hc 内存缓存一次不清；不清 HealthCheck/RateLimitState/ModelApiKey；SQLite rowid 复用 → 新模型 id 撞旧冷却条目，上线即被 auto 跳过。delete_key（key_manager.py:54-62 / admin_router 1000-1005）同缺 rotator 内存清理与 ModelApiKey 解绑。
+- [x] **P1-21 明文密钥导出/揭示绕过二次鉴权**：`admin_router.py:631-696` export（691-95 明文 key）与 975-980 reveal 仅需会话，未挂 `_require_admin_reauth`（155-173 的威胁模型正是"会话被盗"）→ 被盗会话一个 fetch 拖走全部上游明文密钥（含 refresh token）。
 
 ### 适配器/协议
-- [ ] **P1-22 Gemini streamGenerateContent 实际不走流式**：`gemini_converter.py:91` 硬编码 stream=False，`gemini_router.py:137-148` 无 stream 分支 → "流"要等全文完成；且 `chunk_to_gemini`（151-171）丢 tool_calls、吞网关终态 error chunk；router 56-98 源流无 finally aclose（anthropic/responses 都修过，此文件漏）。
+- [x] **P1-22 Gemini streamGenerateContent 实际不走流式**：`gemini_converter.py:91` 硬编码 stream=False，`gemini_router.py:137-148` 无 stream 分支 → "流"要等全文完成；且 `chunk_to_gemini`（151-171）丢 tool_calls、吞网关终态 error chunk；router 56-98 源流无 finally aclose（anthropic/responses 都修过，此文件漏）。
 - [x] **P1-23 openai_compat 流式只认 `data: `（带空格）**：`openai_compat.py:318-324` 与 `github_adapter.py:119-125`，对照聚合路径 223 行用 `startswith("data:")`；无空格上游 → 整条流静默丢弃，直连路径以 `[DONE]` 空成功收尾。
 
 ## P2（择要，完整清单见审查记录）

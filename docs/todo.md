@@ -48,6 +48,27 @@
 - [x] P1-7 评分查询聚合化（✅ 2026-09 完成，commit f4a6507）：RankingService 批量 GROUP BY（avg_by_model + statuses_by_model 两条组查询）+ 10s TTL 内存缓存（key 含模型集合+冷却集）+ 聚合排除健康检查行
 - [x] P1-8 日志脱敏 + 归档状态展示（✅ 2026-09 完成，commit 47fe63f）：redact_text 覆盖 Bearer/sk-/wk-/KV 形态（blob 与回退原文两路）、最近归档状态入 /logs/archives 与前端展示；归档行级索引暂缓（无单条恢复消费方）
 
+### P1-9 隐藏 bug 审计第二批（✅ 2026-09 完成，findings §F18；13 项 P1 + 5 项 P2）
+> 基线 docs/findings-bughunt-2026-09-18.md（审计 HEAD=469e6b2）。本批逐条回读源码核实后修复，新增 51 项回归测试（tests/test_audit_fixes.py）。
+- [x] P1-4 session sticky 三重失效（key 每请求变 / 缓存无界 / 时区错）+ `return None` 契约违反：新增稳定会话键派生（显式头 > IP+system+首条 user 哈希）、monotonic TTL + 容量上限、失败分支统一回落选举
+- [x] P1-5 auto 非流式级联丢 `__proxy_force/__oauth/__fg` → 统一 `_merge_oauth_headers`
+- [x] P1-6 request_overrides 路径不一致（流式缺 alias/body_patch）→ 抽出 `_apply_request_overrides` 统一 5 条出站路径
+- [x] P1-7 fusion `attempt="judge"` 致 route_decision `int()` 抛错吞掉 select+finish → 非数字 attempt 降级存字符串
+- [x] P1-10 rate_limiter upsert 死代码（通用 insert 无 on_conflict）+ 并发 IntegrityError 冒穿 → 方言版 insert + 冲突 re-query
+- [x] P1-12 headroom 从未接线（额度保留只是展示）→ `get_best_candidate` 跳过触达阈值 provider（统计失败不拦）
+- [x] P1-14 OAuth single-flight 假成功 + wait_for cancel 共享 Future 抛 InvalidStateError → shield 等待回传真实结果 + set 前判 done
+- [x] P1-15 刷新失败一律永久下线（429/5xx 也判死）→ `_refresh_credential_dead` 分级（仅 401/invalid_grant 才下线）
+- [x] P1-17 手改价格 manual 标记被刷新抹掉 + 指标 None 抹旧值 → source 写入移入守卫分支 + is not None 守卫
+- [x] P1-18 智力分手工校准永不生效（source 默认 arena）→ 面板 upsert 两分支写 manual
+- [x] P1-20 delete_provider 清理死代码 + 关联表孤儿 + rowid 复用继承脏状态 → SELECT 前移 + 三表清理 + `KeyRotator.forget_key`
+- [x] P1-21 明文密钥导出/揭示无二次鉴权 → 三端点挂 `_require_admin_reauth` + 前端密码询问（Dashboard 改按需揭示）
+- [x] P1-22 Gemini streamGenerateContent 实际非流式 + 丢 tool_calls/错误 + 无 aclose → stream 参数化 + functionCall 分片 + finally aclose
+- [x] P2-13 `_raw_response` 泄漏进错误体 → 返回前 pop
+- [x] P2-14 RPD/TPD 永不重置永不检查 → 日窗口重置 + 纳入 check_limit（默认 0=不限）
+- [x] P2-15 codex delta 按 call_id 索引丢事件 → item_id 建槽/别名
+- [x] P2-16 force_stream 聚合 usage 恒 0 → 注入 `stream_options.include_usage`
+- [x] P2-17 内置价表子串匹配错档（gpt-4o-mini 命中 gpt-4o）→ 最长前缀匹配
+
 ## P2 — 体验与扩展
 
 - [x] P2-9 协议 fixture 测试（✅ 2026-09 完成，commit b678c74）：三协议面完整 SSE 契约样例（tests/test_protocol_fixes.py），抓到并修复 3 个真实 bug（/v1/messages 流式缺 await 全坏、message_start 被 ping 抢首、非流式块序错误）

@@ -190,6 +190,22 @@ class KeyRotator:
         self._fail_count.pop(api_key_id, None)
         self._cooldown_until.pop(api_key_id, None)
 
+    def forget_key(self, api_key_id: int):
+        """P1-20: key 被删除时清空其全部进程内状态。
+
+        与 reactivate 的区别：还要清轮转游标（_cursor/_model_cursor 按 provider/
+        model 轮转，删 key 后索引可能越界或指向已删 key）。SQLite 的 rowid 会
+        复用，残留状态会被新 key 直接继承（上线即"冷却中"）。
+        """
+        self.reactivate(api_key_id)
+        for d in (self._cursor, self._model_cursor):
+            for k in list(d.keys()):
+                try:
+                    if d[k] == api_key_id:
+                        d.pop(k, None)
+                except Exception:
+                    pass
+
     def mark_failure(self, api_key_id: int, status_code: Optional[int] = None):
         """单次请求失败 → 计数加 1，过阈值则进冷却；401/403 永久禁用"""
         if not api_key_id:

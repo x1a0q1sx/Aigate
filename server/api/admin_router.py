@@ -604,6 +604,7 @@ _MODEL_FIELDS = (
     "supports_vision", "context_length", "priority_boost", "is_manual",
     "supports_reasoning_effort",
     "input_modalities", "max_output_tokens",   # v4.3 能力（换机迁移不丢）
+    "price_ratio", "price_ratio_source",       # v4.4 订阅制倍率（换机迁移不丢）
     "request_overrides", "pricing_source",
 )
 
@@ -631,6 +632,7 @@ def _serialize_model_for_export(m: Model) -> dict:
 
 @router.get("/providers/export")
 async def export_providers(
+    raw_request: Request,
     include_keys: bool = False,
     provider_ids: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
@@ -638,8 +640,12 @@ async def export_providers(
     """导出服务商配置为可移植 JSON。
 
     - include_keys=true 时明文导出 API Key（用于换机迁移），默认不导出。
+      P1-21: 明文导出含上游密钥/refresh token，须二次校验管理员密码
+      （仅会话 Cookie 被盗即可整库拖走明文密钥）。
     - provider_ids 为逗号分隔 id 列表，缺省导出全部。
     """
+    if include_keys:
+        _require_admin_reauth(raw_request)
     query = select(Provider).order_by(Provider.id)
     wanted: Optional[set] = None
     if provider_ids:
@@ -983,16 +989,33 @@ async def delete_provider(provider_id: int, db: AsyncSession = Depends(get_db)):
     # 防止删完 provider 后孤儿 model 行残留，导致模型列表混乱
     from server.models.model import Model as _M
     from server.models.api_key import ApiKey as _AK
+    # P1-20: 必须在 DELETE **之前**取出 id 列表——此前先删再查，查询恒空，
+    # 内存清理成死代码，且 HealthCheck/RateLimitState/ModelApiKey 留孤儿行。
+    model_ids = list((await db.execute(
+        select(_M.id).where(_M.provider_id == provider_id)
+    )).scalars().all())
+    key_ids = list((await db.execute(
+        select(_AK.id).where(_AK.provider_id == provider_id)
+    )).scalars().all())
     await db.execute(delete(_AK).where(_AK.provider_id == provider_id))
     await db.execute(delete(_M).where(_M.provider_id == provider_id))
+    # P1-20: 清关联表孤儿（健康检查 / 限流状态 / 模型-key 归属）
+    if model_ids or key_ids:
+        from server.models.health_check import HealthCheck as _HC
+        from server.models.rate_limit import RateLimitState as _RL
+        from server.models.model_api_key import ModelApiKey as _MAK
+        if model_ids:
+            await db.execute(delete(_HC).where(_HC.model_id.in_(model_ids)))
+            await db.execute(delete(_RL).where(_RL.model_id.in_(model_ids)))
+            await db.execute(delete(_MAK).where(_MAK.model_id.in_(model_ids)))
+        if key_ids:
+            await db.execute(delete(_RL).where(_RL.key_id.in_(key_ids)))
+            await db.execute(delete(_MAK).where(_MAK.api_key_id.in_(key_ids)))
     # 清理该 provider 所有 model 在 HealthChecker 中的缓存（避免过时延迟数据干扰）
     from server.main import get_health_checker
     hc = get_health_checker()
     if hc:
-        orphan_model_ids = [m.id for m in (await db.execute(
-            select(_M.id).where(_M.provider_id == provider_id)
-        )).scalars().all()]
-        for mid in orphan_model_ids:
+        for mid in model_ids:
             hc._status_cache.pop(mid, None)
             hc._cooling.pop(mid, None)
             hc._fail_count.pop(mid, None)
@@ -1006,15 +1029,20 @@ async def list_keys(db: AsyncSession = Depends(get_db)):
     return [ApiKeyResponse.model_validate(k) for k in keys]
 
 @router.get("/keys/{key_id}/reveal")
-async def reveal_key(key_id: int, db: AsyncSession = Depends(get_db)):
+async def reveal_key(key_id: int, raw_request: Request, db: AsyncSession = Depends(get_db)):
+    # P1-21: 揭示明文密钥须二次校验管理员密码（与备份导出同威胁模型）
+    _require_admin_reauth(raw_request)
     plaintext = await _key_manager.decrypt_key(db, key_id)
     if plaintext is None:
         raise HTTPException(status_code=404, detail="Key not found")
     return {"id": key_id, "key": plaintext}
 
 @router.get("/aigate-key")
-async def get_aigate_key(reveal: bool = False):
+async def get_aigate_key(raw_request: Request, reveal: bool = False):
     key = getattr(config.security, "aigate_api_key", "") or ""
+    # P1-21: 仅揭示模式需二次校验（掩码态无敏感信息）
+    if reveal:
+        _require_admin_reauth(raw_request)
     if not key:
         return {"configured": False, "masked": "", "key": "" if reveal else None}
     masked = _key_manager.mask_key(key)
@@ -1198,7 +1226,9 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         context_length=data.context_length,
         supports_vision=data.supports_vision,
         input_modalities=data.input_modalities,
-        max_output_tokens=data.max_output_tokens
+        max_output_tokens=data.max_output_tokens,
+        price_ratio=data.price_ratio,
+        clear_price_ratio=data.clear_price_ratio
     )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")

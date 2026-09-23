@@ -163,6 +163,9 @@ async def init_db():
         # v4.3: 模型刷新来源追踪（online=上游列表 / seed=静态种子兜底）
         "ALTER TABLE model_refresh_logs ADD COLUMN list_source VARCHAR(20) DEFAULT 'unknown'",
         "ALTER TABLE model_refresh_logs ADD COLUMN list_note TEXT DEFAULT NULL",
+        # v4.4: 订阅制上游倍率（CodeBuddy/Qoder 按 credit 倍率计费，无 USD 单价）
+        "ALTER TABLE models ADD COLUMN price_ratio REAL DEFAULT NULL",
+        "ALTER TABLE models ADD COLUMN price_ratio_source VARCHAR(50) DEFAULT ''",
     ]
     for sql in _migrations:
         try:
