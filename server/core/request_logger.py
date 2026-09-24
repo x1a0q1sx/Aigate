@@ -296,6 +296,18 @@ async def write_log(db: AsyncSession, **kwargs) -> int:
     except Exception as e:
         print(f"⚠️ 日志入队失败(回退同步写): {e}")
     # 队列不可用（如测试环境/关闭中）→ 原同步路径兜底
+    # 兜底补 routed_provider_id：只写名称的日志会被「按服务商用量」/headroom 聚合丢弃
+    if kwargs.get("routed_provider_id") is None and kwargs.get("routed_provider"):
+        try:
+            from sqlalchemy import select as _sel
+            from server.models.provider import Provider as _P
+            _pid = (await db.execute(
+                _sel(_P.id).where(_P.name == kwargs["routed_provider"]).limit(1)
+            )).scalar_one_or_none()
+            if _pid is not None:
+                kwargs["routed_provider_id"] = _pid
+        except Exception:
+            pass
     rec = RequestLog(**kwargs)
     await dedup_log_row(db, rec)
     db.add(rec)

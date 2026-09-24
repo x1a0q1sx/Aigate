@@ -1150,8 +1150,12 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                            routed_provider, routed_model, error_msg, fallback_count, attempt_errors,
                            stream_body=None, prompt_tokens=0, completion_tokens=0, latency_ms=None,
                            ttft_ms=None, cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None,
-                           est_prompt_tokens=None):
+                           est_prompt_tokens=None, routed_provider_id=None):
     """在流式生成器内异步写请求日志。
+
+    routed_provider_id：调用方已知服务商主键时传入（免一次按名查询）；为 None 时
+    按 routed_provider 名称兜底解析。**必须尽量落 id**——分析页「按服务商用量」
+    与 headroom 每日限额都按 id 聚合，只写名称的历史行会被聚合丢弃（2026-09-24 修）。
 
     方案A：request_logs 作为唯一用量数据源，直接在此写入
     routed_provider_id 与 estimated_cost_usd，不再写入平行的 quota_usage 表。
@@ -1208,10 +1212,11 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
             ct = int(completion_tokens) if completion_tokens else 0
             async with _LogSession() as _ldb:
                 # 解析服务商/模型 id 与单价，写入成本
-                _prov_id = None
+                # 调用方已给 id 时不再按名查询（避免重名/改名导致的错配）
+                _prov_id = routed_provider_id
                 _model_id = None
                 _cost = 0.0
-                if routed_provider:
+                if _prov_id is None and routed_provider:
                     prov_row = (await _ldb.execute(_sa_sel(_QP).where(_QP.name == routed_provider).limit(1))).scalar_one_or_none()
                     _prov_id = prov_row.id if prov_row else None
                 if _prov_id and routed_model:
@@ -1869,7 +1874,8 @@ async def _chat_completions_impl(
                         raw_err = getattr(exc, "raw_err", None) or getattr(exc, "stream_body", None) or et
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             ctx["prov"].name, ctx["mdl"].model_id, et[:500], st_attempt, None,
-                            stream_body=raw_err, diag_start_ts=_diag_start)
+                            stream_body=raw_err, diag_start_ts=_diag_start,
+                            routed_provider_id=getattr(ctx["prov"], "id", None))
                         print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={ctx['prov'].name} "
                               f"模型={ctx['mdl'].model_id} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
 
@@ -1891,7 +1897,8 @@ async def _chat_completions_impl(
                             ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             ctx["prov"].name, ctx["mdl"].model_id, et, st_attempt, None,
-                            diag_start_ts=_diag_start)
+                            diag_start_ts=_diag_start,
+                            routed_provider_id=getattr(ctx["prov"], "id", None))
 
                     async def _finish_session():
                         await cdb.close()
@@ -1969,7 +1976,8 @@ async def _chat_completions_impl(
                             cache_read_tokens=_crd, cache_write_tokens=_cwt,
                             latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms,
                             diag_start_ts=_diag_start,
-                            est_prompt_tokens=est_req_tokens)
+                            est_prompt_tokens=est_req_tokens,
+                            routed_provider_id=getattr(_prov, "id", None))
                         if ar.health_checker:
                             ar.health_checker.mark_success(_mdl.id)
                         yield b"data: [DONE]\n\n"
@@ -1991,7 +1999,8 @@ async def _chat_completions_impl(
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             _prov.name, _mdl.model_id, err_s, st_attempt, stream_errs,
-                            stream_body=raw_err, diag_start_ts=_diag_start)
+                            stream_body=raw_err, diag_start_ts=_diag_start,
+                            routed_provider_id=getattr(_prov, "id", None))
                     finally:
                         await _finish_session()
 
@@ -2181,6 +2190,7 @@ async def _chat_completions_impl(
                     cache_read_tokens=_crd, cache_write_tokens=_cwt,
                     latency_ms=int((time.time() - _w_start) * 1000),
                     diag_start_ts=_diag_start,
+                    routed_provider_id=getattr(_w_provider, "id", None),
                 )
             except Exception:
                 pass
@@ -2321,7 +2331,8 @@ async def _chat_completions_impl(
                                             "error" if _free_err else "success", provider.name, model.model_id, _free_err, 0,
                                             [] if _free_err else None,
                                             latency_ms=int((time.time() - _free_stream_start) * 1000),
-                                            ttft_ms=_free_ttft_ms)
+                                            ttft_ms=_free_ttft_ms,
+                                            routed_provider_id=getattr(provider, "id", None))
                                 except Exception:
                                     pass
                         return StreamingResponse(_free_stream(), media_type="text/event-stream")
@@ -2733,6 +2744,9 @@ async def _chat_completions_impl(
         # 届时再读会拿不到服务商/模型身份（日志行 routed_provider 变空）
         try:
             _rt_prov_name = route_result.provider.name
+            # 服务商主键必须一起快照：日志行只写名称时，分析页「按服务商用量」与
+            # headroom 每日限额（都按 routed_provider_id 聚合）会整行丢弃该请求。
+            _rt_prov_id = getattr(route_result.provider, "id", None)
             _rt_model_id = route_result.model.model_id
             _rt_in_price = float(getattr(route_result.model, "input_price", 0) or 0)
             _rt_out_price = float(getattr(route_result.model, "output_price", 0) or 0)
@@ -2740,6 +2754,7 @@ async def _chat_completions_impl(
             _rt_cw_price = float(getattr(route_result.model, "cache_write_input_price", 0) or 0)
         except Exception:
             _rt_prov_name = _rt_model_id = None
+            _rt_prov_id = None
             _rt_in_price = _rt_out_price = _rt_cr_price = _rt_cw_price = 0.0
         model_overrides_direct = getattr(route_result.model, "request_overrides", None) or {}
         if isinstance(model_overrides_direct, dict):
@@ -2885,6 +2900,7 @@ async def _chat_completions_impl(
                                 conversation_id=conversation_id,
                                 requested_model=request.model,
                                 routed_provider=_prov_name,
+                                routed_provider_id=_rt_prov_id,
                                 routed_model=_mdl_name,
                                 status="error" if _stream_err else "success",
                                 prompt_tokens=pt,

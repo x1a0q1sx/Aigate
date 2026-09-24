@@ -1976,6 +1976,8 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 await write_log(_ldb,
                     conversation_id=_conversation_id, requested_model=_request.model,
                     routed_provider=_route_result.provider.name if (_route_result and _route_result.success) else None,
+                    # 主键必须一起写：分析页「按服务商用量」/headroom 按 routed_provider_id 聚合
+                    routed_provider_id=getattr(_route_result.provider, "id", None) if (_route_result and _route_result.success) else None,
                     routed_model=_route_result.model.model_id if (_route_result and _route_result.success) else None,
                     status=status, latency_ms=latency_ms,
                     prompt_tokens=int(pt) if pt else 0,

@@ -738,32 +738,18 @@ async def analytics_trend(days: int = Query(7, ge=1, le=90), db: AsyncSession = 
 
 @router.get("/analytics/by-provider")
 async def analytics_by_provider(db: AsyncSession = Depends(get_db)):
-    """按服务商拆分今日用量（请求 / Token / 成本 / 占比%）"""
+    """按服务商拆分今日用量（请求 / Token / 成本 / 占比%）
+
+    统一走 `aggregate_usage_by_provider`：按 id 优先、名称兜底聚合。
+    此前直接 `WHERE routed_provider_id IS NOT NULL`，把只写了名称的历史行
+    （直连流式等路径，生产实测占当日 95%）整行丢弃 → 面板显示不全（2026-09-24 修）。
+    """
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    rows = (await db.execute(
-        select(
-            RequestLog.routed_provider_id,
-            func.count(RequestLog.id),
-            func.coalesce(func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens), 0),
-            func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0.0),
-        ).where(RequestLog.created_at >= today_start, RequestLog.routed_provider_id.isnot(None))
-        .group_by(RequestLog.routed_provider_id)
-        .order_by(func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens).desc())
-    )).all()
-    items = []
-    total_tokens = 0
-    for r in rows:
-        pid, reqs, toks, cost = r[0], int(r[1] or 0), int(r[2] or 0), round(float(r[3] or 0), 4)
-        pname = None
-        if pid:
-            p = await db.get(Provider, pid)
-            pname = p.name if p else None
-        items.append({"provider_id": pid, "provider_name": pname or "(unknown)",
-                      "requests": reqs, "tokens": toks, "cost_usd": cost})
-        total_tokens += toks
+    from server.core.provider_usage import aggregate_usage_by_provider
+    items = await aggregate_usage_by_provider(db, since=today_start)
+    total_tokens = sum(it["tokens"] for it in items)
     for it in items:
         it["share_pct"] = round(it["tokens"] / (total_tokens or 1) * 100, 1)
-    items.sort(key=lambda x: x["tokens"], reverse=True)
     return {"total_tokens": total_tokens, "providers": items}
 
 

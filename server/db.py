@@ -202,6 +202,12 @@ async def init_db():
         "UPDATE request_logs SET is_health_check=1 WHERE conversation_id LIKE 'hc-%' AND is_health_check=0",
         "UPDATE providers SET proxy_enabled = 1 "
         "WHERE proxy_enabled = 0 AND proxy_url IS NOT NULL AND TRIM(proxy_url) != ''",
+        # 历史行补 routed_provider_id：早期写入路径只写名称（直连流式最典型，生产实测
+        # 占当日 95%），聚合查询按 id 过滤会整行丢弃 → 用量面板显示不全、headroom
+        # 限额统计不到真实消耗。按名称回填（同名唯一，providers.name 有 unique 约束）。
+        "UPDATE request_logs SET routed_provider_id = ("
+        "  SELECT p.id FROM providers p WHERE p.name = request_logs.routed_provider"
+        ") WHERE routed_provider_id IS NULL AND routed_provider IS NOT NULL",
     ]:
         try:
             async with engine.begin() as conn:
@@ -221,6 +227,8 @@ async def init_db():
         "CREATE INDEX IF NOT EXISTS idx_oauth_provider_owner ON oauth_tokens(provider_code, owner)",
         # D1: 按下游密钥+时间聚合预算用量
         "CREATE INDEX IF NOT EXISTS idx_request_logs_dkey_time ON request_logs(downstream_key_id, created_at)",
+        # 按服务商聚合今日用量（分析页「按服务商用量」/headroom 每日限额）
+        "CREATE INDEX IF NOT EXISTS idx_request_logs_prov_time ON request_logs(routed_provider_id, created_at)",
     ]:
         try:
             async with engine.begin() as conn:

@@ -18,7 +18,6 @@ from __future__ import annotations
 from typing import List, Dict, Optional
 from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
 from server.config import get_config
 from server.models.request_log import RequestLog
 
@@ -42,19 +41,17 @@ def get_headroom_for(provider_id: int) -> int:
 async def get_provider_breakdown(db: AsyncSession) -> List[Dict]:
     """按 provider 拆分今日 token 消耗（供 headroom 与前端使用）。
 
-    方案A：数据源从 quota_usage 改为 request_logs（routed_provider_id + token 列）。
+    统一走 `aggregate_usage_by_provider`（id 优先、名称兜底）。
+    此前 `WHERE routed_provider_id IS NOT NULL` 让只写了名称的请求（直连流式等，
+    生产实测占当日 95%）完全不计入 → 每日限额统计不到真实用量，保留额度形同虚设
+    （2026-09-24 修）。
     """
+    from server.core.provider_usage import aggregate_usage_by_provider
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    rows = (await db.execute(
-        select(
-            RequestLog.routed_provider_id,
-            func.coalesce(func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens), 0),
-        ).where(
-            RequestLog.created_at >= today_start,
-            RequestLog.routed_provider_id.isnot(None),
-        ).group_by(RequestLog.routed_provider_id)
-    )).all()
-    return [{"provider_id": r[0], "tokens": int(r[1] or 0)} for r in rows]
+    items = await aggregate_usage_by_provider(db, since=today_start)
+    # 只保留能定位到具体 provider 的行（headroom 配置以 provider_id 寻址）
+    return [{"provider_id": it["provider_id"], "tokens": it["tokens"]}
+            for it in items if it.get("provider_id") is not None]
 
 
 async def is_in_headroom_cooling(provider_id: int, db: AsyncSession) -> bool:

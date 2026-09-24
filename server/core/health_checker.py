@@ -306,6 +306,7 @@ class HealthChecker:
                     is_health_check=1,
                     requested_model="auto",
                     routed_provider=provider.name,
+                    routed_provider_id=getattr(provider, "id", None),
                     routed_model=model.model_id,
                     status="success" if result.status == "healthy" else "error",
                     latency_ms=result.latency_ms,

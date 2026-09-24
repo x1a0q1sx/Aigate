@@ -127,12 +127,32 @@ async def _write_batch(batch: list) -> None:
     conversation_id 找到该行后「原位更新」为最终状态（单行，不补插）。
     找不到 pending 行（如管理页直发、独立进程调用）则照常插入。"""
     from sqlalchemy import update as _sa_update
+    from sqlalchemy import select as _sa_select
     from server.db import AsyncSessionLocal
+    from server.models.provider import Provider
     from server.models.request_log import RequestLog
     from server.core.request_logger import dedup_log_row
 
     written = 0
     async with AsyncSessionLocal() as db:
+        # 兜底：调用方只写了服务商名称而漏写 routed_provider_id 时按名补解析。
+        # 分析页「按服务商用量」与 headroom 每日限额都按 id 聚合——某条写入路径漏写
+        # id 就等于该请求在用量面板上凭空消失（2026-09-24：直连流式漏写，当天 95%
+        # 的行被聚合丢弃）。这里在落库前统一补齐，新增路径再漏也不会再丢数据。
+        _missing = {k.get("routed_provider") for k in batch
+                    if k.get("routed_provider") and k.get("routed_provider_id") is None}
+        if _missing:
+            try:
+                _rows = (await db.execute(
+                    _sa_select(Provider.name, Provider.id)
+                    .where(Provider.name.in_(_missing)))).all()
+                _name_id = {r[0]: r[1] for r in _rows}
+                for k in batch:
+                    if k.get("routed_provider_id") is None and k.get("routed_provider"):
+                        k["routed_provider_id"] = _name_id.get(k["routed_provider"])
+            except Exception as e:
+                stats["last_error"] = f"provider_id backfill: {str(e)[:120]}"
+
         recs = []
         for kwargs in batch:
             try:

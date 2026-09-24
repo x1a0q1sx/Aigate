@@ -373,3 +373,61 @@
 - 测试：tests/test_model_refresh_concurrency.py 17 项（并发峰值、并发上限、
   超时判失败不等待、异常隔离、provider 已删除、单服务商串行、
   session 工厂派生生产/临时库两路、配置钳制、端点委托防回退、schema 字段）。
+
+## F21 分析页「按服务商用量」显示不全：routed_provider_id 大面积缺失（2026-09-24）
+
+**现象**（用户报）：分析页「按服务商用量」只列出 4 家、且明显占比不对；
+实际当天有 6 家在服务。Providers 页详情弹窗的「今日用量」同样为空。
+
+**生产取证**（当日 832 行日志）：
+
+| 分组 | 行数 | 说明 |
+|---|---|---|
+| `routed_provider_id IS NULL` + 有 ttft | 786 | **直连流式写入路径** |
+| `routed_provider_id IS NULL` + 无 ttft | 50 | pending 在途 + 部分非流式失败 |
+| `routed_provider_id` 有值 | 35 | 仅 combo/auto 少数路径 |
+
+名称分布：CodeBuddy CN 596 行 / Qoder 139 行 / CodeBuddy Intl 51 行 —— 全部
+`routed_provider_id = NULL`。也就是说**当天 95% 的请求在用量面板上凭空消失**。
+
+**根因**：`routed_provider_id` 是后加的列（方案A 把配额统计从 quota_usage 并到
+request_logs 时引入），而 `_write_stream_log` 与若干写入路径当时只写了服务商
+**名称**；聚合查询统一写 `WHERE routed_provider_id IS NOT NULL`，两相叠加 →
+「名单之外的都得靠 id，但大家都只写了名字」。
+
+**连带缺陷**：`headroom_manager.get_provider_breakdown` 用同一份过滤条件 →
+**每日 token 限额统计不到真实用量，保留额度形同虚设**（这是功能性缺陷，
+不只是显示问题）：配置 4000 token 限额的站实际跑了 5000 也不会被跳过。
+
+**修复三层**（缺任一层都会复发）：
+
+1. **聚合层收敛**：新增 `server/core/provider_usage.aggregate_usage_by_provider`
+   ——「id 优先、名称兜底」聚合：加载 providers 名称→id 映射，把只有名称的历史行
+   归到正确服务商并**与 id 行合并为同一行**；名称匹配不到（已删除/改名）保留
+   原始名称的独立桶，不静默丢数据；排除 `is_health_check` 与 `status='pending'`
+   （后者在途且完成时原位更新，提前计入会虚增）。
+   `analytics/by-provider` 与 `get_provider_breakdown` 都改接它。
+2. **写入层补 id**：`_write_stream_log` 新增 `routed_provider_id` 形参（传了就直接
+   用，不再按名查询——重名/改名场景会错配）；直连流式在路由完成时快照
+   `_rt_prov_id`；combo 流式各站点、free_tier 流式、非流式 combo 胜出、
+   媒体生成（4 处）、透传（2 处）、Playground、健康检查全部补齐。
+   **兜底**：`log_queue._write_batch` 与 `write_log` 同步路径在落库前按名解析
+   `routed_provider_id` —— 将来新增路径再漏写也不会丢数据。
+3. **历史数据回填 + 索引**：`init_db` 回填
+   `UPDATE request_logs SET routed_provider_id = (SELECT p.id FROM providers p WHERE p.name = request_logs.routed_provider) WHERE routed_provider_id IS NULL AND routed_provider IS NOT NULL`
+   （幂等，启动跑一次；providers.name 有 unique 约束故无歧义）；
+   新增 `idx_request_logs_prov_time(routed_provider_id, created_at)`。
+
+**前端**：Providers 详情弹窗由「只按 id 命中」改为「id 优先、名称兜底」；
+Analytics 卡片标题加「N 家」计数，名称匹配不到 id 的行加「（已删除）」标注，
+避免用户再看到「明明有流量却不显示」或反之的困惑。
+
+**验证**：tests/test_provider_usage_aggregation.py 21 项（名称行计入、id/名称合并
+单行、已删除桶、health/pending 排除、时间窗、成本累加、NULL token 容错、排序、
+headroom 限额生效、端点返回全集、log_queue 兜底两路、迁移 SQL 幂等 + 注册断言、
+各写入路径断言、前端断言）；并用生产今日真实分布（786 名称行 + 35 id 行、6 家）
+离线复现：修复前面板只见 2 家，修复后 6 家齐全且计数与原始日志一致。
+
+**教训（跨模块）**：给统计列加「必填项」性质的过滤条件时，必须同时保证
+（a）所有写入路径都写该列、（b）历史数据有回填、（c）聚合端有兜底容忍。
+本次三层缺一即复发——审计时曾把「加列」当作纯增量，没检查写入方覆盖度。

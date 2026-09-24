@@ -141,8 +141,13 @@ async def _write_media_log(
     db, media_type: str, status: str, provider_name: str, model: str,
     prompt: str, latency_ms: float, error_msg: str = "",
     result_summary: str = "",
+    provider_id: int = None,
 ):
-    """写一条媒体生成日志到 RequestLog 表"""
+    """写一条媒体生成日志到 RequestLog 表
+
+    provider_id：调用方已知服务商主键时传入——分析页「按服务商用量」与 headroom
+    都按 routed_provider_id 聚合，只写名称的行会被丢弃（2026-09-24 修）。
+    """
     import json as _json
     from server.models.request_log import RequestLog
     from server.core.request_logger import write_log  # v3.6 消息级去重写入
@@ -161,6 +166,7 @@ async def _write_media_log(
             media_type=media_type,
             status=status,
             routed_provider=provider_name,
+            routed_provider_id=provider_id,
             routed_model=model,
             requested_model=model,
             latency_ms=int(latency_ms) if latency_ms else 0,
@@ -213,7 +219,8 @@ async def media_generate_image(data: ImageGenPayload, db: AsyncSession = Depends
         rotator.mark_success(_key_id)
         summary = _build_image_payload(result)
         await _write_media_log(db, "image", "success", provider.name, result.model,
-                              data.prompt, result.elapsed_ms, result_summary=summary)
+                              data.prompt, result.elapsed_ms, result_summary=summary,
+                              provider_id=provider.id)
         return {
             "success": True,
             "model": result.model,
@@ -223,7 +230,8 @@ async def media_generate_image(data: ImageGenPayload, db: AsyncSession = Depends
     else:
         rotator.mark_failure(_key_id)
         await _write_media_log(db, "image", "error", provider.name, req.model,
-                              data.prompt, result.elapsed_ms, error_msg=result.error)
+                              data.prompt, result.elapsed_ms, error_msg=result.error,
+                              provider_id=provider.id)
         return JSONResponse(status_code=502, content={"error": result.error})
 
 
@@ -280,7 +288,8 @@ async def media_generate_video(data: VideoGenPayload, db: AsyncSession = Depends
         rotator.mark_success(_key_id)
         summary = _build_video_payload(result)
         await _write_media_log(db, "video", "success", provider.name, result.model,
-                              data.prompt, result.elapsed_ms, result_summary=summary)
+                              data.prompt, result.elapsed_ms, result_summary=summary,
+                              provider_id=provider.id)
         return {
             "success": True,
             "model": result.model,
@@ -290,7 +299,8 @@ async def media_generate_video(data: VideoGenPayload, db: AsyncSession = Depends
     else:
         rotator.mark_failure(_key_id)
         await _write_media_log(db, "video", "error", provider.name, req.model,
-                              data.prompt, result.elapsed_ms, error_msg=result.error)
+                              data.prompt, result.elapsed_ms, error_msg=result.error,
+                              provider_id=provider.id)
         return JSONResponse(status_code=502, content={"error": result.error})
 
 @router.get("/headroom")

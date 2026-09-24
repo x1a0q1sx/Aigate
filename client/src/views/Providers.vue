@@ -1320,7 +1320,11 @@ export default {
           api.getLogs({ status: 'error', provider: p.name, page_size: 1 }).catch(() => null),
         ])
         this.detailModels = models || []
-        const row = byProv && (byProv.providers || []).find((x) => x.provider_id === p.id)
+        // 优先按 id 命中；id 缺失（历史行只写名称）时按名称兜底，
+        // 否则详情面板今日用量会显示为空（列表页与详情页口径不一致）
+        const _byProv = (byProv && byProv.providers) || []
+        const row = _byProv.find((x) => x.provider_id === p.id)
+          || _byProv.find((x) => x.provider_name === p.name)
         this.detailToday = row || null
         if (cooling) {
           this.detailCoolingModels = (cooling.model_cooling || []).filter(

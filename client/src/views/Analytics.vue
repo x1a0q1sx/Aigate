@@ -248,7 +248,7 @@
     <div class="card" style="margin-top: 20px;" v-if="providerData.length">
       <div class="usage-header" style="margin-bottom: 12px;">
         <h2>按服务商用量</h2>
-        <span class="muted">今日共 {{ formatTokens(providerTotal) }} tokens</span>
+        <span class="muted">{{ providerData.length }} 家 · 今日共 {{ formatTokens(providerTotal) }} tokens</span>
       </div>
       <table>
         <thead>
@@ -263,7 +263,11 @@
         </thead>
         <tbody>
           <tr v-for="p in providerData" :key="p.provider_id || p.provider_name">
-            <td style="font-weight: 600;">{{ p.provider_name }}</td>
+            <td style="font-weight: 600;">
+              {{ p.provider_name }}
+              <span v-if="!p.provider_id" class="muted"
+                    title="服务商已删除或改名，仅按日志中的名称归集">（已删除）</span>
+            </td>
             <td>{{ formatNum(p.requests) }}</td>
             <td>{{ formatTokens(p.tokens) }}</td>
             <td>

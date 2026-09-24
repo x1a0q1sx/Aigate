@@ -117,6 +117,7 @@ async def _passthrough(
                                      json=upstream_body, headers=headers)
     except Exception as e:
         await write_log(db, requested_model=name, routed_provider=provider.name,
+                        routed_provider_id=provider.id,
                         routed_model=model.model_id, status="error",
                         media_type=media_type, error_type="upstream_error",
                         error_msg=str(e)[:500], latency_ms=int((time.time() - _t0) * 1000),
@@ -132,6 +133,7 @@ async def _passthrough(
     usage = (payload or {}).get("usage") or {}
     await write_log(db,
                     requested_model=name, routed_provider=provider.name,
+                    routed_provider_id=provider.id,
                     routed_model=model.model_id,
                     status="success" if resp.status_code == 200 else "error",
                     media_type=media_type, http_status=resp.status_code,
