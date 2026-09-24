@@ -567,6 +567,58 @@ async def test_already_done_today_ignores_failures_and_stale(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_inactive_counts_as_attempted_today(tmp_path):
+    """「活动未开启」当天不再重试。
+
+    ⚠️ 生产回归（2026-09-24）：codebuddy_intl 实测 active=False，此前 inactive
+    不算完成 → 进程崩溃循环重启时每次补签都打一遍上游，一次刷出 25 条重复日志。
+    自动触发只在计划时刻之后发生，那时活动早已刷新完，仍报未开启即当天真没活动。
+    """
+    from server.core.checkin import already_done_today
+    engine, Session = await _db(tmp_path)
+    try:
+        async with Session() as db:
+            db.add(CheckinLog(provider_code="codebuddy_intl", owner="__default",
+                              kind="inactive", message="签到活动未开启"))
+            await db.commit()
+            assert await already_done_today(db, "codebuddy_intl", "__default") is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_collect_targets_skips_inactive_account(tmp_path, monkeypatch):
+    """端到端：已判 inactive 的账号不得再出现在待签列表里。"""
+    from server.core.checkin import collect_targets
+    engine, Session = await _db(tmp_path)
+    try:
+        class _FakeCrypto:
+            def decrypt(self, s):
+                return s[4:] if s.startswith("enc-") else s
+
+        async with Session() as db:
+            db.add(OAuthToken(provider_code="codebuddy_intl", owner="__default",
+                              access_token_enc="enc-tok", is_active=True))
+            db.add(CheckinLog(provider_code="codebuddy_intl", owner="__default",
+                              kind="inactive", message="活动未开启"))
+            await db.commit()
+
+            from server.core.oauth_client import get_oauth_client
+            c = get_oauth_client()
+            orig = c._crypto
+            c._crypto = _FakeCrypto()
+            try:
+                targets, skipped = await collect_targets(db)
+            finally:
+                c._crypto = orig
+
+        assert targets == []
+        assert skipped[0]["reason"] == "already_done_today"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_collect_targets_skips_unsupported_and_done(tmp_path):
     from server.core.checkin import collect_targets
     from server.core import checkin as ck

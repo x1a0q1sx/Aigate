@@ -18,6 +18,11 @@
   body.replayed（HTTP 仍是 200 且无 benefit）——只看 HTTP 状态会把「已领」
   误报成「+100 积分」。
 - **签到全程在推理请求路径之外**：任何失败只落 checkin_logs，绝不触碰路由。
+- **幂等靠 ATTEMPTED_KINDS（含 inactive）**：自动触发只在计划时刻之后发生，
+  那时上游活动早已刷新完，仍报「未开启」就是当天真没活动，反复重试无意义。
+  ⚠️ 2026-09-24 生产教训：只把 claimed/already_claimed 当完成，会让「活动未开启」
+  的站在进程重启时每次补签都打一遍上游（一次崩溃循环刷出 25 条重复日志）。
+  failed 仍不在此列——失败必须允许下次重试。
 """
 from __future__ import annotations
 
@@ -46,6 +51,14 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
 
 # 视为「今日已完成」的 kind —— 定时任务据此幂等跳过
 DONE_KINDS = ("claimed", "already_claimed")
+# 视为「今日已尝试、不必再自动重试」的 kind。
+# inactive（活动未开启）也算：自动触发只在**计划时刻之后**发生（定时 10:30 /
+# 启动补签仅在已过点时才跑），而那一刻上游活动早已刷新完毕 —— 此时仍报「未开启」
+# 就是当天真的没有活动，反复重试无意义。
+# ⚠️ 2026-09-24 生产教训：此前只把 claimed/already_claimed 当完成，导致
+# codebuddy_intl（活动未开启）在进程反复重启时每次补签都打一遍上游，
+# 一次崩溃循环刷出 25 条重复日志。failed 仍不在此列——失败必须允许重试。
+ATTEMPTED_KINDS = DONE_KINDS + ("inactive",)
 
 # CodeBuddy 业务码（实测 + 静态分析）
 CB_ALREADY = (10001, 1001)
@@ -399,9 +412,10 @@ async def run_checkin_batch(targets: List[CheckinTarget], *, trigger: str = "man
 # ── 幂等辅助：今日是否已完成 ─────────────────────────────────
 
 async def already_done_today(db, provider_code: str, owner: str) -> bool:
-    """该账号今天是否已有终态签到记录（claimed/already_claimed）。
+    """该账号今天是否已尝试过签到（claimed/already_claimed/inactive）。
 
-    定时任务据此幂等跳过：已有记录就不再发上游请求（上游自身幂等是第二道防线）。
+    定时任务与启动补签据此幂等跳过：已有记录就不再发上游请求（上游自身幂等是
+    第二道防线）。failed **不算**——失败必须允许下次重试。
     按**北京时间**划分「今天」——上游活动按 UTC+8 刷新（Qoder 每日 10:00）。
     """
     from sqlalchemy import select, and_
@@ -415,7 +429,7 @@ async def already_done_today(db, provider_code: str, owner: str) -> bool:
             select(CheckinLog.id).where(and_(
                 CheckinLog.provider_code == provider_code,
                 CheckinLog.owner == owner,
-                CheckinLog.kind.in_(DONE_KINDS),
+                CheckinLog.kind.in_(ATTEMPTED_KINDS),
                 CheckinLog.created_at >= day_start_utc,
             )).limit(1)
         )).first()
