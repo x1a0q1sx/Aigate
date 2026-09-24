@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import Dashboard from './views/Dashboard.vue'
 import Providers from './views/Providers.vue'
 import OAuthConnections from './views/OAuthConnections.vue'
+import Checkin from './views/Checkin.vue'
 import Models from './views/Models.vue'
 import Health from './views/Health.vue'
 import Auto from './views/Auto.vue'
@@ -24,6 +25,8 @@ const routes = [
   { path: '/dashboard', component: Dashboard, meta: { title: '仪表盘' } },
   // 隐藏页面：OAuth 连接管理（无导航入口，直接访问 /providers/oauth）
   { path: '/providers/oauth', component: OAuthConnections, meta: { title: 'OAuth 连接' } },
+  // 隐藏页面：签到监控（无导航入口，从 OAuth 页进入或直接访问 /providers/checkin）
+  { path: '/providers/checkin', component: Checkin, meta: { title: '签到监控' } },
   { path: '/providers', component: Providers, meta: { title: '服务商' } },
   { path: '/models', component: Models, meta: { title: '模型' } },
   { path: '/aliases', component: Aliases, meta: { title: '模型别名' } },

@@ -40,6 +40,8 @@ def _enabled_for(event: str) -> bool:
         "cooldown": cfg.notify_model_cooldown,
         "all_failed": cfg.notify_all_failed,
         "budget": cfg.notify_budget_exceeded,
+        # 每日签到失败（core/checkin.py）。getattr 兜底：老 config.yaml 无此字段时不炸
+        "checkin": getattr(cfg, "notify_checkin", True),
     }
     return gates.get(event, True)
 

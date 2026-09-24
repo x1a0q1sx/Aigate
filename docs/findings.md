@@ -431,3 +431,99 @@ headroom 限额生效、端点返回全集、log_queue 兜底两路、迁移 SQL
 **教训（跨模块）**：给统计列加「必填项」性质的过滤条件时，必须同时保证
 （a）所有写入路径都写该列、（b）历史数据有回填、（c）聚合端有兜底容忍。
 本次三层缺一即复发——审计时曾把「加列」当作纯增量，没检查写入方覆盖度。
+
+## F22 一键签到 + 额度监控（协议实证与能力边界，2026-09-24）
+
+**需求**：用户看到 Jet-Hub（DeepSeek Harness 插件，做 11 个 AI 编码平台的凭据托管 +
+多账号池）的「一键领取」按钮，想在 AIGate 的 OAuth 页旁边也搞一个签到监控页面。
+
+⚠️ **用户给的链接是错的**：`github.com/zhengwuj/Jet-Hub` 是 404（该用户不存在），
+真实仓库是 **`github.com/zhengwuji/Jet-Hub`**（少一个字母）。
+
+**Jet-Hub 的三个关键事实**（源码 tarball 全量核对，非 README 宣传）：
+
+| README 宣传 | 源码实情 |
+|---|---|
+| 「每日签到积分自动领取」 | **没有任何签到定时器**。唯一的 setInterval 是 30 分钟的**凭据续期**（`src/index.ts:533`），与签到无关 |
+| — | 签到状态**不持久化**，每次实时查上游（无日志、无历史） |
+| — | **无跨平台总览**（无仪表盘、无合计） |
+
+即：用户要的「监控页面」正是 Jet-Hub 缺的部分。同类里更完整的是
+`masknull/dsh-qoder-connect`（自定义签到时刻 + 开机防漏补签 + 签到日志）与
+`techysy/CreditDaddy`（守护进程 + 首页仪表盘 + 每 2 小时扫描）——本实现按后者形态做。
+
+**与 AIGate 重合的平台只有 3 个**（Jet-Hub 11 个，其余 AIGate 无对应 provider）：
+
+| Jet-Hub | AIGate | 签到协议 | 实证强度 |
+|---|---|---|---|
+| `buddy` | `codebuddy_cn` | `POST /v2/billing/meter/checkin-activity-status` + `/daily-checkin` | 强 |
+| `buddy-intl` | `codebuddy_intl` | 同上，host=`www.codebuddy.ai` | 中（仓库无独立实测） |
+| `qoder` | `qoder` | `GET /sash/api/v1/me/campaigns` → `POST …/{id}/claim` | 强（keylog 抓包解出） |
+| `antigravity` | `antigravity` | 明确不支持 | — |
+| `workbuddy` 系 | 无 | 上游无接口 | — |
+
+**本机生产实测（2026-09-24，只读探测）**：
+
+| 平台 | 结果 | 结论 |
+|---|---|---|
+| CodeBuddy CN | HTTP 200 · `active=True` `today_checked_in=True` `streak_days=6` `daily_credit=100` `total_credits=600` `activity=高校新生攻略` | ✅ 协议有效 |
+| CodeBuddy Intl | HTTP 200 · `active=False`（本期活动未开启） | ✅ **端点存在**（此前仓库无独立证据） |
+| Qoder | HTTP 200 · `showCampaign=False campaigns=[]` | ✅ 协议有效（今日已领语义） |
+| u1s1 | 8 个候选端点（`/v1/me/checkin`、`/v1/checkin`、`/v1/me/free_claim`…）**全部 404** | ❌ **无签到接口** |
+
+**u1s1 的真相**：它确实有「每日签到」——但形态完全不同：`/v1/me` 的
+`packages[]` 里存在 `kind="login_checkin"`「登录打卡赠送·每日一次·仅限 u1s1 客户端使用」
+（每次 2,000,000 tokens、约 10 天有效）。**该包由上游在登录时自动发放**，
+不需要也不能由客户端触发（`free_claim` 字段实测为 `null`）。故能力矩阵登记为
+`False` 并在页面标注「上游无签到接口」——**绝不猜一个端点写上去**。
+
+**协议中反直觉之处（实现的关键，全部有测试锁死）**：
+
+1. **CodeBuddy 幂等判据是 body `code`（10001/1001）而非 HTTP 状态** —— 重复领取
+   返回的是 **HTTP 400** + `code:10001`。只看状态码会把「已领」判成失败。
+2. **CodeBuddy 401/403 可能返回 HTML 而非 JSON** —— 必须先取 text 再 parse，
+   否则 `.json()` 抛异常会丢掉「凭据失效」这个关键判据。
+3. **CodeBuddy 必须用 `checkin-activity-status`，不能用 `checkin-status`** ——
+   后者返回占位数据（`active:false`、`checkin_dates:null`），会误判成「活动未开启」。
+4. **`X-Domain` 必须跟产品配置走**（cn=`copilot.tencent.com` / intl=`www.codebuddy.ai`），
+   不能跟凭据里可能过期的 domain —— 否则 baseURL 与身份头自相矛盾。
+5. **Qoder 幂等判据是 body `replayed`** —— 重复领取**同样返回 HTTP 200**，
+   但 `replayed=true` 且**不含 `benefit`**、`claimedAt` 是旧时间。只看状态码会把
+   「今天已领」误报成「领取成功 +100 积分」。
+6. **Qoder 的 claim body 必须是空串 `""` 而非 `{}`**（抓包实测 `content-length: 0`）。
+7. **Qoder 只领 `actionType=CLAIM_BENEFIT` + `claimStatus=CLAIMABLE`** ——
+   实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
+8. **Qoder 状态端点「列表为空」≠「没有活动」** —— 服务端在「今天已领」时返回
+   `{showCampaign:false, campaigns:[]}`。Jet-Hub 曾据此误判「Qoder 无签到端点」。
+9. **Qoder 签到不需要 COSY/WASM 签名** —— 那只有推理端点和模型列表要；
+   签到只要 4 个头（`Accept` / `Bearer` / `Cosy-ClientType: 5` / `User-Agent: Qoder`）。
+10. **严格串行**：Jet-Hub 三处注释强调「并发易触发风控」，并有单测锁死
+    `maxInFlight==1`。本实现同样串行、单账号失败不中断整批、不做重试退避。
+
+**实现**（改动面收敛，不碰现有路由/额度逻辑）：
+
+- 新表 `checkin_logs`（`server/models/checkin_log.py`）：kind 五态
+  `claimed`/`already_claimed`/`inactive`/`unsupported`/`failed`，
+  **「今日已领」不是失败**——这个区分在数据层就成立，否则 UI 无法正确显示。
+  「今日状态」从日志派生（查当天行），不做双写。
+- 新模块 `server/core/checkin.py`：三个适配器 + 能力矩阵 + 批量执行 + 幂等辅助。
+- 调度：挂进既有 `_schedule_maintenance()` 的 `AsyncIOScheduler`（**本项目公认落点，
+  自带 shutdown**），`timezone="Asia/Shanghai"` 显式时区（上游按 UTC+8 刷新，
+  不能依赖服务器 TZ），默认 **10:30 北京时间**（Qoder 活动 10:00 刷新 + 30 分钟余量）；
+  `_busy` 重入保护 + `coalesce/max_instances=1`；
+  **启动补签**（照 `_backfill_oauth_providers` 的既有形态）——服务重启错过时间点后
+  当天自动补签；幂等靠 `collect_targets` 查当天日志（已完成的账号不发上游请求）。
+- 路由 `server/api/checkin_router.py`（prefix **必须** `/admin/api` ——
+  `core/auth.py` 的 `_is_admin_api_path` 只认 `/admin/api/` 与 `/admin/oauth/`，
+  用别的前缀未登录时返回 200+index.html 而非 401 JSON，前端 `JSON.parse` 直接炸）。
+- 前端隐藏页 `/providers/checkin`（照 `/providers/oauth` 的写法）+ OAuth 页头部
+  「签到监控 →」入口；额度进度条复用 OAuth 页的 `quotaPct/quotaText` 口径，
+  两页展示一致。
+- 通知：`notify_event("checkin", …)` + `NotifyConfig.notify_checkin` 开关
+  （getattr 兜底，老 config.yaml 无此字段时不炸）。
+
+**测试**：`tests/test_checkin.py` 40 项，全部锁在上面 10 条反直觉协议上；
+全量 448 项通过（408 基线 + 40 新增）。
+
+**边界与风险**：协议是逆向得来的私有 API，随时可能变——签到全程在推理请求路径
+**之外**，任何失败只落 `checkin_logs`，绝不触碰路由；上游改协议只影响签到页。

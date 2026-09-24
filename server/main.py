@@ -180,7 +180,92 @@ def _schedule_maintenance():
         minutes=1, id="model_refresh_per_provider", coalesce=True, max_instances=1,
     )
 
+    # 每日签到（领取上游免费积分/额度）：默认 10:30 北京时间——Qoder 活动每日
+    # 10:00（UTC+8）刷新，留 30 分钟余量。协议与实测见 core/checkin.py。
+    _register_checkin_job()
+
     _archive_scheduler.start()
+
+
+async def _run_checkin_daily(trigger: str = "scheduled"):
+    """每日签到执行体（定时 / 启动补签共用）。"""
+    if getattr(_run_checkin_daily, "_busy", False):
+        return
+    _run_checkin_daily._busy = True
+    try:
+        from .core.checkin import collect_targets, run_checkin_batch
+        async with AsyncSessionLocal() as db:
+            targets, skipped = await collect_targets(db)
+            if not targets:
+                print(f"✓ 每日签到[{trigger}]：无需签到（跳过 {len(skipped)} 个账号）")
+                return
+            results = await run_checkin_batch(targets, trigger=trigger, db=db)
+        claimed = [r for r in results if r["kind"] == "claimed"]
+        already = [r for r in results if r["kind"] == "already_claimed"]
+        failed = [r for r in results if r["kind"] == "failed"]
+        credit = sum(r["credit"] or 0 for r in claimed)
+        print(f"✓ 每日签到[{trigger}]：新领 {len(claimed)}（+{credit:g} 积分）"
+              f" · 已领 {len(already)} · 失败 {len(failed)}")
+        for r in failed:
+            print(f"⚠️ 签到失败[{r['provider_code']}/{r['owner']}]: {r['message']}"
+                  + (f"（{r['error']}）" if r.get("error") else ""))
+    except Exception as e:
+        print(f"⚠️ 每日签到[{trigger}]失败: {e}")
+    finally:
+        _run_checkin_daily._busy = False
+
+
+def _register_checkin_job():
+    """按配置注册/重排每日签到定时任务（配置保存后也调用，即时生效）。"""
+    if _archive_scheduler is None:
+        return
+    try:
+        _archive_scheduler.remove_job("checkin_daily")
+    except Exception:
+        pass  # 尚未注册
+    cc = getattr(config, "checkin", None)
+    if not cc or not getattr(cc, "enabled", False):
+        print("⏭️ 每日签到未启用（checkin.enabled=false）")
+        return
+    hour = max(0, min(23, int(getattr(cc, "hour", 10) or 0)))
+    minute = max(0, min(59, int(getattr(cc, "minute", 30) or 0)))
+    _archive_scheduler.add_job(
+        _run_checkin_daily, "cron",
+        hour=hour, minute=minute,
+        timezone="Asia/Shanghai",   # 显式时区：上游按 UTC+8 刷新，不依赖服务器 TZ
+        id="checkin_daily", coalesce=True, max_instances=1,
+    )
+    print(f"✓ 每日签到已排程（每天 {hour:02d}:{minute:02d} 北京时间）")
+
+
+def reschedule_checkin_job():
+    """配置变更后重排（供 admin 端点在 save_config 后调用）。"""
+    _register_checkin_job()
+
+
+async def _checkin_startup_catchup():
+    """启动补签：服务重启错过时间点后，当天仍自动补签（同类项目的标准做法）。
+
+    仅当「已过今天的签到时刻」且「当天仍有未完成账号」时才跑；
+    collect_targets 已内置幂等（今日已完成的账号会被跳过），故重复调用无副作用。
+    """
+    try:
+        cc = getattr(config, "checkin", None)
+        if not cc or not getattr(cc, "enabled", False):
+            return
+        if not getattr(cc, "startup_catchup", True):
+            return
+        from datetime import datetime, timedelta, timezone
+        cst = timezone(timedelta(hours=8))
+        now = datetime.now(cst)
+        target = now.replace(hour=max(0, min(23, int(getattr(cc, "hour", 10) or 0))),
+                             minute=max(0, min(59, int(getattr(cc, "minute", 30) or 0))),
+                             second=0, microsecond=0)
+        if now < target:
+            return  # 今天还没到点，交给定时任务
+        await _run_checkin_daily("startup_catchup")
+    except Exception as e:
+        print(f"⚠️ 启动补签失败: {e}")
 # 内置服务商模板，首次启动（空数据库）自动创建。
 # 仅保留 3 个开箱即用的免费/直连渠道，其余由用户自行添加。
 BUILTIN_PROVIDERS = [
@@ -291,6 +376,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("u1s1 attestation 预热失败: %s", e)
     _warm_att_task = _aio.ensure_future(_warm_u1s1_attestation())
+    # 每日签到启动补签：服务重启错过签到时间点时，当天自动补签
+    #（collect_targets 内置幂等——今日已完成的账号会跳过，重复调用无副作用）
+    _checkin_task = _aio.ensure_future(_checkin_startup_catchup())
     # OpenCode 免费层 CLI sidecar 守护：上游只认「官方 CLI 会话」，AIGate 经其 HTTP API
     # 转发（见 core/opencode_sidecar.py）。sidecar 崩了本任务自动拉起；未安装 CLI 时
     # 静默跳过（该免费候选自然不可用，不影响其它路由）。
@@ -443,6 +531,8 @@ from .api.gemini_router import router as gemini_router
 app.include_router(gemini_router)      # A1: /v1beta/* Gemini 原生协议
 from .api.admin_ops_router import router as admin_ops_router
 app.include_router(admin_ops_router)   # B1/B2/B4/B5/D3/D4: 诊断/导出/失败看板/实时监控/通知/价格健康
+from .api.checkin_router import router as checkin_router
+app.include_router(checkin_router)     # 每日签到：/admin/api/checkin/*（一键签到 + 额度监控）
 # ============================================================
 # 挂载前端静态文件 & SPA 路由回退
 # ============================================================

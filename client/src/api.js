@@ -325,6 +325,14 @@ export default {
   // 模型刷新：超时与并发配置（2026-09 并发化）
   getModelRefresh: () => apiGet('/admin/api/model-refresh'),
   updateModelRefresh: (data) => apiPut('/admin/api/model-refresh', data),
+  // 每日签到（领取上游免费积分/额度）+ 额度监控
+  getCheckinOverview: (withUsage = true) =>
+    apiGet(`/admin/api/checkin/overview${withUsage ? '' : '?with_usage=false'}`),
+  runCheckin: (providerCode) =>
+    apiPost('/admin/api/checkin/run', providerCode ? { provider_code: providerCode } : {}),
+  getCheckinLogs: (days = 7) => apiGet(`/admin/api/checkin/logs?days=${days}`),
+  getCheckinConfig: () => apiGet('/admin/api/checkin/config'),
+  updateCheckinConfig: (data) => apiPut('/admin/api/checkin/config', data),
   // OpenCode 桥接（官方 CLI sidecar）
   getOpenCodeBridge: () => apiGet('/admin/api/opencode'),
   updateOpenCodeBridge: (data) => apiPut('/admin/api/opencode', data),

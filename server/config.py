@@ -119,6 +119,7 @@ class NotifyConfig(BaseModel):
     notify_model_cooldown: bool = True      # 模型进入冷却
     notify_all_failed: bool = True          # 组合/auto 全部候选失败
     notify_budget_exceeded: bool = True     # 网关密钥预算超限
+    notify_checkin: bool = True             # 每日签到失败（core/checkin.py）
     min_interval_seconds: int = 300         # 同类事件最小间隔（节流）
 
 
@@ -170,6 +171,17 @@ class RaceConfig(BaseModel):
     enabled: bool = True
     no_content_seconds: int = 15
 
+class CheckinConfig(BaseModel):
+    """每日签到：自动领取上游免费积分/额度（CodeBuddy / Qoder 等）。
+
+    时间按**北京时间**（UTC+8）—— 上游活动按该时区刷新（Qoder 每日 10:00），
+    默认 10:30 留 30 分钟余量。startup_catchup：服务重启错过时间点后自动补签当天。
+    协议与实测见 core/checkin.py 模块 docstring。"""
+    enabled: bool = True            # 自动签到总开关（默认开）
+    hour: int = 10                  # 北京时间（0-23）
+    minute: int = 30                # 0-59
+    startup_catchup: bool = True    # 启动时若当天未签则补签
+
 class OpenCodeBridgeConfig(BaseModel):
     """OpenCode 免费层的官方 CLI 桥接（sidecar）。
 
@@ -215,6 +227,7 @@ class Config(BaseModel):
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
     drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
     race: RaceConfig = Field(default_factory=RaceConfig)
+    checkin: CheckinConfig = Field(default_factory=CheckinConfig)
     opencode_bridge: OpenCodeBridgeConfig = Field(default_factory=OpenCodeBridgeConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""

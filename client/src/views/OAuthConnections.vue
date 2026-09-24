@@ -7,6 +7,7 @@
     >
       <template #actions>
         <input v-model.trim="search" placeholder="搜索服务商" class="search-input" />
+        <router-link to="/providers/checkin" class="btn btn-outline">签到监控 →</router-link>
         <button class="btn btn-outline" @click="load" :disabled="loading">刷新</button>
       </template>
     </PageHeader>
