@@ -527,3 +527,44 @@ headroom 限额生效、端点返回全集、log_queue 兜底两路、迁移 SQL
 
 **边界与风险**：协议是逆向得来的私有 API，随时可能变——签到全程在推理请求路径
 **之外**，任何失败只落 `checkin_logs`，绝不触碰路由；上游改协议只影响签到页。
+
+### F22 补充：两个生产问题（当天遇到并修复）
+
+**1) 幂等遗漏 inactive → 活动未开启的站每次重启都重打上游**（commit fdbe590）
+
+上线后观察 `checkin_logs`，发现 codebuddy_intl 一次刷出 **25 条重复行**，
+而 codebuddy_cn / qoder 各只有 1 条 —— 这个对比正好反证了缺口：
+
+- codebuddy_cn / qoder 的结果是 `already_claimed` → 在 `DONE_KINDS` 里 → 跳过 ✅
+- codebuddy_intl 的结果是 `inactive`（活动未开启）→ **不在** `DONE_KINDS` 里 →
+  每次进程重启的启动补签都再打一遍上游 ❌
+
+修复：`ATTEMPTED_KINDS = DONE_KINDS + ("inactive",)` 作为幂等判据。
+**依据**：自动触发只在**计划时刻之后**发生（定时 10:30 / 启动补签仅在已过点时才跑），
+那一刻上游活动早已刷新完毕 —— 此时仍报「未开启」就是当天真的没有活动，反复重试无意义。
+`failed` 仍不在其列：失败必须允许下次重试。
+
+验证：修复后重启，启动补签输出「无需签到（跳过 5 个账号）」，行数**保持 4 条不变**。
+
+**2) 孤儿进程抢端口 → pm2 崩溃循环 4000+ 次，新代码根本没加载**
+
+部署后 pm2 显示 online、health=200，看起来一切正常，但：
+- `pm2 list` 的 restart 计数在疯涨，日志里刷 `[Errno 98] address already in use`
+- **新功能完全不生效**（签到页 404、启动日志里没有签到排程）
+
+根因：`sudo ss -ltnp | grep :8000` 显示持端口的是 PID 228832 —— 一个
+**PPID=1 的手工 `start.py`**（17:13 启动，早于本次部署），跑着**旧代码**；
+而 pm2 进程每次启动都因端口被占而立即退出 → 被 pm2 反复拉起 → 崩溃循环。
+systemd 的 `aigate.service` 是 disabled/inactive，**不是**它（排除了这个常见嫌疑）。
+
+处置：`pm2 stop` → `kill` 孤儿（优雅退出未果，需 `-9`）→ `pm2 restart`。
+
+**核对方法（以后部署必做）**：
+```bash
+PORT_PID=$(sudo ss -ltnp | grep ':8000' | grep -oP 'pid=\K[0-9]+' | head -1)
+PM2_PID=$(cat ~/.pm2/pids/aigate-3.pid)
+[ "$PORT_PID" = "$PM2_PID" ] && echo OK || echo "pm2 没在管线上服务"
+ps -o pid,ppid,lstart,cmd -p "$PORT_PID"   # PPID 应为 pm2 而非 1
+```
+**教训**：`pm2 restart` 返回成功**不等于**新代码已生效 —— 它可能正在安静地崩溃循环，
+而服务照旧由别的进程提供。部署验证必须落到「持端口进程 = pm2 管理的 pid」这一条。
