@@ -358,6 +358,46 @@ async def put_race_config(body: RaceModel):
     return cfg.model_dump()
 
 
+# ─────────────────────────── 模型刷新：超时与并发 ───────────────────────────
+# 用户反馈「模型刷新太慢」：此前 57 个服务商串行刷新，平均 17s/个、最慢 141s。
+# 现可配置并发数与单服务商硬超时（超时判失败不等待）。
+
+class ModelRefreshConfigModel(BaseModel):
+    timeout_seconds: Optional[int] = None            # 单次网络请求超时（list_models / pricing 各算一次）
+    provider_timeout_seconds: Optional[int] = None   # 单个服务商整体硬超时（超时判失败）
+    concurrency: Optional[int] = None                # 全量刷新并发数（1=串行）
+    scheduled_enabled: Optional[bool] = None
+    interval_minutes: Optional[int] = None
+    remove_missing_models: Optional[bool] = None
+
+
+@router.get("/model-refresh")
+async def get_model_refresh_config():
+    from server.config import get_config
+    return get_config().model_refresh.model_dump()
+
+
+@router.put("/model-refresh")
+async def put_model_refresh_config(body: ModelRefreshConfigModel):
+    from server.config import get_config, save_config
+    cfg = get_config().model_refresh
+    for k, v in body.model_dump(exclude_unset=True).items():
+        if v is None:
+            continue
+        # 钳制到合理区间，防止配 0/负数把刷新打瘫
+        if k == "timeout_seconds":
+            v = max(3, min(600, int(v)))
+        elif k == "provider_timeout_seconds":
+            v = max(5, min(1800, int(v)))
+        elif k == "concurrency":
+            v = max(1, min(32, int(v)))
+        elif k == "interval_minutes":
+            v = max(5, min(43200, int(v)))
+        setattr(cfg, k, v)
+    save_config()
+    return cfg.model_dump()
+
+
 # ─────────────────────────── OpenCode 桥接（官方 CLI sidecar） ───────────────────────────
 
 class OpenCodeBridgeModel(BaseModel):

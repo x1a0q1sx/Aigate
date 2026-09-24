@@ -198,6 +198,9 @@ class ModelsRefreshResponse(BaseModel):
     pricing_sources: List[str] = []
     added_details: List[Dict[str, Any]] = []    # [{"provider_id":int,"provider_name":str,"models":[{"model_id":str,"display_name":str}]}]
     removed_details: List[Dict[str, Any]] = []  # 同上，仅当 remove_missing_models=true 时才有内容
+    # 2026-09 并发刷新：失败/超时的服务商明细（超时按 provider_timeout_seconds 判定）
+    failed_details: List[Dict[str, Any]] = []   # [{"provider_id":int,"provider_name":str,"error":str}]
+    duration_ms: int = 0                        # 本次刷新总耗时（并发后应显著低于串行）
 # v2.0 新增：测速相关 schema
 class PingResult(BaseModel):
     model_id: int

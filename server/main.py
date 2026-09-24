@@ -148,13 +148,29 @@ def _schedule_maintenance():
                         p.model_refresh_last_at = datetime.utcnow()
                         p.model_refresh_next_at = datetime.utcnow() + timedelta(minutes=mins)
                         await db.commit()
-                try:
+            # 2026-09: 到点的多个服务商并发刷新（此前逐个等待，一个卡死会拖垮整轮 tick）
+            if due:
+                from .api.admin_router import refresh_providers_concurrent
+                _mrc = getattr(get_config(), "model_refresh", None)
+                _provs = []
+                for pid, pname, mins in due:
                     async with AsyncSessionLocal() as db:
-                        r = await _rm(pid, "scheduled", db)
-                    print(f"✓ 定时模型刷新[{pname} 每{mins}m]: 新增 {r.added} · 删除 {r.removed}"
-                          f" · 定价 {r.pricing_updated}（详情见分析页·模型刷新）")
-                except Exception as e:
-                    print(f"⚠️ 定时模型刷新[{pname}]失败: {e}")
+                        _p = await db.get(Provider, pid)
+                        if _p is not None:
+                            _provs.append(_p)
+                if _provs:
+                    _res, _errs = await refresh_providers_concurrent(
+                        _provs, trigger="scheduled",
+                        concurrency=max(1, int(getattr(_mrc, "concurrency", 6) or 6)),
+                        provider_timeout=max(5, int(getattr(_mrc, "provider_timeout_seconds", 45) or 45)),
+                    )
+                    _name_by_id = {p.id: p.name for p in _provs}
+                    for _pid, _r in _res.items():
+                        print(f"✓ 定时模型刷新[{_name_by_id.get(_pid, _pid)}]: "
+                              f"新增 {_r.get('added', 0)} · 删除 {_r.get('removed', 0)}"
+                              f" · 定价 {_r.get('pricing_updated', 0)}（详情见分析页·模型刷新）")
+                    for _pid, _msg in _errs.items():
+                        print(f"⚠️ 定时模型刷新[{_name_by_id.get(_pid, _pid)}]失败: {_msg}")
         except Exception as e:
             print(f"⚠️ 定时模型刷新 tick 失败: {e}")
         finally:

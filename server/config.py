@@ -67,12 +67,17 @@ class ProxyPoolConfig(BaseModel):
 
 
 class ModelRefreshConfig(BaseModel):
-    """刷新模型列表时的网络超时（秒）。
-    刷新会顺序请求上游 /v1/models 与定价接口，上游慢或不可达时这里决定最多等多久。"""
+    """刷新模型列表时的网络与并发参数。
+    刷新会对上游 /v1/models 与定价接口各发一次请求，上游慢或不可达时
+    timeout_seconds 决定单次最多等多久。"""
     timeout_seconds: int = 20               # 单次网络请求超时（list_models 与 pricing 各算一次）
     remove_missing_models: bool = True      # 刷新时自动删除上游已下架、本地仍存在的自动同步模型（保留手动添加的 is_manual=True）
     scheduled_enabled: bool = False         # 定时自动刷新全部服务商模型（默认关闭；每次落 model_refresh_logs，分析页可查详情）
     interval_minutes: int = 720             # 定时刷新间隔（分钟），仅 scheduled_enabled=true 时生效
+    # ── 批量刷新并发（2026-09 新增：此前串行 57 个服务商，平均 17s/个 → 全量要 16 分钟）──
+    concurrency: int = 6                    # 全量刷新时的并发服务商数（1=串行；过高会打满上游限流）
+    provider_timeout_seconds: int = 45      # 单个服务商的整体硬超时：超过即判失败、不再等待
+                                            # （单次请求超时是 timeout_seconds，这里是「整站上限」含定价）
 
 
 class ArenaConfig(BaseModel):

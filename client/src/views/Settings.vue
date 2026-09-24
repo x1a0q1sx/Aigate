@@ -177,6 +177,37 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>模型刷新（并发与超时）</h2>
+          <p>刷新模型列表时按并发数同时请求多个服务商，避免串行等待；单个服务商超过「整站超时」即判失败、不再继续等待（失败明细见刷新结果与「分析 · 模型刷新」）。</p>
+        </div>
+        <span class="status-pill" :class="mr.scheduled_enabled ? 'ok' : 'muted'">{{ mr.scheduled_enabled ? '定时已启用' : '仅手动' }}</span>
+      </div>
+      <div class="notify-fields">
+        <label>并发服务商数<input v-model.number="mr.concurrency" type="number" min="1" max="32" />
+          <span class="text-xs text-muted">1 = 串行；建议 4~8，过高可能触发上游限流</span>
+        </label>
+        <label>单服务商超时（秒）<input v-model.number="mr.provider_timeout_seconds" type="number" min="5" max="1800" />
+          <span class="text-xs text-muted">整站上限（含列表+定价），超过即判失败</span>
+        </label>
+        <label>单次请求超时（秒）<input v-model.number="mr.timeout_seconds" type="number" min="3" max="600" />
+          <span class="text-xs text-muted">list_models / 定价各算一次</span>
+        </label>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="mr.remove_missing_models" /> 自动删除上游已下架的模型（保留手动添加）</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="mr.scheduled_enabled" /> 启用定时刷新全部服务商</label>
+      </div>
+      <div class="notify-fields" v-if="mr.scheduled_enabled">
+        <label>定时刷新间隔（分钟）<input v-model.number="mr.interval_minutes" type="number" min="5" /></label>
+      </div>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveModelRefresh" :disabled="mrSaving">{{ mrSaving ? '保存中...' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>OpenCode 免费层桥接</h2>
           <p>上游把免费层锁在「官方 CLI 进程建立的会话」里，纯 HTTP 一律 403；网关经服务器上常驻的
             <code class="mono">opencode serve</code> 转发。这里可调超时与无人值守策略，无需登服务器。</p>
@@ -283,6 +314,11 @@ export default {
       droolSaving: false,
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
+      mr: {
+        timeout_seconds: 20, provider_timeout_seconds: 45, concurrency: 6,
+        scheduled_enabled: false, interval_minutes: 720, remove_missing_models: true,
+      },
+      mrSaving: false,
       oc: {
         enabled: true, timeout_seconds: 180, poll_interval_ms: 600, stall_grace_seconds: 20,
         agent: 'aigate', base_url: 'http://127.0.0.1:4096', port: 4096, bin_path: '',
@@ -330,7 +366,7 @@ export default {
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadOpenCode()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadModelRefresh(), this.loadOpenCode()])
       } finally {
         this.loading = false
       }
@@ -454,6 +490,19 @@ export default {
       } catch (e) {
         toast.error('保存失败: ' + e.message)
       } finally { this.raceSaving = false }
+    },
+    async loadModelRefresh() {
+      try { this.mr = { ...this.mr, ...(await api.getModelRefresh()) } }
+      catch (e) { /* ignore */ }
+    },
+    async saveModelRefresh() {
+      this.mrSaving = true
+      try {
+        this.mr = { ...this.mr, ...(await api.updateModelRefresh(this.mr)) }
+        toast.success('模型刷新配置已保存')
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.mrSaving = false }
     },
     async loadOpenCode() {
       try {

@@ -4,7 +4,9 @@ v2.0: 新增手动测速 API
 """
 from typing import Optional, Any
 from datetime import datetime, timezone
+import asyncio
 import logging
+import time
 logger = logging.getLogger(__name__)
 import httpx
 from pydantic import BaseModel
@@ -12,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete
-from server.db import AsyncSessionLocal
+from server.db import AsyncSessionLocal, engine
 from server.models.provider import Provider
 from server.models.api_key import ApiKey
 from server.models.model import Model
@@ -1305,7 +1307,14 @@ async def refresh_models(
     db: AsyncSession = Depends(get_db)
 ):
     """刷新模型列表，如果 provider_id 指定则只刷新该服务商
-    trigger: 日志来源标记（manual/scheduled）；scheduled 时刷新全部启用服务商（不限有密钥者）。"""
+    trigger: 日志来源标记（manual/scheduled）；scheduled 时刷新全部启用服务商（不限有密钥者）。
+
+    2026-09 并发化：此前逐个服务商串行刷新（实测平均 17s/个，最慢 141s，57 个要十几分钟），
+    现按 config.model_refresh.concurrency 并发、每个服务商加
+    provider_timeout_seconds 硬超时（超时即判失败，不再无限等待）。
+    单服务商刷新失败/超时不影响其余（各自独立 session，异常隔离）。
+    """
+    _t_refresh_start = time.monotonic()
     _trig = (trigger or "manual").strip() or "manual"
     if _trig not in ("manual", "scheduled"):
         _trig = "manual"
@@ -1332,6 +1341,21 @@ async def refresh_models(
             select(Provider).join(ApiKey, Provider.id == ApiKey.provider_id).distinct()
         )
         providers = list(result.scalars().all())
+
+    _mr_cfg = getattr(get_config(), "model_refresh", None)
+    # 单次请求超时同 config.model_refresh.timeout_seconds（适配器读取）
+    _prov_timeout = max(5, int(getattr(_mr_cfg, "provider_timeout_seconds", 45) or 45))
+    _concurrency = max(1, min(32, int(getattr(_mr_cfg, "concurrency", 6) or 6)))
+
+    # 从调用方 session 派生并发用的 session 工厂：生产环境等价于全局
+    # AsyncSessionLocal（同一个 engine），测试里注入的临时库也能正确复用。
+    _sf = _session_factory_for(db)
+
+    # 结果按 provider_id 归集（并发完成后统一汇总，避免共享累加器竞争）
+    _results, _errors = await refresh_providers_concurrent(
+        providers, trigger=_trig, concurrency=_concurrency, provider_timeout=_prov_timeout,
+        session_factory=_sf)
+
     total_added = 0
     total_updated = 0
     total_total = 0
@@ -1341,8 +1365,15 @@ async def refresh_models(
     pricing_sources = []
     added_details = []
     removed_details = []
+    failed_details = []
     for provider in providers:
-        result = await _model_catalog.refresh_models_from_provider(db, provider, _key_manager, trigger=_trig)
+        result = _results.get(provider.id) or {}
+        if provider.id in _errors:
+            failed_details.append({
+                "provider_id": provider.id,
+                "provider_name": provider.name,
+                "error": _errors[provider.id],
+            })
         if "error" in result:
             continue
         total_added += result.get("added", 0)
@@ -1386,7 +1417,128 @@ async def refresh_models(
         pricing_sources=pricing_sources,
         added_details=added_details,
         removed_details=removed_details,
+        failed_details=failed_details,
+        duration_ms=int((time.monotonic() - _t_refresh_start) * 1000),
     )
+
+
+def _session_factory_for(db):
+    """为并发刷新派生 session 工厂。
+
+    生产：调用方 session 与全局 AsyncSessionLocal 同 engine，直接用全局工厂。
+    测试：调用方挂的是临时库 sessionmaker，此时复用**它的构造参数**造新 session，
+    使并发任务落在同一临时库上（并发需要多个独立 session）。
+    任何异常都安全回退到全局 AsyncSessionLocal。
+    """
+    try:
+        # 调用方 session 的类型通常就是某个 async_sessionmaker 产出的 AsyncSession。
+        # 直接借用其 sessionmaker 的 bind：session.get_bind() 在 async 下可能返回
+        # 底层同步 Engine（不可用于 async_sessionmaker），故优先取 session 的 bind 属性。
+        bind = getattr(db, "bind", None)
+        if bind is None:
+            try:
+                bind = db.get_bind()
+            except Exception:
+                bind = None
+        if bind is None:
+            return AsyncSessionLocal
+        if bind is engine:
+            return AsyncSessionLocal
+        # 必须是 async engine（AsyncEngine）；否则回退全局
+        from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+        if not isinstance(bind, AsyncEngine):
+            return AsyncSessionLocal
+        return async_sessionmaker(bind, class_=AsyncSession, expire_on_commit=False)
+    except Exception:
+        return AsyncSessionLocal
+
+
+async def refresh_providers_concurrent(providers, *, trigger: str,
+                                       concurrency: int = 6,
+                                       provider_timeout: int = 45,
+                                       catalog=None, key_manager=None,
+                                       session_factory=None) -> tuple:
+    """并发刷新多个服务商。返回 (results_by_pid, errors_by_pid)。
+
+    设计要点（实测依据：串行 57 站平均 17s/个、最慢 141s）：
+    - **每个服务商独立 DB session**：刷新内部有 commit/rollback，共享 session 会
+      造成 SQLite 写锁竞争与 ORM 状态错乱。session_factory 可注入（测试用临时库）。
+    - **硬超时**：`asyncio.wait_for` 到点即判失败，不再无限等待（用户明确要求
+      「超过多少秒就判定失败，不一直等待」）。
+    - **异常隔离**：任一服务商超时/抛错都不影响其余，且超时也落刷新日志
+      （否则分析页只看到「无此服务商」）。
+    - 单服务商调用时退化为串行（不用信号量）。
+    """
+    _catalog = catalog if catalog is not None else _model_catalog
+    _km = key_manager if key_manager is not None else _key_manager
+    _sf = session_factory if session_factory is not None else AsyncSessionLocal
+    results: dict = {}
+    errors: dict = {}
+    if not providers:
+        return results, errors
+
+    _conc = max(1, min(32, int(concurrency or 6)))
+    _timeout = max(5, int(provider_timeout or 45))
+    if len(providers) <= 1:
+        _conc = 1
+
+    async def _refresh_one(pid: int, pname: str) -> None:
+        t0 = time.monotonic()
+        try:
+            async with _sf() as _s:
+                _prov = await _s.get(Provider, pid)
+                if _prov is None:
+                    errors[pid] = "provider 已删除"
+                    return
+                results[pid] = await asyncio.wait_for(
+                    _catalog.refresh_models_from_provider(
+                        _s, _prov, _km, trigger=trigger),
+                    timeout=_timeout,
+                )
+        except asyncio.TimeoutError:
+            _ms = int((time.monotonic() - t0) * 1000)
+            errors[pid] = f"超时（>{_timeout}s）判失败"
+            logger.warning("模型刷新超时：%s 超过 %ds，已放弃等待", pname, _timeout)
+            await _log_refresh_timeout(pid, pname, trigger, _ms, _timeout)
+        except Exception as e:
+            errors[pid] = f"{type(e).__name__}: {str(e)[:200]}"
+            logger.warning("模型刷新异常 %s: %s", pname, errors[pid])
+            await _log_refresh_timeout(pid, pname, trigger,
+                                       int((time.monotonic() - t0) * 1000), _timeout,
+                                       error=errors[pid])
+
+    sem = asyncio.Semaphore(_conc)
+
+    async def _guarded(pid: int, pname: str) -> None:
+        async with sem:
+            await _refresh_one(pid, pname)
+
+    await asyncio.gather(*[_guarded(p.id, p.name) for p in providers])
+    return results, errors
+
+
+async def _log_refresh_timeout(provider_id: int, provider_name: str, trigger: str,
+                               duration_ms: int, timeout_s: int,
+                               error: str = "") -> None:
+    """超时/异常的服务商也要落 model_refresh_logs，否则分析页看不到失败。"""
+    try:
+        from server.models.model_refresh_log import ModelRefreshLog
+        async with AsyncSessionLocal() as _s:
+            _s.add(ModelRefreshLog(
+                trigger=trigger,
+                provider_id=provider_id,
+                provider_name=provider_name,
+                ok=False,
+                duration_ms=int(duration_ms),
+                added=0, updated=0, removed=0, total=0,
+                pricing_updated=0, metric_updated=0,
+                error=error or f"刷新超时（>{timeout_s}s），已判失败并放弃等待",
+                list_source="unknown",
+            ))
+            await _s.commit()
+    except Exception as e:
+        logger.warning("刷新超时日志落库失败 %s: %s", provider_name, e)
+
 # ========== 手动添加模型 ==========
 class ManualModelAdd(BaseModel):
     model_id: str

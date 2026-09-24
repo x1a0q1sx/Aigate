@@ -17,6 +17,19 @@
         <span class="rf-chip">共 {{ result.total }} 个</span>
         <span class="rf-chip" v-if="result.pricing_updated">价格 {{ result.pricing_updated }}</span>
         <span class="rf-chip" v-if="result.metric_updated">成功率 {{ result.metric_updated }}</span>
+        <span class="rf-chip rf-failed" v-if="result.failed_details && result.failed_details.length">
+          失败/超时 {{ result.failed_details.length }}
+        </span>
+        <span class="rf-chip" v-if="result.duration_ms">耗时 {{ (result.duration_ms / 1000).toFixed(1) }}s</span>
+      </div>
+
+      <!-- 失败/超时的服务商（并发刷新的关键反馈） -->
+      <div class="rf-section" v-if="result.failed_details && result.failed_details.length">
+        <div class="rf-section-title failed">⏱️ 失败/超时（{{ result.failed_details.length }} 个，已跳过不等待）</div>
+        <div class="rf-provider" v-for="p in result.failed_details" :key="'f'+p.provider_id">
+          <div class="rf-provider-name">{{ p.provider_name }}</div>
+          <div class="rf-fail-err">{{ p.error }}</div>
+        </div>
       </div>
 
       <!-- 可点击展开的下拉按钮 -->
@@ -133,6 +146,13 @@ export default {
 .rf-chip.rf-added { color: #16a34a; border-color: #bbf7d0; background: #f0fdf4; }
 .rf-chip.rf-updated { color: #2563eb; border-color: #bfdbfe; background: #eff6ff; }
 .rf-chip.rf-removed { color: #dc2626; border-color: #fecaca; background: #fef2f2; }
+.rf-chip.rf-failed { color: #d97706; border-color: #fde68a; background: #fffbeb; }
+.rf-section-title.failed { color: #d97706; }
+.rf-fail-err {
+  font-size: 12px;
+  color: #b45309;
+  word-break: break-word;
+}
 
 .rf-toggle {
   display: inline-flex;
