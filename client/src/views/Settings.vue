@@ -315,7 +315,7 @@ export default {
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
       mr: {
-        timeout_seconds: 20, provider_timeout_seconds: 45, concurrency: 6,
+        timeout_seconds: 20, provider_timeout_seconds: 45, concurrency: 12,
         scheduled_enabled: false, interval_minutes: 720, remove_missing_models: true,
       },
       mrSaving: false,

@@ -335,3 +335,41 @@
   真实损失是"含图请求可能仍选到不支持图片的模型"——而这仅影响 Auto 的 25 个候选，
   且候选排序已对视觉请求加偏好分。优先做第 1 项（models.dev）即可把可补的多模态
   239 个补上，性价比最高。
+
+## F20 模型刷新并发化 + 单服务商硬超时（2026-09）
+- 用户反馈：「模型刷新速度太慢了，能不能改成多线程的呢，然后再设定一个阈值超过多少秒就判定失败，
+  不一直等待。设置中能进行配置超时时间。」
+- 瓶颈实测（生产 `model_refresh_logs`）：58 个服务商**串行**逐个刷新，
+  单站平均 **17.2s**、最大 **141.4s**（b.ai官方）→ 全量约十几分钟，
+  且端点在整个过程中不返回（前端只能干等）。
+- 改造（commit 6b9cf66）：
+  1) `refresh_providers_concurrent(providers, trigger, concurrency, provider_timeout,
+     catalog, key_manager, session_factory)` —— 抽成模块级函数（便于测试），
+     端点与定时 tick 共用。
+  2) **每个服务商独立 DB session**：刷新内部有 commit/rollback，共享 session 会撞 SQLite
+     写锁并错乱 ORM 状态。session 工厂从调用方 session 派生（`_session_factory_for`），
+     生产=全局 `AsyncSessionLocal`，测试=临时库（否则并发写到错误的库）。
+  3) **硬超时** `asyncio.wait_for`（默认 45s，可配 5~1800）：到点判失败、不再等待。
+  4) **异常隔离**：任一超时/抛错不影响其余；超时也落 `model_refresh_logs`
+     （此前这类失败在分析页完全不可见）。
+  5) 单服务商刷新退化为串行（用户就刷这一个）。
+  6) 定时 tick（main.py 的 per-provider 每分钟扫描）同步改为并发，
+     避免单个卡死拖垮整轮（并保留「先拨钟再执行」的防重入语义）。
+- 配置（`config.model_refresh` + 设置页）：
+  `concurrency`(默认 12, 1~32) / `provider_timeout_seconds`(默认 45, 5~1800) /
+  `timeout_seconds`(单次请求, 默认 20, 3~600)。后端钳制区间防配错。
+  端点 `GET/PUT /admin/api/model-refresh`；刷新结果新增 `failed_details` + `duration_ms`。
+- **生产实测**（58 服务商全量，单站超时 45s）：
+  | 并发 | 耗时 | 成功 | 失败/超时 |
+  |---|---|---|---|
+  | 1（改造前串行） | ~16 min | — | — |
+  | 6 | 101.5s | 52 | 6 |
+  | **12（新默认）** | **60.2s** | 52 | 6 |
+  | 20 | 52.4s | 52 | 6 |
+  边际递减明显（12→20 只快 8s，却把上游限流风险抬高），故默认取 12。
+- 超时的 6 个站（七倍公益/agentrouter/河涛公益/huggingface官方/zzzcoding公益/b.ai官方）
+  是**上游真的慢**（45s 内没回），现在被明确标为失败而非拖死整轮——
+  与串行时代的差别是：它们不再影响其余 52 个站的结果返回时间。
+- 测试：tests/test_model_refresh_concurrency.py 17 项（并发峰值、并发上限、
+  超时判失败不等待、异常隔离、provider 已删除、单服务商串行、
+  session 工厂派生生产/临时库两路、配置钳制、端点委托防回退、schema 字段）。

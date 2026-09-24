@@ -74,8 +74,10 @@ class ModelRefreshConfig(BaseModel):
     remove_missing_models: bool = True      # 刷新时自动删除上游已下架、本地仍存在的自动同步模型（保留手动添加的 is_manual=True）
     scheduled_enabled: bool = False         # 定时自动刷新全部服务商模型（默认关闭；每次落 model_refresh_logs，分析页可查详情）
     interval_minutes: int = 720             # 定时刷新间隔（分钟），仅 scheduled_enabled=true 时生效
-    # ── 批量刷新并发（2026-09 新增：此前串行 57 个服务商，平均 17s/个 → 全量要 16 分钟）──
-    concurrency: int = 6                    # 全量刷新时的并发服务商数（1=串行；过高会打满上游限流）
+    # ── 批量刷新并发（2026-09 新增：此前串行 57 个服务商，平均 17s/个 → 全量十几分钟）──
+    # 生产实测（58 个服务商全量，单站超时 45s）：串行 ~16min → 6 并发 101s
+    # → 12 并发 60s → 20 并发 52s（边际递减；再高主要压上游限流风险）
+    concurrency: int = 12                   # 全量刷新时的并发服务商数（1=串行）
     provider_timeout_seconds: int = 45      # 单个服务商的整体硬超时：超过即判失败、不再等待
                                             # （单次请求超时是 timeout_seconds，这里是「整站上限」含定价）
 

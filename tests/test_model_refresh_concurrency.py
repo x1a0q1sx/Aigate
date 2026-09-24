@@ -46,7 +46,7 @@ class TestConfigDefaults:
     def test_new_fields_present(self):
         from server.config import ModelRefreshConfig
         c = ModelRefreshConfig()
-        assert c.concurrency == 6
+        assert c.concurrency == 12
         assert c.provider_timeout_seconds == 45
         assert c.timeout_seconds == 20          # 旧字段不变
 
