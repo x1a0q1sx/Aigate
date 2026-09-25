@@ -147,6 +147,24 @@ _CLINE = ProviderQuirks(
     },
 )
 
+# LobsterAI（有道龙虾，lobsterai-server.youdao.com）：OpenAI 兼容 + 标准 SSE。
+# 协议来源：Jet-Hub 源码 + 真实凭据实测（2026-09）。三处非标：
+#   1) `stream` 恒为 true —— 上游只支持 SSE，stream:false 返回 500 → force_stream
+#   2) 请求必须带 X-LobsterAI-Client-Capabilities（不带时模型集合少 kimi-k3，
+#      且 reasoning_effort:"off" 会 500）与 X-LobsterAI-Client-Version（动态真值）
+#   3) 非流式响应被包在统一信封 {code,msg,data} 里（chat 端点例外，返回裸 SSE）
+# 思考档位的 wire 值是 openclawLevel（无 "max"，最强档发 "xhigh"），
+# 与产品侧展示名不同 —— 由调用方（credential_resolver 注入的客户端元数据）处理。
+_LOBSTERAI = ProviderQuirks(
+    name="lobsterai",
+    force_stream=True,
+    unwrap_envelope=True,
+    default_headers={
+        "User-Agent": "LobsterAI/0.1.0",
+        "X-LobsterAI-Client-Capabilities": "kimi-k3-agentic-v1,thinking-level-control-v1",
+    },
+)
+
 # u1s1（有一说一）：OpenAI 兼容。推理「客户端信号」= RFC9449 DPoP（官方 CLI device-auth.js
 # 同协议）：Authorization: DPoP <u1s1d-…> + dpop proof 逐请求现签，签名材料来自设备登录时
 # 持久化的密钥对（credential_resolver 注入 __dpop 内部标记，openai_compat 出站前签发）。
@@ -175,6 +193,7 @@ _DOMAIN_RULES = (
     ("codebuddy.ai", _CODEBUDDY_INTL),
     ("api.cline.bot", _CLINE),
     ("api.u1s1.io", _U1S1),
+    ("lobsterai-server.youdao.com", _LOBSTERAI),
 )
 
 

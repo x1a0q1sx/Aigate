@@ -139,6 +139,8 @@ class OAuthClient:
         # cline 类「回调不带 state」的 provider：记住 authorize 时下发的 redirect_uri / 会话
         self._pending_redirect: Dict[str, str] = {}
         self._pending_sessions: Dict[str, str] = {}          # provider_code → packed_state
+        # LobsterAI：state → {uuid, first_keyfrom, owner}（回调时凭 state 找回会话）
+        self._lobsterai_sessions: Dict[str, dict] = {}
 
     # ── 唯一性 ──
     def _key(self, provider_code: str, owner: str = "__default") -> str:
@@ -289,6 +291,146 @@ class OAuthClient:
         self._pending_sessions.pop(provider.code, None)
         return True, "ok", saved
 
+    # ── LobsterAI（有道）登录：本地回调 + authCode 换 token ──────────
+    async def start_lobsterai_login(self, owner: str = "__default") -> dict:
+        """生成登录会话（uuid + first_keyfrom + state）并返回登录 URL。
+
+        ⚠️ portal 的 redirect_uri **必须是 127.0.0.1 形态**（登录页会校验），
+        因此远程部署时用户浏览器回调不到 AIGate —— 走「粘贴回调 URL」模式：
+        前端打开 login_url，用户在自己机器完成授权，浏览器落到
+        `http://127.0.0.1:18090/auth/callback?code=...&state=...`（连接失败页），
+        用户把地址栏 URL 整段粘贴回 AIGate 的「完成登录」输入框。
+        """
+        import uuid as _uuid
+        import secrets as _secrets
+        from server.core import lobsterai as lb
+        state = _secrets.token_hex(16)
+        session = {
+            "uuid": str(_uuid.uuid4()),
+            "first_keyfrom": str(int(time.time() * 1000)),
+            "owner": owner,
+        }
+        self._lobsterai_sessions[state] = session
+        client_version = await lb.resolve_client_version()
+        # redirect_uri 里的端口固定 18090（回调 URL 只用于用户粘贴，服务端不监听）
+        login_url = lb.build_login_url(18090, state)
+        return {
+            "state": state,
+            "login_url": login_url,
+            "client_version": client_version,
+            "callback_hint": "http://127.0.0.1:18090/auth/callback?code=...&state=...",
+        }
+
+    async def complete_lobsterai_login(
+        self, code: str, state: str, db: AsyncSession,
+        callback_url: str = "",
+    ) -> Tuple[bool, str, Optional[OAuthToken]]:
+        """用回调收到的 code 换 token 并持久化。
+
+        code / state 可从回调 URL 整段粘贴里解析（用户直接粘贴地址栏最省事）。
+        身份字段（uuid/first_keyfrom/latest_keyfrom/client_version）存进 scope
+        列 JSON —— 续期时**必须**原样回传，否则上游拒绝（Jet-Hub 的教训）。
+        """
+        import json as _json
+        from urllib.parse import urlparse, parse_qs
+        from server.core import lobsterai as lb
+        # 允许用户粘贴整段回调 URL
+        if callback_url and (not code or not state):
+            try:
+                qs = parse_qs(urlparse(callback_url).query)
+                code = code or (qs.get("code") or [""])[0]
+                state = state or (qs.get("state") or [""])[0]
+            except Exception:
+                pass
+        if not code:
+            return False, "缺少 code（请粘贴完整回调 URL）", None
+        session = self._lobsterai_sessions.pop(state, None) if state else None
+        if session is None:
+            # state 不在内存（服务重启 / 用户粘贴了旧 URL）：身份字段只能新生成，
+            # uuid 变了不影响本次换票，但续期时上游按新身份处理 —— 可接受降级。
+            session = {"uuid": str(__import__("uuid").uuid4()),
+                       "first_keyfrom": str(int(time.time() * 1000)),
+                       "owner": "__default"}
+        owner = session.get("owner") or "__default"
+        client_version = await lb.resolve_client_version()
+        cred, err = await lb.exchange_auth_code(code, session, client_version)
+        if not cred:
+            return False, err, None
+        tok = {
+            "access_token": cred["access_token"],
+            "refresh_token": cred["refresh_token"],
+            "expires_in": cred["expires_in"],
+            "token_type": "Bearer",
+            # 身份字段随凭据持久化（续期必需）—— 复用 scope 列存 JSON（同 qoder 做法）
+            "scope": _json.dumps({
+                "lobsterai": True,
+                "uuid": cred["uuid"],
+                "first_keyfrom": cred["first_keyfrom"],
+                "latest_keyfrom": cred["latest_keyfrom"],
+                "client_version": cred["client_version"],
+                "uid": cred["user_id"],
+                "nickname": cred["nickname"],
+            }, ensure_ascii=False),
+        }
+        saved = await self._save_token(db, "lobsterai", owner, tok)
+        return True, "ok", saved
+
+    async def _refresh_lobsterai(
+        self, db: AsyncSession, provider: OAuthProviderConfig,
+        existing: OAuthToken, refresh_plain: str,
+    ) -> Tuple[bool, str]:
+        """LobsterAI 续期：请求体 = keyfrom 身份载荷 + refreshToken。
+
+        身份字段从 scope 列 JSON 读回（登录时持久化）；缺失时明确报错而不是
+        发一个必然失败的请求（对齐 Jet-Hub「丢失即续期失败只能重登」的结论）。
+        """
+        import json as _json
+        from server.core import lobsterai as lb
+        meta = {}
+        if existing.scope:
+            try:
+                parsed = _json.loads(existing.scope)
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except ValueError:
+                pass
+        if not meta.get("uuid") or not meta.get("first_keyfrom"):
+            existing.last_error = "缺少 uuid/first_keyfrom（续期必需）—— 请重新登录"
+            await db.commit()
+            return False, existing.last_error
+        cred = {
+            "refresh_token": refresh_plain,
+            "uuid": meta.get("uuid", ""),
+            "first_keyfrom": meta.get("first_keyfrom", ""),
+            "latest_keyfrom": meta.get("latest_keyfrom", ""),
+            "client_version": meta.get("client_version", ""),
+            "user_id": meta.get("uid", ""),
+        }
+        new_cred, err = await lb.refresh_token(cred)
+        if not new_cred:
+            existing.last_error = err[:300]
+            if _refresh_credential_dead(0, err):
+                existing.is_active = False
+            await db.commit()
+            return False, err
+        # 身份字段沿用旧值（latest_keyfrom 刻意不更新）；uid/nickname 保留
+        meta.update({
+            "uuid": new_cred["uuid"],
+            "first_keyfrom": new_cred["first_keyfrom"],
+            "latest_keyfrom": new_cred["latest_keyfrom"],
+            "client_version": new_cred["client_version"],
+        })
+        tok = {
+            "access_token": new_cred["access_token"],
+            "refresh_token": new_cred["refresh_token"],
+            "expires_in": new_cred["expires_in"],
+            "token_type": "Bearer",
+            "scope": _json.dumps(meta, ensure_ascii=False),
+        }
+        await self._save_token(db, "lobsterai", existing.owner, tok,
+                               update_existing=existing)
+        return True, "ok"
+
     async def complete_pending(
         self, code: str, db: AsyncSession,
     ) -> Tuple[bool, str, Optional[OAuthToken]]:
@@ -362,6 +504,9 @@ class OAuthClient:
         if _style == "cline":
             # Cline：JSON body {refreshToken,grantType,clientType} → {data:{accessToken,expiresAt}}
             return await self._refresh_cline(db, provider, existing, refresh_plain)
+        if _style == "lobsterai":
+            # LobsterAI：keyfrom 身份载荷 + refreshToken（身份字段从 scope 读回）
+            return await self._refresh_lobsterai(db, provider, existing, refresh_plain)
         # ── Qoder device_token ──
         if provider_code == "qoder" and (provider.extra_params or {}).get("device_code_only"):
             return await self._refresh_device_token(db, provider, existing, refresh_plain)

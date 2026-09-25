@@ -476,6 +476,60 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         api_base_url="https://gateway.kimchi.ai/v1",
         notes="Kimchi — browser-token OAuth + OpenAI 兼容网关",
     ),
+    # ── LobsterAI（有道龙虾）──
+    # 协议来源：Jet-Hub 源码逐行核对（github.com/zhengwuji/Jet-Hub）+ 2026-09 实测。
+    # 流程：本地回调（redirect_uri 必须 127.0.0.1 形态，portal 会校验）
+    #   → 收 ?code=xxx&state=yyy → POST /api/auth/exchange
+    #   body 5 字段 {authCode, firstKeyfrom, latestKeyfrom, uuid, version}
+    #   → 得 {accessToken, refreshToken, expiresIn, user:{id,userId,yid,nickname}}
+    # 关键约束（全部来自源码实测，不是推测）：
+    #   1) uuid / first_keyfrom 由**客户端**生成且不在响应里 → 必须随凭据持久化，
+    #      否则续期失败只能重登（存 scope 列 JSON，同 qoder 的做法）
+    #   2) refresh 请求体除 refreshToken 外**必须带 keyfrom 身份载荷**
+    #      （firstKeyfrom/latestKeyfrom/version/uuid），且 latestKeyfrom 用
+    #      **登录时的原值**不更新（对齐 Go 的 KeyfromBody 语义）
+    #   3) 回调主机名被 portal 锁死 127.0.0.1 → 远程部署走「粘贴回调 URL」模式
+    "lobsterai": OAuthProviderConfig(
+        code="lobsterai",
+        name="LobsterAI (有道)",
+        client_id="",                            # 无 client_id 概念
+        client_secret="",
+        authorize_url="https://lobsterai.youdao.com/portal#/login",
+        token_url="https://lobsterai-server.youdao.com/api/auth/exchange",
+        refresh_url="https://lobsterai-server.youdao.com/api/auth/refresh",
+        redirect_uri="http://127.0.0.1:18090/auth/callback",
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=3600,
+        extra_params={
+            "auth_mode": "lobsterai",
+            "refresh_style": "lobsterai",
+            "callback_path": "/auth/callback",
+            "login_source": "electron",
+            "client_version_api": "https://api-overmind.youdao.com/openapi/get/luna/hardware/lobsterai/prod/update",
+            "client_version_fallback": "2026.9.4",
+            "client_capabilities": "kimi-k3-agentic-v1,thinking-level-control-v1",
+            "user_agent": "LobsterAI/0.1.0",
+            "api_base": "https://lobsterai-server.youdao.com",
+            "portal_base": "https://lobsterai.youdao.com",
+        },
+        api_base_url="https://lobsterai-server.youdao.com/api/proxy/v1",
+        adapter_api_type="openai_compat",
+        static_models=_seed(
+            ("deepseek-v4-flash", "deepseek-v4-flash"),
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
+            ("MiniMax-M3", "MiniMax-M3"),
+            ("MiniMax-M2.7", "MiniMax-M2.7"),
+            ("qwen3.7-max", "qwen3.7-max"),
+            ("qwen3.7-plus", "qwen3.7-plus"),
+            ("kimi-k2.7-code", "kimi-k2.7-code"),
+            ("kimi-k2.6", "kimi-k2.6"),
+            ("glm-5.2", "glm-5.2"),
+            ("glm-5.1", "glm-5.1"),
+            ("doubao-seed-2-1-pro-260628", "doubao-seed-2-1-pro"),
+        ),
+        notes="LobsterAI（有道）— 本地回调 + authCode 换 token；续期需带 keyfrom 身份载荷",
+    ),
 }
 
 

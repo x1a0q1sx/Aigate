@@ -282,6 +282,8 @@ export default {
   // 编辑连接（账号名 / 启用停用）；owner 同服务商下唯一，重名返回 409
   updateOAuthConnection: (id, data) => apiPatch(`/admin/oauth/connections/${id}`, data),
   importOAuthToken: (data) => apiPost('/admin/oauth/import-token', data),
+  // 手动回调（portal 把回调锁死 127.0.0.1 的 provider，如 LobsterAI）
+  completeManualOAuthCallback: (data) => apiPost('/admin/oauth/complete-callback', data),
   // 额度/余额查询（usage 端点缓存 5 分钟，force=true 强刷）
   getOAuthConnectionUsage: (id, force = false) =>
     apiGet(`/admin/oauth/connections/${id}/usage${force ? '?force=true' : ''}`),

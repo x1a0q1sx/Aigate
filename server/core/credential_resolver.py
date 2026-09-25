@@ -97,6 +97,16 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
                                                    "jwk": material["priv"],
                                                    "att": att}}
             rc.adapter = create_adapter_for_provider(api_type)
+            # LobsterAI：X-LobsterAI-Client-Version 是**动态真值**（12h 缓存 + 兜底），
+            # quirks 的静态头表放不下 → 在此注入（缺它会少 kimi-k3 等模型）
+            if oauth_code == "lobsterai":
+                try:
+                    from server.core.lobsterai import resolve_client_version
+                    rc.extra_headers = {**(rc.extra_headers or {}),
+                                        "X-LobsterAI-Client-Version":
+                                            await resolve_client_version()}
+                except Exception:
+                    pass
             return rc
         # free_tier
         rc.kind = "free_tier"

@@ -141,6 +141,18 @@ async def start_oauth_authorize(provider_code: str, request: Request,
             "poll_interval_ms": r["poll_interval_ms"],
             "message": "请在新窗口登录 Qoder 并选择账号，批准后系统会自动收取 device token（约 30 天有效）",
         }
+    # ── LobsterAI：portal 回调锁死 127.0.0.1 → 手动粘贴回调 URL 模式 ────
+    if (provider.extra_params or {}).get("auth_mode") == "lobsterai":
+        r = await get_oauth_client().start_lobsterai_login(owner=owner)
+        return {
+            "manual_callback": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "callback_hint": r["callback_hint"],
+            "message": ("请在新窗口完成 LobsterAI 登录。登录后浏览器会跳到一个"
+                        "打不开的 127.0.0.1 地址（正常现象）—— 把地址栏完整 URL "
+                        "粘贴回本页「完成登录」输入框即可。"),
+        }
     # 运行时 redirect_uri：用本机 incoming host:port 替换默认 localhost:8000
     redirect_override = None
     if request:
@@ -193,6 +205,36 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
 
 
 # ── 回调 ──────────────────────────────────────────
+
+class ManualCallbackPayload(BaseModel):
+    provider_code: str
+    callback_url: str = ""     # 用户粘贴的完整回调 URL（最省事的输入形态）
+    code: str = ""
+    state: str = ""
+
+
+@router.post("/complete-callback")
+async def complete_manual_callback(data: ManualCallbackPayload,
+                                   db: AsyncSession = Depends(get_db)):
+    """手动完成回调（portal 把回调锁死 127.0.0.1 的 provider 用）。
+
+    当前用于 LobsterAI：登录后浏览器落到 `http://127.0.0.1:18090/...`
+    打不开是正常的，用户把地址栏整段 URL 粘贴回来即可（也接受只填 code+state）。
+    """
+    provider = get_oauth_provider(data.provider_code)
+    if not provider:
+        raise HTTPException(status_code=404, detail=f"unknown provider {data.provider_code}")
+    if (provider.extra_params or {}).get("auth_mode") != "lobsterai":
+        raise HTTPException(status_code=400,
+                            detail=f"{data.provider_code} 不支持手动回调模式")
+    ok, msg, saved = await get_oauth_client().complete_lobsterai_login(
+        data.code, data.state, db, callback_url=data.callback_url,
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+    return {"ok": True, "id": saved.id if saved else None,
+            "provider_code": data.provider_code, "owner": saved.owner if saved else None}
+
 
 @router.get("/callback")
 async def oauth_callback(code: str = "", state: str = "", error: str = "", db: AsyncSession = Depends(get_db)):

@@ -27,6 +27,56 @@ from .key_manager import KeyManager
 from server.config import get_config
 
 logger = logging.getLogger(__name__)
+
+
+async def _fetch_lobsterai_models(oauth_client, session: AsyncSession,
+                                  owner: str) -> List[ModelInfo]:
+    """LobsterAI 在线模型列表（专属路径：非标准端点 + keyfrom query）。
+
+    身份字段（uuid/first_keyfrom/…）存在连接记录的 scope 列 JSON 里 ——
+    该端点的 query 就是身份载荷，发错身份会拿到错误的模型集合（Jet-Hub 结论）。
+    任何失败返回空列表，由调用方回退静态种子。
+    """
+    import json as _json
+    from server.core import lobsterai as lb
+    row = await oauth_client._get_token_record(session, "lobsterai", owner)
+    if not row:
+        return []
+    token = oauth_client._crypto.decrypt(row.access_token_enc)
+    meta = {}
+    if row.scope:
+        try:
+            parsed = _json.loads(row.scope)
+            if isinstance(parsed, dict):
+                meta = parsed
+        except ValueError:
+            pass
+    cred = {
+        "access_token": token,
+        "uuid": meta.get("uuid", ""),
+        "first_keyfrom": meta.get("first_keyfrom", ""),
+        "latest_keyfrom": meta.get("latest_keyfrom", ""),
+        "client_version": meta.get("client_version", ""),
+        "user_id": meta.get("uid", ""),
+    }
+    raw = await lb.fetch_models(cred)
+    out: List[ModelInfo] = []
+    for m in raw:
+        out.append(ModelInfo(
+            model_id=m["id"],
+            display_name=m.get("name") or m["id"],
+            is_free=False,
+            input_price=0.0,
+            output_price=0.0,
+            supports_streaming=True,
+            context_length=int(m.get("context_length") or 0),
+            # 远端权威：supportsImage 直接映射（不支持图片是实测结论）
+            input_modalities=["text", "image"] if m.get("supports_vision") else ["text"],
+            max_output_tokens=m.get("max_output_tokens"),
+            supports_vision=bool(m.get("supports_vision")),
+            supports_reasoning_effort=True,
+        ))
+    return out
 # 内置价格参考表 (美元 / 百万 tokens)
 # fmt: off
 BUILTIN_PRICING = {
@@ -446,7 +496,12 @@ class ModelCatalog:
                 try:
                     eh = dict(extra_headers or {})
                     eh["__oauth"] = True
-                    _m = await adapter.list_models(token, provider.base_url, eh)
+                    # LobsterAI：模型列表在 /api/models/available（非标准 /v1/models），
+                    # 且 query 是身份载荷（keyfrom）+ 需客户端能力头 —— 走专属路径
+                    if oauth_code == "lobsterai":
+                        _m = await _fetch_lobsterai_models(_goc(), session, _owner)
+                    else:
+                        _m = await adapter.list_models(token, provider.base_url, eh)
                     if _m:
                         any_success = True
                         for mi in _m:

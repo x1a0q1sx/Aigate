@@ -117,6 +117,29 @@
         </button>
       </template>
     </AppModal>
+
+    <!-- 手动回调（portal 把回调锁死 127.0.0.1 的 provider，如 LobsterAI） -->
+    <AppModal v-model="manualModal.show" :title="'完成 ' + manualModal.provider_code + ' 登录'"
+              icon="link" size="md">
+      <p class="text-sm muted" style="margin-bottom:10px">{{ manualModal.hint }}</p>
+      <div class="form-group">
+        <label class="form-label">登录链接（已在新窗口打开；若被拦截请手动点击）</label>
+        <a :href="manualModal.login_url" target="_blank" rel="noopener noreferrer"
+           class="manual-login-link text-xs">{{ manualModal.login_url }}</a>
+      </div>
+      <div class="form-group">
+        <label class="form-label">回调 URL *（登录后浏览器地址栏整段复制粘贴到这里）</label>
+        <textarea v-model.trim="manualModal.callback_url" rows="3"
+                  placeholder="http://127.0.0.1:18090/auth/callback?code=...&state=..."></textarea>
+      </div>
+      <p v-if="manualModal.error" class="alert alert-error text-sm">{{ manualModal.error }}</p>
+      <template #footer>
+        <button class="btn btn-outline" @click="manualModal.show = false">取消</button>
+        <button class="btn btn-primary" @click="submitManualCallback" :disabled="manualModal.busy">
+          {{ manualModal.busy ? '换取凭据中...' : '完成登录' }}
+        </button>
+      </template>
+    </AppModal>
   </div>
 </template>
 
@@ -140,6 +163,7 @@ export default {
       busyCode: null,
       busyConn: null,
       importModal: { show: false, provider_code: '', access_token: '', refresh_token: '', expires_in: 3600, owner: '__default', busy: false, error: '' },
+      manualModal: { show: false, provider_code: '', login_url: '', callback_hint: '', hint: '', callback_url: '', busy: false, error: '' },
       usage: {},          // connectionId -> { loading, data?, error? }
       renamingId: null,   // 正在改名的连接 id
       renameValue: '',
@@ -198,6 +222,8 @@ export default {
     flowOf(p) {
       const ep = p.extra_params || {}
       if (ep.auth_mode === 'device_poll' || ep.auth_mode === 'u1s1_device') return { label: '设备流', cls: 'badge-info' }
+      if (ep.auth_mode === 'qoder_device') return { label: '设备流', cls: 'badge-info' }
+      if (ep.auth_mode === 'lobsterai') return { label: '手动回调', cls: 'badge-warning' }
       if (ep.device_code_only) return { label: '导入', cls: 'badge-warning' }
       return { label: '浏览器授权', cls: 'badge-neutral' }
     },
@@ -222,7 +248,15 @@ export default {
       this.busyCode = p.code
       try {
         const r = await api.startOAuthAuthorize(p.code)
-        if (r.device_poll && r.login_url) {
+        if (r.manual_callback && r.login_url) {
+          // portal 回调锁死 127.0.0.1：弹引导框，用户自己粘贴回调 URL 回来
+          window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          this.manualModal = {
+            show: true, provider_code: p.code, login_url: r.login_url,
+            callback_hint: r.callback_hint || '', hint: r.message || '',
+            callback_url: '', busy: false, error: '',
+          }
+        } else if (r.device_poll && r.login_url) {
           window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
           toast.info(r.message || '请在新窗口完成登录，成功后系统自动收取 token')
           this.watchDeviceFlow(p.code)
@@ -245,7 +279,15 @@ export default {
       this.busyCode = p.code
       try {
         const r = await api.startOAuthAuthorize(p.code, { newAccount: true })
-        if (r.device_poll && r.login_url) {
+        if (r.manual_callback && r.login_url) {
+          window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          this.manualModal = {
+            show: true, provider_code: p.code, login_url: r.login_url,
+            callback_hint: r.callback_hint || '',
+            hint: (r.message || '') + '（本次将新增一个账号连接）',
+            callback_url: '', busy: false, error: '',
+          }
+        } else if (r.device_poll && r.login_url) {
           window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
           toast.info('请在新窗口登录【另一个账号】，成功后自动新增一条连接')
           this.watchDeviceFlow(p.code)
@@ -259,6 +301,26 @@ export default {
         toast.error('发起授权失败：' + e.message)
       } finally {
         this.busyCode = null
+      }
+    },
+    // 手动回调：用户粘贴整段回调 URL → 后端换票落库
+    async submitManualCallback() {
+      const raw = (this.manualModal.callback_url || '').trim()
+      if (!raw) { this.manualModal.error = '请粘贴登录后浏览器地址栏的完整 URL'; return }
+      this.manualModal.busy = true
+      this.manualModal.error = ''
+      try {
+        const r = await api.completeManualOAuthCallback({
+          provider_code: this.manualModal.provider_code,
+          callback_url: raw,
+        })
+        toast.success('登录成功，账号已保存：' + (r.owner || ''))
+        this.manualModal.show = false
+        this.load()
+      } catch (e) {
+        this.manualModal.error = e.message
+      } finally {
+        this.manualModal.busy = false
       }
     },
     // 账号改名

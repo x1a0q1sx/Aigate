@@ -619,9 +619,67 @@ async def _u1s1_usage(token: str) -> dict:
                       "tokens_per_usd": tpu}}
 
 
+async def _lobsterai_usage(token: str) -> dict:
+    """LobsterAI 积分余额：GET /api/user/profile-summary。
+
+    必须用 profile-summary 而非 /api/user/quota —— 后者只显示 freeCreditsTotal=300，
+    **不含活动积分**（实测某账号 profile-summary 有 5297.72，quota 只有 300）。
+
+    身份字段（uuid/first_keyfrom/…）从连接 scope 列读回；缺失时该端点仍可查
+    （它只用 Bearer 鉴权），故降级而不报错。
+    """
+    meta: dict = {}
+    try:
+        from server.db import AsyncSessionLocal
+        from server.core.oauth_client import get_oauth_client
+        async with AsyncSessionLocal() as db:
+            meta = await get_oauth_client().get_token_meta("lobsterai", db)
+    except Exception:
+        meta = {}
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "LobsterAI/0.1.0",
+    }
+    cv = str(meta.get("client_version") or "")
+    if cv:
+        headers["X-LobsterAI-Client-Version"] = cv
+    headers["X-LobsterAI-Client-Capabilities"] = (
+        "kimi-k3-agentic-v1,thinking-level-control-v1")
+    r = await _get_json("https://lobsterai-server.youdao.com/api/user/profile-summary",
+                        headers)
+    if not r.is_success:
+        return {"quotas": {}, "message": f"LobsterAI 已连接，额度接口返回 {r.status_code}"}
+    body = r.json() if r.content else {}
+    if not isinstance(body, dict) or body.get("code") not in (0, None):
+        return {"quotas": {}, "message": f"LobsterAI 额度响应异常：{str(body)[:120]}"}
+    data = body.get("data") if isinstance(body.get("data"), dict) else {}
+    quotas = {}
+    total = _num(data.get("totalCreditsRemaining"))
+    items = data.get("creditItems")
+    if isinstance(items, list):
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            remaining = max(0.0, _num(item.get("creditsRemaining")))
+            name = str(item.get("type") or f"积分包 {i + 1}")
+            # 服务端只下发剩余量（无总额/已用）→ total=0 且 UI 会显示 '?'
+            # （不编造 total，避免把「剩余」伪装成「1:1 进度」）
+            quotas[name] = {"used": 0.0, "total": 0.0, "remaining": remaining,
+                            "unit": "credit", "unlimited": False, "recurring": False}
+    if not quotas and total > 0:
+        quotas["积分"] = {"used": 0.0, "total": 0.0, "remaining": max(0.0, total),
+                          "unit": "credit", "unlimited": False, "recurring": False}
+    if not quotas:
+        # total 为 0 且无明细 → 视为「查不到」而非「余额为 0」（字段缺失时
+        # _num 返回 0，会把解析失败伪装成 0 积分）
+        return {"quotas": {}, "message": "LobsterAI 额度响应无任何条目"}
+    return {"plan": "LobsterAI", "quotas": quotas,
+            "extra": {"total_credits_remaining": total}}
+
+
 class _RateLimited(Exception):
     pass
-
 
 # ── 调度与缓存 ───────────────────────────────────────────────
 
@@ -701,5 +759,7 @@ async def _dispatch(provider_code: str, token: str) -> dict:
         return await _qoder_usage(token)
     if provider_code == "u1s1":
         return await _u1s1_usage(token)
+    if provider_code == "lobsterai":
+        return await _lobsterai_usage(token)
     return {"plan": None, "quotas": {},
             "message": "该服务商上游没有公开的额度接口（与 9router 覆盖范围一致）"}
