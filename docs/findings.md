@@ -568,3 +568,30 @@ ps -o pid,ppid,lstart,cmd -p "$PORT_PID"   # PPID 应为 pm2 而非 1
 ```
 **教训**：`pm2 restart` 返回成功**不等于**新代码已生效 —— 它可能正在安静地崩溃循环，
 而服务照旧由别的进程提供。部署验证必须落到「持端口进程 = pm2 管理的 pid」这一条。
+
+### F23：Qoder 余额「获取不到」的真相——签到积分不在 userQuota 层（2026-09-25）
+
+用户反馈签到页 Qoder 账户余额获取不到。生产三路探针（旧端点全响应体、
+新 sash 端点、AIGate 真实代码路径）还原了完整链条：
+
+- **旧链路没坏但看得少**：`/api/v2/quota/usage` 一直 200，但只含 `userQuota`
+  （生产账号实测全 0 + `isQuotaExceeded:true`），且**不下发资源包层**；
+- **签到积分的落点在 addOnQuota**（资源包）：Jet-Hub 抓包实测账号
+  `userQuota.remaining=0` 而 `addOnQuota.remaining=100`——只读 userQuota 的
+  实现「签到成功后余额永远是 0」，这正是「漏读某一层」缺陷的又一例；
+- **哨兵到期值渲染成废话**：上游 `expiresAt=253402214400000`（9999-12-31，
+  「无到期」语义）被原样透传，前端渲染「到期 2879999 天后」，整个额度块
+  看起来就是坏的。
+
+修复（commit ad36fab，`_qoder_usage` 重写为三层结构）：
+1. 主走 `/sash/api/v2/me/usage`（与签到同协议族：`Bearer` + `Cosy-ClientType: 5`
+   + `User-Agent: Qoder`，无需 COSY 签名；2026-09-24 生产实测 200），解析
+   `qoderUsage` 下的 套餐额度/资源包/专用资源包 三层（专用包各自 expiresAt 优先）；
+2. 旧端点保留为**兜底**（sash 不可用或响应无任何条目时再试）；
+3. `_qoder_sane_reset` 吞掉年份 ≥9000 的哨兵到期值（`reset_at: None`）；
+4. `displayMode==="enterprise"` 的企业版账号不下发数字，明确提示而非报 0。
+
+部署验证：22 项 qoder 用例 + 全量 453 项全绿；线上输出
+`{"套餐额度": {..., "reset_at": null}}`，不再出现「到期 287 万天后」。
+当前账号套餐额度 0、无资源包是**真实状态**（免费层额度耗尽 + 活动未领取）；
+首次成功领取后「资源包」行会出现对应积分。

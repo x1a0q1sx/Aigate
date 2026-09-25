@@ -14,6 +14,8 @@
 - CodeBuddy/WorkBuddy 模型列表按 2026-09-23 逐模型探测校正（见下方 Fixed）；刷新日志新增 **`list_source`/`list_note`** 两列——分析页模型刷新行以「种子/定价」角标透出列表真实来源，OAuth 静态种子兜底不再伪装成在线拉取
 
 ### Fixed
+- **Qoder 账户余额「获取不到」**（签到页/OAuth 页同源，`_qoder_usage` 重写）：签到所得积分落在 `addOnQuota`（资源包）层，旧端点 `/api/v2/quota/usage` 根本不下发，只读 `userQuota` 会「签到成功后余额永远 0」；现主走与签到同协议族的 `/sash/api/v2/me/usage`（4 头即可，无需 COSY 签名），解析套餐额度/资源包/专用资源包三层（各自 expiresAt 优先），旧端点降级为兜底；`expiresAt=9999` 哨兵值吞掉（此前渲染「到期 2879999 天后」）；企业版账号明确提示不报 0。详见 `docs/findings.md` §F23
+
 - **分析页「按服务商用量」显示不全（当天 95% 的请求凭空消失）**：用户反馈面板只列出 4 家、占比不对。生产取证当日 832 行日志：**786 行只有服务商名称、`routed_provider_id` 为 NULL**（CodeBuddy CN 596 / Qoder 139 / CodeBuddy Intl 51 全部缺席），而聚合查询写死 `WHERE routed_provider_id IS NOT NULL` → 整行丢弃。根因：该列是「配额并入分析」时后加的，而 `_write_stream_log` 等路径当时只写了名称。三层修复：① 聚合收敛到新的 `server/core/provider_usage.aggregate_usage_by_provider`（**id 优先、名称兜底合并**，同名 id 行与名称行归并成一行；匹配不到保留原名的独立桶不丢数据；排除健康检查与在途 pending），`/analytics/by-provider` 与 headroom 共用；② 写入层全面补 id（直连流式快照 `_rt_prov_id`、combo 流式各站点、free_tier、媒体生成 4 处、透传 2 处、Playground、健康检查），并在 `log_queue` 落库前与同步写路径加**按名兜底解析**——将来新增路径再漏写也不会丢；③ 启动回填历史行（幂等 UPDATE）+ 新增 `idx_request_logs_prov_time` 聚合索引。**连带修复功能性缺陷**：`headroom` 每日 token 限额此前同样统计不到这 95% 的用量，保留额度形同虚设（配了 4000 限额的站跑 5000 也不会被跳过），现统计口径与面板一致。前端：Providers 详情弹窗「今日用量」改 id 优先/名称兜底（此前恒空），Analytics 卡片加「N 家」计数与「（已删除）」标注。新增 21 项测试，并用生产真实分布离线复现（修复前只见 2 家 → 修复后 6 家齐全、计数与原始日志一致）。详见 `docs/findings.md` §F21
 
 ### Fixed
