@@ -652,7 +652,10 @@ async def _lobsterai_usage(token: str) -> dict:
         return {"quotas": {}, "message": f"LobsterAI 已连接，额度接口返回 {r.status_code}"}
     body = r.json() if r.content else {}
     if not isinstance(body, dict) or body.get("code") not in (0, None):
-        return {"quotas": {}, "message": f"LobsterAI 额度响应异常：{str(body)[:120]}"}
+        # HTTP 200 也可能带业务错误（实测无凭据时 code:-1 message:"未登录"）
+        msg = str(body.get("message") or body.get("msg") or "") if isinstance(body, dict) else ""
+        return {"quotas": {},
+                "message": f"LobsterAI 额度查询失败：{msg or str(body)[:120]}"}
     data = body.get("data") if isinstance(body.get("data"), dict) else {}
     quotas = {}
     total = _num(data.get("totalCreditsRemaining"))

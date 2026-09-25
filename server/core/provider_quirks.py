@@ -150,15 +150,15 @@ _CLINE = ProviderQuirks(
 # LobsterAI（有道龙虾，lobsterai-server.youdao.com）：OpenAI 兼容 + 标准 SSE。
 # 协议来源：Jet-Hub 源码 + 真实凭据实测（2026-09）。三处非标：
 #   1) `stream` 恒为 true —— 上游只支持 SSE，stream:false 返回 500 → force_stream
+#      （所有请求都走 _collect_stream，chat 端点返回**裸 SSE** 不套信封，
+#       故无需 unwrap_envelope）
 #   2) 请求必须带 X-LobsterAI-Client-Capabilities（不带时模型集合少 kimi-k3，
-#      且 reasoning_effort:"off" 会 500）与 X-LobsterAI-Client-Version（动态真值）
-#   3) 非流式响应被包在统一信封 {code,msg,data} 里（chat 端点例外，返回裸 SSE）
-# 思考档位的 wire 值是 openclawLevel（无 "max"，最强档发 "xhigh"），
-# 与产品侧展示名不同 —— 由调用方（credential_resolver 注入的客户端元数据）处理。
+#      且 reasoning_effort:"off" 会 500）；X-LobsterAI-Client-Version 是
+#      **动态真值**，由 credential_resolver 注入（静态头表放不下）
+#   3) 思考档位的 wire 值是 openclawLevel（无 "max"，最强档发 "xhigh"）
 _LOBSTERAI = ProviderQuirks(
     name="lobsterai",
     force_stream=True,
-    unwrap_envelope=True,
     default_headers={
         "User-Agent": "LobsterAI/0.1.0",
         "X-LobsterAI-Client-Capabilities": "kimi-k3-agentic-v1,thinking-level-control-v1",

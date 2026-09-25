@@ -353,6 +353,18 @@ def test_lobsterai_usage_http_error(monkeypatch):
     assert "401" in r["message"]
 
 
+def test_lobsterai_usage_business_error_in_200(monkeypatch):
+    """HTTP 200 也可能带业务错误（实测无凭据时 code:-1 message:"未登录"）。"""
+    import server.core.oauth_usage as ou
+    calls = []
+    monkeypatch.setattr(ou.httpx, "AsyncClient", make_httpx(calls, [(200, {
+        "code": -1, "message": "未登录", "data": None,
+    })]))
+    r = asyncio.run(_lobsterai_usage("tok"))
+    assert r["quotas"] == {}
+    assert "未登录" in r["message"]
+
+
 # ── quirks 档案 ─────────────────────────────────────
 def test_lobsterai_quirks_registered():
     """域名方言：force_stream（上游只收 SSE）+ 静态头（UA/能力）。"""
