@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -46,6 +47,7 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
     "codebuddy_cn": True,
     "codebuddy_intl": True,     # 端点实测存在（HTTP 200）
     "qoder": True,
+    "lobsterai": True,          # 三步协议（slot → context → check_in），+100 积分/天
     "u1s1": False,              # 实测无签到接口（登录即自动发放 login_checkin 包）
 }
 
@@ -328,8 +330,134 @@ async def _claim_qoder(token: str, base: str = "https://openapi.qoder.sh") -> Cl
     return ClaimOutcome(kind="failed", message="领取失败", error=last_err or "上游未返回可识别结果")
 
 
-# ── 分发 ─────────────────────────────────────────────────────
+def _lobsterai_headers(token: str, client_version: str = "") -> dict:
+    """LobsterAI 积分端点请求头。
 
+    只设四个基础头 + 两个客户端头：LobsterAI **不认** CodeBuddy 那套
+    X-Domain / X-Product / X-IDE-* 归属头（带上不仅无用，还可能让服务端
+    按错误的客户端形态归因 —— Jet-Hub 源码明确记录）。
+    """
+    h = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "LobsterAI/0.1.0",
+        "X-LobsterAI-Client-Capabilities": "kimi-k3-agentic-v1,thinking-level-control-v1",
+    }
+    if client_version:
+        h["X-LobsterAI-Client-Version"] = client_version
+    return h
+
+
+async def _claim_lobsterai(token: str,
+                           base: str = "https://lobsterai-server.youdao.com") -> ClaimOutcome:
+    """LobsterAI 三步签到：活动槽位 → 活动上下文 → check_in。
+
+    判定顺序（Jet-Hub 源码的「业务正常状态与真失败严格分开」原则）：
+    1. 槽位查询失败 → failed
+    2. slotState != available 或无 activityCode → inactive
+    3. 上下文查询失败 → failed
+    4. claimedToday → already_claimed（**不发 check_in 请求**）
+    5. actions 不含 check_in → inactive
+    6. 领取失败 → failed；成功 → claimed（积分三级回退）
+
+    槽位的三个固定参数是**伪装桌面客户端形态**（照抄 sigin.py:52-53）：
+    placement=desktop_sidebar / containerApiVersion=2 / platform=win32 ——
+    即使跑在 Linux 上也照发 win32，改了可能拿不到活动。
+    """
+    import uuid as _uuid
+
+    from server.core import lobsterai as lb   # 复用版本号解析（12h 缓存）
+    version = await lb.resolve_client_version()
+    headers = _lobsterai_headers(token, version)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        # ── 步骤 1：活动槽位 ──
+        slot_url = (f"{base}/api/client-activities/slot"
+                    f"?placement=desktop_sidebar&clientVersion={version}"
+                    f"&containerApiVersion=2&platform=win32")
+        try:
+            code, body, text = await _request(client, "GET", slot_url, headers)
+        except Exception as e:
+            return ClaimOutcome(kind="failed", message="活动槽位查询失败",
+                                error=f"{type(e).__name__}: {str(e)[:200]}")
+        if code in (401, 403):
+            return ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
+                                error=f"HTTP {code}: {text[:200]}")
+        if body is None:
+            return ClaimOutcome(kind="failed", message="活动槽位响应不是 JSON", error=text[:200])
+        if _num(body.get("code"), -1) != 0:
+            msg = str(body.get("message") or body.get("msg") or "")
+            return ClaimOutcome(kind="failed", message=f"活动槽位查询失败：{msg}",
+                                upstream_code=int(_num(body.get("code"), -1)),
+                                error=str(body)[:200])
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        slot_state = str(data.get("slotState") or "")
+        activity = data.get("activity") if isinstance(data.get("activity"), dict) else {}
+        activity_code = str(activity.get("activityCode") or "")
+        config_rev = _read_int(activity, "configRevision")
+        if slot_state != "available" or not activity_code:
+            return ClaimOutcome(kind="inactive",
+                                message=f"无可用活动（slotState={slot_state or '未知'}）")
+
+        # ── 步骤 2：活动上下文（今天领了没 / 有哪些动作）──
+        ctx_url = (f"{base}/api/client-activities/{activity_code}/context"
+                   f"?configRevision={config_rev}")
+        try:
+            code, body, text = await _request(client, "GET", ctx_url, headers)
+        except Exception as e:
+            return ClaimOutcome(kind="failed", message="活动上下文查询失败",
+                                error=f"{type(e).__name__}: {str(e)[:200]}")
+        if body is None:
+            return ClaimOutcome(kind="failed", message="活动上下文响应不是 JSON", error=text[:200])
+        if _num(body.get("code"), -1) != 0:
+            msg = str(body.get("message") or body.get("msg") or "")
+            return ClaimOutcome(kind="failed", message=f"活动上下文查询失败：{msg}",
+                                error=str(body)[:200])
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        state = data.get("state") if isinstance(data.get("state"), dict) else {}
+        if _read_bool(state, "claimedToday"):
+            return ClaimOutcome(kind="already_claimed", message="今天已签到")
+        actions = data.get("actions") if isinstance(data.get("actions"), list) else []
+        if "check_in" not in actions:
+            # 活动存在但当前不可签（未开始/已结束/无资格）——与「今天已领」区分
+            return ClaimOutcome(kind="inactive", message="当前不可签到")
+
+        # ── 步骤 3：签到（客户端幂等键，对齐 sigin.py:63 的 uuid4）──
+        claim_url = f"{base}/api/client-activities/{activity_code}/actions/check_in"
+        payload = json.dumps({
+            "configRevision": config_rev,
+            "idempotencyKey": str(_uuid.uuid4()),
+            "payload": {},
+        }).encode()
+        try:
+            code, body, text = await _request(client, "POST", claim_url, headers, payload)
+        except Exception as e:
+            return ClaimOutcome(kind="failed", message="签到请求失败",
+                                error=f"{type(e).__name__}: {str(e)[:200]}")
+        if code in (401, 403):
+            return ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
+                                error=f"HTTP {code}: {text[:200]}")
+        if body is None:
+            return ClaimOutcome(kind="failed", message="签到响应不是 JSON", error=text[:200])
+        if _num(body.get("code"), -1) != 0:
+            msg = str(body.get("message") or body.get("msg") or "")
+            return ClaimOutcome(kind="failed", message=f"签到失败：{msg}",
+                                upstream_code=int(_num(body.get("code"), -1)),
+                                error=str(body)[:200])
+        data = body.get("data") if isinstance(body.get("data"), dict) else {}
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        # 积分字段三级回退（对齐 sigin.py:65-66）：不同活动/版本用不同字段名
+        credit = 0.0
+        for key in ("creditsGranted", "rewardCredits", "credits"):
+            v = result.get(key)
+            if isinstance(v, (int, float)) and v == v:
+                credit = float(v)
+                break
+        return ClaimOutcome(kind="claimed", credit=credit,
+                            activity_name=activity_code, message="签到成功")
+
+
+# ── 分发 ─────────────────────────────────────────────────────
 async def claim_for_provider(provider_code: str, token: str) -> ClaimOutcome:
     """按 provider 分发签到。永不抛异常，失败以 kind=failed 表达。"""
     cap = CHECKIN_CAPABILITIES.get(provider_code)
@@ -340,6 +468,8 @@ async def claim_for_provider(provider_code: str, token: str) -> ClaimOutcome:
             return await _claim_codebuddy(token, provider_code)
         if provider_code == "qoder":
             return await _claim_qoder(token)
+        if provider_code == "lobsterai":
+            return await _claim_lobsterai(token)
         return ClaimOutcome(kind="unsupported", message=f"未实现签到适配器：{provider_code}")
     except Exception as e:   # 防御：任何解析异常都不冒穿（照 oauth_usage 的做法）
         logger.warning("checkin error for %s: %s", provider_code, e)

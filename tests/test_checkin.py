@@ -752,3 +752,125 @@ def test_migration_and_model_registered():
     src = inspect.getsource(sdb)
     assert "CheckinLog" in src
     assert "idx_checkin_prov_owner_time" in src
+
+
+# ── LobsterAI（有道龙虾）三步签到 ─────────────────────
+@pytest.fixture(autouse=True)
+def _seed_lobsterai_version():
+    """预置客户端版本缓存。
+
+    该测试文件的 httpx patch 是**模块级**的（两者 import 同一个 httpx 模块），
+    不预置的话 `resolve_client_version` 会先消费掉第一个假响应。
+    （同时也让测试不发真实网络请求。）
+    """
+    import time as _t
+    from server.core import lobsterai as _lb
+    saved = _lb._VERSION_CACHE
+    _lb._VERSION_CACHE = (_t.monotonic() + 3600, "2026.9.23")
+    yield
+    _lb._VERSION_CACHE = saved
+
+
+def _lb_envelope(data):
+    return (200, {"code": 0, "msg": "OK", "data": data}, None)
+
+
+def _lb_slot(slot_state="available", code="act-1", rev=7):
+    return _lb_envelope({"slotState": slot_state,
+                         "activity": {"activityCode": code, "configRevision": rev}})
+
+
+def _lb_context(claimed=False, actions=("check_in",)):
+    return _lb_envelope({"state": {"claimedToday": claimed}, "actions": list(actions)})
+
+
+def test_lobsterai_three_steps_and_credit_fallback(monkeypatch):
+    """三步协议（slot → context → check_in）+ 积分三级回退 creditsGranted。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [
+        _lb_slot(),
+        _lb_context(),
+        _lb_envelope({"result": {"creditsGranted": 100}}),
+    ])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "claimed"
+    assert out.credit == 100
+    assert "/api/client-activities/slot" in calls[0]["url"]
+    assert calls[1]["url"].endswith("/api/client-activities/act-1/context?configRevision=7")
+    assert calls[2]["url"].endswith("/api/client-activities/act-1/actions/check_in")
+    # 槽位的三个伪装参数（照抄 sigin.py:52-53 —— 跑在 Linux 上也发 win32）
+    assert "placement=desktop_sidebar" in calls[0]["url"]
+    assert "containerApiVersion=2" in calls[0]["url"]
+    assert "platform=win32" in calls[0]["url"]
+    # 客户端幂等键（服务端据此去重）
+    body = json.loads(calls[2]["content"].decode())
+    assert body["configRevision"] == 7
+    assert body["idempotencyKey"]
+    assert body["payload"] == {}
+    # 不认 CodeBuddy 那套归属头
+    assert "X-Domain" not in calls[0]["headers"]
+    assert "X-Product" not in calls[0]["headers"]
+
+
+def test_lobsterai_credit_reward_fallback(monkeypatch):
+    """积分字段三级回退：creditsGranted → rewardCredits → credits。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [_lb_slot(), _lb_context(),
+                                _lb_envelope({"result": {"rewardCredits": 55}})])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "claimed" and out.credit == 55
+
+
+def test_lobsterai_claimed_today_skips_claim(monkeypatch):
+    """claimedToday → already_claimed，且**不发 check_in 请求**（省调用+避风控）。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [_lb_slot(), _lb_context(claimed=True)])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "already_claimed"
+    assert len(calls) == 2        # 第三步没发
+
+
+def test_lobsterai_no_slot_is_inactive(monkeypatch):
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [_lb_slot(slot_state="unavailable")])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "inactive"
+    assert len(calls) == 1
+
+
+def test_lobsterai_actions_without_checkin_is_inactive(monkeypatch):
+    """活动存在但 actions 不含 check_in → inactive（与「今天已领」区分）。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [_lb_slot(), _lb_context(actions=("view_details",))])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "inactive"
+    assert len(calls) == 2
+
+
+def test_lobsterai_401_reports_relogin(monkeypatch):
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [(401, None, "<html>unauthorized</html>")])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "failed"
+    assert "重新登录" in out.message
+
+
+def test_lobsterai_business_error_in_200(monkeypatch):
+    """HTTP 200 也可能带业务错误（实测无凭据返回 code:-1「未登录」）。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"code": -1, "message": "未登录", "data": None}, None)])
+    out = asyncio.run(claim_for_provider("lobsterai", "tok"))
+    assert out.kind == "failed"
+    assert "未登录" in out.message
+
+
+def test_lobsterai_capability_registered():
+    from server.core.checkin import CHECKIN_CAPABILITIES
+    assert CHECKIN_CAPABILITIES.get("lobsterai") is True
