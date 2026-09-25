@@ -91,14 +91,28 @@ def _agent_host(base_url: str, domain: str) -> str:
 def _clean_body(body: dict) -> dict:
     """剔掉 OpenAI 请求体里的空值与 AIGate 内部字段。
 
-    SOLO 上游对多余/空值字段敏感（`temperature: null` 之类没有依据的字段
-    不该发）。`extra` 是 AIGate 自己的容器，不属于上游协议。
+    ⚠️ 用 `model_dump(exclude_none=True)` 而不是 `if value`：后者会把**合法假值**
+    （`temperature: 0` / `stream: false` / `presence_penalty: 0`）一起丢掉 ——
+    `temperature: 0` 被丢掉会让上游按默认温度回答，是静默的行为变化。
+    （与 `openai_compat.py:196` 的 `model_dump(exclude_none=True)` 同一口径。）
+
+    ⚠️ **例外**：`exclude_none` 会把「纯 tool_calls 的 assistant」的
+    `content: null` 一并剔除，而参考实现（Jet-Hub `serializeTraeMessages` 与
+    Go `PrepareBody`）发的是**显式 null**。这一处的 null 是载荷语义的一部分，
+    故这里补回来 —— 少一个键在部分上游会变成「消息缺字段」。
+
+    `extra` 是 AIGate 自己的容器，不属于上游协议，必须剔掉。
     """
-    out = {}
-    for key, value in (body or {}).items():
-        if key == "extra" or value is None:
-            continue
-        out[key] = value
+    if hasattr(body, "model_dump"):
+        body = body.model_dump(exclude_none=True)
+    out = {k: v for k, v in (body or {}).items()
+           if k != "extra" and v is not None}
+    messages = out.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if (isinstance(msg, dict) and msg.get("role") == "assistant"
+                    and msg.get("tool_calls") and "content" not in msg):
+                msg["content"] = None
     return out
 
 
@@ -374,7 +388,9 @@ class TraeAdapter(BaseAdapter):
     # ── 核心流式调用 ─────────────────────────────────
     async def stream_chat_completion(self, request, api_key, base_url,
                                      extra_headers=None) -> AsyncGenerator[dict, None]:
-        body = request.model_dump() if hasattr(request, "model_dump") else dict(request)
+        # `_clean_body` 优先走 `model_dump(exclude_none=True)`（与 openai_compat
+        # 同一口径：剔除 null、但保留 temperature:0 这类**合法假值**）
+        body = _clean_body(request if hasattr(request, "model_dump") else dict(request))
         model = str(body.get("model") or "")
         domain = _domain_of(base_url)
         meta = await self._resolve_meta(api_key)
@@ -386,7 +402,7 @@ class TraeAdapter(BaseAdapter):
         # SOLO 要求 `function.parameters` 是 JSON 字符串（OpenAI 标准是 object），
         # 那一步序列化只对**转换时已存在**的 tools 生效。转换后再补 `body["tools"]`
         # 会保持 object 形态发给上游被拒（且错误信息不会指向这里）。
-        clean = _clean_body(body)
+        clean = body
         clean["model"] = model
         # 历史裁剪：超 ~480K 字符上游会**静默断流**（不发错误码、流就那么断掉）。
         # 必须在转换**之前**裁剪（裁的是 OpenAI wire 消息），且不切断工具配对。

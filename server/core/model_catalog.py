@@ -137,6 +137,12 @@ def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) ->
     elif api_type == "qoder":
         from server.adapters.qoder_adapter import QoderAdapter
         return QoderAdapter(timeout=timeout) if timeout else QoderAdapter()
+    elif api_type == "codearts":
+        from server.adapters.codearts_adapter import CodeArtsAdapter
+        return CodeArtsAdapter(timeout=timeout) if timeout else CodeArtsAdapter()
+    elif api_type == "trae":
+        from server.adapters.trae_adapter import TraeAdapter
+        return TraeAdapter(timeout=timeout) if timeout else TraeAdapter()
     else:
         return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
 class ModelCatalog:

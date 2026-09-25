@@ -107,6 +107,19 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
                                             await resolve_client_version()}
                 except Exception:
                     pass
+            # CodeArts：**不是 Bearer** —— 推理要 AK/SK/SecurityToken 签名，
+            # access_token 列里存的是凭据 JSON。校验格式（裸 token 发出去必然
+            # 验签 401，报错还指向「签名头错位」这种看不出根因的地方）。
+            if oauth_code == "codearts":
+                import json as _json
+                try:
+                    _cred = _json.loads(rc.api_key)
+                    if not isinstance(_cred, dict) or not _cred.get("access_key_id"):
+                        rc.error = "codearts 凭据格式不对（应为 JSON 凭据），请重新连接"
+                        return rc
+                except (ValueError, TypeError):
+                    rc.error = "codearts 凭据不是 JSON（请重新连接该账号）"
+                    return rc
             return rc
         # free_tier
         rc.kind = "free_tier"

@@ -1608,6 +1608,7 @@ def test_adapter_sse_embedded_queue_error_triggers_retry(monkeypatch):
     # 至少发了两次 chat 请求（说明发生了重试）
     streams = [c for c in calls if c["m"] == "STREAM"]
     assert len(streams) >= 2
+    assert len(streams) <= 3          # 上限被测试锚定，不会真跑 180 次
 
 
 def test_adapter_sse_embedded_fatal_error_not_retried(monkeypatch):
@@ -1628,6 +1629,63 @@ def test_adapter_http_400_non_queue_error_raises_immediately(monkeypatch):
         _req(model="GLM-5.2"), _api_key(), "")))
     assert any(c.get("error") and "400" in c["error"] for c in chunks)
     assert len([c for c in calls if c["m"] == "STREAM"]) >= 1
+
+
+def test_adapter_queue_retry_succeeds_second_attempt(monkeypatch):
+    """排队重试的**成功**路径：第一次 400 并发超限 → 探到 waiting → 重试即成功。
+
+    顺带锁死：每次重试前都查一次排队状态端点（对齐参考实现）。
+    """
+    calls = _patch_queue_retry(monkeypatch, fail_times=1)
+    monkeypatch.setattr(ca, "QUEUE_RETRY_DELAY_SECONDS", 0.0)
+    chunks = _run(_collect(CodeArtsAdapter().stream_chat_completion(
+        _req(model="GLM-5.2"), _api_key(), "")))
+    text = "".join(c["choices"][0]["delta"].get("content") or ""
+                   for c in chunks if c.get("choices"))
+    assert text == "done"
+    assert len([c for c in calls if c["m"] == "STREAM"]) == 2
+    assert len([c for c in calls if c["m"] == "GET"]) >= 1
+    # 排队状态查询必须带签名（与 chat 同一套 AK/SK）且不带 content-type
+    probe = [c for c in calls if c["m"] == "GET"][0]
+    assert probe["headers"]["Authorization"].startswith("SDK-HMAC-SHA256 Access=AK,")
+    assert "content-type" not in probe["headers"]
+    assert probe["headers"]["Agent-Type"] == "INFERHUB_AGENT"
+
+
+def test_adapter_queue_full_is_terminal(monkeypatch):
+    """排队状态端点为终态（`queue_full` / `error`）→ **立即**报错。
+
+    不短路的话用户要等满 30 分钟才收到一个本来此刻就能确定的失败。
+    """
+    calls = _patch_queue_retry(monkeypatch, fail_times=99, queue_status="queue_full")
+    # 上限改小：短路被删掉时本用例快速失败而不是挂住
+    monkeypatch.setattr(ca, "QUEUE_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(ca, "QUEUE_MAX_ATTEMPTS", 3)
+    chunks = _run(_collect(CodeArtsAdapter().stream_chat_completion(
+        _req(model="GLM-5.2"), _api_key(), "")))
+    errs = [c["error"] for c in chunks if c.get("error")]
+    assert errs and "队列已满" in errs[0]
+    assert len([c for c in calls if c["m"] == "STREAM"]) == 1   # 不再重试
+
+
+def test_adapter_queue_probe_unreachable_fails_fast(monkeypatch):
+    """⚠️ 状态端点不可达 + **非**排队码 → 按原错误立即抛出。
+
+    这是「不要把所有 400 都拖成 30 分钟超时」的守护：只有状态端点明确回报
+    waiting/queue_full 才进排队流程。
+    """
+    calls = _patch_queue_retry(monkeypatch, fail_times=99, non_queue_error=True,
+                               probe_raises=True)
+    # 把延时与上限改小：万一守护被删掉，本用例**快速失败**而不是挂满 30 分钟
+    # （挂住比失败更糟 —— 它会把整个测试套拖死，看起来像环境问题）。
+    monkeypatch.setattr(ca, "QUEUE_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(ca, "QUEUE_MAX_ATTEMPTS", 3)
+    chunks = _run(_collect(CodeArtsAdapter().stream_chat_completion(
+        _req(model="GLM-5.2"), _api_key(), "")))
+    errs = [c["error"] for c in chunks if c.get("error")]
+    assert errs and "HTTP 400" in errs[0] and "30 minutes" not in errs[0]
+    assert len([c for c in calls if c["m"] == "STREAM"]) == 1   # 不重试
+    assert len([c for c in calls if c["m"] == "GET"]) == 1      # 只探一次
 
 
 def test_adapter_auth_error_triggers_refresh_callback(monkeypatch):
@@ -1851,6 +1909,74 @@ def _patch_stream(monkeypatch, lines, status=200, repeat=False, fail_first=False
             if status >= 400 and not fail_first:
                 return _Resp(status, [], calls)
             return _Resp(200, list(lines), calls)
+
+    monkeypatch.setattr(ad_mod.httpx, "AsyncClient", _Client)
+    return calls
+
+
+def _patch_queue_retry(monkeypatch, fail_times=1, queue_status="waiting",
+                       non_queue_error=False, probe_raises=False):
+    """伪造「chat 先失败 N 次、状态端点报 queue_status」的场景。
+
+    `non_queue_error=True` 时 chat 返回**非**排队码（不会被自动判定为排队），
+    用于验证「探不到排队就快速失败」的守护。
+    """
+    state = {"stream": 0}
+    calls = []
+
+    class _Resp:
+        def __init__(self, status, lines=None, jbody=None, body=b""):
+            self.status_code = status
+            self._lines = lines or []
+            self._j = jbody
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aread(self):
+            return self._body
+
+        def json(self):
+            return self._j
+
+        async def aiter_lines(self):
+            for line in self._lines:
+                yield line
+
+    err_code = (b'{"error_code":"InferHub.002002009.404",'
+                b'"error_msg":"model is not registered"}') if non_queue_error else (
+                b'{"error_code":"TM.00001041","error_msg":"concurrency limit reached"}')
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None):
+            calls.append({"m": "GET", "url": url, "headers": headers or {}})
+            if probe_raises:
+                raise RuntimeError("status endpoint down")
+            return _Resp(200, jbody={"status": queue_status,
+                                     "queue_position": 1, "message": "队列已满"})
+
+        def stream(self, method, url, headers=None, content=None):
+            calls.append({"m": "STREAM", "url": url, "headers": headers or {},
+                          "content": content})
+            state["stream"] += 1
+            if state["stream"] <= fail_times:
+                return _Resp(400, body=err_code)
+            return _Resp(200, lines=[
+                'data: {"choices":[{"delta":{"content":"done"}}]}',
+                "data: [DONE]"])
 
     monkeypatch.setattr(ad_mod.httpx, "AsyncClient", _Client)
     return calls

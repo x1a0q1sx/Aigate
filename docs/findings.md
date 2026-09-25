@@ -614,3 +614,43 @@ ps -o pid,ppid,lstart,cmd -p "$PORT_PID"   # PPID 应为 pm2 而非 1
 `STATIC_PRICE_RATIOS` 可升级为在线促销推算。Jet-Hub 的合并规则：
 scoped 端点优先、两端口 id 集合**取并集**、`agentReferenced` 例外保留。
 遗留：Intl 的 scoped 端点 500，仅用 `/v3/config` 即可（Intl 探针 200）。
+
+### F25：Jet-Hub 剩余渠道接入（TRAE / CodeArts）+ 错误信息不截断（2026-09-26）
+
+用户要求「Jet-Hub 里的都要」，剩余可实现的 2 家全部落地（第 3 家 antigravity
+三重否决：网关主机必须跑 IDE / 公共 API 实测 403 / 网关化必然违反防封号约束）。
+
+**TRAE（字节）** —— 自有协议适配器（请求与响应双向转换）：
+- 登录 URL **18 参数**，回调地址参数名是 `auth_callback_url`（写错则永远停在
+  「授权中」）；回调**直接回传 token**（非 `?code=`）
+- `machine_id`/`device_id` 客户端生成且不在响应里 → 必须随凭据持久化，
+  且 machine_id **绝不可重生成**（换设备触发风控）
+- refresh_token **轮换**（ExchangeToken 每次返回新值，旧值即刻失效）
+- OpenAI→SOLO 五条转换规则（tools 参数必须 JSON 字符串化、tool_calls→function_call
+  等）；SOLO 自定义 SSE 事件流解析
+- ⚠️ **CN 新版请求体加密未实现**（`x-helios`/`x-medusa`/`x-neptune` 五头），
+  Jet-Hub 亦未实现 → 受影响模型在显示名标注「暂不可用」，**但不过滤**
+  （Jet-Hub 教训：把某一刻的快照当判据会让后人误删可用模型）
+
+**CodeArts Agent（华为）** —— 额度最优（deepseek-v4 每日 1000 万 tokens 免费）：
+- portal OAuth：`code_challenge_method=SHA-256` 是**字面量**（不是标准 S256），
+  写错 portal 静默回退旧 ticket 流程 —— 用户**登录成功**但拿不到 refresh_token，
+  要到几小时后续期时才暴露
+- 回调主机名锁死 127.0.0.1 且端口必须 **≥10000**（低端口被 portal 拒绝）
+- 推理不是 Bearer，是 **SDK-HMAC-SHA256 签名**（AK/SK/SecurityToken 三元组）→
+  access_token 列存 **JSON 凭据**；签名用 node 执行 Jet-Hub 的 sign.ts 逐字节
+  对齐验证（3 条金标准 Authorization 串）
+- ⚠️ **refresh_token 一次性轮换**（STS5.1806）→ 续期必须串行化。本实现的
+  `_refresh_codearts` 只在 `refresh_token()` 的 Single Flight 内被调用，
+  且新 token **立即回写两处**（JSON + refresh_token 列，后者是前置判据）
+- 4 个实测坑：`maas_type: benefit` 参与签名、APIG ~60s 空闲断连（deepseek-v4
+  必须走 DSML 工具模式，不发 tools 字段）、排队码 TM.00001041 需轮询、
+  assistant 历史必须带 `reasoning_content`
+
+**错误信息不截断**（用户反馈）——此前链路三处截断（120/300/500 字符），
+用户看到的 error_msg 不含上游原文。现按用途分工：控制流判据用短形态，
+落库用全量（`ERROR_MSG_MAX_CHARS=20000` 只作防御），回下游客户端的 attempts
+剥掉 `error_detail`；适配器响应体上限 500→4000；前端 `<pre>` 保留换行可折叠。
+
+测试：TRAE 86 项 + CodeArts 116 项 + 接线守卫 10 项 + 错误不截断 9 项，
+全量 **705 项全绿**。

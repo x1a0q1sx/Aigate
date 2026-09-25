@@ -530,6 +530,92 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         ),
         notes="LobsterAI（有道）— 本地回调 + authCode 换 token；续期需带 keyfrom 身份载荷",
     ),
+    # ── TRAE（字节跳动，trae.cn / trae.ai）──
+    # 协议来源：Jet-Hub 源码逐行核对 + 2026-09 实测（见 server/core/trae.py 模块说明）。
+    # 流程：本地回调 127.0.0.1:{port}/authorize（**直接回传 token，不是 ?code=**）
+    #   → POST {oauth_host}/cloudide/api/v3/trae/oauth/ExchangeToken 换 accessToken
+    #   → POST .../GetUserInfo 补 uid/nickname（失败不阻塞）
+    # 关键约束（全部源码依据）：
+    #   1) 登录 URL 必须 **18 个参数**，回调地址参数名是 `auth_callback_url`
+    #      （写成 callback_url / redirect_uri → 登录页永远停在「授权中」）
+    #   2) machine_id / device_id 由客户端生成且**不在任何响应里** → 必须随凭据
+    #      持久化（存 scope 列 JSON，同 qoder/lobsterai 做法）；machine_id 绝不可重生成
+    #   3) refresh_token 会**轮换**（ExchangeToken 每次返回新值），续期后必须回写
+    #   4) 模型只在列出它的通道（function）里可调用，故走 batch 端点按通道路由
+    "trae": OAuthProviderConfig(
+        code="trae",
+        name="TRAE (字节)",
+        client_id="en1oxy7wnw8j9n",      # 无 secret（ClientSecret 恒为 "-"）
+        client_secret="",
+        authorize_url="https://www.trae.cn/authorization",
+        token_url="https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken",
+        refresh_url="https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken",
+        redirect_uri="http://127.0.0.1:18080/authorize",
+        scope="",
+        use_pkce=False,                  # 走 auth_type=local 老流程（PKCE 未实现）
+        refresh_lead_seconds=3600,
+        extra_params={
+            "auth_mode": "trae",
+            "refresh_style": "trae",
+            "callback_path": "/authorize",
+            "callback_port": 18080,      # 被占用时回退随机端口（见 oauth_client）
+            "plugin_version": "2.3.62834",
+            "ide_version": "0.1.52",
+            "oauth_host": "https://api.trae.com.cn",
+            "agent_host": "https://trae-api-cn.mchost.guru",
+            "ug_host": "https://api.trae.cn",
+            "console_host": "https://www.trae.cn",
+            "user_agent": "Trae/0.1.52",
+        },
+        api_base_url="https://trae-api-cn.mchost.guru",
+        adapter_api_type="trae",
+        static_models=_seed(*[(m, m) for m in (
+            "glm-5.2", "glm-5-turbo", "glm-5.1", "DeepSeek-V4-Pro",
+            "kimi-k3", "Doubao-Seed-2.1-Pro", "sagitta", "seed-code-pro-0430",
+        )]),
+        notes="TRAE（字节）— 本地回调直传 token + ExchangeToken 轮换；模型按 function 通道路由；"
+              "⚠️ CN 新版请求体加密未实现（部分模型不可用）",
+    ),
+    # ── CodeArts Agent（华为 DevEco）──
+    # 协议来源：Jet-Hub 源码逐行核对（含 tests/e2e 实测记录）+ 签名逐字节对齐验证。
+    # 关键约束（改前先读 server/core/codearts.py 的 docstring）：
+    #   1) code_challenge_method=SHA-256（**不是**标准 S256）—— 写错 portal 静默
+    #      回退旧 ticket 流程，用户照样登录成功但拿不到 refresh_token
+    #   2) refresh_token **一次性轮换** —— 续期必须串行化（_refresh_codearts 仅在
+    #      refresh_token() 的 Single Flight 内调用），并发刷新会互相作废只能重登
+    #   3) 推理是 SDK-HMAC-SHA256 签名，不是 Bearer → access_token 列存 JSON 凭据
+    "codearts": OAuthProviderConfig(
+        code="codearts",
+        name="CodeArts Agent (华为)",
+        client_id="codearts-agent",              # 逆向自插件 product.json（非密钥）
+        client_secret="",
+        authorize_url="https://codearts.huaweicloud.com/portal/authorize",
+        token_url="https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens",
+        refresh_url="https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens",
+        redirect_uri="",                          # 运行时由 build_oauth_login_url 生成
+        scope="",
+        use_pkce=True,
+        refresh_lead_seconds=1800,                # 30 分钟（对齐 Jet-Hub 节奏）
+        extra_params={
+            "auth_mode": "codearts",
+            "refresh_style": "codearts",
+            "api_base": "https://snap-access.cn-north-4.myhuaweicloud.com",
+            "chat_path": "/api/v2/chat/completions",
+            "min_callback_port": 10000,           # 低端口会被 portal 拒绝
+        },
+        api_base_url="https://snap-access.cn-north-4.myhuaweicloud.com/api/v2",
+        adapter_api_type="codearts",
+        static_models=_seed(
+            ("GLM-5.2", "GLM-5.2"), ("GLM-5.1", "GLM-5.1"), ("GLM-5", "GLM-5"),
+            ("glm-5.3-flash", "glm-5.3-flash"),
+            ("openpangu-2.0-flash", "openpangu-2.0-flash"),
+            ("openpangu-2.0-pro", "openpangu-2.0-pro"),
+            ("deepseek-v4-flash", "deepseek-v4-flash"),
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ),
+        notes="CodeArts（华为）— portal OAuth（PKCE + 字面量 SHA-256 + DPoP）；"
+              "续期一次性轮换，必须串行；推理走 HMAC 签名",
+    ),
 }
 
 

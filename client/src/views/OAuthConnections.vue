@@ -223,7 +223,7 @@ export default {
       const ep = p.extra_params || {}
       if (ep.auth_mode === 'device_poll' || ep.auth_mode === 'u1s1_device') return { label: '设备流', cls: 'badge-info' }
       if (ep.auth_mode === 'qoder_device') return { label: '设备流', cls: 'badge-info' }
-      if (ep.auth_mode === 'lobsterai') return { label: '手动回调', cls: 'badge-warning' }
+      if (['lobsterai', 'trae', 'codearts'].includes(ep.auth_mode)) return { label: '手动回调', cls: 'badge-warning' }
       if (ep.device_code_only) return { label: '导入', cls: 'badge-warning' }
       return { label: '浏览器授权', cls: 'badge-neutral' }
     },

@@ -278,6 +278,12 @@ class CodeArtsAdapter(BaseAdapter):
           思考会泄漏到正文（`src/llm-adapter.ts:1247-1266`）；
         - `data.error_code` 命中排队/限流错误码时 yield `{"__retry_queue": True}`
           让外层走排队重试（HTTP 200 也可能带限流错误）。
+
+        为什么不做 Jet-Hub 的「正文为空时用推理填充可见区」回退：那是 agent 循环
+        在**流结束后**才知道的事，而本适配器是把 chunk 直接透给客户端（与
+        openai_compat 同构），流到中途无从判断。GLM 偶尔整段回答走
+        reasoning_content 的情况原样透出（客户端仍可在思考区看到），
+        与仓库其它适配器口径一致。
         """
         content_ex = ca.DsmlContentExtractor()
         reasoning_ex = ca.DsmlContentExtractor()
@@ -286,9 +292,6 @@ class CodeArtsAdapter(BaseAdapter):
         chunk_meta = {"id": f"chatcmpl-codearts-{ca.new_chat_id()[:20]}",
                       "created": int(time.time()), "model": model}
         tool_index = 0
-        text_started = False
-        reasoning_started = False
-        counters = {"text": 0, "reasoning": 0}
 
         def _chunk(delta: dict, finish=None) -> dict:
             return {
@@ -299,11 +302,9 @@ class CodeArtsAdapter(BaseAdapter):
             }
 
         def _emit_text(text: str) -> dict:
-            counters["text"] += 1
             return _chunk({"content": text})
 
         def _emit_reasoning(text: str) -> dict:
-            counters["reasoning"] += 1
             return _chunk({"reasoning_content": text})
 
         def _emit_tool(call: dict, cid: str) -> dict:
@@ -353,13 +354,10 @@ class CodeArtsAdapter(BaseAdapter):
             if isinstance(content, str) and content:
                 out = content_ex.feed(content)
                 if out["text"]:
-                    text_started = True
                     yield _emit_text(str(out["text"]))
                 if out["reasoning"]:
-                    reasoning_started = True
                     yield _emit_reasoning(str(out["reasoning"]))
                 for call in out["tool_calls"] or []:
-                    text_started = True
                     yield _emit_tool(call, f"dsml-{ca.new_chat_id()}")
             rc = delta.get("reasoning_content")
             if isinstance(rc, str) and rc:
@@ -367,16 +365,13 @@ class CodeArtsAdapter(BaseAdapter):
                 # text + reasoning 合并后全按 reasoning 输出（见 docstring）
                 thinking = str(out["text"] or "") + str(out["reasoning"] or "")
                 if thinking:
-                    reasoning_started = True
                     yield _emit_reasoning(thinking)
                 for call in out["tool_calls"] or []:
-                    text_started = True
                     yield _emit_tool(call, f"dsml-{ca.new_chat_id()}")
             for call in (delta.get("tool_calls") or []):
                 if not isinstance(call, dict):
                     continue
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
-                text_started = True
                 yield _chunk({"tool_calls": [{
                     "index": int(call.get("index") or 0),
                     "id": str(call.get("id") or ""),
@@ -393,13 +388,10 @@ class CodeArtsAdapter(BaseAdapter):
         for extractor, is_reasoning in ((content_ex, False), (reasoning_ex, True)):
             rest = extractor.flush()
             if rest.get("text"):
-                text_started = True
                 yield (_emit_reasoning(rest["text"]) if is_reasoning
                        else _emit_text(rest["text"]))
             if rest.get("reasoning"):
-                reasoning_started = True
                 yield _emit_reasoning(rest["reasoning"])
-        _ = (text_started, reasoning_started)
         if usage:
             pt = int(usage.get("prompt_tokens") or 0)
             ct = int(usage.get("completion_tokens") or 0)
@@ -486,24 +478,17 @@ class CodeArtsAdapter(BaseAdapter):
 
     # ── 模型目录 ─────────────────────────────────────
     async def list_models(self, api_key, base_url, extra_headers=None) -> List[ModelInfo]:
-        """主入口，**永不抛异常**。
+        """主入口，**永不抛异常**（照仓库 qoder/health 的做法）。
 
-        在线目录（gateway benefit + snap builtin 双端点合并）失败时：
-        - 凭据不可用 → 返回空列表（上游整组不可用，谎报静态模型只会误导用户）；
-        - 凭据可用但目录拉取失败 → 回退静态种子（Jet-Hub 的 DEFAULT_MODELS）。
-
-        若已给出 `model`，会把它放在列表**首位** —— 排序即优先级，模型页首屏
-        就能看到真正要用的那个，不必在长列表里翻。
+        `_list_models_impl` 内部已对在线目录失败做了静态种子兜底，这里的
+        外层 try 只兜「兜底逻辑本身也炸」的意外（如 ModelInfo 构造被污染）。
         """
-        warn = ""
         try:
             return await self._list_models_impl(api_key, base_url, extra_headers)
         except Exception as e:
-            warn = f"{type(e).__name__}: {str(e)[:160]}"
-            logger.warning("codearts list_models failed: %s", warn)
-        # 兜底：把异常也变成可用的静态目录，但把原因带到日志与 ModelInfo 之外
-        _ = warn
-        return []
+            logger.warning("codearts list_models failed: %s: %s",
+                           type(e).__name__, str(e)[:160])
+            return []
 
     async def _list_models_impl(self, api_key, base_url,
                                extra_headers=None) -> List[ModelInfo]:

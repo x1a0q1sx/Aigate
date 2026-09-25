@@ -1105,6 +1105,31 @@ def test_adapter_non_stream_aggregates_own_stream(monkeypatch):
     assert result["usage"]["total_tokens"] == 7
 
 
+def test_clean_body_keeps_legal_falsy_values(monkeypatch):
+    """⚠️ 剥空值**不能**剥掉合法假值：`temperature: 0` 被丢掉会让上游按默认
+    温度回答（静默的行为变化）；`stream: false` 也不能丢。
+
+    但「纯 tool_calls 的 assistant」的 `content: null` 必须**补回来** ——
+    参考实现对这种消息发的是显式 null，少一个键在部分上游会变成「消息缺字段」。
+    """
+    from server.adapters.trae_adapter import _clean_body
+    from server.schemas.chat import ChatCompletionRequest
+    req = ChatCompletionRequest(
+        model="m1", stream=False, temperature=0.0, top_p=0.0, max_tokens=100,
+        messages=[{"role": "user", "content": "hi"}], extra={"internal": True})
+    cleaned = _clean_body(req)
+    assert cleaned["temperature"] == 0.0            # 合法假值必须保留
+    assert cleaned["top_p"] == 0.0
+    assert cleaned["stream"] is False
+    assert "extra" not in cleaned                   # AIGate 内部容器不进上游
+    # 纯 tool_calls 的 assistant：content 补成显式 null
+    plain = _clean_body({"messages": [
+        {"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "f", "arguments": "{}"}}]}]})
+    assert "content" in plain["messages"][0]
+    assert plain["messages"][0]["content"] is None
+
+
 def test_adapter_requires_uid():
     """缺 uid 直接报错 —— `X-Uid` 是必填头，发一个空值会被上游当异常设备。
 

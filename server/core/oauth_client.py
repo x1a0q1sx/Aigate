@@ -141,6 +141,11 @@ class OAuthClient:
         self._pending_sessions: Dict[str, str] = {}          # provider_code → packed_state
         # LobsterAI：state → {uuid, first_keyfrom, owner}（回调时凭 state 找回会话）
         self._lobsterai_sessions: Dict[str, dict] = {}
+        # Trae：state → {machine_id, device_id, owner, domain}
+        self._trae_sessions: Dict[str, dict] = {}
+        # CodeArts：state → {port, code_verifier, dpop_jwk, ticket_id, owner}
+        # ⚠️ code_verifier 与 DPoP 私钥必须存下来：续期时两者都要重发
+        self._codearts_sessions: Dict[str, dict] = {}
 
     # ── 唯一性 ──
     def _key(self, provider_code: str, owner: str = "__default") -> str:
@@ -431,6 +436,258 @@ class OAuthClient:
                                update_existing=existing)
         return True, "ok"
 
+    # ── Trae（字节）登录：本地回调**直传 token** + ExchangeToken ──────
+    async def start_trae_login(self, owner: str = "__default",
+                               domain: str = "") -> dict:
+        """生成 machine_id / device_id 与登录 URL。
+
+        ⚠️ machine_id / device_id 由客户端生成且**不在任何响应里** → 随凭据
+        持久化（存 scope 列 JSON）。AIGate 走「粘贴回调 URL」模式：用户在自己
+        机器完成授权后，把地址栏 URL 整段粘回来（回调落在 127.0.0.1，服务端接不到）。
+        """
+        import secrets as _secrets
+        from server.core import trae as tr
+        state = _secrets.token_hex(16)
+        session = {
+            "machine_id": tr.generate_machine_id(),
+            "device_id": tr.generate_device_id(),
+            "owner": owner,
+            "domain": domain,
+        }
+        self._trae_sessions[state] = session
+        port = 18080
+        return {
+            "state": state,
+            "login_url": tr.build_login_url(port, session["machine_id"],
+                                            session["device_id"], domain),
+            "callback_hint": "http://127.0.0.1:18080/authorize?refreshToken=...&userInfo=...",
+        }
+
+    async def complete_trae_login(
+        self, callback_url: str, state: str, db: AsyncSession,
+        domain: str = "",
+    ) -> Tuple[bool, str, Optional[OAuthToken]]:
+        """解析回调 URL → ExchangeToken → GetUserInfo → 持久化。
+
+        ⚠️ 回调**直接回传 token**（refreshToken / userInfo / userJwt），没有 ?code=。
+        带 code / authCodeInfo 的回调是上游的 PKCE 新流程 —— **未支持**，
+        `parse_callback` 会给出精确报错（不是含糊的「缺少 refreshToken」）。
+        """
+        import json as _json
+        from server.core import trae as tr
+        info, reason, is_pkce = tr.parse_callback(callback_url or "")
+        if info is None:
+            return False, reason, None
+        if not state:
+            state = str(info.get("state") or "")
+        session = self._trae_sessions.pop(state, None) if state else None
+        if session is None:
+            # 服务重启 / 用户粘贴旧 URL：身份字段只能新生成。
+            # ⚠️ 必须明确告警：machine_id 变了就是换设备，可能触发风控。
+            session = {"machine_id": tr.generate_machine_id(),
+                       "device_id": tr.generate_device_id(),
+                       "owner": "__default", "domain": domain}
+            logger.warning("trae: state=%s 不在内存，machine_id 已重新生成"
+                           "（上游可能按新设备处理）", state)
+        dom = session.get("domain") or domain
+        refresh_plain = str(info.get("refresh_token") or "")
+        if not refresh_plain:
+            return False, "回调未携带 refreshToken（请确认粘贴的是完整回调 URL）", None
+        exchange, err = await tr.exchange_refresh_token(refresh_plain, dom)
+        if exchange is None:
+            return False, err, None
+        uid = str(info.get("uid") or "")
+        nickname = str(info.get("nickname") or "")
+        # GetUserInfo 补 uid/nickname（失败不阻塞 —— 回调 userInfo 通常已够用）
+        try:
+            fetched, _ferr = await tr.fetch_user_info(
+                str(exchange.get("access_token") or ""), dom)
+            if fetched:
+                uid = uid or str(fetched.get("uid") or "")
+                nickname = nickname or str(fetched.get("screen_name") or "")
+        except Exception:
+            pass
+        cred = tr.build_credential(exchange, {"uid": uid, "nickname": nickname},
+                                   session["machine_id"], session["device_id"], dom)
+        tok = {
+            "access_token": cred["access_token"],
+            "refresh_token": cred["refresh_token"],
+            "expires_in": cred["expires_in"],
+            "token_type": "Bearer",
+            "scope": _json.dumps({
+                "trae": True,
+                "machine_id": cred["machine_id"],
+                "device_id": cred["device_id"],
+                "uid": cred["uid"],
+                "nickname": cred["nickname"],
+                "domain": cred["domain"],
+            }, ensure_ascii=False),
+        }
+        saved = await self._save_token(db, "trae", session["owner"], tok)
+        return True, "ok", saved
+
+    async def _refresh_trae(
+        self, db: AsyncSession, provider: OAuthProviderConfig,
+        existing: OAuthToken, refresh_plain: str,
+    ) -> Tuple[bool, str]:
+        """Trae 续期：ExchangeToken（**轮换** refresh_token，身份字段不动）。"""
+        import json as _json
+        from server.core import trae as tr
+        meta = {}
+        if existing.scope:
+            try:
+                parsed = _json.loads(existing.scope)
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except ValueError:
+                pass
+        if not meta.get("machine_id") or not meta.get("device_id"):
+            existing.last_error = "缺少 machine_id/device_id（续期与请求头必需）—— 请重新登录"
+            await db.commit()
+            return False, existing.last_error
+        dom = str(meta.get("domain") or "")
+        exchange, err = await tr.exchange_refresh_token(refresh_plain, dom)
+        if exchange is None:
+            existing.last_error = err[:300]
+            # 终态判定（对齐 Jet-Hub 的三条依据，按 error 文本粗判）
+            if any(k in err for k in ("HTTP 401", "HTTP 403", "失效", "invalid")):
+                existing.is_active = False
+            await db.commit()
+            return False, err
+        merged = tr.apply_refresh(
+            {"access_token": "", "refresh_token": refresh_plain,
+             "machine_id": meta.get("machine_id", ""),
+             "device_id": meta.get("device_id", ""), "expires_at": ""},
+            exchange)
+        tok = {
+            "access_token": merged["access_token"],
+            "refresh_token": merged["refresh_token"],
+            "expires_in": merged.get("expires_in") or 3600,
+            "token_type": "Bearer",
+            # 身份字段永不重新生成；uid/nickname 保留
+            "scope": existing.scope or _json.dumps(meta, ensure_ascii=False),
+        }
+        await self._save_token(db, "trae", existing.owner, tok,
+                               update_existing=existing)
+        return True, "ok"
+
+    # ── CodeArts（华为）登录：portal OAuth（PKCE + DPoP）──────
+    async def start_codearts_login(self, owner: str = "__default") -> dict:
+        """起登录会话 → {state, login_url, callback_hint}。
+
+        portal 把回调主机名锁死 127.0.0.1（AIGate 监听不到）→ 走「粘贴回调 URL」。
+        端口**必须 ≥10000**（低端口 portal 直接拒绝），用 pick_callback_port()。
+        """
+        import secrets as _secrets
+        from server.core import codearts as ca
+        state = _secrets.token_hex(16)
+        port = ca.pick_callback_port()
+        pkce = ca.generate_pkce_pair()
+        kp = ca.generate_dpop_key_pair()
+        ticket_id = ca.generate_ticket_id()
+        self._codearts_sessions[state] = {
+            "port": port,
+            "code_verifier": pkce.code_verifier,
+            "dpop_jwk": kp["private_key_jwk"],
+            "ticket_id": ticket_id,
+            "owner": owner,
+        }
+        return {
+            "state": state,
+            "login_url": ca.build_oauth_login_url(port, pkce, ticket_id),
+            "callback_hint": f"http://127.0.0.1:{port}/oauth/callback?code=...&state=...",
+        }
+
+    async def complete_codearts_login(
+        self, code: str, state: str, db: AsyncSession,
+        callback_url: str = "",
+    ) -> Tuple[bool, str, Optional[OAuthToken]]:
+        """用回调 code 换凭据并持久化（旧流程 secret 走 ticket 换一次性 AK/SK）。"""
+        import json as _json
+        from server.core import codearts as ca
+        parsed = ca.parse_callback_payload(callback_url or "", code or "", state or "")
+        _kind = parsed.get("kind")
+        if _kind == "invalid":
+            return False, parsed.get("error") or "回调参数无效", None
+        _sess_state = parsed.get("state") or state
+        session = self._codearts_sessions.pop(_sess_state, None) or {}
+        owner = session.get("owner") or "__default"
+        if _kind == "oauth":
+            cred, err = await ca.exchange_authorization_code(
+                parsed.get("code", ""), session.get("code_verifier", ""),
+                int(session.get("port") or 0), session.get("dpop_jwk") or {})
+        else:   # ticket：旧流程回退，只能换一次性 AK/SK（**无** refresh_token）
+            cred, err = await ca.exchange_ticket(
+                session.get("ticket_id", ""), parsed.get("secret", ""))
+        if cred is None:
+            return False, err, None
+        # 凭据整体以 JSON 存进 access_token 列 —— 推理侧要 AK/SK/SecurityToken
+        # 一起拿去签名，拆字段会引入第二套真相源
+        payload = cred.as_dict()
+        payload["code_verifier"] = session.get("code_verifier", "")
+        payload["dpop_private_key_jwk"] = session.get("dpop_jwk")
+        tok = {
+            "access_token": _json.dumps(payload, ensure_ascii=False),
+            # refresh_token 列**也要写**：`_do_refresh` 以该列非空为前置判据
+            # （只塞进 JSON 会被 "no refresh_token stored" 提前挡下）
+            "refresh_token": cred.refresh_token or "",
+            "expires_in": ca.expires_in_from(cred.expires_at),
+            "token_type": "AK/SK",
+            "scope": _json.dumps({
+                "codearts": True,
+                "user_name": cred.user_name,
+                "user_id": cred.user_id,
+                "domain_id": cred.domain_id,
+            }, ensure_ascii=False),
+        }
+        saved = await self._save_token(db, "codearts", owner, tok)
+        return True, "ok", saved
+
+    async def _refresh_codearts(
+        self, db: AsyncSession, provider: OAuthProviderConfig,
+        existing: OAuthToken, refresh_plain: str,
+    ) -> Tuple[bool, str]:
+        """CodeArts 续期：AK/SK/SecurityToken 过 DPoP 换一套新的。
+
+        ⚠️ 本方法**只在** refresh_token() 的 Single Flight 内被调用（`_do_refresh`
+        由 `refresh_token()` 加锁后调用）—— 这是硬要求：refresh_token 一次性轮换，
+        并发刷新会互相作废（STS5.1806），只能让用户重新登录。
+        """
+        import json as _json
+        from server.core import codearts as ca
+        try:
+            cred = _json.loads(self._crypto.decrypt(existing.access_token_enc))
+        except (ValueError, TypeError):
+            existing.last_error = "凭据不是 JSON，请重新登录"
+            await db.commit()
+            return False, existing.last_error
+        new_cred, err, dead = await ca.refresh_token(
+            cred.get("refresh_token", ""), cred.get("code_verifier", ""),
+            cred.get("dpop_private_key_jwk") or {})
+        if new_cred is None:
+            existing.last_error = err[:300]
+            if dead:
+                existing.is_active = False
+            await db.commit()
+            return False, err
+        # ⚠️ 新 refresh_token 必须**立即**回写（一次性轮换）；code_verifier /
+        # DPoP 私钥 / 身份字段不随响应变化，保留旧值
+        payload = new_cred.as_dict()
+        payload["code_verifier"] = cred.get("code_verifier", "")
+        payload["dpop_private_key_jwk"] = cred.get("dpop_private_key_jwk")
+        tok = {
+            "access_token": _json.dumps(payload, ensure_ascii=False),
+            # 新 refresh_token（一次性轮换）**立即**回写两处：JSON 里一份供
+            # exchange_ticket/审计，列里一份供 `_do_refresh` 的前置判据
+            "refresh_token": new_cred.refresh_token or refresh_plain,
+            "expires_in": ca.expires_in_from(new_cred.expires_at),
+            "token_type": "AK/SK",
+            "scope": existing.scope,
+        }
+        await self._save_token(db, "codearts", existing.owner, tok,
+                               update_existing=existing)
+        return True, "ok"
+
     async def complete_pending(
         self, code: str, db: AsyncSession,
     ) -> Tuple[bool, str, Optional[OAuthToken]]:
@@ -507,6 +764,13 @@ class OAuthClient:
         if _style == "lobsterai":
             # LobsterAI：keyfrom 身份载荷 + refreshToken（身份字段从 scope 读回）
             return await self._refresh_lobsterai(db, provider, existing, refresh_plain)
+        if _style == "trae":
+            # Trae：ExchangeToken 轮换 refreshToken；身份字段从 scope 读回
+            return await self._refresh_trae(db, provider, existing, refresh_plain)
+        if _style == "codearts":
+            # CodeArts：DPoP 换新 AK/SK/SecurityToken（一次性轮换，必须串行 —— 本
+            # 调用点已被 refresh_token() 的 Single Flight 包住）
+            return await self._refresh_codearts(db, provider, existing, refresh_plain)
         # ── Qoder device_token ──
         if provider_code == "qoder" and (provider.extra_params or {}).get("device_code_only"):
             return await self._refresh_device_token(db, provider, existing, refresh_plain)

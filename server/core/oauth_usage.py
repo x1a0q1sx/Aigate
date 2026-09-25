@@ -681,6 +681,80 @@ async def _lobsterai_usage(token: str) -> dict:
             "extra": {"total_credits_remaining": total}}
 
 
+async def _codearts_usage(token: str) -> dict:
+    """CodeArts 额度：GET /snap-manager/v1/statistics/plugin（HMAC 签名）。
+
+    token 是**凭据 JSON**（AK/SK/SecurityToken），不是 Bearer。
+    **不累加分类**（`usageTotalPackageCredit` 已是总额，分类相加会翻倍）。
+    非积分账户必须如实提示「Token 计费账户」—— 把它显示成「积分 0」会让用户
+    去找一个并不存在的原因。
+    """
+    import json as _json
+    from server.core import codearts as ca
+    try:
+        cred = _json.loads(token)
+    except (ValueError, TypeError):
+        return {"quotas": {}, "message": "CodeArts 凭据格式不对（应为 JSON）"}
+    if not isinstance(cred, dict) or not cred.get("access_key_id"):
+        return {"quotas": {}, "message": "CodeArts 凭据缺少 AK（请重新连接该账号）"}
+    info, err = await ca.fetch_account_info(cred)
+    if info is None:
+        return {"quotas": {}, "message": f"CodeArts 额度查询失败：{err}"}
+    remain = info.get("credit_remain")
+    if remain is None:
+        # total 不下发（只有 remain）→ 不编造 total，UI 对 0 会显示 '?'
+        return {"quotas": {},
+                "message": ("Token 计费账户（无积分口径）"
+                            if info.get("is_token_package")
+                            else "该账户无积分口径")}
+    return {
+        "plan": info.get("package_name") or "CodeArts Agent",
+        "quotas": {"总积分包": {"used": 0.0, "total": 0.0,
+                            "remaining": float(remain), "unit": "credit",
+                            "unlimited": False}},
+        "extra": {"is_credit_package": info.get("is_credit_package"),
+                  "spec_code": info.get("spec_code")},
+    }
+
+
+async def _trae_usage(token: str) -> dict:
+    """Trae 积分余额：POST /trae/api/v2/pay/ide_user_ent_usage。
+
+    body 必须含 `require_usage: true` —— **不带它拿不到 usage，余额会恒等于额度**。
+    ⚠️ 请求头需完整客户端头（约 20 个，含由 uid 确定性派生的设备身份三件套）；
+    身份字段从连接 scope 列读回。
+    """
+    from server.core import trae as tr
+    meta: dict = {}
+    try:
+        from server.db import AsyncSessionLocal
+        from server.core.oauth_client import get_oauth_client
+        async with AsyncSessionLocal() as db:
+            meta = await get_oauth_client().get_token_meta("trae", db)
+    except Exception:
+        meta = {}
+    uid = str(meta.get("uid") or "")
+    if not uid:
+        return {"quotas": {}, "message": "Trae 缺少 uid，无法查询余额（请重新连接账号）"}
+    result = await tr.fetch_credits({"access_token": token, "uid": uid},
+                                    str(meta.get("domain") or ""))
+    if result.get("error"):
+        return {"quotas": {}, "message": f"Trae 额度查询失败：{result['error']}"}
+    quotas = {}
+    for pkg in result.get("packages") or []:
+        quotas[pkg["name"]] = {
+            "used": max(0.0, float(pkg.get("used") or 0)),
+            "total": float(pkg.get("total") or 0),
+            "remaining": max(0.0, float(pkg.get("remaining") or 0)),
+            "unit": "credits", "unlimited": False, "recurring": False,
+        }
+    if not quotas:
+        # 查不到要能与「余额为 0」区分开
+        return {"quotas": {}, "message": "Trae 额度响应无任何资源包"}
+    return {"plan": "TRAE", "quotas": quotas,
+            "extra": {"total_credits_remaining": result.get("remaining")}}
+
+
 class _RateLimited(Exception):
     pass
 
@@ -764,5 +838,9 @@ async def _dispatch(provider_code: str, token: str) -> dict:
         return await _u1s1_usage(token)
     if provider_code == "lobsterai":
         return await _lobsterai_usage(token)
+    if provider_code == "codearts":
+        return await _codearts_usage(token)
+    if provider_code == "trae":
+        return await _trae_usage(token)
     return {"plan": None, "quotas": {},
             "message": "该服务商上游没有公开的额度接口（与 9router 覆盖范围一致）"}

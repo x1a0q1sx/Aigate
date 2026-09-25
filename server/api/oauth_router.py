@@ -153,6 +153,30 @@ async def start_oauth_authorize(provider_code: str, request: Request,
                         "打不开的 127.0.0.1 地址（正常现象）—— 把地址栏完整 URL "
                         "粘贴回本页「完成登录」输入框即可。"),
         }
+    # ── TRAE：回调**直传 token** + 锁死 127.0.0.1 → 手动粘贴模式 ────
+    if (provider.extra_params or {}).get("auth_mode") == "trae":
+        r = await get_oauth_client().start_trae_login(owner=owner)
+        return {
+            "manual_callback": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "callback_hint": r["callback_hint"],
+            "message": ("请在新窗口完成 TRAE 登录。回调会落到一个打不开的 127.0.0.1 "
+                        "地址（正常现象）—— 把地址栏完整 URL 粘贴回本页"
+                        "「完成登录」输入框即可。"),
+        }
+    # ── CodeArts：回调锁死 127.0.0.1 且端口须 ≥10000 → 手动粘贴模式 ────
+    if (provider.extra_params or {}).get("auth_mode") == "codearts":
+        r = await get_oauth_client().start_codearts_login(owner=owner)
+        return {
+            "manual_callback": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "callback_hint": r["callback_hint"],
+            "message": ("请在新窗口完成华为云 CodeArts 登录。登录后浏览器会跳到一个"
+                        "打不开的 127.0.0.1 地址（正常现象）—— 把地址栏完整 URL "
+                        "粘贴回本页「完成登录」输入框即可。"),
+        }
     # 运行时 redirect_uri：用本机 incoming host:port 替换默认 localhost:8000
     redirect_override = None
     if request:
@@ -224,12 +248,20 @@ async def complete_manual_callback(data: ManualCallbackPayload,
     provider = get_oauth_provider(data.provider_code)
     if not provider:
         raise HTTPException(status_code=404, detail=f"unknown provider {data.provider_code}")
-    if (provider.extra_params or {}).get("auth_mode") != "lobsterai":
+    _mode = (provider.extra_params or {}).get("auth_mode")
+    if _mode not in ("lobsterai", "trae", "codearts"):
         raise HTTPException(status_code=400,
                             detail=f"{data.provider_code} 不支持手动回调模式")
-    ok, msg, saved = await get_oauth_client().complete_lobsterai_login(
-        data.code, data.state, db, callback_url=data.callback_url,
-    )
+    client = get_oauth_client()
+    if _mode == "trae":
+        ok, msg, saved = await client.complete_trae_login(
+            data.callback_url or data.code, data.state, db)
+    elif _mode == "codearts":
+        ok, msg, saved = await client.complete_codearts_login(
+            data.code, data.state, db, callback_url=data.callback_url)
+    else:
+        ok, msg, saved = await client.complete_lobsterai_login(
+            data.code, data.state, db, callback_url=data.callback_url)
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
     return {"ok": True, "id": saved.id if saved else None,

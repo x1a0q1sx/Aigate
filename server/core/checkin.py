@@ -48,6 +48,8 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
     "codebuddy_intl": True,     # 端点实测存在（HTTP 200）
     "qoder": True,
     "lobsterai": True,          # 三步协议（slot → context → check_in），+100 积分/天
+    "codearts": True,           # 四步协议（账户类型 → delivery → claim → confirm）
+    "trae": True,               # 两步：status 预检 → claim → 补查 status，+150 credits/天
     "u1s1": False,              # 实测无签到接口（登录即自动发放 login_checkin 包）
 }
 
@@ -457,6 +459,75 @@ async def _claim_lobsterai(token: str,
                             activity_name=activity_code, message="签到成功")
 
 
+# ── CodeArts（华为）四步签到 ─────────────────────────────────
+
+async def _claim_codearts(token: str) -> ClaimOutcome:
+    """CodeArts 每日签到（四步）。token 是**凭据 JSON**（AK/SK/SecurityToken）。
+
+    ⚠️ 与其它 provider 的 token 语义不同：这里不是 Bearer，是签名材料。
+    `collect_targets` 从 access_token 列解出的正是这段 JSON，直接透传即可。
+    """
+    import json as _json
+    from server.core import codearts as ca
+    try:
+        cred = _json.loads(token)
+    except (ValueError, TypeError):
+        return ClaimOutcome(kind="failed", message="凭据格式不对（应为 JSON 凭据）")
+    if not isinstance(cred, dict) or not cred.get("access_key_id"):
+        return ClaimOutcome(kind="failed", message="凭据缺少 AK（请重新连接该账号）")
+    out = await ca.claim_daily_checkin(cred)
+    kind = str(out.get("kind") or "failed")
+    return ClaimOutcome(
+        kind=kind if kind in ("claimed", "already_claimed", "inactive", "failed") else "failed",
+        credit=float(out.get("credit") or 0.0),
+        activity_name=str(out.get("activity_name") or ""),
+        message=str(out.get("message") or ""),
+        error=str(out.get("error") or ""),
+    )
+
+
+# ── TRAE（字节）两步签到 ─────────────────────────────────────
+
+async def _trae_meta() -> dict:
+    """读 trae 连接 scope 列里的身份字段（uid/domain）。"""
+    try:
+        from server.db import AsyncSessionLocal
+        from server.core.oauth_client import get_oauth_client
+        async with AsyncSessionLocal() as db:
+            return await get_oauth_client().get_token_meta("trae", db)
+    except Exception:
+        return {}
+
+
+async def _claim_trae(token: str) -> ClaimOutcome:
+    """Trae 每日签到（两步协议）。
+
+    ⚠️ 三个不可省的点（Jet-Hub 实测，见 server/core/trae.py 的 claim_checkin）：
+    1. **必须先查 status** —— claim 对「今天已签到」幂等返回 code:0，无法区分，
+       不预检会把已签到的账号报成「领取成功」；
+    2. claim 响应**不含积分数**，领取后必须补查 status 取真实所得，
+       否则恒定显示「+0 积分」；
+    3. 9074 归为业务错误（300s 冷却），**不换设备号重试**。
+    """
+    from server.core import trae as tr
+    meta = await _trae_meta()
+    uid = str(meta.get("uid") or "")
+    if not uid:
+        return ClaimOutcome(kind="failed", message="缺少 uid，无法构造签到设备身份")
+    out = await tr.claim_checkin({"access_token": token, "uid": uid},
+                                 str(meta.get("domain") or ""))
+    kind = str(out.get("kind") or "failed")
+    return ClaimOutcome(
+        kind=kind if kind in ("claimed", "already_claimed", "inactive", "failed") else "failed",
+        credit=float(out.get("credit") or 0.0),
+        streak_days=int(out.get("streak_days") or 0),
+        activity_name="每日签到",
+        message=str(out.get("message") or ""),
+        error=str(out.get("error") or ""),
+        upstream_code=out.get("upstream_code"),
+    )
+
+
 # ── 分发 ─────────────────────────────────────────────────────
 async def claim_for_provider(provider_code: str, token: str) -> ClaimOutcome:
     """按 provider 分发签到。永不抛异常，失败以 kind=failed 表达。"""
@@ -470,6 +541,10 @@ async def claim_for_provider(provider_code: str, token: str) -> ClaimOutcome:
             return await _claim_qoder(token)
         if provider_code == "lobsterai":
             return await _claim_lobsterai(token)
+        if provider_code == "codearts":
+            return await _claim_codearts(token)
+        if provider_code == "trae":
+            return await _claim_trae(token)
         return ClaimOutcome(kind="unsupported", message=f"未实现签到适配器：{provider_code}")
     except Exception as e:   # 防御：任何解析异常都不冒穿（照 oauth_usage 的做法）
         logger.warning("checkin error for %s: %s", provider_code, e)
