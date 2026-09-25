@@ -215,31 +215,87 @@ def test_codebuddy_error_code_message(monkeypatch):
 
 
 # ── qoder ───────────────────────────────────────────
-def test_qoder_usage_user_org(monkeypatch):
+def test_qoder_usage_sash_packages(monkeypatch):
+    """主走 sash 端点；资源包层（签到积分落点）必须解析出来。"""
     calls = []
     _patch(monkeypatch, calls, [(200, {
-        "userQuota": {"total": 600, "used": 200, "remaining": 400, "unit": "credits"},
-        "orgResourcePackage": {"total": 100, "used": 10, "remaining": 90},
-        "totalUsagePercentage": 30, "isQuotaExceeded": False,
-        "expiresAt": 1789999999000,
+        "displayMode": "qoder",
+        "qoderUsage": {
+            "userType": "personal_standard",
+            "userQuota": {"total": 0, "used": 0, "remaining": 0, "unit": "credits"},
+            "addOnQuota": {"total": 100, "used": 0, "remaining": 100, "unit": "credits"},
+            "expiresAt": 253402214400000,   # 9999 年「无到期」哨兵值
+        },
     })])
     r = asyncio.run(_qoder_usage("dt-abc"))
-    assert r["quotas"]["user"]["remaining"] == 400
-    assert r["quotas"]["organization"]["used"] == 10
+    assert calls[0]["url"].endswith("/sash/api/v2/me/usage")
+    assert calls[0]["headers"]["Cosy-ClientType"] == "5"
+    assert calls[0]["headers"]["User-Agent"] == "Qoder"
+    assert r["quotas"]["套餐额度"]["remaining"] == 0
+    assert r["quotas"]["资源包"]["remaining"] == 100
+    assert r["quotas"]["资源包"]["reset_at"] is None          # 哨兵值被吞
+
+
+def test_qoder_sash_dedicated_packages(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [(200, {
+        "displayMode": "qoder",
+        "qoderUsage": {
+            "userQuota": {"total": 600, "used": 200, "remaining": 400, "unit": "credits"},
+            "dedicatedResourcePackages": [
+                {"name": "专属包A", "total": 50, "used": 10, "remaining": 40,
+                 "expiresAt": "2026-10-21T14:54:12Z"},
+            ],
+            "expiresAt": 1789999999000,
+        },
+    })])
+    r = asyncio.run(_qoder_usage("dt-abc"))
+    assert r["quotas"]["套餐额度"]["remaining"] == 400
+    assert r["quotas"]["专属包A"]["remaining"] == 40
+    assert r["quotas"]["专属包A"]["reset_at"].startswith("2026-10-21")
+
+
+def test_qoder_sash_fails_falls_back_legacy(monkeypatch):
+    """sash 不可用时回退旧端点（旧端点看不到资源包层，但聊胜于无）。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        (404, {}),
+        (200, {"userQuota": {"total": 600, "used": 200, "remaining": 400, "unit": "credits"},
+               "orgResourcePackage": {"total": 100, "used": 10, "remaining": 90},
+               "totalUsagePercentage": 30, "isQuotaExceeded": False,
+               "expiresAt": 1789999999000}),
+    ])
+    r = asyncio.run(_qoder_usage("dt-abc"))
+    assert calls[0]["url"].endswith("/sash/api/v2/me/usage")
+    assert calls[1]["url"].endswith("/api/v2/quota/usage")
+    assert r["quotas"]["套餐额度"]["remaining"] == 400
+    assert r["quotas"]["组织资源包"]["used"] == 10
     assert r["extra"]["is_quota_exceeded"] is False
+
+
+def test_qoder_enterprise_no_numbers(monkeypatch):
+    """企业版无额度数字：明确报说明，不回退、不报 0。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"displayMode": "enterprise",
+                                       "enterpriseUsage": {"detailUrl": "https://x"}})])
+    r = asyncio.run(_qoder_usage("dt-abc"))
+    assert r["quotas"] == {}
+    assert "企业版" in (r.get("message") or "")
+    assert len(calls) == 1
 
 
 def test_qoder_pat_exchanges_first(monkeypatch):
     calls = []
     _patch(monkeypatch, calls, [
         (200, {"token": "jt-xyz"}),
-        (200, {"userQuota": {"total": 600, "used": 1, "remaining": 599}}),
+        (200, {"displayMode": "qoder",
+               "qoderUsage": {"userQuota": {"total": 600, "used": 1, "remaining": 599}}}),
     ])
     r = asyncio.run(_qoder_usage("pt-secret"))
     assert calls[0]["url"].endswith("/api/v1/jobToken/exchange")
     assert calls[0]["json"] == {"personal_token": "pt-secret"}
     assert "jt-xyz" in calls[1]["headers"]["Authorization"]  # 额度查询用换出的 jt
-    assert r["quotas"]["user"]["remaining"] == 599
+    assert r["quotas"]["套餐额度"]["remaining"] == 599
 
 
 # ── u1s1 ────────────────────────────────────────────

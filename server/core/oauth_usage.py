@@ -466,8 +466,80 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
     return {"plan": plan, "quotas": quotas}
 
 
+def _qoder_sane_reset(iso: Optional[str]) -> Optional[str]:
+    """吞掉「无到期」哨兵值（9999-12-31）：原样透出会让前端渲染「到期 287 万天后」。"""
+    if not iso:
+        return None
+    try:
+        if datetime.fromisoformat(iso).year >= 9000:
+            return None
+    except ValueError:
+        pass
+    return iso
+
+
+def _qoder_parse_sash(body: dict) -> dict:
+    """解析 /sash/api/v2/me/usage 响应（Jet-Hub 抓包实测协议，2026-09）。
+
+    余额不只在 userQuota：**签到所得积分落在 addOnQuota（资源包）**——实测
+    账号 userQuota.remaining=0 而 addOnQuota.remaining=100；旧端点
+    /api/v2/quota/usage 根本不下发这一层，只读 userQuota 会显示 0。
+    """
+    u = body.get("qoderUsage")
+    if not isinstance(u, dict):
+        u = {}
+    reset_at = _qoder_sane_reset(_parse_reset(u.get("expiresAt") or body.get("expiresAt")))
+    quotas: dict = {}
+
+    def _pkg(name: str, q, reset: Optional[str] = None) -> None:
+        if not isinstance(q, dict) or not q:
+            return
+        quotas[name] = {
+            "used": _num(q.get("used")), "total": _num(q.get("total")),
+            "remaining": _num(q.get("remaining")), "unit": q.get("unit") or "credits",
+            "reset_at": _qoder_sane_reset(_parse_reset(q.get("expiresAt"))) or reset,
+            "unlimited": False, "recurring": False,
+        }
+
+    _pkg("套餐额度", u.get("userQuota"), reset_at)
+    _pkg("资源包", u.get("addOnQuota"), reset_at)
+    for item in (u.get("dedicatedResourcePackages") or []):
+        if isinstance(item, dict):
+            _pkg(item.get("name") or item.get("id") or "专用资源包", item, reset_at)
+    return {"plan": "Qoder", "quotas": quotas,
+            "extra": {"total_usage_pct": _num(u.get("totalUsagePercentage")),
+                      "is_quota_exceeded": bool(u.get("isQuotaExceeded"))}}
+
+
+def _qoder_parse_legacy(body: dict) -> dict:
+    """旧端点 /api/v2/quota/usage 的解析（2026-09 仍在线，作回退；不下发资源包层）。"""
+    uq = body.get("userQuota") or {}
+    oq = body.get("orgResourcePackage") or {}
+    reset_at = _qoder_sane_reset(_parse_reset(body.get("expiresAt")))
+    quotas: dict = {}
+    if uq:
+        quotas["套餐额度"] = {
+            "used": _num(uq.get("used")), "total": _num(uq.get("total")),
+            "remaining": _num(uq.get("remaining")), "unit": uq.get("unit") or "credits",
+            "reset_at": reset_at, "unlimited": False,
+        }
+    if oq:
+        quotas["组织资源包"] = {
+            "used": _num(oq.get("used")), "total": _num(oq.get("total")),
+            "remaining": _num(oq.get("remaining")), "unit": oq.get("unit") or "credits",
+            "reset_at": reset_at, "unlimited": False,
+        }
+    return {"plan": "Qoder", "quotas": quotas,
+            "extra": {"total_usage_pct": _num(body.get("totalUsagePercentage")),
+                      "is_quota_exceeded": bool(body.get("isQuotaExceeded"))}}
+
+
 async def _qoder_usage(token: str) -> dict:
-    """openapi.qoder.sh/api/v2/quota/usage；pt- PAT 先换 jt- 任务 token。"""
+    """Qoder 余额：主走 /sash/api/v2/me/usage（与签到同协议族），旧端点兜底。
+
+    sash 端点只需 4 个头、**不需要 COSY/WASM 签名**（同签到端点，
+    2026-09-24 生产实测 200）；旧端点看不到资源包层，只在 sash 不可用时兜底。
+    """
     if token.startswith("pt-"):
         ex = await _post_json(
             "https://openapi.qoder.sh/api/v1/jobToken/exchange",
@@ -480,30 +552,28 @@ async def _qoder_usage(token: str) -> dict:
         token = (ex.json() or {}).get("token") or ""
     if not token:
         return {"quotas": {}, "message": "Qoder 无可用于额度查询的凭证"}
-    r = await _get_json("https://openapi.qoder.sh/api/v2/quota/usage",
-                        {"Authorization": f"Bearer {token}", "Accept": "application/json"})
-    if not r.is_success:
-        return {"quotas": {}, "message": f"Qoder 已连接，额度接口返回 {r.status_code}"}
-    body = r.json() if r.content else {}
-    uq = body.get("userQuota") or {}
-    oq = body.get("orgResourcePackage") or {}
-    reset_at = _parse_reset(body.get("expiresAt"))
-    quotas = {}
-    if uq:
-        quotas["user"] = {
-            "used": _num(uq.get("used")), "total": _num(uq.get("total")),
-            "remaining": _num(uq.get("remaining")), "unit": uq.get("unit") or "credits",
-            "reset_at": reset_at, "unlimited": False,
-        }
-    if oq:
-        quotas["organization"] = {
-            "used": _num(oq.get("used")), "total": _num(oq.get("total")),
-            "remaining": _num(oq.get("remaining")), "unit": oq.get("unit") or "credits",
-            "reset_at": reset_at, "unlimited": False,
-        }
-    return {"plan": "Qoder", "quotas": quotas,
-            "extra": {"total_usage_pct": _num(body.get("totalUsagePercentage")),
-                      "is_quota_exceeded": bool(body.get("isQuotaExceeded"))}}
+    r = await _get_json(
+        "https://openapi.qoder.sh/sash/api/v2/me/usage",
+        {"Authorization": f"Bearer {token}", "Accept": "application/json",
+         "Cosy-ClientType": "5", "User-Agent": "Qoder"})
+    if r.is_success:
+        body = r.json() if r.content else {}
+        if body.get("displayMode") == "enterprise":
+            # 企业版不下发额度数字，只有外部用量链接（报 0 会误导用户以为没额度）
+            return {"plan": "Qoder", "quotas": {},
+                    "message": "企业版账号不提供额度数字（仅提供外部用量链接）"}
+        out = _qoder_parse_sash(body)
+        if out["quotas"]:
+            return out
+        # 形状异常（无任何条目）→ 旧端点再试一次，两路都空才报错
+    r2 = await _get_json("https://openapi.qoder.sh/api/v2/quota/usage",
+                         {"Authorization": f"Bearer {token}", "Accept": "application/json"})
+    if not r2.is_success:
+        return {"quotas": {}, "message": f"Qoder 已连接，额度接口返回 {r2.status_code}"}
+    out = _qoder_parse_legacy(r2.json() if r2.content else {})
+    if out["quotas"]:
+        return out
+    return {"quotas": {}, "message": "Qoder 额度响应无任何条目（响应形状可能已变）"}
 
 
 async def _u1s1_usage(token: str) -> dict:
