@@ -595,3 +595,22 @@ ps -o pid,ppid,lstart,cmd -p "$PORT_PID"   # PPID 应为 pm2 而非 1
 `{"套餐额度": {..., "reset_at": null}}`，不再出现「到期 287 万天后」。
 当前账号套餐额度 0、无资源包是**真实状态**（免费层额度耗尽 + 活动未领取）；
 首次成功领取后「资源包」行会出现对应积分。
+
+### F24：CodeBuddy 在线模型目录实锤——「无在线列表端点」结论被推翻（2026-09-25）
+
+调研 Jet-Hub 时发现其 buddy 系（即 CodeBuddy）模型目录走两个在线端点。
+生产只读探针（复用 oauth_tokens 凭据 + CodeBuddy 标准头）实测：
+
+| 端点 | codebuddy_cn | codebuddy_intl |
+|---|---|---|
+| `GET /console/enterprises/personal/models` | **200** JSON | 500（openresty HTML） |
+| `GET /v3/config` | **200** JSON | **200** JSON |
+
+响应形状：`data.agents[].models[]`（每个 agent 配置带一份模型 id 列表，
+取并集）；`/v3/config` 另含促销/倍率表（Jet-Hub `parsePromotions` 按
+每日时段+时区+validFrom/Until 本地推算，`factor:0`=免费）。
+
+含义：模型刷新不再需要「种子静默兜底」（种子会过期）；倍率表
+`STATIC_PRICE_RATIOS` 可升级为在线促销推算。Jet-Hub 的合并规则：
+scoped 端点优先、两端口 id 集合**取并集**、`agentReferenced` 例外保留。
+遗留：Intl 的 scoped 端点 500，仅用 `/v3/config` 即可（Intl 探针 200）。
