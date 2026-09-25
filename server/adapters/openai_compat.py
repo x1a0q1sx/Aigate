@@ -206,7 +206,7 @@ class OpenAICompatAdapter(BaseAdapter):
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
-                body = resp.text[:500]
+                body = resp.text[:4000]
                 raise httpx.HTTPStatusError(
                     f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body}",
                     request=resp.request, response=resp
@@ -239,7 +239,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
                     raise httpx.HTTPStatusError(
-                        f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:500]}",
+                        f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:4000]}",
                         request=resp.request, response=resp
                     )
                 async for line in resp.aiter_lines():
@@ -330,7 +330,7 @@ class OpenAICompatAdapter(BaseAdapter):
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode('utf-8', errors='replace')
                         raise httpx.HTTPStatusError(
-                            f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:500]}",
+                            f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:4000]}",
                             request=resp.request, response=resp
                         )
                     try:

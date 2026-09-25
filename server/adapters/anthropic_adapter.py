@@ -374,7 +374,7 @@ class AnthropicAdapter(BaseAdapter):
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
                 raise httpx.HTTPStatusError(
-                    f"HTTP {resp.status_code}: {resp.text[:500]}",
+                    f"HTTP {resp.status_code}: {resp.text[:4000]}",
                     request=resp.request, response=resp,
                 )
             return self._result_from_messages(url, resp.json(), request, created)

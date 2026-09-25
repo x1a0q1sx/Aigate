@@ -1985,7 +1985,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     fallback_count=_route_result.fallback_count if _route_result else 0,
                     user_ip=_raw_request.client.host if _raw_request.client else None,
                     error_type="upstream_error" if error_msg else None,
-                    error_msg=(error_msg or "")[:500],
+                    error_msg=(error_msg or "")[:20000],
                     request_body=req_s, response_body=resp_s,
                     **_proxy_log_fields(),
                 )

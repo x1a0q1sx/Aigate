@@ -547,7 +547,7 @@ class CodexResponsesAdapter(BaseAdapter):
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
                     raise httpx.HTTPStatusError(
-                        f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:500]}",
+                        f"Client error '{resp.status_code} {resp.reason_phrase}' for url '{url}'\nResponse: {body[:4000]}",
                         request=resp.request,
                         response=resp,
                     )

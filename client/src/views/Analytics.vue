@@ -511,7 +511,16 @@
             <td class="k">错误类型</td><td class="v" colspan="3">{{ detailRow.error_type }}</td>
           </tr>
           <tr v-if="detailRow.error_msg">
-            <td class="k">错误信息</td><td class="v" colspan="3" style="word-break: break-all;">{{ detailRow.error_msg }}</td>
+            <td class="k">错误信息</td>
+            <td class="v" colspan="3">
+              <!-- 错误信息可能是多行（概要 + 上游原文），保留换行、等宽字体便于读 JSON；
+                   长错误默认折叠到 12 行，避免详情弹窗被一条错误撑爆 -->
+              <pre class="err-full" :class="{ collapsed: isLongError(detailRow.error_msg) && !errExpanded }">{{ detailRow.error_msg }}</pre>
+              <button v-if="isLongError(detailRow.error_msg)" class="btn btn-outline btn-sm"
+                      style="margin-top:4px" @click="errExpanded = !errExpanded">
+                {{ errExpanded ? '收起' : '展开全部' }}
+              </button>
+            </td>
           </tr>
           </tbody>
         </table>
@@ -666,6 +675,7 @@ export default {
       filterStatus: '',
       filterLogType: '',
       detailRow: null,
+      errExpanded: false,   // 错误信息的展开/收起（长错误默认折叠）
       detailLoading: false,
       archives: [],
       archiveBusy: false,
@@ -1032,7 +1042,10 @@ export default {
       if (n === this.page) { this.pageJump = n; return }
       this.loadPage(n)
     },
+    // 错误信息超过该长度即折叠（保留「展开全部」按钮）
+    isLongError(t) { return !!t && String(t).length > 600 },
     showDetail(r, full = false) {
+      this.errExpanded = false   // 每次打开详情重置展开态
       // 模型刷新行：列表接口已带全量字段（增删清单/错误），直接展示
       if (r.log_type === 'refresh') { this.detailRow = { ...r }; return }
       this.detailLoading = true
@@ -1296,6 +1309,14 @@ export default {
 .detail-meta td { padding: 5px 8px; font-size: 13px; vertical-align: top; }
 .detail-meta td.k { color: var(--gray-500); width: 92px; white-space: nowrap; }
 .detail-meta td.v { word-break: break-all; }
+/* 错误信息：保留换行 + 等宽（读上游 JSON 错误体用），可滚动 */
+.err-full {
+  margin: 0; padding: 6px 8px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  background: rgba(148, 163, 184, 0.10); border-radius: 6px;
+  max-height: 340px; overflow: auto;
+}
+.err-full.collapsed { max-height: 190px; }
 .detail-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

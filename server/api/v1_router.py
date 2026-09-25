@@ -300,7 +300,11 @@ def _api_error(message, *, status=None, type_=None, **extra) -> dict:
 
     error 必须是对象（{message,type,code}）而非字符串 —— Codex 等客户端按
     schema 校验响应，字符串会触发 'Invalid input: expected object' 的类型
-    校验错误，把真实原因埋掉。status 用于推断默认 type。"""
+    校验错误，把真实原因埋掉。status 用于推断默认 type。
+
+    ⚠️ 本函数的产物会**直接回给下游客户端**，故 message 保持短形态（800 字符）。
+    需要给用户看完整上游原文的是**日志**（error_msg 落库），不是这里 —— 见
+    `_record_fail` / `_full_err_text` 的分工说明。"""
     if type_ is None:
         t = status or 0
         type_ = ("rate_limit_error" if t == 429
@@ -309,6 +313,48 @@ def _api_error(message, *, status=None, type_=None, **extra) -> dict:
     if extra:
         err.update(extra)
     return {"error": err}
+
+
+def _strip_error_detail(attempts):
+    """剥掉 attempts 里的 error_detail（全量上游原文），只留短 error 给客户端。
+
+    `error_detail` 是给日志用的（用户在分析页详情弹窗看完整原因）；下游客户端
+    收到完整上游 HTML/JSON 错误页既无用又会撑爆响应体。"""
+    if not attempts:
+        return attempts
+    out = []
+    for a in attempts:
+        if isinstance(a, dict) and "error_detail" in a:
+            out.append({k: v for k, v in a.items() if k != "error_detail"})
+        else:
+            out.append(a)
+    return out
+
+
+def _compose_full_error(short_msg, attempts) -> str:
+    """终态 error_msg = 短概要 + 各次尝试的完整上报错（含上游原文）。
+
+    用户排障路径是「分析页 → 请求日志 → 错误信息」，那里必须能看到上游真实
+    回复（错误码/限流说明/HTML 片段）。此前只存 120~500 字符的短形态，
+    逼得人去翻 pm2 日志。上限只作防御（ERROR_MSG_MAX_CHARS）。"""
+    parts = [str(short_msg or "")]
+    seen = set()
+    for a in (attempts or []):
+        if not isinstance(a, dict):
+            continue
+        detail = a.get("error_detail") or a.get("error")
+        if not detail:
+            continue
+        who = a.get("model") or a.get("target") or f"attempt {a.get('attempt', '?')}"
+        line = f"[{who}] {detail}"
+        if line in seen:
+            continue
+        seen.add(line)
+        parts.append(line)
+    out = "\n".join(parts)
+    if len(out) > ERROR_MSG_MAX_CHARS:
+        return out[:ERROR_MSG_MAX_CHARS] + f"\n... [错误信息超过 {ERROR_MSG_MAX_CHARS} 字符已截断]"
+    return out
 
 
 async def _early_error_log(conversation_id, request, raw_request, message, *, err_type="route_error"):
@@ -321,7 +367,7 @@ async def _early_error_log(conversation_id, request, raw_request, message, *, er
             requested_model=request.model,
             status="error",
             error_type=err_type,
-            error_msg=str(message)[:500],
+            error_msg=str(message)[:ERROR_MSG_MAX_CHARS],
             user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
             is_health_check=conversation_id.startswith("hc-"),
         )
@@ -648,15 +694,40 @@ def _extract_error_body(e: Exception) -> str:
     s = str(e)
     # adapter 已把 response body 拼在异常消息里，格式：...\nResponse: {...}
     if '\nResponse: ' in s:
-        return s.split('\nResponse: ', 1)[1][:5000]
+        return s.split('\nResponse: ', 1)[1][:ERROR_MSG_MAX_CHARS]
     # httpx HTTPStatusError 对象
     try:
         t = getattr(getattr(e, 'response', None), 'text', '') or ''
         if t:
-            return t[:5000]
+            return t[:ERROR_MSG_MAX_CHARS]
     except Exception:
         pass
     return s
+
+
+# 错误信息落库上限（字符）。此前链路上有 120/300/500 三处截断，用户看到的
+# error_msg 根本不含上游原文 —— 排障必须去翻 pm2 日志。现在统一：**控制流判据**
+# 用短形态（is_context_error 等只需前缀特征），**落库的 error_msg 用全量**
+# （上限只作防御，避免超大 HTML 错误页灌爆 SQLite 行）。
+ERROR_MSG_MAX_CHARS = 20000
+
+
+def _full_err_text(e: Exception) -> str:
+    """异常 → 完整错误文本（含上游响应体），仅受 ERROR_MSG_MAX_CHARS 防御上限约束。
+
+    与 `err_short` 的分工：`err_short` 供冷却/上下文判据与「尝试下一个候选」的
+    提示文案（要短）；本函数供 `error_msg` 落库（要全，用户排障直接看详情弹窗）。
+    """
+    raw = _extract_error_body(e)
+    if raw and raw != str(e):
+        # 有上游原文时，异常概要 + 原文都要（概要含状态码/URL，原文含上游错误码）
+        head = f"{type(e).__name__}: {str(e).split(chr(10) + 'Response: ', 1)[0]}"
+        full = f"{head}\n{raw}"
+    else:
+        full = f"{type(e).__name__}: {str(e)}"
+    if len(full) > ERROR_MSG_MAX_CHARS:
+        return full[:ERROR_MSG_MAX_CHARS] + f"\n... [错误信息超过 {ERROR_MSG_MAX_CHARS} 字符已截断]"
+    return full
 
 
 def _proxy_log_fields() -> dict:
@@ -789,11 +860,15 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
             ), attempt_errors
         except Exception as e:
             err_short = f"{type(e).__name__}: {str(e)[:120]}"
-            attempt_errors.append({
+            _full = _full_err_text(e)
+            _ent = {
                 "attempt": attempt,
                 "model": f"{candidate.provider.name}/{candidate.model.model_id}",
                 "error": err_short,
-            })
+            }
+            if _full != err_short:
+                _ent["error_detail"] = _full
+            attempt_errors.append(_ent)
             if ar.health_checker and not is_context_error(err_short):
                 # 上下文超限不是模型故障，不进冷却（请求体大小问题）
                 ar.health_checker.mark_cooling(
@@ -813,7 +888,7 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
                         routed_model=candidate.model.model_id,
                         status="error",
                         error_type="probe_error",
-                        error_msg=err_short,
+                        error_msg=_full_err_text(e),
                         fallback_count=attempt,
                         user_ip=None,
                         request_body=_pj.dumps(request.model_dump(), ensure_ascii=False) if request else None,
@@ -910,12 +985,23 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             return f"{candidate.provider.name}/{candidate.model.model_id}"
         return "?"
 
-    async def _record_fail(attempt, candidate, err_short, raw_body=None, cooling=True):
-        attempt_errors.append({
+    async def _record_fail(attempt, candidate, err_short, raw_body=None, cooling=True,
+                           full_error=None):
+        """记一次候选失败。
+
+        `err_short` 供控制流判据、短提示与**下游客户端响应**（要短）；
+        `full_error`（可选）供**日志落库** error_msg（要全 —— 上游原文常远超
+        120 字符，只存短形态会让用户看不到真正原因）。
+        全量只进 `error_detail`（`_strip_error_detail` 在回客户端前剥掉）。
+        """
+        _ent = {
             "attempt": attempt,
             "model": _cand_full(candidate),
             "error": err_short,
-        })
+        }
+        if full_error and full_error != err_short:
+            _ent["error_detail"] = full_error
+        attempt_errors.append(_ent)
         _decision_attempt(
             conversation_id,
             provider=candidate.provider.name,
@@ -951,7 +1037,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                     routed_model=candidate.model.model_id,
                     status="error",
                     error_type="upstream_error",
-                    error_msg=err_short[:300] + cooldown_note,
+                    error_msg=(full_error or err_short) + cooldown_note,
                     fallback_count=attempt,
                     **_proxy_log_fields(),
                     request_body=_j.dumps(request.model_dump(), ensure_ascii=False) if request else None,
@@ -1083,7 +1169,8 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         if cand is None:
             attempt_errors.append({"attempt": attempt, "error": et})
             return
-        await _record_fail(attempt, cand, et, raw_body=getattr(exc, "raw", None))
+        await _record_fail(attempt, cand, et, raw_body=getattr(exc, "raw", None),
+                           full_error=_full_err_text(exc))
 
     async def _on_loser(attempt):
         ctx = ctx_by_attempt.get(attempt)
@@ -1193,7 +1280,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                     total_latency_ms=decision_total_ms,
                     ttft_ms=ttft_ms,
                     failure_reason=error_msg,
-                    attempts=attempt_errors,
+                    attempts=_strip_error_detail(attempt_errors),
                 )
         except Exception as e:
             print(f"⚠️ 路由决策收尾失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:200]}", flush=True)
@@ -1672,7 +1759,7 @@ async def _chat_completions_impl(
                         except FusionAllFailed as fe:
                             yield _format_sse_chunk(
                                 _api_error("fusion: all candidates failed", status=502,
-                                           attempts=fe.attempts), request.model)
+                                           attempts=_strip_error_detail(fe.attempts)), request.model)
                             yield b"data: [DONE]\n\n"
                             await _fusion_log_fail(fe.attempts)
                             return
@@ -1704,7 +1791,7 @@ async def _chat_completions_impl(
                 except FusionAllFailed as fe:
                     await _fusion_log_fail(fe.attempts)
                     return JSONResponse(status_code=502, content=_api_error(
-                        "fusion: all candidates failed", status=502, attempts=fe.attempts))
+                        "fusion: all candidates failed", status=502, attempts=_strip_error_detail(fe.attempts)))
                 await _fusion_log_done(fresp, fmeta)
                 return JSONResponse(fresp)
 
@@ -1908,7 +1995,7 @@ async def _chat_completions_impl(
                                 status="error",
                                 fallback_count=max(0, len(stream_errs) - 1),
                                 failure_reason="stream ended before a terminal routing result",
-                                attempts=stream_errs,
+                                attempts=_strip_error_detail(stream_errs),
                             ))
                         except Exception:
                             pass
@@ -1927,11 +2014,12 @@ async def _chat_completions_impl(
                         except Exception:
                             pass
                         yield _format_sse_chunk(_api_error("combo all targets failed", status=503,
-                                                           attempts=stream_errs), "unknown")
+                                                           attempts=_strip_error_detail(stream_errs)), "unknown")
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
-                            None, None, "combo all targets failed", 0, stream_errs,
-                            diag_start_ts=_diag_start)
+                            None, None,
+                            _compose_full_error("combo all targets failed", stream_errs),
+                            0, stream_errs, diag_start_ts=_diag_start)
                         await _finish_session()
                         return
 
@@ -2153,7 +2241,9 @@ async def _chat_completions_impl(
                     import json as _j
                     await _write_stream_log(
                         conversation_id, request, raw_request, "error",
-                        None, None, f"Combo '{combo_name}' all targets failed", 0, combo_attempts,
+                        None, None,
+                        _compose_full_error(f"Combo '{combo_name}' all targets failed", combo_attempts),
+                        0, combo_attempts,
                         stream_body=_j.dumps({"attempts": combo_attempts}, ensure_ascii=False),
                         diag_start_ts=_diag_start,
                     )
@@ -2161,7 +2251,7 @@ async def _chat_completions_impl(
                     pass
                 return JSONResponse(
                     status_code=503,
-                    content=_api_error(f"Combo '{combo_name}' all targets failed", status=503, attempts=combo_attempts),
+                    content=_api_error(f"Combo '{combo_name}' all targets failed", status=503, attempts=_strip_error_detail(combo_attempts)),
                 )
             # ── 胜出候选：计量、成功日志、返回 ──
             _wctx = _ns_ctx_by_idx.get(winner_idx)
@@ -2559,8 +2649,11 @@ async def _chat_completions_impl(
                         except Exception:
                             pass
 
-            async def _record_fail(st_attempt, ctx, et, raw_body, cooling=True):
-                stream_errs.append({"attempt": st_attempt, "model": ctx["full_id"], "error": et})
+            async def _record_fail(st_attempt, ctx, et, raw_body, cooling=True, full_error=None):
+                _sent = {"attempt": st_attempt, "model": ctx["full_id"], "error": et}
+                if full_error and full_error != et:
+                    _sent["error_detail"] = full_error
+                stream_errs.append(_sent)
                 _decision_attempt(conversation_id, provider=ctx["prov"].name, model=ctx["mdl"].model_id,
                                   status="failed", attempt=st_attempt,
                                   latency_ms=int((time.time() - ctx["start"]) * 1000),
@@ -2568,7 +2661,8 @@ async def _chat_completions_impl(
                 cd_seconds = ar.config.cooling_period_seconds
                 fc = (ar.health_checker._fail_count.get(ctx["mdl"].id, 0) if (ar.health_checker and ctx["mdl"].id) else 0)
                 cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
-                err_annotated = f"{et} | cooldown={cd_actual}s fail#{fc}"
+                # 落库的 error_msg 用全量（上游原文常远超 120 字符），冷却注记追加在末尾
+                err_annotated = f"{full_error or et} | cooldown={cd_actual}s fail#{fc}"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
                     ctx["prov"].name, ctx["mdl"].model_id, err_annotated, st_attempt, None,
                     stream_body=raw_body or et, diag_start_ts=_diag_start)
@@ -2584,12 +2678,15 @@ async def _chat_completions_impl(
                 if ctx is None:
                     stream_errs.append({"attempt": st_attempt, "error": et})
                     return
+                _full = _full_err_text(exc)
                 # 上下文超限不是模型自身故障：记录但不冷却
                 if is_context_error(et):
                     await record_context_overflow(ctx["mdl"].id, est_req_tokens)
-                    await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None), cooling=False)
+                    await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None),
+                                       cooling=False, full_error=_full)
                     return
-                await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None))
+                await _record_fail(st_attempt, ctx, et, getattr(exc, "raw", None),
+                                   full_error=_full)
 
             async def _on_loser(st_attempt):
                 ctx = ctx_by_idx.get(st_attempt)
@@ -2606,7 +2703,7 @@ async def _chat_completions_impl(
                         status="error",
                         fallback_count=max(0, len(stream_errs) - 1),
                         failure_reason="stream ended before a terminal routing result",
-                        attempts=stream_errs,
+                        attempts=_strip_error_detail(stream_errs),
                     ))
                 except Exception:
                     pass
@@ -2619,7 +2716,7 @@ async def _chat_completions_impl(
                     on_failure=_on_fail, on_loser=_on_loser)
             except _RaceAllFailed:
                 yield _format_sse_chunk(_api_error("no more candidates", status=503,
-                                                   attempts=stream_errs), "unknown")
+                                                   attempts=_strip_error_detail(stream_errs)), "unknown")
                 yield b"data: [DONE]\n\n"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
                     None, None, "no more candidates", 0, stream_errs, diag_start_ts=_diag_start)
@@ -2666,11 +2763,14 @@ async def _chat_completions_impl(
                 _diag(conversation_id, "upstream_stream_error", _diag_start, attempt=winner_idx,
                       provider=ctx["prov"].name, model=ctx["mdl"].model_id, error=type(se).__name__)
                 err_s = f"{type(se).__name__}: {str(se)[:200]}"
+                _full = _full_err_text(se)
                 if is_context_error(err_s):
                     await record_context_overflow(ctx["mdl"].id, est_req_tokens)
-                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s, cooling=False)
+                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s,
+                                       cooling=False, full_error=_full)
                 else:
-                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s)
+                    await _record_fail(winner_idx, ctx, err_s, _extract_error_body(se) or err_s,
+                                       full_error=_full)
                 yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
                 yield b"data: [DONE]\n\n"
             finally:
@@ -2701,7 +2801,8 @@ async def _chat_completions_impl(
                         requested_model=request.model,
                         status="error",
                         error_type="upstream_error",
-                        error_msg=response.get("error", "all_candidates_failed"),
+                        error_msg=_compose_full_error(response.get("error", "all_candidates_failed"),
+                                                      _attempt_errors),
                         fallback_count=len(_attempt_errors),
                         user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
                         request_body=_j.dumps(request.model_dump(), ensure_ascii=False),
@@ -2722,7 +2823,8 @@ async def _chat_completions_impl(
             )
             return JSONResponse(
                 status_code=503,
-                content=_api_error(str(response.get("error") or "all_candidates_failed"), status=503, attempts=_attempt_errors),
+                content=_api_error(str(response.get("error") or "all_candidates_failed"), status=503,
+                                   attempts=_strip_error_detail(_attempt_errors)),
             )
         made_by_cascade = True
         # response 已经是上游返回的完整 dict，携带 usage/choices/model
