@@ -146,6 +146,8 @@ class OAuthClient:
         # CodeArts：state → {port, code_verifier, dpop_jwk, ticket_id, owner}
         # ⚠️ code_verifier 与 DPoP 私钥必须存下来：续期时两者都要重发
         self._codearts_sessions: Dict[str, dict] = {}
+        # Freebuff：state → {info, owner, created_at}（CLI 授权码轮询，无回调）
+        self._freebuff_sessions: Dict[str, dict] = {}
 
     # ── 唯一性 ──
     def _key(self, provider_code: str, owner: str = "__default") -> str:
@@ -688,6 +690,76 @@ class OAuthClient:
                                update_existing=existing)
         return True, "ok"
 
+    # ── Freebuff（Codebuff 免费层）：CLI 授权码轮询登录 ──────
+    async def start_freebuff_login(self, owner: str = "__default") -> dict:
+        """POST /api/auth/cli/code 拿登录 URL，并启动后台轮询收 authToken。
+
+        与官方 CLI 同协议（免装客户端）：用户在浏览器打开 login_url 用 Google
+        登录并授权，后台每 5 秒轮询 /api/auth/cli/status，拿到 user.authToken
+        即落库。无需回调地址，故远程部署也能用。
+        """
+        import secrets as _secrets
+        from server.core import freebuff as fb
+        state = _secrets.token_hex(16)
+        info, err = await fb.start_cli_login(proxy=self._proxy_url())
+        if not info:
+            return {"error": f"Freebuff 登录启动失败：{err}"}
+        self._freebuff_sessions[state] = {
+            "info": info, "owner": owner, "created_at": time.time(),
+        }
+        asyncio.create_task(self._poll_freebuff_login(state, info, owner))
+        return {
+            "state": state,
+            "login_url": info["login_url"],
+            "poll_interval_ms": 5000,
+            "owner": owner,
+        }
+
+    async def _poll_freebuff_login(self, state: str, info: dict, owner: str):
+        """轮询等用户完成 Google 登录；拿到 authToken 即落库（5 分钟超时）。"""
+        from server.core import freebuff as fb
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            await asyncio.sleep(5)
+            user, err, pending = await fb.poll_cli_login(info, proxy=self._proxy_url())
+            if user:
+                import json as _json
+                tok = {
+                    "access_token": str(user.get("authToken") or ""),
+                    # authToken 长期有效、无标准刷新（refresh_style=none）
+                    "refresh_token": "",
+                    "expires_in": 365 * 86400,
+                    "token_type": "Bearer",
+                    # 身份字段（uid/email）存 scope 列 JSON：额度/日志展示要用，
+                    # 且与 lobsterai/qoder 的既有做法一致
+                    "scope": _json.dumps({
+                        "uid": user.get("id"), "email": user.get("email"),
+                        "username": user.get("username"),
+                    }, ensure_ascii=False),
+                }
+                try:
+                    async with AsyncSessionLocal() as db:
+                        await self._save_token(db, "freebuff", owner, tok)
+                    logger.info("freebuff authToken acquired for %s", owner)
+                except Exception as e:
+                    logger.warning("freebuff token save failed: %s", e)
+                finally:
+                    self._freebuff_sessions.pop(state, None)
+                return
+            if not pending:
+                logger.info("freebuff login aborted: %s", err)
+                self._freebuff_sessions.pop(state, None)
+                return
+        self._freebuff_sessions.pop(state, None)
+
+    def _proxy_url(self):
+        """当前代理池出口（freebuff 免费层按出口国别分层，走代理可换出口）。"""
+        try:
+            from server.core.proxy_pool import get_proxy_pool
+            return get_proxy_pool().proxied_kwargs().get("proxy")
+        except Exception:
+            return None
+
     async def complete_pending(
         self, code: str, db: AsyncSession,
     ) -> Tuple[bool, str, Optional[OAuthToken]]:
@@ -747,14 +819,18 @@ class OAuthClient:
         if not provider:
             return False, f"unknown provider {provider_code}"
         existing = await self._get_token_record(db, provider_code, owner)
+        # ── 长期凭证（refresh_style=none，如 u1s1 api_key / freebuff authToken）──
+        # ⚠️ 必须在 refresh_token 检查**之前**：这类 provider 本就没有 refresh_token，
+        # 先检查会得到 "no refresh_token stored" 的假错误（freebuff 实测踩到）。
+        if (provider.extra_params or {}).get("refresh_style") == "none":
+            if not existing:
+                return False, f"no token record for {provider_code}/{owner}"
+            return True, "long-lived credential (re-login when it expires)"
         if not existing or not existing.refresh_token_enc:
             return False, "no refresh_token stored"
         refresh_plain = self._crypto.decrypt(existing.refresh_token_enc)
         # ── 非标准刷新协议按 extra_params.refresh_style 分发 ──
         _style = (provider.extra_params or {}).get("refresh_style")
-        if _style == "none":
-            # 长期凭证（如 u1s1 api_key）：无标准刷新，到期重登录即可
-            return True, "long-lived credential (re-login when it expires)"
         if _style == "codebuddy" or provider_code == "codebuddy_cn":
             # 腾讯系（CN/国际服同构）：X-Refresh-Token 头 + 空 JSON body
             return await self._refresh_codebuddy(db, provider, existing, refresh_plain)

@@ -57,6 +57,8 @@
         </div>
       </div>
 
+      <div v-if="p.note" class="provider-note text-xs">{{ p.note }}</div>
+
       <div v-for="a in p.accounts" :key="a.id" class="acct-row">
         <div class="acct-main">
           <span class="acct-owner">{{ a.owner }}</span>
@@ -71,15 +73,8 @@
         <div v-if="a.today_message || a.today_error" class="acct-msg text-xs">
           {{ a.today_message }}<span v-if="a.today_error" class="acct-err">（{{ a.today_error }}）</span>
         </div>
-        <!-- 额度（复用 OAuth 页的口径与样式） -->
-        <div v-if="a.usage" class="usage-panel">
-          <div v-if="a.usage.message" class="usage-msg text-xs">{{ a.usage.message }}</div>
-          <div v-for="(q, name) in quotaRows(a.usage)" :key="name" class="quota-row">
-            <span class="quota-name" :title="name">{{ name }}</span>
-            <div class="quota-bar"><i :class="{ warn: quotaPct(q) > 85, hot: quotaPct(q) >= 100 }" :style="{ width: quotaPct(q) + '%' }"></i></div>
-            <span class="quota-val">{{ quotaText(q) }}</span>
-          </div>
-        </div>
+        <!-- 额度（复用统一 QuotaPanel：积分总量 + 赠包折叠，三页口径一致） -->
+        <QuotaPanel v-if="a.usage" :entry="a.usage" />
       </div>
     </div>
 
@@ -145,6 +140,7 @@
 import api from '../api'
 import toast from '../toast'
 import PageHeader from '../components/PageHeader.vue'
+import QuotaPanel from '../components/QuotaPanel.vue'
 
 // 平台显示名（后端 provider_code → 人话）
 const PLATFORM_LABELS = {
@@ -152,11 +148,15 @@ const PLATFORM_LABELS = {
   codebuddy_intl: 'CodeBuddy (International)',
   qoder: 'Qoder',
   u1s1: 'u1s1 (有一说一)',
+  lobsterai: 'LobsterAI (有道)',
+  codearts: 'CodeArts Agent (华为)',
+  trae: 'TRAE (字节)',
+  freebuff: 'Freebuff (Codebuff)',
 }
 
 export default {
   name: 'Checkin',
-  components: { PageHeader },
+  components: { PageHeader, QuotaPanel },
   data() {
     return {
       loading: false, running: false, errorText: '',
@@ -254,48 +254,6 @@ export default {
       if (!Number.isFinite(d.getTime())) return iso
       return d.toLocaleString('zh-CN', { hour12: false })
     },
-    // ── 额度展示（与 OAuthConnections.vue 口径一致）──
-    quotaRows(entry) { return (entry && entry.quotas) || {} },
-    quotaPct(q) {
-      if (q.unlimited) return 0
-      const total = Number(q.total) || 0
-      if (!total) return 0
-      return Math.max(0, Math.min(100, (Number(q.used) || 0) / total * 100))
-    },
-    quotaText(q) {
-      if (q.unlimited) return '不限量'
-      const money = (v) => '$' + (Number(v) || 0).toFixed(2)
-      if (q.unit === 'USD') {
-        const bal = q.remaining != null ? q.remaining : q.total
-        return `剩 ${money(bal)}` + (q.display_name ? `（${q.display_name}）` : '')
-      }
-      const isPct = Math.round(Number(q.total) || 0) === 100 && !q.unit
-      let text
-      if (isPct) text = `已用 ${Math.round(Number(q.used) || 0)}%`
-      else {
-        const u = Math.round(Number(q.used) || 0)
-        const t = Math.round(Number(q.total) || 0)
-        text = `${u.toLocaleString()}/${t.toLocaleString()}` + (q.unit ? ` ${q.unit}` : '')
-        if (q.display_name && !isPct && q.unit !== 'USD') text += `（${q.display_name}）`
-      }
-      if (q.reset_at) {
-        const tl = this._timeLeft(q.reset_at)
-        text += ` · ${q.recurring ? '重置' : '到期'} ${tl}`
-      }
-      return text
-    },
-    _timeLeft(iso) {
-      const ms = new Date(iso).getTime() - Date.now()
-      if (!Number.isFinite(ms)) return iso
-      if (ms <= 0) return '已过'
-      const d = Math.floor(ms / 86400000)
-      const h = Math.floor((ms % 86400000) / 3600000)
-      const m = Math.floor((ms % 3600000) / 60000)
-      if (d >= 7) return d + ' 天后'
-      if (d > 0) return d + ' 天 ' + h + ' 时后'
-      if (h > 0) return h + ' 时 ' + m + ' 分后'
-      return m + ' 分后'
-    },
   },
 }
 </script>
@@ -342,33 +300,15 @@ export default {
 .acct-credit { color: #34d399; font-weight: 600; }
 .acct-msg { color: var(--text-muted, #7e8ea9); }
 .acct-err { color: #f87171; }
-.usage-panel { display: flex; flex-direction: column; gap: 6px; }
-.quota-row {
-  display: grid;
-  grid-template-columns: minmax(80px, 1.4fr) 1fr minmax(120px, auto);
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
+.provider-note {
+  color: var(--text-muted, #7e8ea9);
+  background: rgba(126, 142, 169, 0.08);
+  border-left: 2px solid var(--border-color, #1c2839);
+  padding: 4px 8px;
+  border-radius: 0 4px 4px 0;
+  margin-bottom: 8px;
+  line-height: 1.6;
 }
-.quota-name {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--text-muted, #a9b7cd);
-}
-.quota-bar {
-  height: 6px; border-radius: 3px;
-  background: rgba(126, 142, 169, 0.18);
-  overflow: hidden;
-}
-.quota-bar i {
-  display: block; height: 100%;
-  background: var(--primary, #5b8dff);
-  border-radius: 3px;
-  transition: width 0.25s;
-}
-.quota-bar i.warn { background: #fbbf24; }
-.quota-bar i.hot { background: #f87171; }
-.quota-val { text-align: right; white-space: nowrap; }
-.usage-msg { color: var(--text-muted, #7e8ea9); }
 .cfg-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

@@ -143,6 +143,9 @@ def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) ->
     elif api_type == "trae":
         from server.adapters.trae_adapter import TraeAdapter
         return TraeAdapter(timeout=timeout) if timeout else TraeAdapter()
+    elif api_type == "freebuff":
+        from server.adapters.freebuff_adapter import FreebuffAdapter
+        return FreebuffAdapter(timeout=timeout) if timeout else FreebuffAdapter()
     else:
         return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
 class ModelCatalog:

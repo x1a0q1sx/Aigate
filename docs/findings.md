@@ -654,3 +654,119 @@ scoped 端点优先、两端口 id 集合**取并集**、`agentReferenced` 例�
 
 测试：TRAE 86 项 + CodeArts 116 项 + 接线守卫 10 项 + 错误不截断 9 项，
 全量 **705 项全绿**。
+
+## F26 签到页三项排查 + Freebuff 渠道接入（2026-09-26）
+
+### 一、CodeBuddy (International) 签到失败 —— 上游本期未开放，非接入问题
+
+用户反馈「CodeBuddy Intl 签到失败」。生产 `checkin_logs` 显示连续 3 天 `kind=inactive`
+（09-24 启动补签、09-25/26 定时），message = 「签到活动未开启（上游 active=false）」。
+
+**本机实测（只读探测，生产凭据）**：
+
+| 端点 | 结果 |
+|---|---|
+| `POST /v2/billing/meter/checkin-activity-status` | HTTP 200 · `active=false` · `today_checked_in=false` · `daily_credit=100` · **`activity_name="本期：专家能量包"`** · **`start_time=""` `end_time=""`** |
+| `POST /v2/billing/meter/checkin-status` | HTTP 200 · 全空占位（`activity_name=""`、`season=0`） |
+| `POST /v2/billing/meter/daily-checkin` | **HTTP 400 · code 10001**「签到活动未开启或已过期」 |
+
+**换美国出口 IP 复核**（挂服务器代理 7890 重打）：**结论完全相同**（`active=false`、
+活动名与空时间段一致）→ 排除「地区门控」，是**上游本期没给国际版排活动**。
+对照 CN 同端点同时刻 `active=true`、`streak_days=8`、`checkin_dates` 8 条、`total_credits=800`
+—— 两侧协议同构，差异纯在上游运营侧。
+
+**处置**：`CHECKIN_CAPABILITIES["codebuddy_intl"]` 保持 `True`（端点与活动框架都在，
+活动随时可能开，预检会如实反映）；新增 `CHECKIN_NOTES["codebuddy_intl"]` 在签到页
+写明「本期未开放，开启后自动签到」，避免用户以为是我们坏了。
+`inactive` 仍计入 `ATTEMPTED_KINDS`（当天不重复打上游）。
+
+### 二、u1s1 签到失败 —— 打卡只能在官网仪表盘做，但打卡包是登录自动发放
+
+此前登记为「8 个候选端点全 404、无签到接口」。本轮**从官网前端源码挖到了真实端点**：
+
+- 下载 `https://u1s1.io/app.js`（252KB，v116）→ 找到签到 UI 与调用：
+  ```js
+  const result = await api("/api/packages/login-checkin/claim", {
+    method: "POST",
+    body: JSON.stringify({ "cap-token": capToken, "cf-turnstile-response": turnstileToken }),
+  });
+  ```
+- 即 `POST https://u1s1.io/api/packages/login-checkin/claim`（**u1s1.io 网站域**，不是
+  api.u1s1.io），且要**两道人机验证**：Capcat（capcat.ai 的 PoW 隐形验证，`cap.solve()`）
+  + Cloudflare Turnstile（`/auth/turnstile/config` 实测 `{"enabled":true,"sitekey":"0x4AAA…"}`）；
+  另有手机号验证闸门（未绑定手机时按钮跳去绑手机）。
+
+**鉴权实测（生产凭据，6 种组合全 401 `{"error":{"message":"not logged in"}}`）**：
+`api_key` Bearer、`device_token`(u1s1d-) Bearer、DPoP 签名（`Authorization: DPoP …` +
+逐请求 proof）打 `/api/me`、`/api/packages/login-checkin/claim`、`/api/v1/checkin`
+—— 全部只认**网页会话 cookie**。官方 CLI（`u1s1-cli@1.11.6`，解包核对 dist/usage.js）
+同样**不做签到**，只提示「每天到仪表盘打卡领免费包 → https://u1s1.io/dashboard」。
+
+**但打卡包是登录自动发放的**（这才是关键）：`GET /v1/me` 的 `packages[]` 里
+`kind="login_checkin"`（200 万 tokens/个、约 10 天有效、`note="登录打卡赠送·每日一次·
+仅限 u1s1 客户端使用"`），生产账号实测 **6 个包 = 6 次登录**（created_at 与各次登录日期
+一一对应）。**AIGate 重新连接该账号即等于打卡**。
+
+**处置**：能力保持 `False`（客户端无法触发领取）+ `CHECKIN_NOTES` 说明真相；
+**新增额度透出** —— `_u1s1_usage` 现在解析 `packages[]`，按 `kind` 归组求和
+（照官方 CLI `groupPackages` 口径），输出「登录打卡包 ×N」「邀请赠送包」等条目
+（unit=tokens、组内取最晚到期），用户终于能在页面上看到打卡包还剩多少。
+
+### 三、Freebuff（Codebuff 免费层）渠道接入
+
+用户要求融入 `github.com/pingmike2/freebuff2api-wokers`。**双源交叉核对**：
+社区逆向实现（worker.js / server.js / extract_freebuff.py，AGPL-3.0，含 2026-09 实测）
++ **官方仓库 CodebuffAI/freebuff**（free-agents.ts / freebuff-session.ts /
+freebuff-streak.ts / freebuff-countries.ts / use-freebuff-streak-query.ts）。
+
+**协议：三段式门控（不是"拿 token 直接调 chat"）**
+
+```
+session(开) → agent-runs(主 + context-pruner 子 run) → chat/completions
+```
+
+- `POST /api/v1/freebuff/session`（`x-freebuff-model`）→ `instanceId`；
+  一个 session 约 1 小时，**创建时按模型单价扣 Freebucks**，复用不扣 → 必须缓存
+- `POST /api/v1/agent-runs {action:START, agentId}` 拿 `runId`（chat 校验其存在）
+- `POST /api/v1/chat/completions`，**上游强制流式**（`stream` 恒 true）
+
+**三条「不说就静默降级」的硬约束**（官方源码依据，全部有测试锁死）：
+
+1. **Buffy 前缀**：system 必须以 `You are Buffy, the strategic coding assistant.`
+   **字节级开头**（`hasFreebuffRootSystemPromptOpening` 校验）；旧的
+   `[System Override…]` 绕过已被官方修补为 403 `free_mode_cli_required`。
+2. **外域客户端指纹**（官方 2026-09-17/18 两轮升级）：tools 出现 Claude Code/Codex/
+   OpenClaw/opencode 的**精确工具名**、或 system 命中 harness 身份短语 → **静默降级到
+   `inclusionai/ling-3.0-tiny:free`**（不报错、只换模型）。对策：工具名统一加
+   `mcp__` 前缀（官方认可 `server__tool` 形态，且 `isUnrecognisedToolName` 把含 `__`
+   的名字排除在观测名单外）+ 注入官方 `decide` 作为 genuine 签名工具 + harness 短语
+   等义替换。响应侧剥前缀还原，客户端无感。
+3. **`codebuff_metadata`**：必须带 `run_id` / `client_id` / `cost_mode:"free"` /
+   `trace_session_id`（同对话跨轮复用，官方从 previousRun 取）。
+
+**国别分层（官方 `freebuff-countries.ts`，2026-09-12 实测）**：tier1 US；
+tier2 CA/GB/AU/NZ/IE/NO/SE/DK/FI/NL/AT/LU/IS；tier3 DE/FR/ES/IT/PT/BE/CH/LI/MT/KR
+—— 以上 full access；**其余国家（含 CN/SG/JP）与任何 VPN/代理出口一律 limited access**
+（模型目录缩减，仍可用）。生产服务器出口 CN、代理出口 SG/JP → 该渠道在 AIGate 上
+默认 limited access，**这是上游策略不是接入 bug**（已在注册表注释与适配器 docstring 写明）。
+
+**Freebucks 计费**：按次扣费的**每日钱包**（不是「每模型每天 N 次」白名单）。
+两个 limit 并存，**只信 GET 快照的 `daily.limit`**（429 响应体的 limit 是当日闸值）。
+`accessTier`：`full`=未降级（仅撞通用 cap）；`limited`=**新号默认档**（25/天，与 IP 无关）。
+
+**登录**：CLI 授权码轮询（与官方 CLI 同协议，免装客户端）——
+`POST /api/auth/cli/code {fingerprintId}` → `{loginUrl, fingerprintHash}` →
+浏览器 Google 登录 → 轮询 `GET /api/auth/cli/status` → `user.authToken`。
+**本机实测通过**（生产服务器直连可达：`start_cli_login` 返回真实 loginUrl、
+未登录时 poll 正确 pending；在线模型目录拉取 59 个模型）。
+authToken 长期有效、无标准刷新（`refresh_style=none`）。
+
+**顺带修掉一个既有 bug**：`_do_refresh` 此前**先检查 `refresh_token_enc` 再分发
+`refresh_style`** → `refresh_style=none` 的长期凭证（u1s1、freebuff）永远得到
+「no refresh_token stored」的假错误。已把 none 分支前移，并加接线守卫测试锁死顺序。
+
+**签到能力**：`False` —— 官方 streak（`freebuff-streak.ts calculateFreebuffStreak`）
+由「当天是否用过模型」推导，**只有 GET 没有领取端点**（官方全仓库仅
+`use-freebuff-streak-query.ts` 一处 GET）。即「用一次 = 打卡」，上游自动记录。
+
+测试：Freebuff 38 项 + 接线守卫新增 9 项；全量 **755 项全绿**。

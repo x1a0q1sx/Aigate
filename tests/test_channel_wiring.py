@@ -124,3 +124,83 @@ def test_codearts_refresh_is_serialized_by_single_flight():
     from server.core import oauth_client as oc
     oc_src = inspect.getsource(oc.OAuthClient._refresh_codearts)
     assert "Single Flight" in oc_src or "单飞" in oc_src or "串行" in oc_src
+
+
+# ── Freebuff（Codebuff 免费层）接线守卫 ─────────────────
+
+def test_freebuff_registry_entry():
+    from server.core.oauth_registry import get_oauth_provider
+    p = get_oauth_provider("freebuff")
+    assert p is not None
+    assert p.adapter_api_type == "freebuff"
+    ep = p.extra_params or {}
+    assert ep.get("auth_mode") == "freebuff_cli"
+    assert ep.get("refresh_style") == "none"     # 长期凭证，无标准刷新
+    assert p.static_models, "必须有种子模型（在线目录失败时的兜底）"
+
+
+def test_freebuff_login_methods_present():
+    """start/poll 登录方法必须存在（CLI 授权码轮询，无回调）。"""
+    from server.core import oauth_client as oc
+    assert hasattr(oc.OAuthClient, "start_freebuff_login")
+    assert hasattr(oc.OAuthClient, "_poll_freebuff_login")
+    src = inspect.getsource(oc.OAuthClient.start_freebuff_login)
+    assert "start_cli_login" in src
+
+
+def test_freebuff_router_branch():
+    import io
+    src = io.open("server/api/oauth_router.py", encoding="utf-8").read()
+    assert 'auth_mode") == "freebuff_cli"' in src
+    assert "start_freebuff_login" in src
+
+
+def test_freebuff_adapter_dispatch():
+    from server.core.model_catalog import create_adapter_for_provider
+    from server.adapters.freebuff_adapter import FreebuffAdapter
+    assert isinstance(create_adapter_for_provider("freebuff"), FreebuffAdapter)
+
+
+def test_freebuff_usage_dispatch_registered():
+    from server.core.oauth_usage import _dispatch
+    src = inspect.getsource(_dispatch)
+    assert "_freebuff_usage" in src
+
+
+def test_freebuff_refresh_style_none_checked_before_refresh_token():
+    """⚠️ refresh_style=none 必须在 refresh_token 检查**之前**。
+
+    freebuff/u1s1 这类长期凭证本就没有 refresh_token；先检查会得到
+    "no refresh_token stored" 的假错误（实现时实测踩到）。
+    """
+    from server.core import oauth_client as oc
+    src = inspect.getsource(oc.OAuthClient._do_refresh)
+    i_none = src.index('refresh_style") == "none"')
+    i_tok = src.index("not existing.refresh_token_enc")
+    assert i_none < i_tok, "长期凭证分支必须在 refresh_token 检查之前"
+
+
+def test_freebuff_checkin_capability_false_with_reason():
+    """Freebuff 的 streak 是「用过即打卡」（官方只读，无领取端点）→ 能力 False。"""
+    from server.core.checkin import CHECKIN_CAPABILITIES, CHECKIN_NOTES
+    assert CHECKIN_CAPABILITIES.get("freebuff") is False
+    assert "freebuff" in CHECKIN_NOTES
+
+
+def test_freebuff_adapter_documents_gating():
+    """三段式门控 + 静默降级风险必须在适配器/协议模块里留证。"""
+    import server.core.freebuff as fb
+    import server.adapters.freebuff_adapter as fa
+    src = inspect.getsource(fb)
+    assert "Buffy" in src
+    assert "mcp__" in src or "MCP_TOOL_PREFIX" in src
+    assert "freebuff-countries" in src or "limited access" in src
+    a_src = inspect.getsource(fa)
+    assert "静默降级" in a_src or "silent" in a_src.lower()
+
+
+def test_freebuff_country_tier_documented_in_registry():
+    """国别分层是上游策略，必须在注册表注释里写明（避免被当 bug 修）。"""
+    import server.core.oauth_registry as reg
+    src = inspect.getsource(reg)
+    assert "limited access" in src or "国别" in src

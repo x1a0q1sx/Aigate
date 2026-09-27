@@ -616,6 +616,58 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         notes="CodeArts（华为）— portal OAuth（PKCE + 字面量 SHA-256 + DPoP）；"
               "续期一次性轮换，必须串行；推理走 HMAC 签名",
     ),
+    # ── Freebuff（Codebuff 免费层）──
+    # 协议来源（双源交叉核对）：pingmike2/freebuff2api-wokers 的 worker.js /
+    # freebuff_tools/extract_freebuff.py（社区逆向，含 2026-09 实测）+ CodebuffAI/freebuff
+    # 官方源码（free-agents.ts / freebuff-session.ts / freebuff-countries.ts）。
+    # 流程：CLI 授权码轮询（与官方 CLI 同协议，免装客户端）
+    #   POST /api/auth/cli/code {fingerprintId} → {loginUrl, fingerprintHash, expiresAt}
+    #   → 用户在浏览器用 Google 登录 → 轮询 GET /api/auth/cli/status → user.authToken
+    # 关键约束（全部有源码依据，改前先读 server/core/freebuff.py 模块说明）：
+    #   1) authToken 长期有效、无标准 refresh（refresh_style=none，同 u1s1）
+    #   2) 推理是**三段式门控**（session → agent-runs → chat），不是直接调 chat；
+    #      session 创建时扣 Freebucks（按模型单价）
+    #   3) system 必须以 Buffy 开头 + 工具名要加 mcp__ 前缀，否则**静默降级模型**
+    #   4) 免费层按出口国别分层：US=full access，其余（含 CN/SG/JP）与任何
+    #      VPN/代理出口一律 limited access（模型目录缩减，仍可用）—— 上游策略
+    "freebuff": OAuthProviderConfig(
+        code="freebuff",
+        name="Freebuff (Codebuff 免费层)",
+        client_id="",                            # 无 client_id 概念（CLI 授权码流）
+        client_secret="",
+        authorize_url="https://www.codebuff.com/login",
+        token_url="",                             # 授权码轮询，无标准 token 端点
+        refresh_url="",
+        redirect_uri="",                          # 无回调（轮询模式）
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=86400,               # 长期凭证，无刷新
+        extra_params={
+            "auth_mode": "freebuff_cli",
+            "refresh_style": "none",
+            "api_base": "https://www.codebuff.com",
+            "poll_interval_ms": 5000,
+            "poll_timeout_s": 300,                # 与官方 CLI 一致（5 分钟）
+        },
+        api_base_url="https://www.codebuff.com",
+        adapter_api_type="freebuff",
+        static_models=_seed(*[(mid, name) for mid, name in (
+            ("mimo/mimo-v2.5", "MiMo 2.5"),
+            ("deepseek/deepseek-v4-flash", "DeepSeek V4 Flash"),
+            ("deepseek/deepseek-v4-pro", "DeepSeek V4 Pro"),
+            ("openai/gpt-5.6-luna", "GPT-5.6 Luna"),
+            ("minimax/minimax-m3", "MiniMax M3"),
+            ("z-ai/glm-5.2", "GLM 5.2"),
+            ("z-ai/glm-5.3-flash", "GLM 5.3 Flash"),
+            ("crof/kimi-k3-eco", "Kimi K3 Eco"),
+            ("upstage/solar-pro4", "Solar Pro 4"),
+            ("meta/muse-spark-1.2-contributor", "Muse Spark 1.2"),
+            ("google/gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ("anthropic/claude-fable-5", "Claude Fable 5"),
+        )]),
+        notes="Freebuff（Codebuff 免费层）— CLI 授权码轮询登录；Freebucks 按次扣费的每日钱包；"
+              "⚠️ 免费层按出口国别分层（US=full，其余=limited，模型目录缩减）",
+    ),
 }
 
 

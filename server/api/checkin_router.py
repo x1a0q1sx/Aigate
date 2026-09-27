@@ -71,7 +71,7 @@ async def checkin_overview(days: int = Query(7, ge=1, le=90),
     - 能力矩阵（哪些平台支持签到）
     """
     from server.config import get_config
-    from server.core.checkin import CHECKIN_CAPABILITIES
+    from server.core.checkin import CHECKIN_CAPABILITIES, CHECKIN_NOTES
     from server.core.oauth_client import get_oauth_client
 
     cfg = getattr(get_config(), "checkin", None)
@@ -137,6 +137,7 @@ async def checkin_overview(days: int = Query(7, ge=1, le=90),
         providers.append({
             "provider_code": code,
             "supported": CHECKIN_CAPABILITIES[code],
+            "note": CHECKIN_NOTES.get(code, ""),
             "accounts": accounts,
             "done_today": done,
             "total_accounts": len(accounts),

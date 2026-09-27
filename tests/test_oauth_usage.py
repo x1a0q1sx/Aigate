@@ -315,6 +315,87 @@ def test_u1s1_me_balance(monkeypatch):
     assert calls[0]["url"] == "https://api.u1s1.io/v1/me"
 
 
+def test_u1s1_packages_grouped_and_exposed(monkeypatch):
+    """打卡包（login_checkin）按 kind 归组求和后透出。
+
+    2026-09-26 定论：u1s1 的打卡包由上游在**登录时自动发放**（无法客户端触发），
+    但用户必须能在签到页看到它 —— 否则会以为「签到没生效」。
+    多个同 kind 包（实测 6 个）要归组成一行（×N），否则同名牌刷屏。
+    """
+    calls = []
+    _patch(monkeypatch, calls, [(200, {
+        "email": "a@b.c", "remaining_usd": 0,
+        "daily_free_usd": 0, "daily_free_remaining_usd": 0,
+        "tokens_per_usd": 200000,
+        "packages": [
+            {"kind": "login_checkin", "total_tokens": 2000000, "remaining": 0,
+             "expires_at": "2026-10-04 15:14:18"},
+            {"kind": "login_checkin", "total_tokens": 2000000, "remaining": 15803,
+             "expires_at": "2026-10-24 08:27:24"},
+            {"kind": "invite", "total_tokens": 5000000, "remaining": 5000000,
+             "expires_at": "2026-11-01 00:00:00"},
+        ],
+    })])
+    r = asyncio.run(_u1s1_usage("u1s1-key"))
+    q = r["quotas"]
+    lc = q["登录打卡包 ×2"]
+    assert lc["total"] == 4000000
+    assert lc["remaining"] == 15803
+    assert lc["unit"] == "tokens"
+    # 组内取**最晚**到期（用户问「这批还能用到什么时候」）
+    assert lc["reset_at"].startswith("2026-10-24")
+    assert q["邀请赠送包"]["remaining"] == 5000000
+    assert r["extra"]["packages_total_remaining_tokens"] == 5015803
+
+
+def test_u1s1_no_packages_no_extra_quota(monkeypatch):
+    """无 packages 时不得凭空多出条目（老网关不下发该字段）。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {
+        "email": "a@b.c", "remaining_usd": 1.0,
+        "daily_free_usd": 0, "daily_free_remaining_usd": 0,
+    })])
+    r = asyncio.run(_u1s1_usage("u1s1-key"))
+    assert list(r["quotas"]) == ["永久余额"]
+    assert r["extra"]["packages_total_remaining_tokens"] == 0
+
+
+# ── CodeBuddy 积分总量聚合（用户需求 2026-09-26：账号级「积分总量」） ──
+def test_codebuddy_credits_summary_aggregates(monkeypatch):
+    """33 个赠包逐个列不可读 → extra 里给账号级合计（total/used/remaining）。"""
+    calls = []
+    day = 86400000
+    now_ms = 1789000000000
+    _patch(monkeypatch, calls, [(200, {"code": 0, "data": {"Response": {"Data": {
+        "Accounts": [
+            {"PackageName": "基础体验包", "CycleCapacityUsedPrecise": "10",
+             "CycleCapacitySizePrecise": "100",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 20 * day,
+             "DeductionEndTime": now_ms + 200 * day},
+            {"PackageName": "赠包A", "CapacityUsedPrecise": "30",
+             "CapacitySizePrecise": "100",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 5 * day,
+             "DeductionEndTime": now_ms + 5 * day},
+            {"PackageName": "赠包B", "CapacityUsedPrecise": "0",
+             "CapacitySizePrecise": "500",
+             "CycleStartTime": now_ms, "CycleEndTime": now_ms + 9 * day,
+             "DeductionEndTime": now_ms + 9 * day},
+        ]}}}})])
+    r = asyncio.run(_codebuddy_usage(
+        "tok", "https://copilot.tencent.com/v2/chat/completions"))
+    ex = r["extra"]
+    assert ex["credits_total"] == 700
+    assert ex["credits_used"] == 40
+    assert ex["credits_remaining"] == 660
+    assert ex["bonus_pack_count"] == 2
+    assert ex["refill_pack_count"] == 1
+    # 每条额度也要有 remaining/unit/kind（前端 QuotaPanel 据此分流）
+    assert r["quotas"]["Monthly"]["remaining"] == 90
+    assert r["quotas"]["Monthly"]["kind"] == "plan"
+    assert r["quotas"]["Bonus Pack 1"]["remaining"] == 70
+    assert r["quotas"]["Bonus Pack 1"]["kind"] == "bonus"
+
+
 def test_dispatch_unknown_provider_message():
     r = asyncio.run(get_connection_usage("kimchi", "tok"))
     assert "额度接口" in r["message"] or "没有" in r["message"]

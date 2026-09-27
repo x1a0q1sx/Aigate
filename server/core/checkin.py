@@ -45,12 +45,35 @@ CST = timezone(timedelta(hours=8))
 # 能力真相源：True=支持签到；False=上游无接口；None=待探测（UI 灰态不渲染按钮）
 CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
     "codebuddy_cn": True,
-    "codebuddy_intl": True,     # 端点实测存在（HTTP 200）
+    # 端点与活动框架均存在，但上游**本期未给国际版开活动**（2026-09-26 复核：
+    # active=false、start/end_time 为空、claim 返回 10001；换美国出口 IP 同结论）。
+    # 保持 True：活动随时可能开，预检能如实反映状态（inactive ≠ 不支持）。
+    "codebuddy_intl": True,
     "qoder": True,
     "lobsterai": True,          # 三步协议（slot → context → check_in），+100 积分/天
     "codearts": True,           # 四步协议（账户类型 → delivery → claim → confirm）
     "trae": True,               # 两步：status 预检 → claim → 补查 status，+150 credits/天
-    "u1s1": False,              # 实测无签到接口（登录即自动发放 login_checkin 包）
+    # 2026-09-26 深挖定论：u1s1 的「登录打卡」**只能在官网仪表盘点**——
+    # 真实端点 POST u1s1.io/api/packages/login-checkin/claim 要 web 会话 cookie +
+    # Capcat PoW 令牌 + Cloudflare Turnstile 令牌（网页 app.js 实证），
+    # api_key / device_token(DPoP) 全部 401；官方 CLI 也只提示「去仪表盘打卡」。
+    # 但打卡包由**上游在登录时自动发放**（实测 6 个包 = 6 次登录），
+    # AIGate 的 OAuth 登录本身就在触发它 → 额度页如实展示打卡包即可。
+    "u1s1": False,
+    # Freebuff：streak 由「当天是否用过模型」推导（官方 freebuff-streak.ts
+    # calculateFreebuffStreak 按 usageDates 算），**只有 GET 没有领取端点**
+    # （官方仓库全量搜索仅 cli/src/hooks/use-freebuff-streak-query.ts 一处 GET）。
+    # 即「用一次 = 打卡」，上游自动记录，客户端无从触发。
+    "freebuff": False,
+}
+
+# 平台说明（签到页展示；把「为什么这个号没签到」讲清楚，避免用户以为是我们坏了）
+CHECKIN_NOTES: Dict[str, str] = {
+    "codebuddy_intl": "上游端点与活动框架都在，但本期未给国际版开放活动（active=false、claim 返回 10001）。活动开启后本页会自动签到，无需改动。",
+    "u1s1": "打卡只能在 u1s1 官网仪表盘完成（需网页会话 + 人机验证）；但其打卡包由上游在每次登录时自动发放 —— AIGate 重新连接该账号即等于打卡。下方额度区可查看打卡包余额。",
+    "freebuff": "Freebuff 的「连续天数」由**当天是否用模型**推导（官方语义：用一次即打卡），上游无领取端点，无需也无法在此签到；额度区显示 Freebucks 余额。",
+    "trae": "CN 区 deepseek-v4-flash 走加密信封（未实现），其余模型正常；签到与模型调用互不影响。",
+    "codearts": "四步协议（账户类型 → delivery → claim → confirm）；Token 计费账户无积分口径属正常。",
 }
 
 # 视为「今日已完成」的 kind —— 定时任务据此幂等跳过

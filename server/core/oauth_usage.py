@@ -448,22 +448,35 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
         base = _cadence(acc)
         seen[base] = seen.get(base, 0) + 1
         name = base if seen[base] == 1 else f"{base} {seen[base]}"
+        total = _num(acc.get("CycleCapacitySizePrecise", acc.get("CycleCapacitySize")))
+        used = _num(acc.get("CycleCapacityUsedPrecise", acc.get("CycleCapacityUsed")))
         quotas[name] = {
-            "used": _num(acc.get("CycleCapacityUsedPrecise", acc.get("CycleCapacityUsed"))),
-            "total": _num(acc.get("CycleCapacitySizePrecise", acc.get("CycleCapacitySize"))),
+            "used": used, "total": total, "remaining": max(0.0, total - used),
+            "unit": "credits", "kind": "plan",
             "reset_at": _cycle_end(acc), "unlimited": False, "recurring": True,
         }
     # 赠包按**到期先后**编号：出口会统一按到期排序，若编号沿用上游数组顺序，
     # 排完就会出现 2,3,…,10,1,11… 这种看着像漏号的错觉（实测 33 个赠包时很显眼）。
     bonuses.sort(key=lambda a: (_cycle_end(a) or "9999"))
     for i, acc in enumerate(bonuses):
+        total = _num(acc.get("CapacitySizePrecise", acc.get("CapacitySize")))
+        used = _num(acc.get("CapacityUsedPrecise", acc.get("CapacityUsed")))
         quotas[f"Bonus Pack {i + 1}"] = {
-            "used": _num(acc.get("CapacityUsedPrecise", acc.get("CapacityUsed"))),
-            "total": _num(acc.get("CapacitySizePrecise", acc.get("CapacitySize"))),
+            "used": used, "total": total, "remaining": max(0.0, total - used),
+            "unit": "credits", "kind": "bonus",
             "reset_at": _cycle_end(acc), "unlimited": False, "recurring": False,
         }
     plan = (refills or accounts)[0].get("PackageName") or "CodeBuddy"
-    return {"plan": plan, "quotas": quotas}
+    # 账号级积分汇总（签到页/连接页要显示「积分总量」；赠包多达 30+ 个，
+    # 逐个加总对用户不可读）。remaining 是可用积分，total 是含已用的总配额。
+    return {"plan": plan, "quotas": quotas,
+            "extra": {
+                "credits_total": round(sum(q["total"] for q in quotas.values()), 2),
+                "credits_used": round(sum(q["used"] for q in quotas.values()), 2),
+                "credits_remaining": round(sum(q["remaining"] for q in quotas.values()), 2),
+                "bonus_pack_count": len(bonuses),
+                "refill_pack_count": len(refills),
+            }}
 
 
 def _qoder_sane_reset(iso: Optional[str]) -> Optional[str]:
@@ -614,9 +627,145 @@ async def _u1s1_usage(token: str) -> dict:
             "remaining": daily_left, "unit": "USD", "unlimited": False, "recurring": True,
             "display_name": f"≈ {int(daily_left * tpu):,} tokens" if tpu else None,
         }
+    # ── 用量包（packages）：打卡包/邀请包等一次性 token 包 ──
+    # 打卡包（kind=login_checkin）由**上游在登录时自动发放**（实测 6 个包 =
+    # 6 次登录，每个 200 万 token / 约 10 天有效）。签到页要能看到它还剩多少，
+    # 否则用户以为「签到没生效」。按 kind 归组求和（照官方 CLI groupPackages
+    # 的口径），逐包列出会让 6 个同名牌刷屏。
+    pkgs = me.get("packages")
+    if isinstance(pkgs, list) and pkgs:
+        groups: dict = {}
+        for p in pkgs:
+            if not isinstance(p, dict):
+                continue
+            kind = str(p.get("kind") or "other")
+            g = groups.setdefault(kind, {"total": 0.0, "remaining": 0.0, "count": 0,
+                                         "expires_at": None})
+            g["total"] += _num(p.get("total_tokens"))
+            g["remaining"] += _num(p.get("remaining"))
+            g["count"] += 1
+            exp = p.get("expires_at")
+            # 组内取**最晚**到期（用户问「这批还能用到什么时候」，最晚的更相关）
+            if exp and (g["expires_at"] is None or str(exp) > str(g["expires_at"])):
+                g["expires_at"] = exp
+        _PKG_LABELS = {
+            "login_checkin": "登录打卡包", "login_checkin_bonus": "打卡加成包",
+            "invite": "邀请赠送包", "new_user": "新用户赠送包",
+            "payment_delay_gift": "临时加量包", "topup_daily": "每日加量包",
+            "admin_grant": "官方赠送包",
+        }
+        for kind, g in groups.items():
+            if g["total"] <= 0 and g["remaining"] <= 0:
+                continue
+            label = _PKG_LABELS.get(kind, f"{kind} 包")
+            if g["count"] > 1:
+                label += f" ×{g['count']}"
+            quotas[label] = {
+                "used": max(0.0, g["total"] - g["remaining"]), "total": g["total"],
+                "remaining": g["remaining"], "unit": "tokens", "unlimited": False,
+                "recurring": False,
+                "reset_at": _parse_reset(g["expires_at"]),
+            }
+    total_remaining = sum(_num(q.get("remaining")) for q in quotas.values()
+                          if q.get("unit") == "tokens")
     return {"plan": "u1s1", "quotas": quotas,
             "extra": {"email": me.get("email"), "free_claim": me.get("free_claim"),
-                      "tokens_per_usd": tpu}}
+                      "tokens_per_usd": tpu,
+                      "packages_total_remaining_tokens": total_remaining}}
+
+
+async def _freebuff_usage(token: str) -> dict:
+    """Freebuff 额度：GET /api/v1/freebuff/session（0 消耗快照，不创建 session）。
+
+    `x-freebuff-include-unused-rate-limits: 1` 让上游直接回吐 freebucks
+    （balance / daily{limit,spent,remaining,resetAt} / prices / offPeak）。
+    两个 limit 并存时**只信快照的 daily.limit** —— 429 响应体的 limit 是当日闸值，
+    拿它减 recentCount 推余额是错的（README 明确警告过的坑）。
+
+    accessTier 说明：`full`=没被降级（仅撞通用 cap）；`limited`=**新号默认档**
+    （25 点/天，与 IP 国别无关）。如实透出，不做「提额」误导。
+    """
+    from server.core import freebuff as fb
+    proxy = None
+    try:
+        from server.core.proxy_pool import get_proxy_pool
+        proxy = get_proxy_pool().proxied_kwargs().get("proxy")
+    except Exception:
+        proxy = None
+    snap, err = await fb.query_snapshot(token, proxy=proxy)
+    if snap is None:
+        return {"quotas": {}, "message": f"Freebuff 额度查询失败：{err}"}
+    code = snap["status_code"]
+    data = snap["data"] if isinstance(snap["data"], dict) else {}
+    if code == 401:
+        return {"quotas": {}, "message": "Freebuff authToken 无效或已被撤销（请重新连接）"}
+    if code == 403:
+        st = data.get("status")
+        if st == "banned":
+            return {"quotas": {}, "message": "Freebuff 账号已被封禁（Terminal，不可恢复）"}
+        if st == "country_blocked":
+            return {"quotas": {},
+                    "message": f"Freebuff 地区受限（{data.get('countryCode') or 'UNKNOWN'}）"}
+    fb_data = data.get("freebucks")
+    if not isinstance(fb_data, dict):
+        # 404 = 当前没有活跃 session（账号可用但拿不到快照）；429 = 额度用完
+        if code == 429:
+            return {"quotas": {}, "message": "Freebuff Freebucks 额度已用完（等重置）"}
+        if data.get("status") == "rate_limited":
+            return {"quotas": {}, "message": "Freebuff Freebucks 额度已用完（等重置）"}
+        if code == 404 or data.get("status") in ("none", "ended"):
+            return {"quotas": {},
+                    "message": "Freebuff 已连接（当前无活跃 session，额度快照不可用）"}
+        return {"quotas": {},
+                "message": f"Freebuff 额度响应异常（HTTP {code}）：{str(data)[:150]}"}
+
+    daily = fb_data.get("daily") if isinstance(fb_data.get("daily"), dict) else {}
+    limit = _num(daily.get("limit"))
+    spent = _num(daily.get("spent"))
+    remaining = _num(daily.get("remaining"), max(0.0, limit - spent))
+    quotas = {}
+    if limit > 0 or spent > 0:
+        quotas["每日 Freebucks"] = {
+            "used": spent, "total": limit, "remaining": remaining,
+            "unit": "freebucks", "unlimited": False, "recurring": True,
+            "reset_at": _parse_reset(daily.get("resetAt")),
+        }
+    balance = fb_data.get("balance")
+    if balance is not None:
+        bal = _num(balance)
+        quotas["钱包余额"] = {"used": 0.0, "total": bal, "remaining": bal,
+                          "unit": "freebucks", "unlimited": False}
+    wallet = fb_data.get("wallet") if isinstance(fb_data.get("wallet"), dict) else {}
+    if wallet.get("balance") is not None:
+        wb = _num(wallet.get("balance"))
+        quotas["付费档余额"] = {"used": 0.0, "total": wb, "remaining": wb,
+                          "unit": "freebucks", "unlimited": False}
+    if not quotas:
+        return {"quotas": {}, "message": "Freebuff 额度快照无任何条目"}
+
+    # 今日可打次数：floor(remaining / prices[模型])（照社区面板的口径，一眼看出还能用谁）
+    prices = fb_data.get("prices") if isinstance(fb_data.get("prices"), dict) else {}
+    afford = []
+    for mid, cost in prices.items():
+        try:
+            c = float(cost)
+        except (TypeError, ValueError):
+            continue
+        n = int(remaining / c) if c > 0 else int(remaining)
+        if n > 0:
+            afford.append((n, mid.split("/")[-1]))
+    afford.sort(reverse=True)
+    tier = str(data.get("accessTier") or "")
+    return {"plan": "Freebuff", "quotas": quotas,
+            "extra": {
+                "access_tier": tier,
+                "plan_id": fb_data.get("planId"),
+                "daily_remaining": remaining,
+                "affordable_models": [f"{name}×{n}" for n, name in afford[:8]],
+                "price_notices": fb_data.get("priceNotices") or {},
+                "note": ("出口国别为 limited 档（非 US 出口的默认档，模型目录缩减）"
+                         if tier == "limited" else None),
+            }}
 
 
 async def _lobsterai_usage(token: str) -> dict:
@@ -842,5 +991,7 @@ async def _dispatch(provider_code: str, token: str) -> dict:
         return await _codearts_usage(token)
     if provider_code == "trae":
         return await _trae_usage(token)
+    if provider_code == "freebuff":
+        return await _freebuff_usage(token)
     return {"plan": None, "quotas": {},
             "message": "该服务商上游没有公开的额度接口（与 9router 覆盖范围一致）"}

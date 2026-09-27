@@ -177,6 +177,20 @@ async def start_oauth_authorize(provider_code: str, request: Request,
                         "打不开的 127.0.0.1 地址（正常现象）—— 把地址栏完整 URL "
                         "粘贴回本页「完成登录」输入框即可。"),
         }
+    # ── Freebuff：CLI 授权码轮询（无回调，与官方 CLI 同协议）────
+    if (provider.extra_params or {}).get("auth_mode") == "freebuff_cli":
+        r = await get_oauth_client().start_freebuff_login(owner=owner)
+        if "error" in r:
+            raise HTTPException(status_code=400, detail=r["error"])
+        return {
+            "device_poll": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "poll_interval_ms": r["poll_interval_ms"],
+            "message": ("请在新窗口打开链接并用 Google 账号登录授权。"
+                        "授权完成后系统会自动收取 authToken（无需回调，"
+                        "最多等待 5 分钟）。"),
+        }
     # 运行时 redirect_uri：用本机 incoming host:port 替换默认 localhost:8000
     redirect_override = None
     if request:

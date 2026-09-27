@@ -283,12 +283,7 @@
               <div v-else-if="detailUsage[c.id].error" class="text-xs detail-err">{{ detailUsage[c.id].error }}</div>
               <template v-else-if="detailUsage[c.id].data">
                 <div class="text-xs text-muted" style="margin-bottom:4px">{{ detailUsage[c.id].data.plan || c.provider_code }}</div>
-                <div v-for="(q, name) in detailUsage[c.id].data.quotas || {}" :key="name" class="quota-row">
-                  <span class="quota-name" :title="name">{{ name }}<template v-if="q.display_name && q.display_name !== name"> · {{ q.display_name }}</template></span>
-                  <div class="quota-bar"><i :class="{ warn: quotaPct(q) > 85, hot: quotaPct(q) >= 100 }" :style="{ width: quotaPct(q) + '%' }"></i></div>
-                  <span class="quota-val">{{ quotaText(q) }}</span>
-                </div>
-                <div v-if="detailUsage[c.id].data.message" class="text-xs text-muted">{{ detailUsage[c.id].data.message }}</div>
+                <QuotaPanel :entry="detailUsage[c.id].data" />
               </template>
             </template>
           </div>
@@ -785,6 +780,7 @@ import StatCard from '../components/StatCard.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import AppModal from '../components/AppModal.vue'
 import EmptyState from '../components/EmptyState.vue'
+import QuotaPanel from '../components/QuotaPanel.vue'
 import ModelRefreshModal from '../components/ModelRefreshModal.vue'
 import { FREE_TIER_PROVIDERS, OAUTH_PROVIDERS as OAUTH_CATALOG, APIKEY_PROVIDERS } from '../data/providersConstants.js'
 
@@ -792,7 +788,7 @@ const PIN_KEY = 'aigate:pinnedProviders'
 
 export default {
   name: 'Providers',
-  components: { AppIcon, PageHeader, StatCard, StatusBadge, AppModal, EmptyState, ModelRefreshModal },
+  components: { AppIcon, PageHeader, StatCard, StatusBadge, AppModal, EmptyState, ModelRefreshModal, QuotaPanel },
   data() {
     return {
       providers: [],
@@ -1369,35 +1365,6 @@ export default {
       const h = Math.floor((ms % 86400000) / 3600000)
       if (d > 0) return '剩余 ' + d + ' 天 ' + h + ' 时'
       return '剩余 ' + h + ' 时 ' + Math.floor((ms % 3600000) / 60000) + ' 分'
-    },
-    quotaPct(q) {
-      if (q.unlimited) return 0
-      const total = Number(q.total) || 0
-      if (!total) return 0
-      return Math.max(0, Math.min(100, (Number(q.used) || 0) / total * 100))
-    },
-    quotaText(q) {
-      if (q.unlimited) return '不限量'
-      const money = (v) => '$' + (Number(v) || 0).toFixed(2)
-      if (q.unit === 'USD') {
-        const bal = q.remaining != null ? q.remaining : q.total
-        return `剩 ${money(bal)}` + (q.display_name ? `（${q.display_name}）` : '')
-      }
-      const isPct = Math.round(Number(q.total) || 0) === 100 && !q.unit
-      let text
-      if (isPct) text = `已用 ${Math.round(Number(q.used) || 0)}%`
-      else {
-        const u = Math.round(Number(q.used) || 0)
-        const t = Math.round(Number(q.total) || 0)
-        text = `${u.toLocaleString()}/${t.toLocaleString()}` + (q.unit ? ` ${q.unit}` : '')
-      }
-      if (q.reset_at) {
-        const ts = new Date(q.reset_at).getTime()
-        const yearsOut = Number.isFinite(ts) ? (ts - Date.now()) / 31536000000 : 0
-        // 上游用 9999-12-31 表示「无限期/不重置」时不必展示
-        if (yearsOut > 0 && yearsOut < 10) text += ` · 重置 ${this.fmtTime(q.reset_at)}`
-      }
-      return text
     },
     fmtTime(v) {
       if (!v) return '-'
@@ -2370,18 +2337,6 @@ export default {
 }
 .acct-block:first-of-type { border-top: none; margin-top: 4px; }
 .acct-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-/* 额度进度条（对齐 OAuth 连接页样式） */
-.quota-row {
-  display: grid;
-  grid-template-columns: minmax(96px, 1.4fr) 1fr minmax(120px, auto);
-  align-items: center; gap: 8px; font-size: 12px;
-}
-.quota-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted, #a9b7cd); }
-.quota-bar { height: 6px; border-radius: 3px; background: rgba(126, 142, 169, 0.18); overflow: hidden; }
-.quota-bar i { display: block; height: 100%; background: var(--primary, #5b8dff); border-radius: 3px; transition: width 0.25s; }
-.quota-bar i.warn { background: #fbbf24; }
-.quota-bar i.hot { background: #f87171; }
-.quota-val { text-align: right; white-space: nowrap; }
 
 @media (max-width: 900px) {
   .catalog-grid {
