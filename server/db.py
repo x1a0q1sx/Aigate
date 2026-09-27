@@ -1,8 +1,11 @@
 """
 数据库初始化模块
 """
+import logging
 import os
 import warnings
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy import text
@@ -80,6 +83,56 @@ INTEL_SEEDS = [
     ("qwen3-32b*", 65, "C", "轻量"),
     ("llama-3.1-8b*", 60, "C", "轻量"),
 ]
+async def _repair_dirty_provider_headers() -> None:
+    """把 providers.headers 里已入库的非字符串值就地刷成 str（幂等）。
+
+    2026-09-27 事故存量清理（新写入由 ORM TypeDecorator + schema 校验器拦截）。
+
+    两个必须守住的细节：
+    1. **不改 updated_at**：用 Core update 并把 updated_at 显式写回自身列，
+       阻止列级 onupdate 覆盖 —— 数据修复不该伪装成一次用户编辑。
+    2. **方言安全**：走 Core update + 表定义（而非 text() 直写），让
+       HeaderJSON/SQLAlchemy 负责序列化 —— SQLite(TEXT) 与 PG(jsonb) 都对。
+    """
+    import json as _json
+    from server.core.header_values import normalize_map
+
+    try:
+        async with engine.begin() as conn:
+            rows = (await conn.execute(
+                text("SELECT id, headers FROM providers")
+            )).fetchall()
+            fixed = 0
+            for pid, raw in rows:
+                if raw is None:
+                    continue
+                data = raw
+                if isinstance(data, (str, bytes)):
+                    try:
+                        data = _json.loads(data)
+                    except Exception:
+                        continue  # 非法 JSON 不在本次修复范围（原样保留）
+                if not isinstance(data, dict):
+                    continue
+                clean = normalize_map(data, strict=False)
+                if clean != data:
+                    await conn.execute(
+                        Provider.__table__.update()
+                        .where(Provider.__table__.c.id == pid)
+                        .values(headers=clean,
+                                # 显式写回自身 → 抑制 onupdate（见上）
+                                updated_at=Provider.__table__.c.updated_at)
+                    )
+                    fixed += 1
+            if fixed:
+                logger.warning(
+                    "[db] 修复了 %d 个服务商的 headers 非字符串值（httpx 要求头值必须是 str）",
+                    fixed,
+                )
+    except Exception as e:  # 修复失败不阻断启动
+        logger.warning("[db] providers.headers 存量修复跳过：%s", e)
+
+
 async def init_db():
     """初始化数据库表 + 增量迁移（每条独立事务）+ WAL 模式（SQLite）+ 种子。
 
@@ -200,6 +253,15 @@ async def init_db():
                     await conn.execute(text(sql))
             except Exception:
                 pass
+
+    # 存量脏数据修复：providers.headers 里的非字符串值 → str
+    #
+    # 2026-09-27 生产事故：导入路径曾把 {"x-video-timeout": 1800}（int）写进库，
+    # 导致 GET /admin/api/providers 响应校验 500（服务商页/模型页一起挂），
+    # 且 httpx 拒绝非 str 头值 → 该服务商推理请求全部失败。
+    # 修复分四层，本步负责把**已入库的存量**刷干净（新写入由 ORM/schema 两层拦住）。
+    # 用 text() 直写：不触发 onupdate，updated_at 保持原值（历史脏数据不该改写用户配置时间）。
+    await _repair_dirty_provider_headers()
 
     # 回填（幂等）
     for sql in [

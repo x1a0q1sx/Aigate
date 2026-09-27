@@ -10,6 +10,7 @@ import httpx
 from typing import AsyncGenerator, List
 from dataclasses import dataclass
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.core.provider_quirks import (
     quirks_for, transform_payload, unwrap_response, auth_token_for,
@@ -166,10 +167,10 @@ class OpenAICompatAdapter(BaseAdapter):
         if q and q.default_headers:
             headers.update(q.default_headers)
         # 网关内部路由标记（__proxy_* / __oauth / __dpop / __fg）不是上游协议的一部分，绝不出站；
-        # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支
+        # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支。
+        # 统一走 outbound_headers：剥离 __ 前缀内部键 + 值强制 str（httpx 硬要求）。
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items()
-                            if k not in ("__proxy_force", "__proxy_url", "__oauth", "__dpop", "__fg")})
+            headers.update(outbound_headers(extra_headers))
         headers["Content-Type"] = "application/json"
         # u1s1 设备凭证：官方「客户端信号」= RFC9449 DPoP，逐请求现签（htm/htu 绑定目标 URL）；
         # x-u1s1-attestation 为平台完整性审查的客户端证明（/v1/models 领取，见 u1s1_attestation）

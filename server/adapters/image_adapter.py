@@ -34,6 +34,7 @@ import httpx
 from typing import Optional, AsyncGenerator, List
 from dataclasses import dataclass
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.header_values import outbound_headers
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,8 @@ class ImageAdapter(BaseAdapter):
     def _get_headers(self, api_key: str, extra_headers: dict = None) -> dict:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         if extra_headers:
-            headers.update(extra_headers)
+            # 统一出站净化：剥离 __ 前缀内部键 + 值强制 str（httpx 硬要求）
+            headers.update(outbound_headers(extra_headers))
         return headers
 
     async def generate_images(

@@ -31,6 +31,7 @@ def _proxy_kwargs(*, force: bool = False) -> dict:
 
 from server.core.usage_normalize import normalize_usage
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.schemas.chat import ChatCompletionRequest
 
@@ -166,17 +167,15 @@ class AnthropicAdapter(BaseAdapter):
             if api_key and str(api_key).strip():
                 headers["x-api-key"] = api_key
         if extra_headers:
-            headers.update(extra_headers)
+            # 出站净化：剥离全部 __ 前缀内部键（__baseUrl/__oauth/__proxy_*/__fg/__dpop）
+            # + 值强制 str。内部键在下方逻辑里按需读取，绝不随请求出站。
+            headers.update(outbound_headers(extra_headers))
             # 第三方反代常见的适配：用户显式带了 base_url 又带了 x-api-key，补 Bearer
             if not oauth and api_key and str(api_key).strip() and not headers.get("Authorization"):
                 # 仅当 base_url 看起来不是官方 anthropic 时，补 Bearer（由 caller 注入 extra_headers["__baseUrl"]）
                 base = extra_headers.get("__baseUrl") or ""
                 if base and "api.anthropic.com" not in base:
                     headers["Authorization"] = f"Bearer {api_key}"
-        headers.pop("__baseUrl", None)
-        headers.pop("__oauth", None)
-        headers.pop("__proxy_url", None)
-        headers.pop("__proxy_force", None)
         return headers
 
     def _content_blocks(self, content: Any) -> list:

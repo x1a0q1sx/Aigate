@@ -770,3 +770,77 @@ authToken 长期有效、无标准刷新（`refresh_style=none`）。
 `use-freebuff-streak-query.ts` 一处 GET）。即「用一次 = 打卡」，上游自动记录。
 
 测试：Freebuff 38 项 + 接线守卫新增 9 项；全量 **755 项全绿**。
+
+---
+
+## F27 服务商页空白 / 模型页报错：headers 非字符串值（2026-09-27）
+
+**用户报告**：「服务商管理页加载不出来内容，模型页报错」。
+
+### 症状与根因（生产日志实证）
+
+```
+pydantic_core._pydantic_core.ValidationError: 1 validation error for ProviderResponse
+headers.x-video-timeout
+  Input should be a valid string [type=string_type, input_value=1800, input_type=int]
+```
+
+- `GET /admin/api/providers` **500 × 13**（access log 实测）→ 服务商页拿不到数据 → 空白。
+- 模型页 `Promise.all([api.getProviders(), api.getCombos(), ...])` 中
+  `getProviders()` 未 catch → **同一个 500 把整个模型页带崩**。
+- 全库排查出 3 行脏数据（均为用户手工导入时写入）：
+
+| id | 服务商 | 脏值 |
+|---|---|---|
+| 89 | aistudio | `x-video-timeout: 1800` (int) |
+| 90 | openi | `x-video-timeout: 3000` (int) |
+| 93 | 钱咖生视频 | `x-video-timeout: 1500` (int) |
+
+**写入源头**：`POST /providers/import` 直接吃任意 JSON（`data: Any`），
+`provider.headers = entry.get("headers") or {}` **不做类型校验**；而
+`ProviderResponse.headers: Optional[Dict[str, str]]` 是 Pydantic v2 ——
+v2 **不再**像 v1 那样把 int 强转 str，直接抛错（本地实测确认）。
+
+### 第二现场：推理请求也被打断（比页面 500 更严重）
+
+httpx 硬性要求头值为 `str`/`bytes`：
+
+```
+TypeError: Header value must be str or bytes, not <class 'int'>
+```
+
+生产 `request_logs` 实测 aistudio 出现该报错 —— 即这 3 家的**所有推理请求**
+（chat / 模型列表 / 健康检查）此前都在失败，只是用户先看到的是页面问题。
+
+### 同类潜在故障（顺带修掉）
+
+`_merge_oauth_headers` 注入的 `__oauth = True`（**bool**）在
+codex_responses / github / anthropic 适配器里**未被过滤**（它们只滤了
+`__proxy_force` / `__proxy_url`）→ OAuth 类服务商一旦改用这些适配器，
+httpx 会抛同样的 TypeError。生产当前 codex 服务商都是 api_key 类型故未触发，
+属"尚未引爆的同类雷"。修复方式：不再让各适配器各维护一份过滤名单（漏一个键
+就是一类故障），统一走 `outbound_headers()`，约定 **`__` 前缀 = 网关内部键，
+一律不出站**。
+
+### 修复：四层防御（入库 / 出库 / 存量 / 出站）
+
+| 层 | 位置 | 行为 |
+|---|---|---|
+| ① ORM 读写 | `models/provider.py::HeaderJSON` + `@validates` | 任何写入路径（API/导入/恢复/脚本）存不进非 str；读取历史脏数据自动净化。`@validates` 覆盖"赋值后同会话立即读"的事故时序 |
+| ② schema | `schemas/provider.py::_HeaderNormalizeMixin` | 写入侧（Create/Update）**严格**：嵌套值 422 明确报错；读取侧（Response）**宽松**：丢弃脏值，绝不整体 500 |
+| ③ 存量 | `db.py::_repair_dirty_provider_headers` | 启动时幂等刷净老库；**不改 `updated_at`**（修复不该伪装成用户编辑）；走 Core update 保证 SQLite/PG 双方言安全 |
+| ④ 出站 | `core/header_values.py::outbound_headers` | 6 个适配器统一调用：剥离 `__` 内部键 + 值强制 str |
+
+**前端韧性**（避免"一个接口挂全页崩"重演）：
+- 模型页：辅助数据（providers/combos）失败 → 显示可重试横幅，**模型主列表照常加载**；
+- 服务商页：此前 **无 try/catch**（mounted 里未捕获 rejection → 整页空白无提示），
+  现显式报错 + 重试按钮。
+
+### 测试
+
+新增 `tests/test_header_values.py` **28 项**：归一化函数（标量/None/嵌套/严格模式）、
+出站净化（含"未净化的 int 头确实会被 httpx 拒绝"的反证）、ORM 三层
+（写后 refresh / 赋值即读 / 历史脏行读取）、schema 两侧、
+启动修复（幂等 + `updated_at` 不变 + 源码守卫）、
+**端点级复现**（脏行存在时 `list_providers` 仍返回 200）、
+6 个适配器的出站头 httpx 可用性。全量 **783 项全绿**。

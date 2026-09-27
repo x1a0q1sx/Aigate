@@ -31,6 +31,11 @@
 
     <ModelRefreshModal :visible="showRefreshModal" :result="refreshResult || {}" @close="showRefreshModal = false" />
 
+    <div v-if="loadError" class="alert alert-error text-sm">
+      {{ loadError }}
+      <button class="btn btn-ghost btn-xs" @click="load">重试</button>
+    </div>
+
     <div class="stats-grid">
       <StatCard label="已添加" icon="server" :value="providers.length" />
       <StatCard label="API Key" icon="key" :value="dashboardStats.apiKey" />
@@ -796,6 +801,7 @@ export default {
       providerStats: {},
       oauthProvidersState: [],
       oauthConnections: [],
+      loadError: '',                // 主列表加载失败原因（避免整页空白无提示）
       pageTab: 'enabled',
       providerFilter: 'all',
       providerSearch: '',
@@ -982,25 +988,32 @@ export default {
   },
   methods: {
     async load() {
-      const [providers, keys, modelStats, oauthProviders, oauthConnections, atomExe] = await Promise.all([
-        api.getProviders(),
-        api.getKeys().catch(() => []),
-        api.getProviderModelStats().catch(() => []),
-        api.getOAuthProviders().catch(() => []),
-        api.getOAuthConnections().catch(() => []),
-        api.getAtomExeStatus().catch(() => ({ found: true })),
-      ])
-      this.providers = providers || []
-      this.allKeys = keys || []
-      this.providerStats = Object.fromEntries(
-        (modelStats || []).map((item) => [Number(item.provider_id), {
-          model_count: Number(item.model_count) || 0,
-          fail_count: Number(item.fail_count) || 0,
-        }])
-      )
-      this.oauthProvidersState = oauthProviders || []
-      this.oauthConnections = oauthConnections || []
-      this.atomExeStatus = atomExe && atomExe.found !== undefined ? atomExe : { found: true }
+      // 主列表（providers）失败必须显式报错：此前无 try/catch，接口 500 时
+      // mounted 里未捕获的 rejection 会让整页停在空白，用户完全看不到原因。
+      this.loadError = ''
+      try {
+        const [providers, keys, modelStats, oauthProviders, oauthConnections, atomExe] = await Promise.all([
+          api.getProviders(),
+          api.getKeys().catch(() => []),
+          api.getProviderModelStats().catch(() => []),
+          api.getOAuthProviders().catch(() => []),
+          api.getOAuthConnections().catch(() => []),
+          api.getAtomExeStatus().catch(() => ({ found: true })),
+        ])
+        this.providers = providers || []
+        this.allKeys = keys || []
+        this.providerStats = Object.fromEntries(
+          (modelStats || []).map((item) => [Number(item.provider_id), {
+            model_count: Number(item.model_count) || 0,
+            fail_count: Number(item.fail_count) || 0,
+          }])
+        )
+        this.oauthProvidersState = oauthProviders || []
+        this.oauthConnections = oauthConnections || []
+        this.atomExeStatus = atomExe && atomExe.found !== undefined ? atomExe : { found: true }
+      } catch (e) {
+        this.loadError = '服务商列表加载失败：' + e.message
+      }
     },
     normalizeUrl(v) {
       return String(v || '')

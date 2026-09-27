@@ -16,6 +16,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from .base_adapter import BaseAdapter, HealthResult, ModelInfo
+from server.core.header_values import outbound_headers
 from server.schemas.chat import ChatCompletionRequest
 
 
@@ -215,7 +216,7 @@ class CodexResponsesAdapter(BaseAdapter):
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
+            headers.update(outbound_headers(extra_headers))
         if not headers.get("originator"):
             headers["originator"] = "codex_cli_rs"
         if not headers.get("session_id"):
@@ -760,7 +761,7 @@ class CodexResponsesAdapter(BaseAdapter):
         if api_key and str(api_key).strip():
             headers["Authorization"] = f"Bearer {api_key}"
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
+            headers.update(outbound_headers(extra_headers))
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400 and "backend-api/codex" in (base_url or ""):

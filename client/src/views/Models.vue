@@ -18,6 +18,11 @@
 
     <ModelRefreshModal :visible="showRefreshModal" :result="refreshResult || {}" @close="showRefreshModal = false" />
 
+    <p v-if="auxError" class="alert alert-error text-sm">
+      {{ auxError }}
+      <button class="btn btn-ghost btn-xs" @click="load">重试</button>
+    </p>
+
     <!-- 测速进度条 -->
     <div v-if="pingingAll" class="card ping-progress">
       <div class="ping-row">
@@ -426,6 +431,7 @@ export default {
       models: [],
       providers: [],
       comboNames: [],
+      auxError: '',
       filterProvider: '',
       filterFree: false,
       filterAuto: false,
@@ -520,8 +526,15 @@ export default {
     },
     async load() {
       try {
+        this.auxError = ''
+        // providers / combos 是**筛选下拉与分组**的辅助数据：任一失败都不该让
+        // 模型主列表打不开（2026-09-27 事故：/admin/api/providers 500 时
+        // Promise.all 直接把整个模型页带崩，用户只看到"加载失败"）。
         const [providers, combos] = await Promise.all([
-          api.getProviders(),
+          api.getProviders().catch((e) => {
+            this.auxError = '服务商列表加载失败（筛选与分组不可用）：' + e.message
+            return []
+          }),
           api.getCombos().catch(() => []),
         ])
         this.providers = providers || []

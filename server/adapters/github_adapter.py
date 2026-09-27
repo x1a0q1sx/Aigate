@@ -18,6 +18,7 @@ def _proxy_kwargs(*, force: bool = False) -> dict:
 
 from typing import AsyncGenerator, List
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
+from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 # GitHub Models 内置价格表 (美元 / 百万 tokens)
@@ -83,7 +84,7 @@ class GitHubAdapter(BaseAdapter):
             "Content-Type": "application/json",
         }
         if extra_headers:
-            headers.update({k: v for k, v in extra_headers.items() if k not in ("__proxy_force", "__proxy_url")})
+            headers.update(outbound_headers(extra_headers))
         return headers
     async def chat_completion(
         self,

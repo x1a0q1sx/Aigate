@@ -1,11 +1,37 @@
 """
 Provider 相关 schema
 """
-from typing import List, Optional, Dict, Any
+from typing import ClassVar, List, Optional, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from server.core.header_values import normalize_map
 from server.models.model import Model
-class ProviderCreate(BaseModel):
+
+
+class _HeaderNormalizeMixin(BaseModel):
+    """headers 字段的值归一化 —— 三个 schema 共用（写入侧严、读取侧宽）。
+
+    2026-09-27 生产事故：导入路径把 {"x-video-timeout": 1800} 存进库，
+    ProviderResponse 校验失败让 GET /admin/api/providers 整体 500。
+    故：
+    - 写入侧（Create/Update，_headers_strict=True）对 dict/list 值直接 422，
+      用户在导入/编辑时就能看到明确报错，垃圾进不了库；
+    - 读取侧（Response，_headers_strict=False）静默丢弃非标量值，
+      历史脏数据最多让某个头失效，**绝不让整个列表接口挂掉**。
+
+    子类用 ClassVar 声明 _headers_strict，validator 读 cls 上的值。
+    """
+    _headers_strict: ClassVar[bool] = False
+
+    @field_validator("headers", mode="before", check_fields=False)
+    @classmethod
+    def _normalize_headers(cls, v):
+        return normalize_map(v, strict=cls._headers_strict)
+
+
+class ProviderCreate(_HeaderNormalizeMixin):
+    _headers_strict: ClassVar[bool] = True
     name: str
     base_url: str
     api_type: str = "openai_compat"
@@ -22,7 +48,8 @@ class ProviderCreate(BaseModel):
     model_refresh_interval_minutes: int = 60
     # v4.3: 指纹过滤（u1s1 竞品名/工具名遮蔽），默认开
     fingerprint_filter_enabled: bool = True
-class ProviderUpdate(BaseModel):
+class ProviderUpdate(_HeaderNormalizeMixin):
+    _headers_strict: ClassVar[bool] = True
     name: Optional[str] = None
     base_url: Optional[str] = None
     api_type: Optional[str] = None
@@ -37,7 +64,7 @@ class ProviderUpdate(BaseModel):
     model_refresh_enabled: Optional[bool] = None
     model_refresh_interval_minutes: Optional[int] = None
     fingerprint_filter_enabled: Optional[bool] = None
-class ProviderResponse(BaseModel):
+class ProviderResponse(_HeaderNormalizeMixin):
     id: int
     name: str
     base_url: str

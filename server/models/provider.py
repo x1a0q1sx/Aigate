@@ -3,7 +3,32 @@
 """
 from datetime import datetime
 from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Boolean
+from sqlalchemy.orm import validates
+from sqlalchemy.types import TypeDecorator
+
+from server.core.header_values import normalize_map
 from .base import Base
+
+
+class HeaderJSON(TypeDecorator):
+    """providers.headers 专用 JSON 列：读写两侧都把值强制成 str。
+
+    2026-09-27 生产事故：导入路径写入 {"x-video-timeout": 1800}（int），
+    导致 ① 响应模型校验 500 打挂服务商页/模型页；② httpx 出站直接
+    TypeError（该服务商所有推理请求失败）。JSON 列本身不校验值类型，
+    故在 ORM 层兜底：**任何写入路径**（API/导入/恢复/脚本）都存不进非 str 值，
+    **任何读取路径**读到的历史脏数据也自动变干净。
+    """
+    impl = JSON
+    cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return normalize_map(value, strict=False)
+
+    def process_result_value(self, value, dialect):
+        return normalize_map(value, strict=False)
+
+
 class Provider(Base):
     __tablename__ = "providers"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -33,7 +58,9 @@ class Provider(Base):
     # apply_patch/update_plan 工具名），出站前做语义等价改写、响应侧还原。
     # 仅对档案里带 blocked_tool_names/neutralize_competitor_tokens 的域名生效。默认开。
     fingerprint_filter_enabled = Column(Boolean, nullable=False, default=True)
-    headers = Column(JSON, nullable=True, default=dict)
+    # 自定义出站头（provider 级）。值必须恒为 str（httpx 硬要求）——
+    # 用 HeaderJSON 在 ORM 层双向兜底，详见该类型 docstring。
+    headers = Column(HeaderJSON, nullable=True, default=dict)
     proxy_url = Column(String(500), nullable=True, default=None)
     # Kept briefly for import compatibility; new configurations use proxy_enabled only.
     # When enabled, use the configured proxy pool even if the global pool switch is off.
@@ -41,5 +68,13 @@ class Provider(Base):
     description = Column(Text, nullable=True, default="")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @validates("headers")
+    def _normalize_headers(self, key, value):
+        """赋值即归一化：TypeDecorator 只在写库/读库时生效，而导入路径会
+        「先赋值、后在同会话内直接读」——不在此处兜底，同一进程内仍会
+        读到 int 值（事故当天导入后立刻列表就 500，正是这个时序）。"""
+        return normalize_map(value, strict=False)
+
     def __repr__(self):
         return f"<Provider {self.id} {self.name}>"
