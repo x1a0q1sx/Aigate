@@ -17,6 +17,13 @@
 - **「今天已领」不是失败**：CodeBuddy 靠 body code 10001/1001，Qoder 靠
   body.replayed（HTTP 仍是 200 且无 benefit）——只看 HTTP 状态会把「已领」
   误报成「+100 积分」。
+- **10001/1001 的语义必须由文案证实**（2026-09-28 防御增强，照抄 WorkDaddy）：
+  同一批码上游也用于「活动未开启」等含义——文案匹配「未开启/已过期」判 inactive，
+  匹配「已签到/重复签到」才判 already_claimed，都对不上如实 failed（可重试）。
+  绝不把「未知含义的 10001」当已签到，否则当天不再重试。
+- **域名兜底**（同批增强）：产品配置的 base 仍是第一顺位（生产已验证）；当它出现
+  **传输层失败**（连接错误 / 401/403 / 返回 HTML）时，用 token JWT `iss` 指向的
+  已知域名再试一次——上游换域名时不至于整站失效。业务错误不兜底（换域无用）。
 - **签到全程在推理请求路径之外**：任何失败只落 checkin_logs，绝不触碰路由。
 - **幂等靠 ATTEMPTED_KINDS（含 inactive）**：自动触发只在计划时刻之后发生，
   那时上游活动早已刷新完，仍报「未开启」就是当天真没活动，反复重试无意义。
@@ -27,8 +34,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -88,9 +97,51 @@ DONE_KINDS = ("claimed", "already_claimed")
 ATTEMPTED_KINDS = DONE_KINDS + ("inactive",)
 
 # CodeBuddy 业务码（实测 + 静态分析）
+# ⚠️ 2026-09-28 防御增强：10001/1001 不再「见码即已领」——语义必须由文案证实
+# （WorkDaddy 的 classifyCheckinResult 同款判据）。上游同一批码也用于表达
+# 「活动未开启」等含义；只认 ALREADY 文案、INACTIVE 优先，其它如实 failed。
 CB_ALREADY = (10001, 1001)
 CB_NO_QUALIFICATION = 1002
 CB_ACTIVITY_ENDED = 1003
+
+# 文案判据（照抄 WorkDaddy 的 INACTIVE_MESSAGE / ALREADY_MESSAGE 正则）
+_CB_INACTIVE_MESSAGE = re.compile(
+    r"未开启|未开始|未开放|已过期|无.*活动|活动.*(?:结束|关闭|暂停)")
+_CB_ALREADY_MESSAGE = re.compile(
+    r"已签到|已领取|已经.*(?:签到|领取)|重复签到|already", re.IGNORECASE)
+
+# JWT iss → 站点域名（照抄 WorkDaddy 的 ISSUER_HOST_MAP，补腾讯/国际版入口）。
+# token 被哪个域签发就该请求哪个域；产品配置的 base 只是第一顺位。
+# iss 推不出 / 不在表内 → 无兜底（不猜域名）。
+_ISSUER_HOST_MAP = {
+    "https://www.workbuddy.ai": "https://www.workbuddy.ai",
+    "https://www.workbuddy.cn": "https://www.workbuddy.cn",
+    "https://www.codebuddy.ai": "https://www.codebuddy.ai",
+    "https://www.codebuddy.cn": "https://www.codebuddy.cn",
+    "https://copilot.tencent.com": "https://copilot.tencent.com",
+}
+
+
+def token_issuer_base(token: str) -> Optional[str]:
+    """解 JWT payload 的 `iss`（**不验签**，仅读取归属域），在已知域内返回 base。
+
+    任意一步失败都返回 None —— iss 只是兜底线索，绝不能让它的解析问题
+    影响正常签到路径。
+    """
+    try:
+        part = str(token or "").split(".")[1]
+        if not part:
+            return None
+        pad = "=" * ((4 - len(part) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(part + pad).decode("utf-8"))
+        iss = str(payload.get("iss") or "").strip().lower().rstrip("/")
+        if not iss:
+            return None
+        if "://" not in iss:
+            iss = "https://" + iss
+        return _ISSUER_HOST_MAP.get(iss)
+    except Exception:
+        return None
 
 # CodeBuddy 产品配置：X-Domain / User-Agent 必须与请求的 base_url 一致，
 # 不能跟着凭据里可能过期的 domain 走（Jet-Hub 记录的踩坑）
@@ -182,12 +233,34 @@ async def _claim_codebuddy(token: str, provider_code: str) -> ClaimOutcome:
     ⚠️ 必须用 `checkin-activity-status`，不能用 `checkin-status` —— 后者返回
     占位数据（active:false、checkin_dates:null），会误判成「活动未开启」
     （Jet-Hub 记录的踩坑）。
+
+    域名兜底（P3）：产品配置 base 先行（生产已验证）；仅当它出现**传输层失败**
+    （连接异常 / 401/403 / 返回 HTML）时，改用 token `iss` 指向的已知域名重试
+    一次。业务错误（JSON code!=0）不兜底 —— 那说明 token 与该域是通的，换域无用。
     """
     product = _CODEBUDDY_PRODUCTS.get(provider_code)
     if not product:
         return ClaimOutcome(kind="unsupported", message=f"未知的 CodeBuddy 变体：{provider_code}")
+    outcome, transport = await _claim_codebuddy_on(token, product, product["base"])
+    if not transport:
+        return outcome
+    issuer = token_issuer_base(token)
+    if issuer and issuer != product["base"]:
+        logger.info("checkin %s 主域 %s 传输层失败，改用签发域 %s 兜底",
+                    provider_code, product["base"], issuer)
+        outcome, _ = await _claim_codebuddy_on(token, product, issuer)
+    return outcome
+
+
+async def _claim_codebuddy_on(token: str, product: dict, base: str
+                              ) -> Tuple[ClaimOutcome, bool]:
+    """在指定 base 上执行两步签到，返回 (结果, 是否传输层失败)。
+
+    「传输层失败」= 换一个域名可能就好的失败：连接异常 / 401/403（token 可能
+    属于另一个域）/ 响应不是 JSON（网关或 HTML 页）。业务层 JSON 响应一律
+    transport=False。
+    """
     headers = _codebuddy_headers(token, product)
-    base = product["base"]
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         # ── 步骤 1：状态预检 ──
@@ -195,19 +268,19 @@ async def _claim_codebuddy(token: str, provider_code: str) -> ClaimOutcome:
         try:
             code, body, text = await _request(client, "POST", status_url, headers, b"{}")
         except Exception as e:
-            return ClaimOutcome(kind="failed", message="状态查询失败",
-                                error=f"{type(e).__name__}: {str(e)[:200]}")
+            return (ClaimOutcome(kind="failed", message="状态查询失败",
+                                 error=f"{type(e).__name__}: {str(e)[:200]}"), True)
         if code in (401, 403):
-            return ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
-                                error=f"HTTP {code}: {text[:200]}")
+            return (ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
+                                 error=f"HTTP {code}: {text[:200]}"), True)
         if body is None:
-            return ClaimOutcome(kind="failed", message="状态响应不是 JSON",
-                                error=text[:300])
+            return (ClaimOutcome(kind="failed", message="状态响应不是 JSON",
+                                 error=text[:300]), True)
         if _num(body.get("code"), -1) != 0:
-            return ClaimOutcome(kind="failed",
-                                message=f"状态查询错误：{body.get('msg') or 'unknown'}",
-                                upstream_code=int(_num(body.get("code"), -1)),
-                                error=str(body)[:300])
+            return (ClaimOutcome(kind="failed",
+                                 message=f"状态查询错误：{body.get('msg') or 'unknown'}",
+                                 upstream_code=int(_num(body.get("code"), -1)),
+                                 error=str(body)[:300]), False)
         data = body.get("data") if isinstance(body.get("data"), dict) else {}
         active = _read_bool(data, "active")
         today_checked = _read_bool(data, "today_checked_in")
@@ -217,49 +290,61 @@ async def _claim_codebuddy(token: str, provider_code: str) -> ClaimOutcome:
 
         if today_checked:
             # 已领 → 不再发 claim 请求（省一次调用，也避免上游风控）
-            return ClaimOutcome(kind="already_claimed", streak_days=streak,
-                                total_credits=total, activity_name=activity,
-                                message="今天已签到", extra={"checkin_dates": data.get("checkin_dates")})
+            return (ClaimOutcome(kind="already_claimed", streak_days=streak,
+                                 total_credits=total, activity_name=activity,
+                                 message="今天已签到", extra={"checkin_dates": data.get("checkin_dates")}),
+                    False)
         if not active:
-            return ClaimOutcome(kind="inactive", streak_days=streak, total_credits=total,
-                                activity_name=activity,
-                                message="签到活动未开启（上游 active=false）")
+            return (ClaimOutcome(kind="inactive", streak_days=streak, total_credits=total,
+                                 activity_name=activity,
+                                 message="签到活动未开启（上游 active=false）"), False)
 
         # ── 步骤 2：领取 ──
         claim_url = f"{base}/v2/billing/meter/daily-checkin"
         try:
             code2, body2, text2 = await _request(client, "POST", claim_url, headers, b"{}")
         except Exception as e:
-            return ClaimOutcome(kind="failed", message="领取请求失败",
-                                error=f"{type(e).__name__}: {str(e)[:200]}")
+            return (ClaimOutcome(kind="failed", message="领取请求失败",
+                                 error=f"{type(e).__name__}: {str(e)[:200]}"), True)
 
     if code2 in (401, 403):
-        return ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
-                            error=f"HTTP {code2}: {text2[:200]}")
+        return (ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
+                             error=f"HTTP {code2}: {text2[:200]}"), True)
     if body2 is None:
-        return ClaimOutcome(kind="failed", message="领取响应不是 JSON", error=text2[:300])
+        return (ClaimOutcome(kind="failed", message="领取响应不是 JSON",
+                             error=text2[:300]), True)
 
     bcode = int(_num(body2.get("code"), -1))
     msg = str(body2.get("msg") or "")
     # ⚠️ 判据只看 body code，不看 HTTP 状态（重复领取返回 HTTP 400 + code 10001）
     if bcode in CB_ALREADY:
-        return ClaimOutcome(kind="already_claimed", upstream_code=bcode,
-                            message=msg or "今天已签到")
+        # P3：语义必须由文案证实 —— INACTIVE 优先于 ALREADY（上游同一批码也
+        # 用于「活动未开启」）；文案对不上就如实 failed（允许当天重试），
+        # 绝不猜成「已领」把重试窗口关掉。
+        if msg and _CB_INACTIVE_MESSAGE.search(msg):
+            return (ClaimOutcome(kind="inactive", upstream_code=bcode,
+                                 message=msg or "签到活动未开启"), False)
+        if msg and _CB_ALREADY_MESSAGE.search(msg):
+            return (ClaimOutcome(kind="already_claimed", upstream_code=bcode,
+                                 message=msg or "今天已签到"), False)
+        return (ClaimOutcome(kind="failed", upstream_code=bcode,
+                             message=f"上游返回 {bcode} 但文案未表明已签到，按失败处理",
+                             error=msg or str(body2)[:300]), False)
     if bcode in (CB_NO_QUALIFICATION, CB_ACTIVITY_ENDED):
-        return ClaimOutcome(kind="inactive", upstream_code=bcode,
-                            message=msg or "当前无领取资格")
+        return (ClaimOutcome(kind="inactive", upstream_code=bcode,
+                             message=msg or "当前无领取资格"), False)
     if bcode != 0:
-        return ClaimOutcome(kind="failed", upstream_code=bcode,
-                            message=msg or "领取失败", error=str(body2)[:300])
+        return (ClaimOutcome(kind="failed", upstream_code=bcode,
+                             message=msg or "领取失败", error=str(body2)[:300]), False)
 
     cdata = body2.get("data") if isinstance(body2.get("data"), dict) else None
     if cdata is None:
-        return ClaimOutcome(kind="failed", upstream_code=bcode,
-                            message="领取响应缺少 data 字段", error=str(body2)[:300])
-    return ClaimOutcome(kind="claimed", credit=_num(cdata.get("credit")),
-                        streak_days=_read_int(cdata, "streak_days"),
-                        total_credits=total, activity_name=activity,
-                        message=msg or "领取成功")
+        return (ClaimOutcome(kind="failed", upstream_code=bcode,
+                             message="领取响应缺少 data 字段", error=str(body2)[:300]), False)
+    return (ClaimOutcome(kind="claimed", credit=_num(cdata.get("credit")),
+                         streak_days=_read_int(cdata, "streak_days"),
+                         total_credits=total, activity_name=activity,
+                         message=msg or "领取成功"), False)
 
 
 # ── Qoder ────────────────────────────────────────────────────

@@ -15,6 +15,8 @@
     POST /activity/growth/buddy/switch       切换出战 Buddy（body: {instance_id})
     GET  /activity/growth/buddy/quota        盲盒额度（affordable/balance/cost_per_open）
     GET  /activity/growth/lottery/chances    抽奖次数
+    POST /v2/activity/growth/buddy/open      开盲盒（body: {count:1}；消耗能量）
+    POST /v2/activity/growth/lottery/draw    抽奖（body: {client_token}；每次必须新 UUID）
     GET  /v2/activity/growth/buddy/travel/config    旅行地点列表
     GET  /activity/growth/buddy/travel/status       旅行状态（idle/traveling/arrived）
     POST /v2/activity/growth/buddy/travel/depart    派出（body: {location_id})
@@ -577,21 +579,165 @@ async def accept_automatable_tasks(token: str, provider_code: str) -> GrowthActi
     return await accept_tasks(token, provider_code, pending)
 
 
-# ── 只读辅助：盲盒 / 抽奖（暂不自动执行，仅展示）──────────────
+# ── 写操作：盲盒 / 抽奖 ───────────────────────────────────────
+# 两者都是**消耗性操作**（盲盒烧能量、抽奖烧次数，收益随机）。WorkDaddy 只把
+# 它们做成面板按钮（每次点 1 下开 1 个）；本模块在用户明确要求下自动化，因此
+# 加三道克制约束：
+#   1) 单次请求只开/抽 1 个（照抄 WorkDaddy 的 body），循环逐次发；
+#   2) 单次运行有上限（见下两个常量），绝不无限循环烧光库存；
+#   3) 抽奖 body 必须带 `client_token`（上游防重放设计），**每次新生成** UUID ——
+#      复用旧 token 会被判定重放而失败。
 
-async def fetch_lottery_chances(token: str, provider_code: str) -> int:
+# 上游 quota 实测返回 max_open_count=5 —— 单次运行开盒数不超过它
+GACHA_MAX_OPEN_PER_RUN = 5
+# 抽奖次数靠阶梯/活动慢慢攒，10 次封顶纯属防御（防上游口径变化导致死循环）
+LOTTERY_MAX_DRAW_PER_RUN = 10
+
+
+def _summarize_gacha_reward(d: dict) -> str:
+    """从盲盒 open 响应提取奖品名（照抄 WorkDaddy summarizeGrowthActionReward）。
+
+    响应形态：{results:[{instance:{name,rarity}, template:{name,rarity}}]}。
+    """
+    results = d.get("results") if isinstance(d.get("results"), list) else []
+    first = results[0] if results and isinstance(results[0], dict) else {}
+    inst = first.get("instance") if isinstance(first.get("instance"), dict) else {}
+    tpl = first.get("template") if isinstance(first.get("template"), dict) else {}
+    name = str(inst.get("name") or tpl.get("name") or d.get("name") or "")[:80]
+    rarity = str(inst.get("rarity") or tpl.get("rarity") or "")[:32]
+    return f"{name} · {rarity}" if name and rarity else name
+
+
+def _summarize_lottery_reward(d: dict) -> str:
+    """从抽奖 draw 响应提取奖品（prize_name 优先，退回 credit/energy 数值）。"""
+    name = str(d.get("prize_name") or d.get("name") or d.get("reward_name") or "")[:80]
+    if name:
+        return name
+    credit = _num(d.get("credit_granted") if d.get("credit_granted") is not None
+                  else d.get("credits") if d.get("credits") is not None
+                  else d.get("reward_credit"))
+    energy = _num(d.get("energy_granted") if d.get("energy_granted") is not None
+                  else d.get("energy") if d.get("energy") is not None
+                  else d.get("reward_energy"))
+    parts = []
+    if credit > 0:
+        parts.append(f"{credit:g} 积分")
+    if energy > 0:
+        parts.append(f"{energy:g} 能量")
+    return " · ".join(parts) or "奖励已到账"
+
+
+async def _gacha_quota(client: httpx.AsyncClient, base: str, headers: dict
+                       ) -> Tuple[Optional[dict], str]:
+    """查盲盒额度（只读）。返回 ({"affordable","balance","cost"}, err)。"""
+    try:
+        st, body, _ = await _get(client, f"{base}/activity/growth/buddy/quota", headers)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:150]}"
+    ok, err, d = _payload_ok(st, body)
+    if not ok:
+        return None, err
+    return {"affordable": _int(d.get("affordable")),
+            "balance": _int(d.get("balance")),
+            "cost": _int(d.get("cost_per_open"))}, ""
+
+
+async def _lottery_chances(client: httpx.AsyncClient, base: str, headers: dict
+                           ) -> Tuple[Optional[int], str]:
+    """查抽奖次数（只读）。返回 (次数, err)。"""
+    try:
+        st, body, _ = await _get(client, f"{base}/activity/growth/lottery/chances", headers)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {str(e)[:150]}"
+    ok, err, d = _payload_ok(st, body)
+    if not ok:
+        return None, err
+    return _int(d.get("balance")), ""
+
+
+async def run_gacha(token: str, provider_code: str) -> GrowthAction:
+    """把当前能量能开的盲盒开掉：1 次一个、单次运行最多 GACHA_MAX_OPEN_PER_RUN 个。
+
+    中途某次失败时：若已有战果则如实收尾（kind=claimed 带已得清单），
+    一个都没开成才报 failed —— 失败可重试，战果不丢失。
+    """
     product = GROWTH_PRODUCTS.get(provider_code)
     if not product:
-        return 0
+        return GrowthAction(kind="unsupported", message=f"未知的 CodeBuddy 变体：{provider_code}")
+    base = product["base"]
     headers = growth_headers(token, product)
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            st, body, _ = await _get(
-                client, f"{product['base']}/activity/growth/lottery/chances", headers)
-        ok, _, d = _payload_ok(st, body)
-        return _int(d.get("balance")) if ok else 0
-    except Exception:
-        return 0
+            quota, err = await _gacha_quota(client, base, headers)
+            if quota is None:
+                return GrowthAction(kind="failed", message=f"盲盒额度查询失败：{err}", error=err)
+            if quota["affordable"] <= 0:
+                return GrowthAction(kind="already",
+                                    message=f"没有可开的盲盒（能量 {quota['balance']}，每开需 {quota['cost']}）")
+            wins: List[str] = []
+            credit = energy = 0.0
+            for _ in range(min(quota["affordable"], GACHA_MAX_OPEN_PER_RUN)):
+                st, body, _ = await _post(
+                    client, f"{base}/v2/activity/growth/buddy/open", headers, {"count": 1})
+                ok, err, d = _payload_ok(st, body)
+                if not ok:
+                    if wins:
+                        break   # 已有战果，如实收尾
+                    return GrowthAction(kind="failed", message=f"开盲盒失败：{err}", error=err)
+                wins.append(_summarize_gacha_reward(d) or "未知奖品")
+                credit += _num(d.get("credit_granted") if d.get("credit_granted") is not None
+                               else d.get("credits"))
+                energy += _num(d.get("energy_granted") if d.get("energy_granted") is not None
+                               else d.get("energy"))
+    except Exception as e:
+        return GrowthAction(kind="failed", message="开盲盒请求失败",
+                            error=f"{type(e).__name__}: {str(e)[:200]}")
+    return GrowthAction(kind="claimed", credit=credit, energy=energy,
+                        message=f"已开 {len(wins)} 个盲盒：{'；'.join(wins)}"[:300],
+                        detail={"wins": wins, "opened": len(wins)})
+
+
+async def run_lottery(token: str, provider_code: str) -> GrowthAction:
+    """把抽奖次数用掉：每次带**新生成**的 client_token（防重放），单次运行封顶。"""
+    import uuid as _uuid
+    product = GROWTH_PRODUCTS.get(provider_code)
+    if not product:
+        return GrowthAction(kind="unsupported", message=f"未知的 CodeBuddy 变体：{provider_code}")
+    base = product["base"]
+    headers = growth_headers(token, product)
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            chances, err = await _lottery_chances(client, base, headers)
+            if chances is None:
+                return GrowthAction(kind="failed", message=f"抽奖次数查询失败：{err}", error=err)
+            if chances <= 0:
+                return GrowthAction(kind="already", message="暂无抽奖次数")
+            wins: List[str] = []
+            credit = energy = 0.0
+            for _ in range(min(chances, LOTTERY_MAX_DRAW_PER_RUN)):
+                # ⚠️ client_token 每抽一次换新的（WorkDaddy 形态 draw-<uuid4>）——
+                # 上游按它防重放，复用会被拒
+                st, body, _ = await _post(
+                    client, f"{base}/v2/activity/growth/lottery/draw", headers,
+                    {"client_token": f"draw-{_uuid.uuid4()}"})
+                ok, err, d = _payload_ok(st, body)
+                if not ok:
+                    if wins:
+                        break
+                    return GrowthAction(kind="failed", message=f"抽奖失败：{err}", error=err)
+                wins.append(_summarize_lottery_reward(d))
+                credit += _num(d.get("credit_granted") if d.get("credit_granted") is not None
+                               else d.get("credits") if d.get("credits") is not None
+                               else d.get("reward_credit"))
+                energy += _num(d.get("energy_granted") if d.get("energy_granted") is not None
+                               else d.get("energy") if d.get("energy") is not None
+                               else d.get("reward_energy"))
+    except Exception as e:
+        return GrowthAction(kind="failed", message="抽奖请求失败",
+                            error=f"{type(e).__name__}: {str(e)[:200]}")
+    return GrowthAction(kind="claimed", credit=credit, energy=energy,
+                        message=f"已抽奖 {len(wins)} 次：{'；'.join(wins)}"[:300],
+                        detail={"wins": wins, "draws": len(wins)})
 
 
 # ── 批量执行（定时 / 手动共用）─────────────────────────────────
@@ -662,11 +808,14 @@ async def collect_growth_targets(db) -> Tuple[List[GrowthTarget], List[dict]]:
 
 async def run_growth_batch(targets: List[GrowthTarget], *, trigger: str = "manual",
                            db=None, do_travel: bool = True, do_tasks: bool = True,
+                           do_gacha: bool = False, do_lottery: bool = False,
                            notify: bool = True) -> List[dict]:
-    """顺序执行一批成长中心处理（旅行 + 任务），逐个落 growth_logs。
+    """顺序执行一批成长中心处理（旅行 + 任务 + 盲盒 + 抽奖），逐个落 growth_logs。
 
     **严格串行**：与签到同口径（上游对单账号高频请求敏感）。
     单账号失败不中断整批；每个动作各自按天幂等。
+    动作顺序固定 travel → task → gacha → lottery：旅行领的能量当轮就能用于开盒。
+    do_gacha / do_lottery 默认 False —— 盲盒/抽奖是消耗性操作，由配置显式开启。
     """
     import json as _json
     results: List[dict] = []
@@ -676,10 +825,17 @@ async def run_growth_batch(targets: List[GrowthTarget], *, trigger: str = "manua
         for action, enabled, runner in (
             ("travel", do_travel, _run_travel_action),
             ("task", do_tasks, _run_task_action),
+            ("gacha", do_gacha, _run_gacha_action),
+            ("lottery", do_lottery, _run_lottery_action),
         ):
             if not enabled:
                 continue
-            if db is not None and await _already_done_today(db, t.provider_code, t.owner, action):
+            # 按天幂等只约束**自动触发**（防定时/补跑重复烧库存）；盲盒/抽奖是
+            # 消耗性操作，手动点按钮 = 明确授权这一次，不受当天已跑过的拦截 ——
+            # 否则定时 11:00 一趟 no-op 之后，下午能量到账用户手动点就失效了。
+            manual_consumptive = trigger == "manual" and action in ("gacha", "lottery")
+            if (db is not None and not manual_consumptive
+                    and await _already_done_today(db, t.provider_code, t.owner, action)):
                 results.append({"provider_code": t.provider_code, "owner": t.owner,
                                 "action": action, "kind": "already",
                                 "message": "今天已处理过，跳过"})
@@ -736,6 +892,14 @@ async def _run_travel_action(token: str, provider_code: str) -> GrowthAction:
 
 async def _run_task_action(token: str, provider_code: str) -> GrowthAction:
     return await accept_automatable_tasks(token, provider_code)
+
+
+async def _run_gacha_action(token: str, provider_code: str) -> GrowthAction:
+    return await run_gacha(token, provider_code)
+
+
+async def _run_lottery_action(token: str, provider_code: str) -> GrowthAction:
+    return await run_lottery(token, provider_code)
 
 
 async def fetch_growth_overview(db) -> List[dict]:

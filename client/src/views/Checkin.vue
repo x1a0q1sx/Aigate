@@ -88,8 +88,9 @@
         <div>
           <h2>成长中心 <span class="badge badge-neutral">CodeBuddy</span></h2>
           <p>
-            派 Buddy 旅行领礼物、接取成长任务换积分。只自动做「客户端外能完成」的事
-            （旅行派发/领奖 + 白名单任务接取），其余如实列出提示手动完成。
+            派 Buddy 旅行领礼物、接取成长任务换积分、自动开盲盒/抽奖。只自动做
+            「客户端外能完成」的事（白名单任务接取），其余如实列出提示手动完成。
+            盲盒/抽奖是消耗性操作，默认不自动执行，点按钮 = 手动授权这一轮。
           </p>
         </div>
         <div class="growth-head-actions">
@@ -98,6 +99,12 @@
           </button>
           <button class="btn btn-outline btn-sm" @click="runGrowth(null, 'task')" :disabled="growthRunning">
             接取任务
+          </button>
+          <button class="btn btn-outline btn-sm" @click="runGrowth(null, 'gacha')" :disabled="growthRunning">
+            开盲盒
+          </button>
+          <button class="btn btn-outline btn-sm" @click="runGrowth(null, 'lottery')" :disabled="growthRunning">
+            抽奖
           </button>
           <button class="btn btn-primary btn-sm" @click="runGrowth(null, null)" :disabled="growthRunning">
             {{ growthRunning ? '处理中…' : '一键处理全部' }}
@@ -158,6 +165,18 @@
             <span v-if="a.streak.makeup_cards" class="muted">· 补签卡 {{ a.streak.makeup_cards }}</span>
           </div>
 
+          <!-- 盲盒 / 抽奖 -->
+          <div class="growth-line" v-if="a.gacha">
+            <span class="growth-k">盲盒</span>
+            <span v-if="a.gacha.affordable > 0" class="badge badge-success">可开 {{ a.gacha.affordable }} 个</span>
+            <span v-else class="muted">能量 {{ a.gacha.balance }} / 每开 {{ a.gacha.cost_per_open }}（暂不足）</span>
+          </div>
+          <div class="growth-line" v-if="a.lottery">
+            <span class="growth-k">抽奖</span>
+            <span v-if="a.lottery.chances > 0" class="badge badge-success">待抽 {{ a.lottery.chances }} 次</span>
+            <span v-else class="muted">暂无抽奖次数</span>
+          </div>
+
           <!-- 手动任务提示 -->
           <div v-if="a.manual_tasks && a.manual_tasks.length" class="text-xs muted growth-manual">
             需手动完成：{{ a.manual_tasks.join('、') }}
@@ -197,6 +216,8 @@
         <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.enabled" /> 启用自动处理</label>
         <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.travel" /> 自动旅行</label>
         <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.tasks" /> 自动接取任务</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.gacha" /> 自动开盲盒（消耗能量）</label>
+        <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.lottery" /> 自动抽奖（消耗次数）</label>
         <label class="checkbox-label"><input type="checkbox" v-model="growthCfg.startup_catchup" /> 启动补跑</label>
         <label>小时（北京时间）<input v-model.number="growthCfg.hour" type="number" min="0" max="23" /></label>
         <label>分钟<input v-model.number="growthCfg.minute" type="number" min="0" max="59" /></label>
@@ -295,7 +316,7 @@ export default {
       runMsg: '', runMsgCls: 'alert-info',
       // 成长中心（CodeBuddy Buddy 旅行 / 成长任务）
       growth: { accounts: [], next_run_at: null },
-      growthCfg: { enabled: true, travel: true, tasks: true, hour: 11, minute: 0, startup_catchup: true },
+      growthCfg: { enabled: true, travel: true, tasks: true, gacha: false, lottery: false, hour: 11, minute: 0, startup_catchup: true },
       growthCfgSaving: false, growthRunning: false,
       growthMsg: '', growthMsgCls: 'alert-info',
     }
@@ -373,7 +394,7 @@ export default {
         } else {
           this.growthMsg = acted.length
             ? `执行 ${acted.length} 项（+${credit} 积分 / +${energy} 能量）`
-            : '无变化（旅行进行中或无待接任务）'
+            : '无变化（旅行进行中、无待接任务或盲盒/抽奖无可消耗）'
           this.growthMsgCls = 'alert-success'
         }
         await this.load()

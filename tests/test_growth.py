@@ -625,3 +625,162 @@ def test_growth_log_registered_in_db():
     src = inspect.getsource(db)
     assert "from .models.growth_log import GrowthLog" in src
     assert "idx_growth_prov_owner_time" in src
+
+# ── 盲盒 / 抽奖自动执行（2026-09-28，P2）─────────────────────
+# 消耗性操作的三道克制约束必须锁死：单次 1 个、运行上限、client_token 防重放。
+
+def test_run_gacha_opens_one_per_request_and_reports_wins(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [
+        _ok({"affordable": 1, "balance": 13, "cost_per_open": 10, "max_open_count": 5}),
+        _ok({"results": [{"instance": {"name": "咖啡猫", "rarity": "SR"},
+                          "template": {"name": "咖啡猫", "rarity": "SR"}}]}),
+    ])
+    out = asyncio.run(cg.run_gacha("tok", "codebuddy_cn"))
+    assert out.ok and out.kind == "claimed"
+    assert "咖啡猫" in out.message and "SR" in out.message
+    assert out.detail["opened"] == 1
+    assert calls[0]["url"].endswith("/activity/growth/buddy/quota")
+    assert calls[1]["url"].endswith("/v2/activity/growth/buddy/open")
+    assert json.loads(calls[1]["content"]) == {"count": 1}, "每次只开 1 个"
+
+
+def test_run_gacha_respects_run_cap(monkeypatch):
+    """affordable=7 也只开 5 个（上游 max_open_count=5，防烧光库存）。"""
+    results = [_ok({"affordable": 7, "balance": 70, "cost_per_open": 10})]
+    results += [_ok({"results": [{"instance": {"name": f"猫{i}"}}]}) for i in range(6)]
+    calls = []
+    _patch(monkeypatch, calls, results)
+    out = asyncio.run(cg.run_gacha("tok", "codebuddy_cn"))
+    opens = [c for c in calls if c["url"].endswith("/buddy/open")]
+    assert len(opens) == cg.GACHA_MAX_OPEN_PER_RUN == 5
+    assert out.detail["opened"] == 5
+
+
+def test_run_gacha_zero_affordable_is_noop(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [_ok({"affordable": 0, "balance": 3, "cost_per_open": 10})])
+    out = asyncio.run(cg.run_gacha("tok", "codebuddy_cn"))
+    assert out.kind == "already"
+    assert all(not c["url"].endswith("/buddy/open") for c in calls), "无可开不得发写请求"
+
+
+def test_run_gacha_first_failure_is_retryable(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [
+        _ok({"affordable": 2, "balance": 20, "cost_per_open": 10}),
+        (200, {"code": 500, "msg": "开盒过于频繁"}, None),
+    ])
+    out = asyncio.run(cg.run_gacha("tok", "codebuddy_cn"))
+    assert out.kind == "failed", "一个都没开成必须报 failed（允许重试）"
+
+
+def test_run_gacha_midway_failure_keeps_wins(monkeypatch):
+    """已开到 1 个后中途失败：kind=claimed 保留战果，不丢也不虚报。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        _ok({"affordable": 3, "balance": 30, "cost_per_open": 10}),
+        _ok({"results": [{"instance": {"name": "猫A", "rarity": "R"}}]}),
+        (200, {"code": 500, "msg": "开盒过于频繁"}, None),
+    ])
+    out = asyncio.run(cg.run_gacha("tok", "codebuddy_cn"))
+    assert out.kind == "claimed"
+    assert out.detail["opened"] == 1 and "猫A" in out.message
+
+
+def test_lottery_draw_fresh_client_token_each_draw(monkeypatch):
+    """client_token 是上游防重放设计：每次抽奖必须换新 UUID。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        _ok({"balance": 3}),
+        _ok({"prize_name": "100 积分"}),
+        _ok({"credit_granted": 5}),
+        _ok({"energy_granted": 2}),
+    ])
+    out = asyncio.run(cg.run_lottery("tok", "codebuddy_cn"))
+    assert out.kind == "claimed"
+    posts = [c for c in calls if c["url"].endswith("/lottery/draw")]
+    assert len(posts) == 3
+    tokens = [json.loads(c["content"])["client_token"] for c in posts]
+    assert len(set(tokens)) == 3, "client_token 每次必须新生成"
+    assert all(t.startswith("draw-") and len(t) > 10 for t in tokens)
+    assert "100 积分" in out.message and "5 积分" in out.message and "2 能量" in out.message
+
+
+def test_run_lottery_zero_chances_is_noop(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [_ok({"balance": 0})])
+    out = asyncio.run(cg.run_lottery("tok", "codebuddy_cn"))
+    assert out.kind == "already"
+    assert all(not c["url"].endswith("/lottery/draw") for c in calls)
+
+
+def test_run_lottery_run_cap(monkeypatch):
+    results = [_ok({"balance": 99})]
+    results += [_ok({"prize_name": f"奖{i}"}) for i in range(11)]
+    calls = []
+    _patch(monkeypatch, calls, results)
+    out = asyncio.run(cg.run_lottery("tok", "codebuddy_cn"))
+    draws = [c for c in calls if c["url"].endswith("/lottery/draw")]
+    assert len(draws) == cg.LOTTERY_MAX_DRAW_PER_RUN == 10
+
+
+def test_batch_gacha_lottery_default_off_and_flags_work(monkeypatch):
+    """run_growth_batch 默认不碰盲盒/抽奖（消耗性）；显式传 flag 才执行。"""
+    gacha_calls = []
+
+    async def _g(token, code):
+        gacha_calls.append(1)
+        return cg.GrowthAction(kind="claimed", message="win")
+
+    monkeypatch.setattr(cg, "run_gacha", _g)
+    monkeypatch.setattr(cg, "run_lottery",
+                        lambda t, c: asyncio.sleep(0, result=cg.GrowthAction(kind="claimed")))
+    monkeypatch.setattr(cg, "run_travel",
+                        lambda t, c: asyncio.sleep(0, result=cg.GrowthAction(kind="traveled")))
+    monkeypatch.setattr(cg, "accept_automatable_tasks",
+                        lambda t, c: asyncio.sleep(0, result=cg.GrowthAction(kind="accepted")))
+    targets = [cg.GrowthTarget("codebuddy_cn", "u1", "tok")]
+    out = asyncio.run(cg.run_growth_batch(targets, do_travel=True, do_tasks=True, notify=False))
+    assert not gacha_calls and len(out) == 2, "默认必须不碰盲盒/抽奖"
+    out = asyncio.run(cg.run_growth_batch(targets, do_travel=False, do_tasks=False,
+                                          do_gacha=True, do_lottery=True, notify=False))
+    assert len(out) == 2 and {r["action"] for r in out} == {"gacha", "lottery"}
+    assert gacha_calls
+
+
+def test_manual_trigger_bypasses_daily_done_for_consumptive_actions(monkeypatch):
+    """手动点按钮 = 明确授权：当天定时跑过（含 no-op）后手动仍可再执行盲盒/抽奖；
+    定时触发仍受按天幂等约束（防重复烧库存）。"""
+    from server.models.growth_log import GrowthLog
+
+    async def _g(token, code):
+        return cg.GrowthAction(kind="claimed", message="win")
+
+    monkeypatch.setattr(cg, "run_gacha", _g)
+
+    async def _run():
+        engine, Session, Base = _mk_db()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        async with Session() as db:
+            db.add(GrowthLog(provider_code="codebuddy_cn", owner="u1", action="gacha",
+                             kind="already"))
+            await db.commit()
+            targets = [cg.GrowthTarget("codebuddy_cn", "u1", "tok")]
+            out = await cg.run_growth_batch(targets, trigger="scheduled", db=db,
+                                            do_travel=False, do_tasks=False,
+                                            do_gacha=True, notify=False)
+            assert out[0]["kind"] == "already" and "跳过" in out[0]["message"]
+            out = await cg.run_growth_batch(targets, trigger="manual", db=db,
+                                            do_travel=False, do_tasks=False,
+                                            do_gacha=True, notify=False)
+            assert out[0]["kind"] == "claimed"
+        await engine.dispose()
+    asyncio.run(_run())
+
+
+def test_growth_config_gacha_lottery_default_off():
+    from server.config import GrowthConfig
+    c = GrowthConfig()
+    assert c.gacha is False and c.lottery is False, "消耗性操作默认必须关"

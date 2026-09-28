@@ -1232,3 +1232,58 @@ traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读�
 配置默认值与调度接线守卫、端点注册。
 **已反向验证**：注入「忽略白名单」与「traveling 重复派发」两个错误实现后，
 对应测试立刻失败。
+
+## F34 成长中心补全：盲盒/抽奖自动执行 + 签到防御增强（P2+P3，2026-09-28）
+
+用户拍板「P2、P3 一起做完」。P2=盲盒/抽奖自动执行（此前只展示，因为是消耗性
+操作）；P3=签到防御增强（照抄 WorkDaddy `checkin-result.js` 的两个防御）。
+
+### P2 盲盒/抽奖（`core/codebuddy_growth.py`）
+
+协议（WorkDaddy `growth-daily.js` 逐行核对）：
+
+    POST /v2/activity/growth/buddy/open     body {"count": 1}
+    POST /v2/activity/growth/lottery/draw   body {"client_token": "draw-<uuid4>"}
+
+值得注意的三个事实：
+
+1. **`client_token` 是客户端自生成的 UUID**（WorkDaddy：`draw-${crypto.randomUUID()}`），
+   不是从上游领的 —— 上游按它防重放，**每次请求必须换新**，复用旧值会被拒。
+2. **WorkDaddy 自己也不自动执行这两个动作**：`openBuddyBlindBox`/`drawGrowthLottery`
+   只导出给面板按钮（每次点 1 下开 1 个），daemon.js 只 import 了只读的
+   `fetchDailyProgress`。自动化是用户明确要求的，因此加三道克制约束：
+   **单次请求只开/抽 1 个**（照抄 WorkDaddy body）+ **单次运行上限**
+   （`GACHA_MAX_OPEN_PER_RUN=5`，即上游 `max_open_count`；`LOTTERY_MAX_DRAW_PER_RUN=10`）
+   + **按天幂等只约束自动触发**（手动点按钮 = 明确授权这一次，不受「今天定时已跑过」
+   拦截 —— 否则定时 11:00 一趟 no-op 之后，下午能量到账用户手动点就失效了）。
+3. **中途失败保留战果**：已开到 N 个后某次失败 → `kind=claimed` 如实收尾
+   （message 带已得清单），一个都没开成才 `failed`（可重试）。
+
+批量顺序固定 travel → task → gacha → lottery：旅行领的能量当轮就能用于开盒。
+配置 `growth.gacha` / `growth.lottery` **默认关**（消耗性操作，想自动消耗再打开）；
+手动按钮不受该开关拦截。
+
+### P3 签到防御（`core/checkin.py`）
+
+照抄 WorkDaddy `checkin-result.js`，两处：
+
+1. **10001/1001 的语义必须由文案证实**：`INACTIVE` 正则
+   （未开启/未开始/未开放/已过期/无*活动/活动*结束|关闭|暂停）**优先**于
+   `ALREADY` 正则（已签到/已领取/已经*签到|领取/重复签到/already）；
+   文案对不上就如实 `failed`（允许当天重试）——绝不把「未知含义的 10001」
+   当已签到把重试窗口关掉。此前是「见码即已领」。
+2. **JWT iss 域名兜底**：`token_issuer_base()` 解 JWT payload 的 `iss`
+   （不验签，只读归属域），映射已知域（codebuddy.ai/.cn、workbuddy.ai/.cn、
+   copilot.tencent.com）。产品配置 base **仍是第一顺位**（生产已验证；WorkDaddy
+   是签发域先行，但我们产品 base 更可靠）；仅当它出现**传输层失败**（连接异常 /
+   401/403 / 返回 HTML）时改用签发域重试一次。**业务错误不兜底** —— JSON
+   code!=0 说明 token 与该域是通的，换域无用。
+
+### 测试
+
+新增 **15 项**（全量 **890 项全绿**）：10001 文案六分支（已签/重复/未开启/已结束/
+含糊/空文案）、iss 解析（已知/未知/缺 iss/非 JWT/垃圾输入）、传输层失败换域成功
+（主域先试、兜底落签发域）、业务错误不换域；盲盒单次一个 + 战果提取、运行上限、
+零库存 no-op、首败可重试、中途败保留战果、抽奖 client_token 三连抽各不相同、
+零次数 no-op、批量默认不碰（flag 显式才执行）、手动绕过按天幂等（定时仍受约束）、
+配置默认关。

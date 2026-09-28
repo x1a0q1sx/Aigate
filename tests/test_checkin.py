@@ -874,3 +874,104 @@ def test_lobsterai_business_error_in_200(monkeypatch):
 def test_lobsterai_capability_registered():
     from server.core.checkin import CHECKIN_CAPABILITIES
     assert CHECKIN_CAPABILITIES.get("lobsterai") is True
+
+
+# ── P3 防御增强（2026-09-28，照抄 WorkDaddy checkin-result.js）──
+
+def _jwt(iss=None):
+    """iss=None 返回非 JWT 形态（兜底必须安静返回 None）。"""
+    if iss is None:
+        return "tok"
+    import base64 as _b64
+    payload = _b64.urlsafe_b64encode(json.dumps({"iss": iss}).encode()).decode().rstrip("=")
+    return f"hdr.{payload}.sig"
+
+
+def test_token_issuer_base_known_and_unknown():
+    from server.core.checkin import token_issuer_base
+    assert token_issuer_base(_jwt("https://www.codebuddy.ai")) == "https://www.codebuddy.ai"
+    assert token_issuer_base(_jwt("https://www.workbuddy.cn")) == "https://www.workbuddy.cn"
+    assert token_issuer_base(_jwt("https://Copilot.Tencent.com/")) == "https://copilot.tencent.com"
+    # 未知域 / 缺 iss / 非 JWT / 垃圾输入 → 一律 None（不猜域名）
+    assert token_issuer_base(_jwt("https://evil.example.com")) is None
+    assert token_issuer_base(_jwt()) is None
+    assert token_issuer_base("not-a-jwt") is None
+    assert token_issuer_base("a.!!!.b") is None
+    assert token_issuer_base("") is None
+    assert token_issuer_base(None) is None
+
+
+def test_codebuddy_10001_message_decides_kind(monkeypatch):
+    """10001 的语义必须由文案证实：已签到→already；未开启→inactive；含糊→failed。"""
+    from server.core.checkin import claim_for_provider
+    for msg, want in (
+        ("今天已签到，请明天再来", "already_claimed"),
+        ("重复签到", "already_claimed"),
+        ("签到活动未开启", "inactive"),
+        ("活动已结束", "inactive"),
+        ("系统繁忙，请稍后再试", "failed"),
+        ("", "failed"),
+    ):
+        calls = []
+        _patch(monkeypatch, calls, [
+            _cb_status(today_checked=False),
+            (400, {"code": 10001, "msg": msg}, None),
+        ])
+        out = asyncio.run(claim_for_provider("codebuddy_cn", "tok"))
+        assert out.kind == want, f"msg={msg!r} 期望 {want}，得到 {out.kind}"
+
+
+def test_codebuddy_transport_failure_falls_back_to_issuer_host(monkeypatch):
+    """主域连接失败 + token 签发域在已知表内 → 改用签发域重试一次。"""
+    import httpx as _httpx
+    from server.core import checkin as ck
+
+    tok = _jwt("https://www.workbuddy.ai")   # iss 域 != codebuddy_intl 的产品 base
+    calls = []
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._p = payload
+            self.text = json.dumps(payload)
+            self.content = self.text.encode()
+
+        def json(self):
+            return self._p
+
+    class _Routed:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, content=None):
+            calls.append(url)
+            if url.startswith("https://www.codebuddy.ai"):
+                raise _httpx.ConnectError("primary down", request=None)
+            if url.endswith("checkin-activity-status"):
+                return _Resp({"code": 0, "data": {"active": True,
+                                                  "today_checked_in": False}})
+            return _Resp({"code": 0, "data": {"credit": 100, "streak_days": 1}})
+
+    monkeypatch.setattr(ck.httpx, "AsyncClient", _Routed)
+    out = asyncio.run(ck.claim_for_provider("codebuddy_intl", tok))
+    assert out.kind == "claimed", out.message
+    assert calls[0].startswith("https://www.codebuddy.ai"), "主域必须先试"
+    assert calls[-1].startswith("https://www.workbuddy.ai"), "兜底必须落在签发域"
+
+
+def test_codebuddy_business_error_does_not_fallback(monkeypatch):
+    """业务错误（JSON code!=0）说明 token 与该域是通的 —— 不得换域重试。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [
+        (200, {"code": 5, "msg": "参数错误"}, None),
+    ])
+    out = asyncio.run(claim_for_provider("codebuddy_cn", _jwt("https://www.workbuddy.cn")))
+    assert out.kind == "failed"
+    assert len(calls) == 1, "业务错误不得触发域名兜底"

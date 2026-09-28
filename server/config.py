@@ -184,11 +184,13 @@ class CheckinConfig(BaseModel):
 
 
 class GrowthConfig(BaseModel):
-    """CodeBuddy 成长中心：Buddy 旅行 + 成长任务（纯 HTTP，见 core/codebuddy_growth.py）。
+    """CodeBuddy 成长中心：Buddy 旅行 + 成长任务 + 盲盒/抽奖（纯 HTTP，见 core/codebuddy_growth.py）。
 
-    只做两件**客户端外能完成**的事（照抄 WorkDaddy 的 AUTOMATABLE_TASK_CODES 白名单）：
+    客户端外能完成的事（照抄 WorkDaddy 的做法）：
     - travel：按状态自动「派发 / 领奖」（每日一次，按北京时间去重）
     - tasks：自动**接取**白名单内的成长任务（不改状态、不伪造完成）
+    - gacha / lottery：自动开盲盒 / 抽奖 —— **消耗性操作**（烧能量/次数、收益随机），
+      有单次运行上限（5 盒 / 10 抽）与按天幂等；默认关，想自动消耗再打开。
 
     时间与签到错开（默认 11:00，签到后 30 分钟）—— 同一账号的请求严格串行，
     避免上游风控。国际版实测无此活动（数据为空），会自动如实显示「本版无此活动」。
@@ -196,6 +198,8 @@ class GrowthConfig(BaseModel):
     enabled: bool = True            # 总开关（默认开）
     travel: bool = True             # 自动处理旅行（派发 + 领奖）
     tasks: bool = True              # 自动接取可自动化的成长任务
+    gacha: bool = False             # 自动开盲盒（消耗能量；默认关）
+    lottery: bool = False           # 自动抽奖（消耗次数；默认关）
     hour: int = 11                  # 北京时间（0-23），与签到错开
     minute: int = 0                 # 0-59
     startup_catchup: bool = True    # 启动补跑（当天未处理时）

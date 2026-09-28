@@ -332,7 +332,7 @@ async def checkin_growth(with_snapshot: bool = Query(True),
 
 class GrowthRunPayload(BaseModel):
     provider_code: Optional[str] = None   # 省略 = 全部 CodeBuddy 账号
-    action: Optional[str] = None          # travel | task | None(=两者都做)
+    action: Optional[str] = None          # travel | task | gacha | lottery | None(=按配置全做)
 
 
 @router.post("/checkin/growth/run")
@@ -340,7 +340,7 @@ async def checkin_growth_run(payload: GrowthRunPayload = None,
                              db: AsyncSession = Depends(get_db)):
     """手动处理成长中心（严格串行）。
 
-    `action` 限定只做旅行或只接任务；省略则按配置（growth.travel / growth.tasks）。
+    `action` 限定只做某一件事；省略则按配置（growth.travel / tasks / gacha / lottery）。
     幂等：当天已处理过的动作自动跳过。
     """
     from server.config import get_config
@@ -351,12 +351,15 @@ async def checkin_growth_run(payload: GrowthRunPayload = None,
     if code and code not in GROWTH_PRODUCTS:
         raise HTTPException(status_code=400, detail=f"成长中心不支持该平台：{code}")
     act = (payload.action if payload else None) or None
-    if act and act not in ("travel", "task"):
+    if act and act not in ("travel", "task", "gacha", "lottery"):
         raise HTTPException(status_code=400, detail=f"未知动作：{act}")
 
     gc = getattr(get_config(), "growth", None)
     do_travel = bool(getattr(gc, "travel", True)) if act in (None, "travel") else False
     do_tasks = bool(getattr(gc, "tasks", True)) if act in (None, "task") else False
+    # 盲盒/抽奖是消耗性操作：手动点按钮 = 明确授权这一次，不受配置开关拦截
+    do_gacha = True if act == "gacha" else bool(getattr(gc, "gacha", False))
+    do_lottery = True if act == "lottery" else bool(getattr(gc, "lottery", False))
 
     targets, skipped = await collect_growth_targets(db)
     if code:
@@ -368,7 +371,8 @@ async def checkin_growth_run(payload: GrowthRunPayload = None,
 
     results = await run_growth_batch(
         targets, trigger="manual", db=db,
-        do_travel=do_travel, do_tasks=do_tasks)
+        do_travel=do_travel, do_tasks=do_tasks,
+        do_gacha=do_gacha, do_lottery=do_lottery)
     acted = [r for r in results if r["kind"] in ("traveled", "claimed", "accepted")]
     failed = [r for r in results if r["kind"] == "failed"]
     return {"ok": True, "ran": len(results), "acted": len(acted), "failed": len(failed),
@@ -381,6 +385,8 @@ class GrowthConfigModel(BaseModel):
     enabled: Optional[bool] = None
     travel: Optional[bool] = None
     tasks: Optional[bool] = None
+    gacha: Optional[bool] = None
+    lottery: Optional[bool] = None
     hour: Optional[int] = None
     minute: Optional[int] = None
     startup_catchup: Optional[bool] = None

@@ -192,7 +192,7 @@ def _schedule_maintenance():
 
 
 async def _run_growth_daily(trigger: str = "scheduled"):
-    """成长中心执行体（定时 / 启动补跑共用）：旅行 + 接取可自动化任务。"""
+    """成长中心执行体（定时 / 启动补跑共用）：旅行 + 接任务 + 盲盒/抽奖（按配置）。"""
     if getattr(_run_growth_daily, "_busy", False):
         return
     _run_growth_daily._busy = True
@@ -201,6 +201,8 @@ async def _run_growth_daily(trigger: str = "scheduled"):
         gc = getattr(config, "growth", None)
         do_travel = bool(getattr(gc, "travel", True))
         do_tasks = bool(getattr(gc, "tasks", True))
+        do_gacha = bool(getattr(gc, "gacha", False))
+        do_lottery = bool(getattr(gc, "lottery", False))
         async with AsyncSessionLocal() as db:
             targets, skipped = await collect_growth_targets(db)
             if not targets:
@@ -208,7 +210,8 @@ async def _run_growth_daily(trigger: str = "scheduled"):
                 return
             results = await run_growth_batch(
                 targets, trigger=trigger, db=db,
-                do_travel=do_travel, do_tasks=do_tasks)
+                do_travel=do_travel, do_tasks=do_tasks,
+                do_gacha=do_gacha, do_lottery=do_lottery)
         gained = sum(r.get("credit") or 0 for r in results)
         energy = sum(r.get("energy") or 0 for r in results)
         acted = [r for r in results if r["kind"] in ("traveled", "claimed", "accepted")]
