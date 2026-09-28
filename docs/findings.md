@@ -844,3 +844,82 @@ httpx 会抛同样的 TypeError。生产当前 codex 服务商都是 api_key 类
 启动修复（幂等 + `updated_at` 不变 + 源码守卫）、
 **端点级复现**（脏行存在时 `list_providers` 仍返回 200）、
 6 个适配器的出站头 httpx 可用性。全量 **783 项全绿**。
+
+## F28 CodeBuddy 多账号 token 串号 + Freebuff 档位闸门（2026-09-28）
+
+用户反馈两项：① 「codebuddy 两个账号的额度咋都是一样的，159 那个账号额度不对」；
+② 「freebuff 的模型访问报错」。两项根因独立，均已在生产取证。
+
+### 一、CodeBuddy 两账号额度相同 = 一条连接被另一个账号覆盖
+
+**取证**：生产 `oauth_tokens` 里 row1（owner `15944101987`）与 row6
+（owner `13500818840`）的 `access_token_enc` / `refresh_token_enc`
+**sha1 完全相同**；JWT payload 显示两条的 `sub` 都是 `86b50828-…`、
+`preferred_username` 都是 `13500818840` —— 即两条连接**指向同一个账号**，
+额度自然一样，而 159 账号的凭据已被静默丢弃。
+
+**成因**：`POST /admin/oauth/authorize/{code}` 的 owner 在**轮询开始前**就已分配
+（`_next_owner_for_provider`：首个 `__default`，其后 `account-N`）；device poll 是
+后台协程，用户在**另一个账号**上完成登录时，轮询仍把 token 写回原来分配的 owner
+→ 覆盖第一个账号的凭据。时间线吻合：row1 最后一次 refresh 14:32，row6 建立于
+23:40（+08），而修复「新增账号不再覆盖主账号」的 commit `2f427b2` 提交于 14:58
+—— 修的是**分配规则**，没修**轮询落库**这条路径。
+
+**取证手段**：从 `data/backups/aigate-20260922-033000.db`（覆盖发生前一天的备份）
+解出原始凭据，确认身份 `15944101987` 且**仍然有效**（billing 接口 200，43 个额度包
+合计 7653 积分）。
+
+**修复（写入侧守卫 + 轮询侧自动改存）**：
+| 层 | 位置 | 行为 |
+|---|---|---|
+| 身份解析 | `oauth_client.token_identity()` | 解 JWT payload 取 `preferred_username`/`email`/`sub`（**不校验签名**，只做「是不是同一账号」比对；非 JWT 返回 None） |
+| 写入守卫 | `oauth_client._save_token` | 默认**拒绝**把一条连接改成另一个账号（原凭据原封不动）；`allow_identity_change=True` 是显式替换的逃生口 |
+| 轮询改存 | `_poll_codebuddy_token` / `_poll_freebuff_login` | 拿到 token 先比身份，不同 → 自动挪到 `account-N`（与 authorize 入口同规则）→ 一键连接语义从「静默覆盖」变成「自动新增账号」 |
+| 导入入口 | `oauth_router.import_oauth_token` | 撞守卫返回 **409** 而不是 500 |
+| 刷新路径 | 所有 `update_existing=` 调用 | 不受影响（同账号换新 token 正常放行） |
+
+**线上数据修复**：从 09-22 备份恢复 row1 凭据（逐字节，不拼接不推测），
+修复后复核：row1 = `15944101987`（43 包 / 7653 积分）、row6 = `13500818840`
+（33 包 / 3548 积分）、**各连接 token 已唯一**。
+
+### 二、Freebuff 模型报错 = 上游静默换模型，而 chat 仍带请求的模型名
+
+**用户看到的报错**：
+```
+HTTP 409 {"error":"session_model_mismatch",
+          "message":"Limited free access is only available with GLM 5.3 Flash or
+                     DeepSeek V4.1 Flash or MiMo 2.6 Flash or Solar Mini 4 or Solar Pro 4."}
+```
+
+**真因（生产实测）**：上游在档位受限时**静默替换 session 模型** —— POST session
+请求 `stealth/space-bunny-alpha`，上游返回 200 且 `status=active`，但 `model` 字段
+给的是 `deepseek/deepseek-v4-flash`。而 chat 请求体里仍带**请求的**模型名，上游按
+「会话模型 ≠ 请求模型」拒掉，报的正是上面的 409（消息里那串"仅限这些模型"）。
+`worker.js` 也记录了同一现象（其 `normalizeSession` 用 `data?.model || requestedModel`）。
+
+**档位真相**：免费层按出口国别分层（US=full，其余=limited）。limited 档的放行集合
+就是 `GET /session` 快照里 `rateLimitsByModel` 的键（实测 CN 出口 5 个：
+`deepseek/deepseek-v4-flash`、`mimo/mimo-v2.5`、`upstage/solar-mini4`、
+`upstage/solar-pro4`、`z-ai/glm-5.3-flash`），与上游文案一一对应。
+
+**修复**：
+| 问题 | 修复 |
+|---|---|
+| chat 用请求模型（真凶） | 改用 session **实际授予**的模型（run 链同步）；替换时记 warning，如实透出 |
+| 409 一律当「session 脏」 | 分开：档位拒绝 → 直接终止 + **DELETE 释放单会话锁**（不再清缓存重建 —— POST session 是**扣费**的，实测白扣 10 Freebucks）；真 stale（superseded 等）→ 仍重建重试一次 |
+| 409 错误码被盖成 `session_model_mismatch` | 如实回显上游真实码（实测有 `session_superseded` / `model_locked`），否则用户会去改模型而不是重试 |
+| 单会话锁冲突无恢复 | 照 worker.js 补「GET 拿持锁 instanceId → DELETE → 再 POST」**只重试一次**（`current_session_instance()` 只在释放锁时调用 —— 该 GET 本身会占用 session，为查额度随手调会顶掉正在进行的 chat） |
+| 报错不可执行 | 转成「指出哪个模型 + 给出实测放行清单 + 给换出口这条路」，保留上游原文 |
+| 模型页看不出能用谁 | 放行清单在**已有的**额度查询/健康探测里顺手缓存（**零额外请求**），模型页把清单外模型标「当前档位不可用」但**不过滤**（出口换区/升档后即可用，失败由上游如实报错）；额度面板新增 note 行直接列 id |
+
+**验证**：档位拒绝时余额不变（5 → 5，确认不再白扣）；放行模型 `upstage/solar-mini4`
+可正常建 session。⚠️ 探测过程用尽该账号当日 Freebucks（daily 25/25，Pacific 日界重置）。
+
+### 测试
+
+新增 **25 项**（808 全绿）：
+- freebuff 13 项：档位/脏 session 语义区分、不白重建、释放锁、真 stale 仍重试、
+  **上游替换模型时 chat 用授予模型**（+反向对照）、409 回显真实码、
+  单会话锁释放后重试、标注但不过滤、未知不标注、健康探测顺带记清单且绝不 POST
+- oauth 12 项：JWT 身份解析、跨账号拒绝覆盖、同账号续期放行、非 JWT 不参与、
+  逃生口、owner 分配（含空洞复用）、轮询自动改存（正反两向）、导入 409、源码守卫
