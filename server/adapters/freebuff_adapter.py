@@ -161,9 +161,20 @@ class FreebuffAdapter(BaseAdapter):
         last_err: Optional[Exception] = None
         for attempt in range(2):
             sess = await self._ensure_session(token, model, force_proxy=force_proxy)
-            run_id = await self._ensure_run(token, fb.agent_for_model(model),
+            # ⚠️ 上游会在档位受限时**静默换模型**：POST session 返回的 model 可能不是
+            # 请求的那个（实测 CN limited 档：请求 crof/kimi-k3-eco → 授予
+            # deepseek/deepseek-v4-flash）。chat 必须用 **session 实际授予的模型**，
+            # 否则上游按「会话模型 ≠ 请求模型」拒掉，报的正是用户遇到的
+            # `session_model_mismatch`（消息里列一串"仅限这些模型"）。
+            # 这里如实透出替换结果（log + 响应 model 字段），不假装用的还是原模型。
+            effective = str(sess.get("model") or model)
+            if effective != model:
+                logger.warning(
+                    "freebuff: 上游把 session 模型由 %s 换为 %s（档位受限，非请求错误）",
+                    model, effective)
+            run_id = await self._ensure_run(token, fb.agent_for_model(effective),
                                             force_proxy=force_proxy)
-            payload = fb.build_chat_payload(body, model, run_id, sess["instance_id"], token)
+            payload = fb.build_chat_payload(body, effective, run_id, sess["instance_id"], token)
             raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             headers = {
                 "Authorization": f"Bearer {token}",

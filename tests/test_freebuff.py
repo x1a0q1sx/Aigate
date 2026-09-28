@@ -722,6 +722,67 @@ def test_adapter_still_retries_on_genuine_stale_session(monkeypatch):
     assert len(session_posts) == 2, "真 stale 仍应重建一次"
 
 
+def test_chat_uses_session_granted_model_when_upstream_substitutes(monkeypatch):
+    """⚠️ 用户报错的真凶：上游会在档位受限时**静默换模型**。
+
+    实测（CN limited 档）：POST session 请求 `crof/kimi-k3-eco` → 上游 200 但授予
+    `deepseek/deepseek-v4-flash`。若 chat 仍带**请求的**模型名，上游按「会话模型 ≠
+    请求模型」拒掉 —— 报的正是用户看到的 session_model_mismatch（消息里列一串
+    "Limited free access is only available with ..."）。
+    chat 必须用 session 实际授予的模型。
+    """
+    calls = []
+    _patch_adapter(monkeypatch, calls, [
+        # 请求 stealth/space-bunny-alpha，上游改授予 deepseek/deepseek-v4-flash
+        (200, {"status": "active", "instanceId": "inst-1",
+               "model": "deepseek/deepseek-v4-flash",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+        (200, {"runId": "run-1"}),
+        (200, {"runId": "run-2"}),
+        (200, {"_sse": ['data: {"choices":[{"delta":{"content":"ok"}}]}']}),
+    ])
+    a = FreebuffAdapter()
+
+    async def _run():
+        return [c async for c in a.stream_chat_completion(
+            {"model": "stealth/space-bunny-alpha",
+             "messages": [{"role": "user", "content": "x"}]}, "tok", "")]
+
+    out = asyncio.run(_run())
+    assert out and out[0]["choices"][0]["delta"]["content"] == "ok"
+    # 出站 chat 的 model 必须是 session 授予的那个
+    chat = [c for c in calls if c["m"] == "SEND"][0]
+    sent = json.loads(chat["content"].decode())
+    assert sent["model"] == "deepseek/deepseek-v4-flash", \
+        "chat 必须用 session 实际授予的模型，否则上游按会话模型不符拒掉"
+    # run 也要按授予模型映射（agent 与模型必须配套）
+    run_posts = [c for c in calls if c["m"] == "POST"
+                 and c["url"].endswith("/api/v1/agent-runs")]
+    assert run_posts[0]["json"]["agentId"] == "base2-free-deepseek-flash"
+
+
+def test_chat_uses_requested_model_when_no_substitution(monkeypatch):
+    """反向对照：上游没换模型时必须用请求的模型（别把正常路径也改掉）。"""
+    calls = []
+    _patch_adapter(monkeypatch, calls, [
+        (200, {"status": "active", "instanceId": "inst-1", "model": "mimo/mimo-v2.5",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+        (200, {"runId": "run-1"}),
+        (200, {"runId": "run-2"}),
+        (200, {"_sse": ['data: {"choices":[{"delta":{"content":"ok"}}]}']}),
+    ])
+    a = FreebuffAdapter()
+
+    async def _run():
+        return [c async for c in a.stream_chat_completion(
+            {"model": "mimo/mimo-v2.5", "messages": [{"role": "user", "content": "x"}]},
+            "tok", "")]
+
+    asyncio.run(_run())
+    chat = [c for c in calls if c["m"] == "SEND"][0]
+    assert json.loads(chat["content"].decode())["model"] == "mimo/mimo-v2.5"
+
+
 # ── 档位放行清单（只标注、不过滤）──────────────────────────
 
 def test_entitled_model_ids_reads_snapshot_and_ignores_garbage():
