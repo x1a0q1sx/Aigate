@@ -184,7 +184,93 @@ def _schedule_maintenance():
     # 10:00（UTC+8）刷新，留 30 分钟余量。协议与实测见 core/checkin.py。
     _register_checkin_job()
 
+    # CodeBuddy 成长中心（Buddy 旅行 + 成长任务）：默认 11:00 北京时间，与签到
+    # 错开 30 分钟（同账号请求严格串行，避免上游风控）。协议见 core/codebuddy_growth.py。
+    _register_growth_job()
+
     _archive_scheduler.start()
+
+
+async def _run_growth_daily(trigger: str = "scheduled"):
+    """成长中心执行体（定时 / 启动补跑共用）：旅行 + 接取可自动化任务。"""
+    if getattr(_run_growth_daily, "_busy", False):
+        return
+    _run_growth_daily._busy = True
+    try:
+        from .core.codebuddy_growth import collect_growth_targets, run_growth_batch
+        gc = getattr(config, "growth", None)
+        do_travel = bool(getattr(gc, "travel", True))
+        do_tasks = bool(getattr(gc, "tasks", True))
+        async with AsyncSessionLocal() as db:
+            targets, skipped = await collect_growth_targets(db)
+            if not targets:
+                print(f"✓ 成长中心[{trigger}]：无账号需处理（跳过 {len(skipped)} 个）")
+                return
+            results = await run_growth_batch(
+                targets, trigger=trigger, db=db,
+                do_travel=do_travel, do_tasks=do_tasks)
+        gained = sum(r.get("credit") or 0 for r in results)
+        energy = sum(r.get("energy") or 0 for r in results)
+        acted = [r for r in results if r["kind"] in ("traveled", "claimed", "accepted")]
+        failed = [r for r in results if r["kind"] == "failed"]
+        print(f"✓ 成长中心[{trigger}]：执行 {len(acted)} 项"
+              f"（+{gained:g} 积分 / +{energy:g} 能量）· 失败 {len(failed)}")
+        for r in failed:
+            print(f"⚠️ 成长中心失败[{r['provider_code']}/{r['owner']}·{r['action']}]: "
+                  f"{r['message']}" + (f"（{r['error']}）" if r.get("error") else ""))
+    except Exception as e:
+        print(f"⚠️ 成长中心[{trigger}]失败: {e}")
+    finally:
+        _run_growth_daily._busy = False
+
+
+def _register_growth_job():
+    """按配置注册/重排成长中心定时任务（配置保存后也调用，即时生效）。"""
+    if _archive_scheduler is None:
+        return
+    try:
+        _archive_scheduler.remove_job("growth_daily")
+    except Exception:
+        pass  # 尚未注册
+    gc = getattr(config, "growth", None)
+    if not gc or not getattr(gc, "enabled", False):
+        print("⏭️ 成长中心未启用（growth.enabled=false）")
+        return
+    hour = max(0, min(23, int(getattr(gc, "hour", 11) or 0)))
+    minute = max(0, min(59, int(getattr(gc, "minute", 0) or 0)))
+    _archive_scheduler.add_job(
+        _run_growth_daily, "cron",
+        hour=hour, minute=minute,
+        timezone="Asia/Shanghai",   # 与签到同口径：上游按 UTC+8 刷新
+        id="growth_daily", coalesce=True, max_instances=1,
+    )
+    print(f"✓ 成长中心已排程（每天 {hour:02d}:{minute:02d} 北京时间）")
+
+
+def reschedule_growth_job():
+    """配置变更后重排（供 admin 端点在 save_config 后调用）。"""
+    _register_growth_job()
+
+
+async def _growth_startup_catchup():
+    """启动补跑：服务重启错过时间点后，当天仍自动处理（幂等由日志按天去重保证）。"""
+    try:
+        gc = getattr(config, "growth", None)
+        if not gc or not getattr(gc, "enabled", False):
+            return
+        if not getattr(gc, "startup_catchup", True):
+            return
+        from datetime import datetime, timedelta, timezone
+        cst = timezone(timedelta(hours=8))
+        now = datetime.now(cst)
+        target = now.replace(hour=max(0, min(23, int(getattr(gc, "hour", 11) or 0))),
+                             minute=max(0, min(59, int(getattr(gc, "minute", 0) or 0))),
+                             second=0, microsecond=0)
+        if now < target:
+            return  # 今天还没到点，交给定时任务
+        await _run_growth_daily("startup_catchup")
+    except Exception as e:
+        print(f"⚠️ 成长中心启动补跑失败: {e}")
 
 
 async def _run_checkin_daily(trigger: str = "scheduled"):
@@ -379,6 +465,8 @@ async def lifespan(app: FastAPI):
     # 每日签到启动补签：服务重启错过签到时间点时，当天自动补签
     #（collect_targets 内置幂等——今日已完成的账号会跳过，重复调用无副作用）
     _checkin_task = _aio.ensure_future(_checkin_startup_catchup())
+    # 成长中心启动补跑：与签到同机制（幂等由 growth_logs 按天去重保证）
+    _growth_task = _aio.ensure_future(_growth_startup_catchup())
     # OpenCode 免费层 CLI sidecar 守护：上游只认「官方 CLI 会话」，AIGate 经其 HTTP API
     # 转发（见 core/opencode_sidecar.py）。sidecar 崩了本任务自动拉起；未安装 CLI 时
     # 静默跳过（该免费候选自然不可用，不影响其它路由）。

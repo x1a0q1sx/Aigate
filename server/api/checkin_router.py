@@ -263,3 +263,154 @@ async def put_checkin_config(body: CheckinConfigModel):
     except Exception as e:
         logger.warning("checkin reschedule failed: %s", e)
     return cfg.model_dump()
+
+
+# ── 成长中心（Buddy 旅行 / 成长任务）────────────────────────────
+# 与签到同页展示，但**独立数据源**（core/codebuddy_growth.py）：
+# 签到领的是「每日积分」，成长中心是「活动任务 + 宠物养成」。
+# 只做客户端外能完成的事（照抄 WorkDaddy 白名单），其余如实列给用户手动做。
+
+@router.get("/checkin/growth")
+async def checkin_growth(with_snapshot: bool = Query(True),
+                         db: AsyncSession = Depends(get_db)):
+    """成长中心概览：各账号的旅行状态 / Buddy / 任务进度 / 连续活跃 / 盲盒。
+
+    `with_snapshot=false` 只返回配置与最近日志（不请求上游，页面秒开）。
+    只读：本端点**不发任何写请求**。
+    """
+    from server.config import get_config
+    from server.models.growth_log import GrowthLog
+    from server.core.codebuddy_growth import AUTOMATABLE_TASK_CODES
+
+    cfg = getattr(get_config(), "growth", None)
+    day_start = _cst_day_start_utc()
+    recent = (await db.execute(
+        select(GrowthLog).where(GrowthLog.created_at >= day_start - timedelta(days=7))
+        .order_by(desc(GrowthLog.created_at)).limit(200)
+    )).scalars().all()
+    logs = [{
+        "id": r.id,
+        "created_at": r.created_at.isoformat() + "Z" if r.created_at else None,
+        "provider_code": r.provider_code, "owner": r.owner, "trigger": r.trigger,
+        "action": r.action, "kind": r.kind, "credit": r.credit, "energy": r.energy,
+        "location": r.location, "task_codes": r.task_codes,
+        "message": r.message, "error": r.error, "duration_ms": r.duration_ms,
+    } for r in recent]
+
+    accounts = []
+    if with_snapshot:
+        from server.core.codebuddy_growth import fetch_growth_overview
+        try:
+            accounts = await fetch_growth_overview(db)
+        except Exception as e:
+            logger.warning("growth overview failed: %s", e)
+            accounts = [{"ok": False, "message": f"成长中心查询失败：{type(e).__name__}"}]
+
+    # 今日处理状态（从日志派生，与签到同口径）
+    today_rows = (await db.execute(
+        select(GrowthLog).where(GrowthLog.created_at >= day_start)
+    )).scalars().all()
+    today_map = {}
+    for r in today_rows:
+        today_map[(r.provider_code, r.owner, r.action)] = r
+
+    return {
+        "config": cfg.model_dump() if cfg else {},
+        "next_run_at": _next_run_at(cfg),
+        "accounts": accounts,
+        "today": {
+            f"{k[0]}|{k[1]}|{k[2]}": {
+                "kind": v.kind, "credit": v.credit, "energy": v.energy,
+                "message": v.message, "at": v.created_at.isoformat() + "Z" if v.created_at else None,
+            } for k, v in today_map.items()
+        },
+        "logs": logs,
+        # 可自动化的任务码（UI 可提示「这些能自动接取」）
+        "automatable_task_codes": sorted(AUTOMATABLE_TASK_CODES),
+    }
+
+
+class GrowthRunPayload(BaseModel):
+    provider_code: Optional[str] = None   # 省略 = 全部 CodeBuddy 账号
+    action: Optional[str] = None          # travel | task | None(=两者都做)
+
+
+@router.post("/checkin/growth/run")
+async def checkin_growth_run(payload: GrowthRunPayload = None,
+                             db: AsyncSession = Depends(get_db)):
+    """手动处理成长中心（严格串行）。
+
+    `action` 限定只做旅行或只接任务；省略则按配置（growth.travel / growth.tasks）。
+    幂等：当天已处理过的动作自动跳过。
+    """
+    from server.config import get_config
+    from server.core.codebuddy_growth import (
+        collect_growth_targets, run_growth_batch, GROWTH_PRODUCTS)
+
+    code = (payload.provider_code if payload else None) or None
+    if code and code not in GROWTH_PRODUCTS:
+        raise HTTPException(status_code=400, detail=f"成长中心不支持该平台：{code}")
+    act = (payload.action if payload else None) or None
+    if act and act not in ("travel", "task"):
+        raise HTTPException(status_code=400, detail=f"未知动作：{act}")
+
+    gc = getattr(get_config(), "growth", None)
+    do_travel = bool(getattr(gc, "travel", True)) if act in (None, "travel") else False
+    do_tasks = bool(getattr(gc, "tasks", True)) if act in (None, "task") else False
+
+    targets, skipped = await collect_growth_targets(db)
+    if code:
+        targets = [t for t in targets if t.provider_code == code]
+
+    if not targets:
+        return {"ok": True, "ran": 0, "results": [], "skipped": skipped,
+                "message": "没有可处理的账号"}
+
+    results = await run_growth_batch(
+        targets, trigger="manual", db=db,
+        do_travel=do_travel, do_tasks=do_tasks)
+    acted = [r for r in results if r["kind"] in ("traveled", "claimed", "accepted")]
+    failed = [r for r in results if r["kind"] == "failed"]
+    return {"ok": True, "ran": len(results), "acted": len(acted), "failed": len(failed),
+            "credit": sum(r.get("credit") or 0 for r in results),
+            "energy": sum(r.get("energy") or 0 for r in results),
+            "results": results, "skipped": skipped}
+
+
+class GrowthConfigModel(BaseModel):
+    enabled: Optional[bool] = None
+    travel: Optional[bool] = None
+    tasks: Optional[bool] = None
+    hour: Optional[int] = None
+    minute: Optional[int] = None
+    startup_catchup: Optional[bool] = None
+
+
+@router.get("/checkin/growth/config")
+async def get_growth_config():
+    from server.config import get_config
+    cfg = getattr(get_config(), "growth", None)
+    return cfg.model_dump() if cfg else {}
+
+
+@router.put("/checkin/growth/config")
+async def put_growth_config(body: GrowthConfigModel):
+    from server.config import get_config, save_config
+    cfg = getattr(get_config(), "growth", None)
+    if cfg is None:
+        raise HTTPException(status_code=500, detail="growth 配置段缺失")
+    for k, v in body.model_dump(exclude_unset=True).items():
+        if v is None:
+            continue
+        if k == "hour":
+            v = max(0, min(23, int(v)))      # 钳制，防配错打瘫定时器
+        elif k == "minute":
+            v = max(0, min(59, int(v)))
+        setattr(cfg, k, v)
+    save_config()
+    try:
+        from server.main import reschedule_growth_job
+        reschedule_growth_job()
+    except Exception as e:
+        logger.warning("growth reschedule failed: %s", e)
+    return cfg.model_dump()

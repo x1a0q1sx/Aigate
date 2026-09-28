@@ -182,6 +182,25 @@ class CheckinConfig(BaseModel):
     minute: int = 30                # 0-59
     startup_catchup: bool = True    # 启动时若当天未签则补签
 
+
+class GrowthConfig(BaseModel):
+    """CodeBuddy 成长中心：Buddy 旅行 + 成长任务（纯 HTTP，见 core/codebuddy_growth.py）。
+
+    只做两件**客户端外能完成**的事（照抄 WorkDaddy 的 AUTOMATABLE_TASK_CODES 白名单）：
+    - travel：按状态自动「派发 / 领奖」（每日一次，按北京时间去重）
+    - tasks：自动**接取**白名单内的成长任务（不改状态、不伪造完成）
+
+    时间与签到错开（默认 11:00，签到后 30 分钟）—— 同一账号的请求严格串行，
+    避免上游风控。国际版实测无此活动（数据为空），会自动如实显示「本版无此活动」。
+    """
+    enabled: bool = True            # 总开关（默认开）
+    travel: bool = True             # 自动处理旅行（派发 + 领奖）
+    tasks: bool = True              # 自动接取可自动化的成长任务
+    hour: int = 11                  # 北京时间（0-23），与签到错开
+    minute: int = 0                 # 0-59
+    startup_catchup: bool = True    # 启动补跑（当天未处理时）
+
+
 class OpenCodeBridgeConfig(BaseModel):
     """OpenCode 免费层的官方 CLI 桥接（sidecar）。
 
@@ -228,6 +247,7 @@ class Config(BaseModel):
     drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
     race: RaceConfig = Field(default_factory=RaceConfig)
     checkin: CheckinConfig = Field(default_factory=CheckinConfig)
+    growth: GrowthConfig = Field(default_factory=GrowthConfig)
     opencode_bridge: OpenCodeBridgeConfig = Field(default_factory=OpenCodeBridgeConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""

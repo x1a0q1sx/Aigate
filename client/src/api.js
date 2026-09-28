@@ -335,6 +335,13 @@ export default {
   getCheckinLogs: (days = 7) => apiGet(`/admin/api/checkin/logs?days=${days}`),
   getCheckinConfig: () => apiGet('/admin/api/checkin/config'),
   updateCheckinConfig: (data) => apiPut('/admin/api/checkin/config', data),
+  // 成长中心（CodeBuddy Buddy 旅行 / 成长任务，纯 HTTP）
+  getGrowth: (withSnapshot = true) =>
+    apiGet(`/admin/api/checkin/growth${withSnapshot ? '' : '?with_snapshot=false'}`),
+  runGrowth: (providerCode, action) => apiPost('/admin/api/checkin/growth/run',
+    { ...(providerCode ? { provider_code: providerCode } : {}), ...(action ? { action } : {}) }),
+  getGrowthConfig: () => apiGet('/admin/api/checkin/growth/config'),
+  updateGrowthConfig: (data) => apiPut('/admin/api/checkin/growth/config', data),
   // OpenCode 桥接（官方 CLI sidecar）
   getOpenCodeBridge: () => apiGet('/admin/api/opencode'),
   updateOpenCodeBridge: (data) => apiPut('/admin/api/opencode', data),
