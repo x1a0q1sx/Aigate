@@ -525,7 +525,9 @@ async def create_session(token: str, model: str, instance_id: Optional[str] = No
         if r.status_code == 401:
             raise SessionError("authToken 无效或已撤销（请重新连接）", r.status_code, terminal=True)
         if r.status_code == 429:
-            raise SessionError(f"Freebucks 额度已用尽：{str(data.get('message') or '')[:120]}", r.status_code)
+            # 上游 429 体无 message 字段（实测）→ 用结构化字段拼可执行提示，
+            # 不再产出「Freebucks 额度已用尽：」后面空着的残缺文案。
+            raise SessionError("Freebucks 额度已用尽" + quota_exhausted_message(data), r.status_code)
         raise SessionError(f"create session failed: HTTP {r.status_code} {str(data)[:150]}", r.status_code)
     raise SessionError("create session failed: 释放占锁 session 后仍冲突", 409)
 
@@ -657,6 +659,65 @@ def entitled_model_ids(snapshot: dict) -> list:
     return [str(k) for k in rlm.keys() if isinstance(k, str) and k]
 
 
+def quota_backed_model_ids(snapshot: dict) -> list:
+    """快照里**当前真有可用额度**的模型 id（rateLimitsByModel[*].limit > 0）。
+
+    ⚠️ 与 entitled_model_ids 的区别（2026-09-28 实测）：`rateLimitsByModel` 的键
+    是「本档位包含的模型」，但**不保证现在有额度** —— `z-ai/glm-5.3-flash` 就在
+    键里、`pool: "glm"`（Reward 奖励池）、`limit: 0`，实际调用被上游 429 拒掉
+    （`{"status":"rate_limited","pool":"freebucks",...}`）。只按「在不在键里」标注
+    会把这类模型显示成「可用」，用户点了才撞墙 —— 故另出一份按 limit 过滤的清单。
+    """
+    if not isinstance(snapshot, dict):
+        return []
+    rlm = snapshot.get("rateLimitsByModel")
+    if not isinstance(rlm, dict):
+        return []
+    out = []
+    for k, v in rlm.items():
+        if not isinstance(k, str) or not k:
+            continue
+        lim = v.get("limit") if isinstance(v, dict) else None
+        try:
+            if lim is None or float(lim) > 0:
+                out.append(k)   # limit 缺失/不可解析 → 当作有额度（不误标）
+        except (TypeError, ValueError):
+            out.append(k)
+    return out
+
+
+def quota_exhausted_message(data: dict) -> str:
+    """429（Freebucks 用尽）→ 可执行提示。
+
+    ⚠️ 上游 429 响应体**没有 `message` 字段**（实测），只有结构化信息：
+    `pool/poolLabel`、`limit`/`recentCount`、`resetAt`/`retryAfterMs`、
+    `freebucksShortfall{price,balance}`、`upgrade.message`。此前只取 message →
+    文案变成「Freebucks 额度已用尽：」后面空着，用户看不出还差多少、何时恢复。
+    """
+    d = data if isinstance(data, dict) else {}
+    pool = str(d.get("poolLabel") or d.get("pool") or "Freebucks")
+    parts = [f"{pool} 额度已用尽"]
+    short = d.get("freebucksShortfall") if isinstance(d.get("freebucksShortfall"), dict) else {}
+    try:
+        price = float(short.get("price"))
+        balance = float(short.get("balance"))
+        parts.append(f"本次需 {price:g}、余额 {balance:g}")
+    except (TypeError, ValueError):
+        pass
+    retry_ms = d.get("retryAfterMs")
+    try:
+        mins = int(float(retry_ms) / 60000)
+        if mins > 0:
+            parts.append(f"约 {mins} 分钟后重置")
+    except (TypeError, ValueError):
+        pass
+    if not any("重置" in p for p in parts):
+        reset = d.get("resetAt")
+        if reset:
+            parts.append(f"重置时间 {str(reset)[:19]}Z")
+    return "（" + "；".join(parts[1:]) + "）" if len(parts) > 1 else ""
+
+
 # ── 档位放行清单缓存（仅供显示名标注，绝不用于过滤）───────────────
 # 只在**已经有**快照的地方顺手记下（额度查询 / 健康探测），不额外发请求 ——
 # worker.js 明确警告过：为查状态而 GET /session 会顶掉正在进行的 chat。
@@ -670,15 +731,22 @@ def _token_fp(token: str) -> str:
 
 
 def note_entitlement(token: str, snapshot: dict) -> None:
-    """把快照里的放行清单记进缓存（无信息则不动，避免用空表覆盖已知值）。"""
+    """把快照里的放行清单记进缓存（无信息则不动，避免用空表覆盖已知值）。
+
+    同时记两份：`entitled`（档位包含的模型，rateLimitsByModel 的键）与
+    `quota_backed`（其中 limit>0、现在真打得动的）。两者语义不同，见
+    quota_backed_model_ids 的说明。
+    """
     ids = entitled_model_ids(snapshot)
     if not ids:
         return
-    _ENTITLED_CACHE[_token_fp(token)] = (time.monotonic() + ENTITLED_CACHE_TTL, frozenset(ids))
+    backed = quota_backed_model_ids(snapshot)
+    _ENTITLED_CACHE[_token_fp(token)] = (
+        time.monotonic() + ENTITLED_CACHE_TTL, frozenset(ids), frozenset(backed))
 
 
 def known_entitlement(token: str):
-    """已知的放行模型集合；未知（缓存过期/从未探测）返回 None。
+    """已知的档位包含模型集合；未知（缓存过期/从未探测）返回 None。
 
     返回 None 与返回空集语义不同：None = 不知道（不标注），空集 = 上游明确说一个都不放行。
     """
@@ -686,6 +754,19 @@ def known_entitlement(token: str):
     if not hit or hit[0] <= time.monotonic():
         return None
     return hit[1]
+
+
+def known_quota_backed(token: str):
+    """已知的**当前有额度**的模型集合（limit>0）；未知返回 None。
+
+    与 known_entitlement 配对使用：在档位里但不在本集合 → 现在没额度，
+    模型页标「当前无额度」而不是显示成可用（glm-5.3-flash 就是这种）。
+    """
+    hit = _ENTITLED_CACHE.get(_token_fp(token))
+    if not hit or hit[0] <= time.monotonic():
+        return None
+    return hit[2]
+
 
 
 def _uuid4() -> str:

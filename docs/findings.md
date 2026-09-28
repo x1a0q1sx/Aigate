@@ -997,3 +997,71 @@ UPDATE 带原值守卫（幂等、可重复执行），落库前写回滚凭据�
 新增 **6 项**（全量 **814 项全绿**）：占位键不叠加（复现生产报文）、真 Anthropic
 仍合并、残缺 Anthropic 仍合并、DeepSeek 拆分字段识别、缓存写字段、Responses
 带占位键不误判。
+
+## F30 Freebuff glm-5.3-flash 报 500 = 网关异常处理缺口 + 「在档位≠有额度」（2026-09-28）
+
+**用户反馈**：选 `Freebuff (Codebuff 免费层)/z-ai/glm-5.3-flash` 报
+`HTTP 500: Internal Server Error`。
+
+**两个独立问题叠在一起**：
+
+### 一、网关异常处理缺口（把可读原因吞成 500）
+
+`playground_chat` 的适配器调用点**只捕获 httpx 三类异常**：
+
+```python
+except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+```
+
+而 freebuff 适配器抛的是**业务异常**（`SessionError`）——不在捕获列表里 →
+穿透出 endpoint → FastAPI 兜底成 **500 Internal Server Error**。真实原因
+（`Freebucks 额度已用尽`）只留在服务端日志里，前端什么都看不到。
+
+对照 `/v1`：同一位置是 `except Exception` 宽捕获 → 503 + 可读文案。
+**两条路径口径不一致**，playground 是漏网的那条。
+
+**修复**：非流式与流式两条路径都补宽捕获（对齐 `/v1`）——
+非流式 → 503 + `upstream_call_failed: <类型>: <原因>`；
+流式 → SSE `error` 事件（**不再让异常穿透生成器**，否则前端只看到流中断）。
+
+### 二、「在档位里」≠「现在有额度」
+
+`rateLimitsByModel` 的**键**是「本档位包含的模型」，但**不保证有额度**。
+生产实测该账号：
+
+| 模型 | pool | limit |
+|---|---|---|
+| deepseek/deepseek-v4-flash / mimo-v2.5 / solar-mini4 / solar-pro4 | `limited` | **6** |
+| **z-ai/glm-5.3-flash** | `glm`（Reward 奖励池） | **0** |
+
+旧标注只判「在不在键里」→ glm 被当成可用，用户点了才撞墙。而实际调用时
+上游回的是 **429**（不是档位拒绝）：
+
+```json
+{"status":"rate_limited","pool":"freebucks","poolLabel":"Freebucks","limit":25,
+ "recentCount":25,"resetAt":"2026-09-28T07:00:00.000Z","retryAfterMs":1493705,
+ "freebucksShortfall":{"price":5,"balance":0}}
+```
+
+同时该账号当日 Freebucks 确实用尽（`daily: 25/25, remaining 0`；wallet 0）。
+
+**修复**：新增 `quota_backed_model_ids()`（按 `limit > 0` 过滤）与
+`known_quota_backed()` 缓存（与 `known_entitlement` 成对，仍**只标注不过滤**）；
+模型页对「档位内但无额度」的模型标「**当前无额度**」（与「档位不可用」区分）；
+额度面板 note 补一句「其中 … 当前额度为 0（奖励池），要等发放或升档」。
+
+### 三、顺带修掉残缺错误文案
+
+上游 429 响应体**没有 `message` 字段**（实测），而旧代码是
+`f"Freebucks 额度已用尽：{data.get('message') or ''}"` → 文案变成
+**「Freebucks 额度已用尽：」后面空着**（日志里可见）。新增
+`quota_exhausted_message()` 从结构化字段拼：「（本次需 5、余额 0；约 24 分钟后重置）」。
+
+### 测试
+
+新增 **10 项**（全量 **824 项全绿**）：
+- `tests/test_playground_errors.py` 5 项：非流式业务异常 → 503 可读文案、
+  流式业务异常 → SSE error + [DONE]、httpx 两条原路径不回归、源码守卫
+  （**已验证：撤掉修复后其中 3 项立刻失败**）
+- `tests/test_freebuff.py` +5 项：limit=0 与档位内可区分、模型页分开标注、
+  429 文案用结构化字段、create_session 的 429 文案可执行、额度面板 note 分述

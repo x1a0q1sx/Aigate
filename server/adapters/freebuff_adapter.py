@@ -351,6 +351,10 @@ class FreebuffAdapter(BaseAdapter):
         # 已知档位放行清单（来自此前额度查询/健康探测的快照，不额外发请求）。
         # None = 未知 → 一律不加标注（绝不因一次没探到就把整列标成不可用）。
         entitled = fb.known_entitlement(api_key)
+        # 「在档位里」≠「现在有额度」：rateLimitsByModel 的键包含奖励池模型
+        # （glm-5.3-flash，pool=glm/limit=0），实际调用会被 429 拒掉 —— 单列一份
+        # limit>0 的清单，避免把这类模型显示成可用（用户点了才撞墙）。
+        backed = fb.known_quota_backed(api_key)
         out = []
         for mid in ids:
             name = display.get(mid, mid)
@@ -358,6 +362,8 @@ class FreebuffAdapter(BaseAdapter):
                 # 如实标注、但**不过滤**：出口换区/账号升档后即可用，
                 # 且失败时由上游如实报错（对齐 Trae「暂不可用」标注的既有做法）。
                 name = f"{name} · 当前档位不可用"
+            elif backed is not None and mid not in backed:
+                name = f"{name} · 当前无额度"
             out.append(ModelInfo(
                 model_id=mid,
                 display_name=name,

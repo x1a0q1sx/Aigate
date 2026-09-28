@@ -2136,6 +2136,13 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 from server.api.v1_router import _api_error as _api_error_fn
                 yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), str(e)[:500])
+            except Exception as e:
+                # 适配器自抛的业务错误（SessionError / RuntimeError 等）也必须变成
+                # SSE error 事件：否则异常穿透生成器 → 前端只看到流中断，原因丢失。
+                # 对齐 /v1 的宽捕获口径（那边 except Exception → _api_error）。
+                from server.api.v1_router import _api_error as _api_error_fn
+                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"), model_id_full)
+                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), str(e)[:500])
             yield b"data: [DONE]\n\n"
         return StreamingResponse(wrap_stream(), media_type="text/event-stream")
 
@@ -2150,6 +2157,16 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
             await _write_log("error", None, int((time.time() - _send_time)*1000), str(e)[:500])
             return JSONResponse(status_code=503, content={"error": f"upstream_call_failed: {type(e).__name__}: {str(e)[:200]}"})
+        except Exception as e:
+            # ⚠️ 此前只捕获 httpx 三类异常，适配器自抛的业务错误（如 freebuff 的
+            # SessionError「Freebucks 额度已用尽」/「模型不在此档」）会穿透成
+            # **HTTP 500 Internal Server Error** —— 用户只看到 500，看不到真正原因
+            # （生产实测：glm-5.3-flash 因额度用尽报 500，日志里才有可读文案）。
+            # 对齐 /v1 的宽捕获：一律转成 503 + 可读 error 文案。
+            await _write_log("error", None, int((time.time() - _send_time)*1000), str(e)[:500])
+            return JSONResponse(status_code=503,
+                                content={"error": f"upstream_call_failed: {type(e).__name__}: {str(e)[:300]}"})
+
 
     if isinstance(result, dict) and "model" in result:
         result["model"] = model_id_full

@@ -765,12 +765,21 @@ async def _freebuff_usage(token: str) -> dict:
     # 档位放行清单（就是快照里的 rateLimitsByModel）：这是**唯一权威**的「这个号
     # 现在能用哪些模型」。上游拒绝时只回短名文案（GLM 5.3 Flash …），与目录 id
     # 对不上，用户照着改也改不对 —— 这里直接给 id。
+    # ⚠️ 「在档位里」≠「现在有额度」：glm-5.3-flash 在键里但 pool=glm/limit=0，
+    # 调用会被 429 拒（2026-09-28 实测）→ 分开列出，不让用户点了才撞墙。
     entitled = fb.entitled_model_ids(data)
+    backed = fb.quota_backed_model_ids(data)
+    exhausted = [m for m in entitled if m not in backed]
     if tier == "limited":
-        note = ("出口国别为 limited 档（非 US 出口的默认档）：仅放行 "
-                + "、".join(entitled) + "；其余模型会被上游以 session_model_mismatch 拒绝。"
-                "在服务商设置里开启「走代理」可换出口试试。") if entitled else \
-               "出口国别为 limited 档（非 US 出口的默认档，模型目录缩减）"
+        if entitled:
+            note = ("出口国别为 limited 档（非 US 出口的默认档）：仅放行 "
+                    + "、".join(entitled) + "；其余模型会被上游以 session_model_mismatch 拒绝。"
+                    "在服务商设置里开启「走代理」可换出口试试。")
+            if exhausted:
+                note += ("其中 " + "、".join(exhausted)
+                         + " 当前额度为 0（奖励池），要等发放或升档。")
+        else:
+            note = "出口国别为 limited 档（非 US 出口的默认档，模型目录缩减）"
     else:
         note = None
     return {"plan": "Freebuff", "quotas": quotas,
@@ -780,6 +789,7 @@ async def _freebuff_usage(token: str) -> dict:
                 "daily_remaining": remaining,
                 "affordable_models": [f"{name}×{n}" for n, name in afford[:8]],
                 "entitled_models": entitled,
+                "quota_backed_models": backed,
                 "price_notices": fb_data.get("priceNotices") or {},
                 "note": note,
             }}

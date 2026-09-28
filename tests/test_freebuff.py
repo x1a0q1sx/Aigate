@@ -851,3 +851,89 @@ def test_health_check_records_entitlement_for_later_listing(monkeypatch):
     # 只读：健康探测绝不 POST（POST 会扣 Freebucks）
     assert not [c for c in calls if c["m"] == "POST"]
     fb._ENTITLED_CACHE.clear()
+
+
+# ============ 2026-09-28 实测：429 文案 / 「在档位≠有额度」标注 ============
+
+def test_quota_backed_model_ids_excludes_zero_limit_reward_pool():
+    """「在档位里」≠「现在有额度」：glm-5.3-flash 在 rateLimitsByModel 键里，
+    但 pool=glm（奖励池）limit=0，实际调用被 429 拒 —— 必须能区分出来。"""
+    snap = {"rateLimitsByModel": {
+        "deepseek/deepseek-v4-flash": {"limit": 6, "pool": "limited"},
+        "upstage/solar-mini4": {"limit": 6, "pool": "limited"},
+        "z-ai/glm-5.3-flash": {"limit": 0, "pool": "glm", "poolLabel": "Reward"},
+    }}
+    assert set(fb.entitled_model_ids(snap)) == {
+        "deepseek/deepseek-v4-flash", "upstage/solar-mini4", "z-ai/glm-5.3-flash"}
+    assert set(fb.quota_backed_model_ids(snap)) == {
+        "deepseek/deepseek-v4-flash", "upstage/solar-mini4"}
+    # limit 缺失/不可解析 → 当作有额度（绝不误标成「无额度」）
+    assert fb.quota_backed_model_ids({"rateLimitsByModel": {"a/b": {}, "c/d": {"limit": "x"}}}) == ["a/b", "c/d"]
+    assert fb.quota_backed_model_ids({}) == []
+    assert fb.quota_backed_model_ids(None) == []
+
+
+def test_adapter_annotates_zero_quota_model_separately(monkeypatch):
+    """档位内但 limit=0 的模型标「当前无额度」（不是「档位不可用」，也不是默认可用）。"""
+    async def _net(proxy=None):
+        return ["deepseek/deepseek-v4-flash", "z-ai/glm-5.3-flash", "openai/gpt-6-luna"]
+
+    monkeypatch.setattr(fb, "fetch_release_models", _net)
+    fb._ENTITLED_CACHE.clear()
+    fb.note_entitlement("tok-q", {"rateLimitsByModel": {
+        "deepseek/deepseek-v4-flash": {"limit": 6},
+        "z-ai/glm-5.3-flash": {"limit": 0, "pool": "glm"},
+    }})
+    models = asyncio.run(FreebuffAdapter().list_models("tok-q", ""))
+    assert [m.model_id for m in models] == [
+        "deepseek/deepseek-v4-flash", "z-ai/glm-5.3-flash", "openai/gpt-6-luna"], "不得过滤"
+    by_id = {m.model_id: m.display_name for m in models}
+    assert "不可用" not in by_id["deepseek/deepseek-v4-flash"] and "无额度" not in by_id["deepseek/deepseek-v4-flash"]
+    assert "当前无额度" in by_id["z-ai/glm-5.3-flash"]
+    assert "当前档位不可用" in by_id["openai/gpt-6-luna"]
+    fb._ENTITLED_CACHE.clear()
+
+
+def test_quota_exhausted_message_uses_structured_fields():
+    """上游 429 体**没有 message 字段**（实测）—— 提示必须从结构化字段拼，
+    否则文案是「Freebucks 额度已用尽：」后面空着（用户看不出还差多少/何时恢复）。
+
+    约定：本函数只产出**明细后缀**（括号段），标题由调用方拼
+    （见 create_session 的 "Freebucks 额度已用尽" + quota_exhausted_message(...)）。
+    """
+    body = {"status": "rate_limited", "accessTier": "limited", "model": "z-ai/glm-5.3-flash",
+            "pool": "freebucks", "poolLabel": "Freebucks", "limit": 25, "recentCount": 25,
+            "resetAt": "2026-09-28T07:00:00.000Z", "retryAfterMs": 1493705,
+            "freebucksShortfall": {"price": 5, "balance": 0}}
+    msg = fb.quota_exhausted_message(body)
+    assert "需 5" in msg and "余额 0" in msg and "重置" in msg
+    # 无 retryAfterMs 时回落到 resetAt
+    msg2 = fb.quota_exhausted_message({"freebucksShortfall": {"price": 5, "balance": 0},
+                                       "resetAt": "2026-09-28T07:00:00.000Z"})
+    assert "重置时间 2026-09-28T07:00:00" in msg2
+    # 结构化字段缺失也不得崩、不得产出残缺冒号
+    assert fb.quota_exhausted_message({}) == ""
+    assert fb.quota_exhausted_message(None) == ""
+
+
+def test_create_session_429_message_is_actionable(monkeypatch):
+    """429 → SessionError 文案带「还差多少 / 何时恢复」，不是空冒号。"""
+    calls = []
+    _patch(monkeypatch, calls, [(429, {"status": "rate_limited", "poolLabel": "Freebucks",
+                                       "freebucksShortfall": {"price": 5, "balance": 0},
+                                       "retryAfterMs": 600000})])
+    with pytest.raises(fb.SessionError) as ei:
+        asyncio.run(fb.create_session("tok", "z-ai/glm-5.3-flash"))
+    s = str(ei.value)
+    assert "Freebucks 额度已用尽" in s and "需 5" in s and "余额 0" in s
+    assert ei.value.status == 429 and ei.value.terminal is False
+
+
+def test_usage_note_separates_entitled_from_quota_backed():
+    """额度面板 note 必须把「档位放行」与「当前有额度」分开说。"""
+    import inspect
+    from server.core import oauth_usage
+    src = inspect.getsource(oauth_usage._freebuff_usage)
+    assert "quota_backed_model_ids" in src
+    assert "当前额度为 0（奖励池）" in src
+    assert '"quota_backed_models": backed' in src
