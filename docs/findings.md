@@ -1174,3 +1174,61 @@ P3 签到防御增强。
 
 **Intl 版本无此活动**（实测端点全 200 但数据为空：`buddy:null`、`buddies:[]`、
 `travel.config:{}`）→ 按 provider 分别登记能力，如实显示「本版无此活动」。
+
+## F33 CodeBuddy 成长中心接入（Buddy 旅行 + 成长任务，2026-09-28）
+
+用户要求把 WorkDaddy 的功能「开搞」。调研结论见
+`docs/findings-workdaddy-features.md`（F32）—— 这块是**纯 HTTP API**，与桌面端无关。
+
+### 落地内容
+
+| 层 | 文件 | 说明 |
+|---|---|---|
+| 协议 | `core/codebuddy_growth.py` | 只读快照 + 旅行（depart/claim/run）+ 任务接取 |
+| 数据 | `models/growth_log.py` | 操作日志（traveled/claimed/accepted/already/inactive/failed） |
+| 配置 | `config.GrowthConfig` | enabled / travel / tasks / hour=11 / minute=0 / startup_catchup |
+| 调度 | `main.py` | 每日 **11:00 北京时间**（与签到 10:30 错开）+ 启动补跑 + 即时重排 |
+| API | `api/checkin_router.py` | `GET /checkin/growth`、`POST .../run`、`GET/PUT .../config` |
+| 前端 | `views/Checkin.vue` | 签到页新增「成长中心」区块（旅行/Buddy/任务/活跃/任务明细） |
+
+### 三条设计约束（照抄上游，不发明）
+
+1. **只自动做「客户端外能完成」的事**：`AUTOMATABLE_TASK_CODES` 与 WorkDaddy
+   源码**逐字一致**（14 个码）。白名单外的（关注公众号、体验公益专家等）需要
+   真实点击，自动化必失败 → **如实列出提示手动做**，不硬做。
+2. **严格串行 + 按天幂等**：同账号请求串行（上游对高频敏感）；每个动作当天
+   只做一次，`failed` 不算（必须允许重试）。
+3. **只读优先、失败不编造**：`fetch_snapshot` 只发 GET；拿不到就如实标不可用。
+
+### 生产实测（部署即生效）
+
+启动补跑自动执行，`growth_logs` 落库：
+
+```
+[09:26:21] codebuddy_cn/15944101987 travel/already   旅行进行中（等待到达）
+[09:26:22] codebuddy_cn/15944101987 task/accepted    已接取 3 个任务
+[09:26:23] codebuddy_cn/13500818840 travel/traveled  已派出旅行
+[09:26:24] codebuddy_cn/13500818840 task/accepted    已接取 3 个任务
+[09:26:24] codebuddy_intl/__default travel/inactive  本版无旅行活动（上游返回空配置）
+[09:26:25] codebuddy_intl/__default task/already     没有待接取的可自动化任务
+```
+
+- 159 账号旅行本就在进行中 → **正确跳过**（不重复派发）；135 账号 idle → **派发成功**
+- 两个 CN 账号各接取 3 个任务；Intl 如实报「本版无活动」
+- **幂等复验**：再跑一次 6 项全部 `already 今天已处理过，跳过`，**0 次上游写请求**
+
+### 一个排查教训
+
+部署时我用 `git checkout -- <文件>` 清理手拷的未跟踪副本，结果**把 pull 覆盖了**
+（自检仍显示旧版本 `v1e86c3d`）。正确做法是 `rm -f` 未跟踪文件再 pull ——
+`git checkout --` 对**已跟踪**文件是「丢弃改动」，在这里是误用。
+
+### 测试
+
+新增 **38 项**（全量 **875 项全绿**）：白名单（逐字核对 WorkDaddy）、`instance_id`
+纯数字校验、任务码注入防护、旅行状态机（arrived→claim / idle→depart /
+traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读性、批量串行（
+`maxInFlight==1`）、单账号失败不中断、动作开关、按天幂等（含 `failed` 允许重试）、
+配置默认值与调度接线守卫、端点注册。
+**已反向验证**：注入「忽略白名单」与「traveling 重复派发」两个错误实现后，
+对应测试立刻失败。
