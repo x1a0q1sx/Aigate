@@ -614,14 +614,57 @@ def test_create_session_409_not_entitled_raises_actionable_error(monkeypatch):
     assert ei.value.status == 409
 
 
-def test_create_session_409_stale_keeps_old_message(monkeypatch):
-    """session 脏（superseded）保持原样：上层要按 stale 分支重建重试。"""
+def test_create_session_409_stale_reports_real_code(monkeypatch):
+    """非档位的 409 必须**如实回显上游错误码**，不得一律盖成 session_model_mismatch。
+
+    上游对多种情况都回 409（实测 session_superseded / model_locked 等）。盖错码会把
+    「另一个实例占了 session」误导成「模型不在此档」，用户就会去改模型而不是重试。
+    """
     calls = []
-    _patch(monkeypatch, calls, [(409, {"error": "session_superseded", "message": "taken over"})])
+    _patch(monkeypatch, calls, [
+        (409, {"error": "session_superseded", "message": "taken over"}),
+        # 释放占锁 session 后的重试（GET 拿持锁 id → DELETE）
+        (200, {"status": "active", "instanceId": "inst-holder", "model": "m"}),
+        (200, {}),
+        # 重试仍冲突 → 抛错
+        (409, {"error": "model_locked", "message": "still locked"}),
+    ])
     with pytest.raises(fb.SessionError) as ei:
         asyncio.run(fb.create_session("tok", "m"))
-    assert "session_model_mismatch" in str(ei.value)
+    msg = str(ei.value)
+    assert "session_model_mismatch" not in msg, "不得把其它 409 盖成档位拒绝"
+    assert "model_locked" in msg, "必须回显真实错误码"
     assert ei.value.status == 409
+    # 确实做了「GET 拿持锁 id → DELETE 释放」这一次重试
+    deletes = [c for c in calls if c["m"] == "DELETE"]
+    assert len(deletes) == 1
+
+
+def test_create_session_releases_lock_and_retries_once(monkeypatch):
+    """409 冲突 → 释放占锁 session 后重试一次即成功（照 worker.js 单会话锁恢复）。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        (409, {"error": "session_superseded", "message": "Your session ended"}),
+        (200, {"status": "active", "instanceId": "inst-holder", "model": "m"}),
+        (200, {}),   # DELETE 响应
+        (200, {"status": "active", "instanceId": "inst-new", "model": "m",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+    ])
+    s = asyncio.run(fb.create_session("tok", "m"))
+    assert s["instance_id"] == "inst-new"
+    deletes = [c for c in calls if c["m"] == "DELETE"]
+    assert len(deletes) == 1, "必须释放占锁 session"
+    assert deletes[0]["headers"]["x-freebuff-instance-id"] == "inst-holder"
+
+
+def test_create_session_gate_does_not_probe_lock(monkeypatch):
+    """档位拒绝：不得走「释放锁」分支（那是给真冲突用的），直接给可执行提示。"""
+    calls = []
+    _patch(monkeypatch, calls, [(409, _NOT_ENTITLED_BODY)])
+    with pytest.raises(fb.SessionError) as ei:
+        asyncio.run(fb.create_session("tok", "openai/gpt-6-luna"))
+    assert "走代理" in str(ei.value)
+    assert not [c for c in calls if c["m"] == "DELETE"], "档位拒绝不该去删 session"
 
 
 def test_adapter_does_not_rebuild_session_on_model_gate(monkeypatch):

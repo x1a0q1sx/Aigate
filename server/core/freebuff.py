@@ -464,50 +464,90 @@ async def create_session(token: str, model: str, instance_id: Optional[str] = No
     """POST /api/v1/freebuff/session（预生成 instance-id，照 worker.js 单会话签名）。
 
     返回 {instance_id, model, expires_at, raw}；抛 SessionError / ModelUnavailable。
+
+    409 冲突处理（照 worker.js）：单账号同一时刻只能一个 session，旧 session 若还
+    占着锁，POST 会 409。**只重试一次**「GET 拿持锁 instanceId → DELETE 释放 → 再 POST」
+    （DELETE 上游会异步退 Freebucks）。旧逻辑直接抛错 → 切模型会一直失败，且旧
+    session 继续占锁。实测触发：用户上一次请求的 session 未释放就换模型。
     """
-    inst = instance_id or _uuid4()
+    model_unlock_retried = False
+    for attempt in range(2):
+        inst = instance_id or _uuid4()
+        try:
+            async with httpx.AsyncClient(timeout=SESSION_TIMEOUT, proxy=proxy) as c:
+                r = await c.post(f"{FREEBUFF_API_BASE}/api/v1/freebuff/session",
+                                 headers={**_auth_headers(token),
+                                          "x-freebuff-model": model,
+                                          "x-freebuff-instance-id": inst,
+                                          "Content-Type": "application/json"},
+                                 content=b"{}")
+        except Exception as e:
+            raise SessionError(f"{type(e).__name__}: {str(e)[:150]}", 0)
+        try:
+            data = r.json() if r.content else {}
+        except ValueError:
+            data = {"_text": r.text[:200]}
+        if r.status_code == 410 or _has_exact_code(data, "model_unavailable"):
+            raise ModelUnavailable(str(data.get("message") or data.get("error") or "model_unavailable")[:200])
+        if r.status_code == 200 and data.get("status") == "active" and data.get("instanceId"):
+            return {"instance_id": data["instanceId"], "model": data.get("model") or model,
+                    "expires_at": data.get("expiresAt") or data.get("expires_at"), "raw": data}
+        if r.status_code == 200 and data.get("status") == "queued":
+            raise SessionError(f"session 排队中（{data.get('instanceId') or 'no-instance'}）", r.status_code)
+        if r.status_code == 409:
+            # ⚠️ 档位拒绝时错误码在 `error`、原因在 `message`：必须拿**整包**判定，
+            # 只看 message 会漏判（上游 message 里没有 "session_model_mismatch" 字样）。
+            blob = json.dumps(data, ensure_ascii=False)
+            code = str(data.get("error") or data.get("code") or "")
+            msg = str(data.get("message") or data.get("error") or "模型锁冲突")
+            # 档位拒绝与「session 脏」是两回事：前者重试同一个模型必然再失败，
+            # 且占着单会话锁 —— 交给调用方释放，并给出可执行提示。
+            if is_model_not_entitled(blob):
+                raise SessionError(model_gate_message(model, blob), r.status_code)
+            # 其它 409 = 旧 session 还占着单会话锁 → 释放后重试一次
+            if not model_unlock_retried:
+                model_unlock_retried = True
+                holder = await current_session_instance(token, proxy=proxy)
+                if holder:
+                    await delete_session(token, holder, proxy=proxy)
+                    logger.info("freebuff: 释放占锁 session %s 后重试（%s）", holder[:8], msg[:80])
+                    continue
+            # 其余 409 必须**如实回显上游错误码**，不能一律盖成 session_model_mismatch：
+            # 上游对多种情况都回 409（实测 session_superseded / model_locked 等），
+            # 盖错码会把「另一个实例占了 session」误导成「模型不在此档」。
+            raise SessionError(f"{code or 'session_conflict'}: {msg[:150]}", r.status_code)
+        if r.status_code == 403:
+            st = data.get("status")
+            if st == "banned":
+                raise SessionError("账号已被封禁（Terminal，不可恢复）", r.status_code, terminal=True)
+            if st == "country_blocked":
+                raise SessionError(f"地区受限（{data.get('countryCode') or 'UNKNOWN'}）", r.status_code, terminal=True)
+        if r.status_code == 401:
+            raise SessionError("authToken 无效或已撤销（请重新连接）", r.status_code, terminal=True)
+        if r.status_code == 429:
+            raise SessionError(f"Freebucks 额度已用尽：{str(data.get('message') or '')[:120]}", r.status_code)
+        raise SessionError(f"create session failed: HTTP {r.status_code} {str(data)[:150]}", r.status_code)
+    raise SessionError("create session failed: 释放占锁 session 后仍冲突", 409)
+
+
+async def current_session_instance(token: str, proxy: Optional[str] = None) -> Optional[str]:
+    """GET /api/v1/freebuff/session → 当前活跃 session 的 instanceId（无则 None）。
+
+    ⚠️ 只在**需要释放占锁 session** 时调用（worker.js 同款用法）：这个 GET 本身
+    会占用账号 session，为查额度而随手调用会顶掉正在进行的 chat（worker.js 明确
+    警告过两次）。查额度请用 query_snapshot()。
+    """
     try:
         async with httpx.AsyncClient(timeout=SESSION_TIMEOUT, proxy=proxy) as c:
-            r = await c.post(f"{FREEBUFF_API_BASE}/api/v1/freebuff/session",
-                             headers={**_auth_headers(token),
-                                      "x-freebuff-model": model,
-                                      "x-freebuff-instance-id": inst,
-                                      "Content-Type": "application/json"},
-                             content=b"{}")
-    except Exception as e:
-        raise SessionError(f"{type(e).__name__}: {str(e)[:150]}", 0)
-    try:
+            r = await c.get(f"{FREEBUFF_API_BASE}/api/v1/freebuff/session",
+                            headers=_auth_headers(token))
         data = r.json() if r.content else {}
-    except ValueError:
-        data = {"_text": r.text[:200]}
-    if r.status_code == 410 or _has_exact_code(data, "model_unavailable"):
-        raise ModelUnavailable(str(data.get("message") or data.get("error") or "model_unavailable")[:200])
-    if r.status_code == 200 and data.get("status") == "active" and data.get("instanceId"):
-        return {"instance_id": data["instanceId"], "model": data.get("model") or model,
-                "expires_at": data.get("expiresAt") or data.get("expires_at"), "raw": data}
-    if r.status_code == 200 and data.get("status") == "queued":
-        raise SessionError(f"session 排队中（{data.get('instanceId') or 'no-instance'}）", r.status_code)
-    if r.status_code == 409:
-        # ⚠️ 档位拒绝时错误码在 `error`、原因在 `message`：必须拿**整包**判定，
-        # 只看 message 会漏判（上游 message 里没有 "session_model_mismatch" 字样）。
-        blob = json.dumps(data, ensure_ascii=False)
-        msg = str(data.get("message") or data.get("error") or "模型锁冲突")
-        # 档位拒绝与「session 脏」是两回事：前者重试同一个模型必然再失败，
-        # 且占着单会话锁 —— 交给调用方释放，并给出可执行提示。
-        if is_model_not_entitled(blob):
-            raise SessionError(model_gate_message(model, blob), r.status_code)
-        raise SessionError(f"session_model_mismatch: {msg[:150]}", r.status_code)
-    if r.status_code == 403:
-        st = data.get("status")
-        if st == "banned":
-            raise SessionError("账号已被封禁（Terminal，不可恢复）", r.status_code, terminal=True)
-        if st == "country_blocked":
-            raise SessionError(f"地区受限（{data.get('countryCode') or 'UNKNOWN'}）", r.status_code, terminal=True)
-    if r.status_code == 401:
-        raise SessionError("authToken 无效或已撤销（请重新连接）", r.status_code, terminal=True)
-    if r.status_code == 429:
-        raise SessionError(f"Freebucks 额度已用尽：{str(data.get('message') or '')[:120]}", r.status_code)
-    raise SessionError(f"create session failed: HTTP {r.status_code} {str(data)[:150]}", r.status_code)
+    except Exception:
+        return None
+    if isinstance(data, dict) and data.get("status") == "active":
+        inst = data.get("instanceId")
+        return str(inst) if inst else None
+    return None
 
 
 async def delete_session(token: str, instance_id: str, proxy: Optional[str] = None) -> bool:
