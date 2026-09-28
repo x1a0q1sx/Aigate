@@ -848,6 +848,75 @@ def test_normalize_usage_empty_and_garbage():
     assert u.total_tokens == 0
 
 
+# ============ F29 方言判定：占位键不得触发 Anthropic 口径（2026-09-28 事故） ============
+
+def test_normalize_usage_codebuddy_decoy_keys_do_not_double_prompt():
+    """上游塞恒为 0 的 cache_read_input_tokens/cache_creation_input_tokens 占位键时，
+    带 prompt_tokens 的报文必须仍按「prompt 已含缓存」口径处理 —— 不得再加一遍。
+
+    生产实测（CodeBuddy，2026-09-28）：prompt_tokens=75014 且
+    prompt_cache_hit_tokens=74112，旧逻辑误判 Anthropic 口径后
+    prompt 变 149126（翻倍），命中率 98.8% 显示成 49.7%。
+    """
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({
+        "prompt_tokens": 75014, "completion_tokens": 3803, "total_tokens": 78817,
+        "prompt_cache_hit_tokens": 74112, "prompt_cache_miss_tokens": 902,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+        "prompt_cache_write_tokens": 0, "cached_tokens": 0,
+        "completion_tokens_details": {"reasoning_tokens": 2775},
+    })
+    assert u.source == "openai_chat"
+    assert u.prompt_tokens == 75014, "prompt 不得被重复叠加缓存读"
+    assert u.cache_read_tokens == 74112, "DeepSeek 风格 prompt_cache_hit_tokens 必须被采纳"
+    assert u.cache_write_tokens == 0
+    assert abs(u.cache_hit_rate - 98.8) < 0.1
+
+
+def test_normalize_usage_anthropic_still_merges_cache_into_prompt():
+    """真 Anthropic 报文（只有 input_tokens，无 prompt_tokens）口径保持不变。"""
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"input_tokens": 200, "output_tokens": 50,
+                         "cache_read_input_tokens": 700, "cache_creation_input_tokens": 100})
+    assert (u.source, u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens) == ("anthropic", 1000, 700, 100)
+
+
+def test_normalize_usage_decoy_keys_without_main_counts_still_merge():
+    """无 input_tokens 也无 prompt_tokens、只有 Anthropic 缓存键的残缺报文：
+    仍按 Anthropic 合并（缓存信息不丢）。"""
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"cache_read_input_tokens": 300, "cache_creation_input_tokens": 40})
+    assert u.source == "anthropic"
+    assert u.prompt_tokens == 340 and u.cache_read_tokens == 300
+
+
+def test_normalize_usage_deepseek_split_fields_no_cache_read_key():
+    """只有 prompt_cache_hit_tokens（无任何 cache_* 键）时也要识别为缓存读，
+    且不改动 prompt（prompt 已含 hit+miss）。"""
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"prompt_tokens": 5000, "completion_tokens": 100,
+                         "prompt_cache_hit_tokens": 4608, "prompt_cache_miss_tokens": 392})
+    assert u.prompt_tokens == 5000 and u.cache_read_tokens == 4608
+    assert u.source == "openai_chat"
+
+
+def test_normalize_usage_cache_write_deepseek_field():
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"prompt_tokens": 1000, "completion_tokens": 10,
+                         "prompt_cache_write_tokens": 512})
+    assert u.cache_write_tokens == 512
+
+
+def test_normalize_usage_responses_with_decoy_anthropic_keys():
+    """Responses 方言带占位 Anthropic 键：source 仍为 openai_responses 且 prompt 不叠加。"""
+    from server.core.usage_normalize import normalize_usage
+    u = normalize_usage({"input_tokens": 900, "output_tokens": 30,
+                         "input_tokens_details": {"cached_tokens": 800},
+                         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0})
+    assert u.source == "openai_responses"
+    assert u.prompt_tokens == 900 and u.cache_read_tokens == 800
+
+
 # ===================== P1-5 上下文估算校准 =====================
 
 def test_context_overflows_with_observed_limit():

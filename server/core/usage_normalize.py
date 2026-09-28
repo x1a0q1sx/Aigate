@@ -23,6 +23,16 @@
 - source             = 命中的方言（openai_chat / openai_responses / anthropic / unknown）
 
 这样 cache_hit_rate = cache_read / prompt_tokens 在所有上游下口径一致。
+
+⚠️ 方言判定只认**主计数字段名**（F29，2026-09-28 事故）：
+Anthropic API 只会返回 input_tokens/output_tokens，**从不返回 prompt_tokens**；
+反过来，带 prompt_tokens 的报文一律按 OpenAI 口径处理（prompt 已含缓存）。
+不能拿「存在 cache_read_input_tokens 键」当 Anthropic 判据——上游会塞
+**恒为 0 的占位键**：CodeBuddy 的 usage 同时带 prompt_tokens（含缓存口径）
+与 cache_read_input_tokens: 0 / cache_creation_input_tokens: 0，旧判定误入
+Anthropic 分支把已含在 prompt 里的缓存读又加一遍 → prompt 翻倍、命中率腰斩
+（生产实测：真实 98.8% 显示成 49.7%，6k+ 行受影响；备份库 5970 行逐行核对
+`stored == raw + cache_read`，反例 0）。
 """
 from dataclasses import dataclass, field
 
@@ -95,19 +105,23 @@ def normalize_usage(usage) -> NormalizedUsage:
     nu.prompt_tokens = _to_int(usage.get("prompt_tokens")) or _to_int(usage.get("input_tokens"))
     nu.completion_tokens = _to_int(usage.get("completion_tokens")) or _to_int(usage.get("output_tokens"))
 
-    # ── 缓存读：OpenAI chat → Responses → Anthropic 命名 ──
+    # ── 缓存读：OpenAI chat → Responses → DeepSeek 拆分 → Anthropic 命名 ──
+    # prompt_cache_hit_tokens 是 DeepSeek/CodeBuddy 风格的显式命中计数
+    # （prompt_cache_miss_tokens 为其补集；prompt 已含两者，只取命中数）。
     nu.cache_read_tokens = (
         _to_int(_sub(usage, "prompt_tokens_details").get("cached_tokens"))
         or _to_int(_sub(usage, "input_tokens_details").get("cached_tokens"))
+        or _to_int(usage.get("prompt_cache_hit_tokens"))
         or _to_int(usage.get("cache_read_tokens"))
         or _to_int(usage.get("cache_read_input_tokens"))
     )
-    # ── 缓存写：chat details → Responses details/details → Anthropic 命名/新版结构 ──
+    # ── 缓存写：chat details → Responses details/details → DeepSeek 拆分 → Anthropic 命名/新版结构 ──
     nu.cache_write_tokens = (
         _to_int(_sub(usage, "prompt_tokens_details").get("cache_creation_tokens"))
         or _to_int(_sub(usage, "prompt_tokens_details").get("cache_write_tokens"))
         or _to_int(_sub(usage, "input_tokens_details").get("cache_write_tokens"))
         or _to_int(_sub(usage, "input_tokens_details").get("cache_creation_tokens"))
+        or _to_int(usage.get("prompt_cache_write_tokens"))
         or _to_int(_sub(usage, "cache_creation_details").get("total_tokens"))
         or _to_int(usage.get("cache_creation_input_tokens"))
     )
@@ -122,11 +136,27 @@ def normalize_usage(usage) -> NormalizedUsage:
     )
 
     # ── 方言标记 + Anthropic 口径修正（input_tokens 不含缓存 → 并入 prompt） ──
-    if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage or "cache_creation" in usage:
+    # ⚠️ 判据只用**主计数字段名 + 显式明细结构**（F29）：Anthropic 报文只回
+    # input_tokens / output_tokens，**从不带 prompt_tokens**；反之带 prompt_tokens
+    # 的报文一律是「prompt 已含缓存」口径，无论里面有没有 cache_read_input_tokens
+    # 键（上游会塞恒为 0 的占位键，按「键是否存在」判会误加一遍缓存读 → prompt 翻倍）。
+    _anth_keys = ("cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation")
+    _resp_keys = ("input_tokens_details", "cache_creation_details")
+    if "prompt_tokens" in usage:
+        nu.source = "openai_responses" if any(k in usage for k in _resp_keys) else "openai_chat"
+    elif "input_tokens" in usage:
+        if any(k in usage for k in _resp_keys):
+            # 显式 Responses 明细结构 → input 含缓存口径，不叠加
+            nu.source = "openai_responses"
+        elif any(k in usage for k in _anth_keys):
+            nu.source = "anthropic"
+            nu.prompt_tokens = nu.prompt_tokens + nu.cache_read_tokens + nu.cache_write_tokens
+        else:
+            nu.source = "openai_responses"
+    elif any(k in usage for k in _anth_keys):
+        # 残缺 Anthropic 报文（无主计数）：缓存仍并入 prompt，语义不丢
         nu.source = "anthropic"
         nu.prompt_tokens = nu.prompt_tokens + nu.cache_read_tokens + nu.cache_write_tokens
-    elif "input_tokens_details" in usage or "cache_creation_details" in usage or "input_tokens" in usage:
-        nu.source = "openai_responses"
-    elif "prompt_tokens" in usage or "completion_tokens" in usage:
+    elif "completion_tokens" in usage or "output_tokens" in usage:
         nu.source = "openai_chat"
     return nu

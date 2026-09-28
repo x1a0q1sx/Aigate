@@ -923,3 +923,77 @@ HTTP 409 {"error":"session_model_mismatch",
   单会话锁释放后重试、标注但不过滤、未知不标注、健康探测顺带记清单且绝不 POST
 - oauth 12 项：JWT 身份解析、跨账号拒绝覆盖、同账号续期放行、非 JWT 不参与、
   逃生口、owner 分配（含空洞复用）、轮询自动改存（正反两向）、导入 409、源码守卫
+
+## F29 分析页缓存命中率腰斩 = 上游占位键骗过方言判定，prompt 被重复叠加缓存读（2026-09-28）
+
+**用户反馈**：「看下分析页下的请求日志，缓存都不到一半，这对吗？」
+
+**结论：不对。真实命中率是 ~98.8%，面板显示的 49.7% 是统计口径 bug —— 而且不是
+缓存策略问题，是 prompt_tokens 被多算了一倍。**
+
+### 取证（生产原始报文，逐行可复算）
+
+从响应体 blob 里解出 CodeBuddy 的原始 usage（`id=33120`，Intl）：
+
+```json
+{"prompt_tokens": 75014, "completion_tokens": 3803, "total_tokens": 78817,
+ "prompt_tokens_details": {"cached_tokens": 74112},
+ "prompt_cache_hit_tokens": 74112, "prompt_cache_miss_tokens": 902,
+ "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+ "prompt_cache_write_tokens": 0, "cached_tokens": 0}
+```
+
+三处自洽证据：
+1. **`prompt_cache_hit_tokens + prompt_cache_miss_tokens = 74112 + 902 = 75014 = prompt_tokens`**
+   → 上游口径明确是「prompt 已含缓存」（OpenAI 语义），命中率 = 74112/75014 = **98.8%**。
+2. `prompt_tokens_details.cached_tokens = 74112`，与 `prompt_cache_hit_tokens` 一致。
+3. 但 AIGate 日志存的是 `prompt_tokens=149126 = 75014 + 74112` —— **缓存读被加了两遍**。
+
+### 根因：方言判定按「键是否存在」，被恒为 0 的占位键骗了
+
+`server/core/usage_normalize.py` 的旧判定：
+
+```python
+if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage or "cache_creation" in usage:
+    nu.source = "anthropic"
+    nu.prompt_tokens += nu.cache_read_tokens + nu.cache_write_tokens   # ← Anthropic 口径修正
+```
+
+Anthropic 的 `input_tokens` **不含**缓存，所以合并是对的；但 CodeBuddy 的报文
+**同时**带 `prompt_tokens`（已含缓存）和 `cache_read_input_tokens: 0` /
+`cache_creation_input_tokens: 0` 这两个**恒为 0 的占位键**（上游 SDK 模板残留）。
+旧判定只看键名 → 误入 Anthropic 分支 → 把已含在 prompt 里的缓存读又加一遍。
+
+**影响面（全量核对）**：
+| 项 | 值 |
+|---|---|
+| 受影响服务商 | 仅 CodeBuddy 两家（Intl / CN）——其余 Qoder/基元律动/烁公益站/sensenova/微信等全是标准 OpenAI 形状，未受影响 |
+| 受影响行数 | **6303 行**（2026-09-22 09:27 起，此前该上游不返回这些键） |
+| 精确性 | 归档 3792 行 + 备份库 5970 行逐行核对 `stored == raw + cache_read`，**反例 0** |
+| 报表值 → 真值 | prompt 合计 2,490,615,470 → 1,252,674,990；命中率 49.6% → ~98.6% |
+
+### 修复（两处，都是「按语义判，不按键名判」）
+
+1. **方言判定改用主计数字段**：Anthropic API **从不返回 `prompt_tokens`**，反之带
+   `prompt_tokens` 的报文一律是 OpenAI 口径（prompt 已含缓存）。判据改为
+   「有 prompt_tokens → openai_chat / openai_responses（看有无 `*_details`）；
+   只有 input_tokens 且带 Anthropic 缓存键 → anthropic 并合并」。
+   另补「显式 Responses 明细结构优先」分支，避免带占位键的 Responses 报文被误判。
+2. **补齐 DeepSeek/CodeBuddy 风格缓存字段**：新增 `prompt_cache_hit_tokens`
+   （缓存读）与 `prompt_cache_write_tokens`（缓存写）识别 —— 旧逻辑完全不认这两个
+   字段，即使不误判方言，命中数也会丢（CodeBuddy 报文里 `cached_tokens` 在外层
+   是 0，真值只在 `prompt_cache_hit_tokens`）。
+
+### 历史数据修复
+
+`scripts/repair_prompt_double_count.py`（默认干跑，`--apply` 落库）：三处来源
+（live blob → 归档 jsonl.gz → 备份库）合并取原始 usage，**三条判据同时成立才修**
+（取到 raw_prompt + 报文带 Anthropic 占位键特征 + `stored == raw + cache_read`），
+UPDATE 带原值守卫（幂等、可重复执行），落库前写回滚凭据（id/旧值/新值）。
+干跑结果：**6303/6303 全部可证，跳过 0，异常差值 0**。
+
+### 测试
+
+新增 **6 项**（全量 **814 项全绿**）：占位键不叠加（复现生产报文）、真 Anthropic
+仍合并、残缺 Anthropic 仍合并、DeepSeek 拆分字段识别、缓存写字段、Responses
+带占位键不误判。
