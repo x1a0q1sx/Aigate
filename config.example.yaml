@@ -99,3 +99,15 @@ drool_guard:
 race:
   enabled: true
   no_content_seconds: 15
+
+# Qoder 签到/积分（/sash/ 端点）的请求身份。
+# ⚠️ campaigns 对请求头敏感（Jet-Hub 消融 + AIGate 生产复现）：
+#   - sash_client_type 必须是桌面身份 '10'（CLI '5' 恒拿空活动列表）；
+#   - machine_token + machine_type 必须成对（缺任一只下发 VIEW_DETAILS，领不到每日 100 Credits）。
+# 取值：桌面端 %APPDATA%\Qoder\SharedClientCache\cache\machine_token.json 的 {"token","type"}，
+# 或本机 .qoder*/.bin/umid-*/runtime-info.exe <env> --account-stdin 实时生成（env 与 IDE 版本有关）。
+# 设备身份与账号无关，全账号共用；不配置则 Qoder 签到如实提示缺失，不会误报「已领取」。
+qoder:
+  sash_client_type: "10"
+  machine_token: ""
+  machine_type: ""

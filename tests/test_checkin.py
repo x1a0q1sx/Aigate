@@ -259,10 +259,12 @@ def test_qoder_claim_success(monkeypatch):
     out = asyncio.run(claim_for_provider("qoder", "dt-tok"))
     assert out.kind == "claimed"
     assert out.credit == 100
-    # 头：4 个，状态查询不带 Content-Type
+    # 头：桌面身份 '10'（CLI '5' 恒拿空活动列表，2026-09-28 修复）；未配置
+    # 设备身份时不得带 machine 头；状态查询不带 Content-Type
     h = calls[0]["headers"]
-    assert h["Cosy-ClientType"] == "5"
+    assert h["Cosy-ClientType"] == "10"
     assert h["User-Agent"] == "Qoder"
+    assert "Cosy-MachineToken" not in h and "Cosy-MachineType" not in h
     assert "Content-Type" not in h
     # claim 多一个 Content-Type，且 body 必须是空串（不是 {}）
     assert calls[1]["headers"]["Content-Type"] == "application/json"
@@ -296,8 +298,9 @@ def test_qoder_empty_campaigns_is_already_claimed(monkeypatch):
     assert len(calls) == 1          # 无可领活动不发 claim
 
 
-def test_qoder_skips_view_details_campaigns(monkeypatch):
-    """实测还有 VIEW_DETAILS 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。"""
+def test_qoder_view_details_only_without_machine_identity_is_inactive(monkeypatch):
+    """只有 VIEW_DETAILS = 缺设备身份的典型形态（Jet-Hub 消融：服务端不下发
+    CLAIM_BENEFIT）—— 如实报 inactive + 配置提示，绝不谎报「今天已领取」。"""
     from server.core.checkin import claim_for_provider
     calls = []
     _patch(monkeypatch, calls, [
@@ -307,8 +310,9 @@ def test_qoder_skips_view_details_campaigns(monkeypatch):
         ]),
     ])
     out = asyncio.run(claim_for_provider("qoder", "dt-tok"))
-    assert out.kind == "already_claimed"    # 无可领 → 已领语义
-    assert len(calls) == 1                  # 没有对 VIEW_DETAILS 发 claim
+    assert out.kind == "inactive"
+    assert "machine_token" in out.message       # 提示可操作（去配 config）
+    assert len(calls) == 1                      # 没有对 VIEW_DETAILS 发 claim
 
 
 def test_qoder_skips_already_claimed_campaigns(monkeypatch):
@@ -975,3 +979,76 @@ def test_codebuddy_business_error_does_not_fallback(monkeypatch):
     out = asyncio.run(claim_for_provider("codebuddy_cn", _jwt("https://www.workbuddy.cn")))
     assert out.kind == "failed"
     assert len(calls) == 1, "业务错误不得触发域名兜底"
+
+# ── Qoder 身份头 + 非 200 判定（2026-09-28 排查「今天没签到成功」）────────
+
+def test_qoder_machine_headers_from_config(monkeypatch):
+    """配置了 qoder.machine_token/machine_type → 成对出现在请求头。"""
+    from types import SimpleNamespace
+    from server.core.checkin import claim_for_provider
+    import server.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "get_config",
+        lambda: SimpleNamespace(qoder=SimpleNamespace(
+            sash_client_type="10", machine_token="MT-TOK", machine_type="MT-TYPE")))
+    calls = []
+    _patch(monkeypatch, calls, [
+        _q_campaigns([_claimable()]),
+        (200, {"status": "CLAIMED", "replayed": False,
+               "benefit": {"kind": "CREDITS", "amount": 100}}, None),
+    ])
+    out = asyncio.run(claim_for_provider("qoder", "dt-tok"))
+    assert out.kind == "claimed" and out.credit == 100
+    h = calls[0]["headers"]
+    assert h["Cosy-MachineToken"] == "MT-TOK"
+    assert h["Cosy-MachineType"] == "MT-TYPE"
+    assert h["Cosy-ClientType"] == "10"
+    # claim 请求同样带成对头
+    assert calls[1]["headers"]["Cosy-MachineToken"] == "MT-TOK"
+
+
+def test_qoder_view_details_with_machine_configured_is_already(monkeypatch):
+    """设备身份已配置、仍只有 VIEW_DETAILS（无 CLAIM_BENEFIT）→ 保守判已领。"""
+    from types import SimpleNamespace
+    from server.core.checkin import claim_for_provider
+    import server.config as cfgmod
+
+    monkeypatch.setattr(
+        cfgmod, "get_config",
+        lambda: SimpleNamespace(qoder=SimpleNamespace(
+            sash_client_type="10", machine_token="T", machine_type="Y")))
+    calls = []
+    _patch(monkeypatch, calls, [
+        _q_campaigns([
+            {"campaignId": "c-details", "actionType": "VIEW_DETAILS",
+             "claimStatus": "CLAIMABLE", "benefit": {"amount": 999}},
+        ]),
+    ])
+    out = asyncio.run(claim_for_provider("qoder", "dt-tok"))
+    assert out.kind == "already_claimed"
+    assert len(calls) == 1
+
+
+def test_qoder_non_200_is_failed_never_already(monkeypatch):
+    """campaign 服务抖动 503（体里无 campaigns 键）必须判 failed 可重试 ——
+    2026-09-28 教训：曾被当空列表误报「今天已领取」且当天幂等不再重试。"""
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [
+        (503, {"errorCode": "DEPENDENCY_UNAVAILABLE",
+               "errorMessage": "campaign service is temporarily unavailable",
+               "requestId": "r1"}, None),
+    ])
+    out = asyncio.run(claim_for_provider("qoder", "dt-tok"))
+    assert out.kind == "failed", "非 200 绝不能落进「无可领活动→已领」分支"
+    assert "503" in out.message
+    assert out.credit == 0.0
+
+
+def test_qoder_config_defaults_and_registered():
+    from server.config import Config, QoderConfig
+    c = QoderConfig()
+    assert c.sash_client_type == "10"
+    assert c.machine_token == "" and c.machine_type == "", "设备身份默认必须为空"
+    assert "qoder" in Config.model_fields

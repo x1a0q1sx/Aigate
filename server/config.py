@@ -171,6 +171,27 @@ class RaceConfig(BaseModel):
     enabled: bool = True
     no_content_seconds: int = 15
 
+class QoderConfig(BaseModel):
+    """Qoder 签到/积分（/sash/ 端点）的请求身份。
+
+    ⚠️ campaigns 端点对请求头**极度敏感**（Jet-Hub 2026-09-25 抓包 + 消融实验
+    实证，AIGate 2026-09-28 生产复现同结论）：
+    - `sash_client_type` 必须是**桌面 app 身份 '10'** —— CLI 身份 '5' 时
+      `/sash/api/v1/me/campaigns` **恒返回空活动列表**（一直在的 bug）；
+    - `machine_token` + `machine_type` 必须成对发送（`Cosy-MachineToken` /
+      `Cosy-MachineType`），缺任一服务端只下发 VIEW_DETAILS、**不下发可领项**
+      （CLAIM_BENEFIT）—— 只改 ClientType 仍领不到。
+    取值来自 Qoder 桌面端设备身份：
+    `%APPDATA%\\Qoder\\SharedClientCache\\cache\\machine_token.json` 的
+    `{"token": ..., "type": ...}`（或本机 `.qoder*/.bin/umid-*/runtime-info.exe
+    <env> --account-stdin` 实时生成；env 编号与 IDE 版本有关，与缓存文件一致的
+    即为该机正确值）。设备身份与账号无关，全账号共用。不配置 → 签到如实提示
+    配置方法（绝不误报「已领取」）。用量端点对这些头不敏感，不受影响。
+    """
+    sash_client_type: str = "10"    # 桌面 app 身份（CLI '5' 会恒拿空活动）
+    machine_token: str = ""         # Cosy-MachineToken（桌面端 machine_token.json 的 token）
+    machine_type: str = ""          # Cosy-MachineType（同文件的 type；与 token 必须成对）
+
 class CheckinConfig(BaseModel):
     """每日签到：自动领取上游免费积分/额度（CodeBuddy / Qoder 等）。
 
@@ -252,6 +273,7 @@ class Config(BaseModel):
     race: RaceConfig = Field(default_factory=RaceConfig)
     checkin: CheckinConfig = Field(default_factory=CheckinConfig)
     growth: GrowthConfig = Field(default_factory=GrowthConfig)
+    qoder: QoderConfig = Field(default_factory=QoderConfig)
     opencode_bridge: OpenCodeBridgeConfig = Field(default_factory=OpenCodeBridgeConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""

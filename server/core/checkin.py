@@ -17,6 +17,11 @@
 - **「今天已领」不是失败**：CodeBuddy 靠 body code 10001/1001，Qoder 靠
   body.replayed（HTTP 仍是 200 且无 benefit）——只看 HTTP 状态会把「已领」
   误报成「+100 积分」。
+- **Qoder 的 /sash/ 端点身份头有硬要求**（2026-09-28 修复）：campaigns 必须
+  `Cosy-ClientType: '10'`（桌面身份）+ `Cosy-MachineToken/MachineType` 成对
+  （config.yaml `qoder.machine_token/machine_type`，取自桌面端
+  machine_token.json）——CLI 身份 '5' 恒拿空列表、缺 machine 头只下发
+  VIEW_DETAILS，二者都会被旧实现误报成「今天已领取」。
 - **10001/1001 的语义必须由文案证实**（2026-09-28 防御增强，照抄 WorkDaddy）：
   同一批码上游也用于「活动未开启」等含义——文案匹配「未开启/已过期」判 inactive，
   匹配「已签到/重复签到」才判 already_claimed，都对不上如实 failed（可重试）。
@@ -79,6 +84,7 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
 # 平台说明（签到页展示；把「为什么这个号没签到」讲清楚，避免用户以为是我们坏了）
 CHECKIN_NOTES: Dict[str, str] = {
     "codebuddy_intl": "上游端点与活动框架都在，但本期未给国际版开放活动（active=false、claim 返回 10001）。活动开启后本页会自动签到，无需改动。",
+    "qoder": "每日领取要求桌面端身份头（Cosy-ClientType '10' + Cosy-Machine 成对头，config.yaml qoder.machine_token/machine_type，取自桌面端 %APPDATA%\\Qoder\\SharedClientCache\\cache\\machine_token.json 的 token/type）。未配置时服务端只下发 VIEW_DETAILS，看不到可领的每日 100 Credits。",
     "u1s1": "打卡只能在 u1s1 官网仪表盘完成（需网页会话 + 人机验证）；但其打卡包由上游在每次登录时自动发放 —— AIGate 重新连接该账号即等于打卡。下方额度区可查看打卡包余额。",
     "freebuff": "Freebuff 的「连续天数」由**当天是否用模型**推导（官方语义：用一次即打卡），上游无领取端点，无需也无法在此签到；额度区显示 Freebucks 余额。",
     "trae": "CN 区 deepseek-v4-flash 走加密信封（未实现），其余模型正常；签到与模型调用互不影响。",
@@ -350,20 +356,39 @@ async def _claim_codebuddy_on(token: str, product: dict, base: str
 # ── Qoder ────────────────────────────────────────────────────
 
 def _qoder_headers(token: str, with_content_type: bool = False) -> dict:
-    """Qoder 积分端点请求头。
+    """Qoder /sash/ 端点请求头（身份配置见 config.QoderConfig 的 docstring）。
 
-    实测（抓包）这 4 个头就是全部所需 —— **不需要 WASM/COSY 签名**
-    （那只有推理端点和模型列表要），也不需要 cosy-machine* 那组。
+    ⚠️ 不需要 WASM/COSY 签名（那只有推理端点和模型列表要），但**身份头有硬要求**
+    （Jet-Hub 2026-09-25 消融实验 + AIGate 2026-09-28 生产复现）：
+    - `Cosy-ClientType` 必须是**桌面 app 身份 '10'** —— CLI 身份 '5' 时
+      campaigns **恒返回空列表**（旧实现一直用 '5'，等于从没看到过可领活动）；
+    - `Cosy-MachineToken` + `Cosy-MachineType` **必须成对**（来自桌面端
+      machine_token.json，config.yaml `qoder.machine_token/machine_type`），
+      缺任一服务端只下发 VIEW_DETAILS、不下发可领项。
     """
+    from server.config import get_config
+    qc = getattr(get_config(), "qoder", None)
     h = {
         "Accept": "application/json",
         "Authorization": f"Bearer {token}",
-        "Cosy-ClientType": "5",   # 源码 Bx() 的固定头，服务端据此区分客户端形态
+        "Cosy-ClientType": str(getattr(qc, "sash_client_type", "") or "10"),
         "User-Agent": "Qoder",
     }
+    mt = str(getattr(qc, "machine_token", "") or "") if qc else ""
+    mty = str(getattr(qc, "machine_type", "") or "") if qc else ""
+    if mt and mty:   # 成对才发（单发任一头实测无效）
+        h["Cosy-MachineToken"] = mt
+        h["Cosy-MachineType"] = mty
     if with_content_type:
         h["Content-Type"] = "application/json"
     return h
+
+
+def _qoder_machine_configured() -> bool:
+    """Qoder 设备身份（machine 成对头）是否已配置。"""
+    from server.config import get_config
+    qc = getattr(get_config(), "qoder", None)
+    return bool(qc and getattr(qc, "machine_token", "") and getattr(qc, "machine_type", ""))
 
 
 async def _claim_qoder(token: str, base: str = "https://openapi.qoder.sh") -> ClaimOutcome:
@@ -372,6 +397,14 @@ async def _claim_qoder(token: str, base: str = "https://openapi.qoder.sh") -> Cl
     ⚠️ 服务端在「今天已领」时返回 {showCampaign:false, campaigns:[]} ——
     「已领」与「本来就没活动」在响应上无法区分，故列表为空时保守判 already_claimed
     （Jet-Hub 记录的踩坑：曾据此误判「Qoder 无签到端点」）。
+
+    ⚠️ 2026-09-28 两个修复（当天排查「Qoder 今天没签到成功」）：
+    1. **非 200 必须判失败** —— campaign 服务抖动返回 503 JSON（体里没有
+       campaigns 键）曾被当空列表误报「今天已领取」，且 already_claimed 计入
+       当天幂等 → 上游恢复后当天也不再重试。
+    2. **「无可领项」不再一律报已领** —— 有 CLAIM_BENEFIT 但状态非 CLAIMABLE
+       → 已领；只有 VIEW_DETAILS 且未配置设备身份 → inactive + 配置提示
+       （Jet-Hub 消融：缺 machine 成对头时服务端就只下发 VIEW_DETAILS）。
     """
     headers = _qoder_headers(token)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -384,6 +417,9 @@ async def _claim_qoder(token: str, base: str = "https://openapi.qoder.sh") -> Cl
         if code in (401, 403):
             return ClaimOutcome(kind="failed", message="凭据已失效，请重新登录该账号",
                                 error=f"HTTP {code}: {text[:200]}")
+        if code != 200:
+            return ClaimOutcome(kind="failed", message=f"活动列表查询失败（HTTP {code}）",
+                                error=text[:300])
         if body is None:
             return ClaimOutcome(kind="failed", message="活动列表响应不是 JSON", error=text[:300])
 
@@ -396,6 +432,19 @@ async def _claim_qoder(token: str, base: str = "https://openapi.qoder.sh") -> Cl
                      and c.get("claimStatus") == "CLAIMABLE"
                      and c.get("campaignId")]
         if not claimable:
+            benefits = [c for c in campaigns
+                        if isinstance(c, dict) and c.get("actionType") == "CLAIM_BENEFIT"]
+            if benefits:
+                # 有每日领取活动但都不可领（CLAIMED 等）→ 今天已领过
+                return ClaimOutcome(kind="already_claimed",
+                                    message=f"今天已领取（活动状态 {benefits[0].get('claimStatus')}）")
+            if campaigns and not _qoder_machine_configured():
+                # 只看到 VIEW_DETAILS：缺设备身份的典型形态（Jet-Hub 消融实证），
+                # 此时「每日领取」根本不在下发名单里，报「已领取」是撒谎
+                return ClaimOutcome(kind="inactive",
+                                    message="未配置 Qoder 设备身份，服务端不下发可领活动"
+                                            "（config.yaml qoder.machine_token / machine_type，"
+                                            "取自桌面端 machine_token.json）")
             return ClaimOutcome(kind="already_claimed", message="今天已领取（无可领活动）")
 
         # ── 步骤 2：逐个领取 ──

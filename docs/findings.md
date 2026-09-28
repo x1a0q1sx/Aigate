@@ -1287,3 +1287,63 @@ traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读�
 零库存 no-op、首败可重试、中途败保留战果、抽奖 client_token 三连抽各不相同、
 零次数 no-op、批量默认不碰（flag 显式才执行）、手动绕过按天幂等（定时仍受约束）、
 配置默认关。
+
+## F35 Qoder 签到从来没成功过：campaigns 对请求头敏感（2026-09-28）
+
+用户报「qoder 今天签到没成功」。排查发现**远比「今天」严重**：签到日志里
+09-24 以来的 Qoder 记录**全是** `already_claimed「今天已领取（无可领活动）」`
+—— 这不是已领，是**从没看到过可领活动**。
+
+### 三层根因（每层都会独立导致失败）
+
+1. **`Cosy-ClientType: '5'`（CLI 身份）恒拿空活动列表** —— 我们旧实现用的正是
+   '5'。Jet-Hub `qoder-credits.ts` 的 2026-09-25 消融实验写明：campaigns 端点
+   只有**桌面 app 身份 '10'** 才进入活动下发分支。
+2. **缺 `Cosy-MachineToken` + `Cosy-MachineType` 成对头** —— 只改 '10' 仍不够，
+   服务端只下发 1 条 `VIEW_DETAILS`（`claimable:false`），不下发
+   `CLAIM_BENEFIT/CLAIMABLE`。旧代码注释曾写「也不需要 cosy-machine* 那组」
+   —— **这个判断是错的**（来源：旧版 Jet-Hub 注释，其 09-25 已自我修正）。
+3. **503 抖动被误报成「今天已领取」** —— campaign 服务抖动返回 503 JSON
+   （体里没有 `campaigns` 键）被旧判据当空列表 → already_claimed → 计入当天
+   幂等 → **上游恢复后当天也不再重试**。今天的手动记录（09:17）正是这一形态。
+
+### 生产消融（2026-09-28，同一账号只改头）
+
+| 请求头 | campaigns 响应 |
+|---|---|
+| A：ClientType 5（旧实现） | `[]` 空 |
+| B：ClientType 10 仅 | 1 条 `VIEW_DETAILS/CLAIMABLE` |
+| C：CT10 + machine 成对头（env5 身份） | **2 条，含 `CLAIM_BENEFIT/CLAIMABLE/100`** |
+| D：CT10 + machine 成对头（env0 身份） | 同 C（该账号对身份值不敏感，但按 Jet-Hub 结论仍应配 IDE 同款） |
+
+### 设备身份的取值（Jet-Hub `qoder-machine.ts`）
+
+- 值来自 Qoder 桌面端：`%APPDATA%\Qoder\SharedClientCache\cache\machine_token.json`
+  的 `{"token","type"}` → 即两个头；**与账号无关、全账号共用**，实测旧文件也有效。
+- 实时生成走本机 `.qoder*/.bin/umid-<平台>-<hash>/runtime-info.exe
+  <env> --account-stdin`（stdin 喂 `{"account":""}`，输出单行 JSON 取
+  `machineToken/machineType`）。⚠️ **env 编号与 IDE 版本有关**（Jet-Hub 的机器
+  是 `3`，本机全局 Qoder 是 **`5`**，输出与该机缓存文件逐字节一致；漏 env 参数
+  会拿到另一套 fallback 身份）。
+- 服务端部署没有桌面端 → 把这对值写进 `config.yaml qoder.machine_token/machine_type`
+  （新增 `QoderConfig`，`sash_client_type` 默认 '10'）。
+
+### 修复（`core/checkin.py`）
+
+1. `_qoder_headers`：ClientType 从配置读（默认 '10'）+ 配置了 machine 值就成对
+   附上（**单发任一头实测无效，缺一不发**）。
+2. **非 200 一律 failed**（message 带 HTTP 码），不再落「空列表→已领」分支。
+3. 「无可领项」细分三种：有 CLAIM_BENEFIT 但状态非 CLAIMABLE → 已领（带状态）；
+   只有 VIEW_DETAILS 且未配置设备身份 → **inactive + 配置提示**（不再谎报已领）；
+   空列表 → 保守已领（Jet-Hub 语义不变：与「真没活动」不可区分）。
+4. `CHECKIN_NOTES["qoder"]` 写明取值方法。
+
+### 实领与验证
+
+- 排查当场用正确头**实领今天的 100 Credits**（`CLAIMED/replayed:false/
+  amount:100/30 天`）—— 即「今天没成功」的当下补救。
+- 新增/调整 6 项测试（全量 **894 全绿**）：ClientType '10'、未配置不带 machine 头、
+  配置后成对出现、VIEW_DETAILS 无身份 → inactive、有身份 → 保守已领、
+  503 → failed 永不 already。
+- ⚠️ 此前 09-25~27 的 `already_claimed` 记录**不可信**（同一误报形态），那几天
+  是否真有活动已无法追溯；修复后日志语义才真实。
