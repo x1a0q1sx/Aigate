@@ -45,6 +45,12 @@ SESSION_MIN_REMAIN_MS = 60_000
 # run 链缓存（worker.js 实测 run_id 可跨请求复用，10 分钟）
 RUN_CACHE_TTL = 600.0
 
+# 档位放行清单缓存：来自 GET /session 快照的 rateLimitsByModel（只读、0 消耗）。
+# 用途仅限**在模型显示名上标注**，绝不用于过滤/删模型 —— 出口换区或账号升档
+# 后清单会变，把某一刻的快照当判据会让后人误删可用模型（Jet-Hub 反复踩过的坑）。
+_ENTITLED: Dict[str, tuple] = {}     # token_hash -> (expires_monotonic, frozenset)
+ENTITLED_TTL = 300.0
+
 _SESSIONS: Dict[str, dict] = {}      # (token_hash, model) -> {instance_id, expires_at_monotonic}
 _RUNS: Dict[str, tuple] = {}         # (token_hash, agent) -> (expires_monotonic, run_id, child_run_id)
 _LOCKS: Dict[str, asyncio.Lock] = {}  # token_hash -> Lock（单账号串行）
@@ -185,6 +191,18 @@ class FreebuffAdapter(BaseAdapter):
                 detail = ""
             await resp.aclose()
             await client.aclose()
+            # ⚠️ 409 有两种语义，必须分开（合并会把「模型不在此档」当成「session 脏」）：
+            #   · session_superseded / waiting_room_required / session_expired
+            #     → 缓存 instance 真失效，清缓存重建重试一次（worker.js staleSession 分支）
+            #   · session_model_mismatch
+            #     → **上游拒绝该模型**（免费层按档位放行）。重建再试只会拿同一个模型
+            #       再撞一次 409，而 POST session 是**扣费**的（实测两个 price>0 的模型
+            #       白扣 10 Freebucks）→ 必须直接终止，并 DELETE 释放单会话锁，
+            #       否则下次换成可用模型也会被这个占着锁的 session 顶掉。
+            if resp.status_code == 409 and fb.is_model_not_entitled(detail):
+                await fb.delete_session(token, sess["instance_id"], proxy=proxy)
+                _SESSIONS.pop((_tk(token), model), None)
+                raise RuntimeError(fb.model_gate_message(model, detail))
             stale = resp.status_code in (428, 409) or "waiting_room" in detail or "session_superseded" in detail
             if stale and attempt == 0:
                 # 清掉缓存 session，重建后重试一次（照 worker.js staleSession 分支）
@@ -319,11 +337,19 @@ class FreebuffAdapter(BaseAdapter):
                           extra_headers=None) -> List[ModelInfo]:
         ids = await self._model_ids()
         display = dict(fb.FALLBACK_MODELS)
+        # 已知档位放行清单（来自此前额度查询/健康探测的快照，不额外发请求）。
+        # None = 未知 → 一律不加标注（绝不因一次没探到就把整列标成不可用）。
+        entitled = fb.known_entitlement(api_key)
         out = []
         for mid in ids:
+            name = display.get(mid, mid)
+            if entitled is not None and mid not in entitled:
+                # 如实标注、但**不过滤**：出口换区/账号升档后即可用，
+                # 且失败时由上游如实报错（对齐 Trae「暂不可用」标注的既有做法）。
+                name = f"{name} · 当前档位不可用"
             out.append(ModelInfo(
                 model_id=mid,
-                display_name=display.get(mid, mid),
+                display_name=name,
                 # Freebucks 按次扣费（非 token 计费）→ 无 USD 单价，全部标免费
                 is_free=True,
                 input_price=0.0, output_price=0.0,
@@ -356,6 +382,8 @@ class FreebuffAdapter(BaseAdapter):
                                 error_message=(err or "查询失败")[:200])
         code = snap["status_code"]
         data = snap["data"] if isinstance(snap["data"], dict) else {}
+        # 顺手记下档位放行清单（快照本来就拿到了，零额外请求）→ 模型页可标注
+        fb.note_entitlement(api_key, data)
         if code == 401:
             return HealthResult(status="unhealthy", latency_ms=latency,
                                 error_message="authToken 无效或已被撤销")

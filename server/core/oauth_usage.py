@@ -697,6 +697,12 @@ async def _freebuff_usage(token: str) -> dict:
         return {"quotas": {}, "message": f"Freebuff 额度查询失败：{err}"}
     code = snap["status_code"]
     data = snap["data"] if isinstance(snap["data"], dict) else {}
+    # 顺手把档位放行清单记进缓存（快照本来就拿到了，零额外请求）→ 模型页据此
+    # 标注「当前档位不可用」。只标注不过滤：出口换区/升档后即可用，失败由上游如实报错。
+    try:
+        fb.note_entitlement(token, data)
+    except Exception:
+        pass
     if code == 401:
         return {"quotas": {}, "message": "Freebuff authToken 无效或已被撤销（请重新连接）"}
     if code == 403:
@@ -756,15 +762,26 @@ async def _freebuff_usage(token: str) -> dict:
             afford.append((n, mid.split("/")[-1]))
     afford.sort(reverse=True)
     tier = str(data.get("accessTier") or "")
+    # 档位放行清单（就是快照里的 rateLimitsByModel）：这是**唯一权威**的「这个号
+    # 现在能用哪些模型」。上游拒绝时只回短名文案（GLM 5.3 Flash …），与目录 id
+    # 对不上，用户照着改也改不对 —— 这里直接给 id。
+    entitled = fb.entitled_model_ids(data)
+    if tier == "limited":
+        note = ("出口国别为 limited 档（非 US 出口的默认档）：仅放行 "
+                + "、".join(entitled) + "；其余模型会被上游以 session_model_mismatch 拒绝。"
+                "在服务商设置里开启「走代理」可换出口试试。") if entitled else \
+               "出口国别为 limited 档（非 US 出口的默认档，模型目录缩减）"
+    else:
+        note = None
     return {"plan": "Freebuff", "quotas": quotas,
             "extra": {
                 "access_tier": tier,
                 "plan_id": fb_data.get("planId"),
                 "daily_remaining": remaining,
                 "affordable_models": [f"{name}×{n}" for n, name in afford[:8]],
+                "entitled_models": entitled,
                 "price_notices": fb_data.get("priceNotices") or {},
-                "note": ("出口国别为 limited 档（非 US 出口的默认档，模型目录缩减）"
-                         if tier == "limited" else None),
+                "note": note,
             }}
 
 

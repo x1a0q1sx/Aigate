@@ -488,8 +488,15 @@ async def create_session(token: str, model: str, instance_id: Optional[str] = No
     if r.status_code == 200 and data.get("status") == "queued":
         raise SessionError(f"session 排队中（{data.get('instanceId') or 'no-instance'}）", r.status_code)
     if r.status_code == 409:
-        raise SessionError(f"session_model_mismatch: {str(data.get('message') or data.get('error') or '模型锁冲突')[:150]}",
-                           r.status_code)
+        # ⚠️ 档位拒绝时错误码在 `error`、原因在 `message`：必须拿**整包**判定，
+        # 只看 message 会漏判（上游 message 里没有 "session_model_mismatch" 字样）。
+        blob = json.dumps(data, ensure_ascii=False)
+        msg = str(data.get("message") or data.get("error") or "模型锁冲突")
+        # 档位拒绝与「session 脏」是两回事：前者重试同一个模型必然再失败，
+        # 且占着单会话锁 —— 交给调用方释放，并给出可执行提示。
+        if is_model_not_entitled(blob):
+            raise SessionError(model_gate_message(model, blob), r.status_code)
+        raise SessionError(f"session_model_mismatch: {msg[:150]}", r.status_code)
     if r.status_code == 403:
         st = data.get("status")
         if st == "banned":
@@ -563,6 +570,82 @@ def _has_exact_code(data, code: str) -> bool:
         if isinstance(v, dict) and v.get("code") == code:
             return True
     return False
+
+
+# ── 档位闸门（免费层按出口/账号档位放行模型）───────────────────
+# `session_model_mismatch` 的实际语义是「这个模型不在你的档位里」，不是 session 脏。
+# 上游文案只列它自己认的短名（GLM 5.3 Flash / DeepSeek V4.1 Flash …），与 AIGate
+# 目录里的 id 对不上，用户照着重试仍会失败 —— 故统一转成可执行提示。
+# 实测（2026-09-28，CN 出口 limited 档）：GET 快照的 rateLimitsByModel 键集合
+# 与放行清单一一对应（deepseek/deepseek-v4-flash、mimo/mimo-v2.5、
+# upstage/solar-mini4、upstage/solar-pro4、z-ai/glm-5.3-flash）。
+NOT_ENTITLED_MARKERS = ("session_model_mismatch", "not valid for limited access")
+
+
+def is_model_not_entitled(text: str) -> bool:
+    """错误文本是否表示「模型不在此档」（而非 session 脏/失效）。"""
+    d = (text or "").lower()
+    return any(m in d for m in NOT_ENTITLED_MARKERS)
+
+
+def model_gate_message(model: str, detail: str = "") -> str:
+    """档位拒绝 → 可执行提示（列出实测放行模型，不编造）。"""
+    upstream = ""
+    try:
+        obj = json.loads(detail)
+        if isinstance(obj, dict):
+            upstream = str(obj.get("message") or obj.get("error") or "")
+    except (ValueError, TypeError):
+        upstream = detail or ""
+    tail = f"；上游原文：{upstream[:200]}" if upstream else ""
+    return (f"freebuff 免费层不提供该模型（{model}）：当前出口档位只放行部分模型。"
+            f"请改用可用模型（DeepSeek V4 Flash / MiMo 2.5 / Solar Mini 4 / "
+            f"Solar Pro 4 / GLM 5.3 Flash），或在服务商设置里开启「走代理」"
+            f"换到 full access 出口{tail}")
+
+
+def entitled_model_ids(snapshot: dict) -> list:
+    """从 GET /session 快照取当前档位放行的模型 id（无信息时返回空表）。
+
+    只读、0 消耗；拿不到就返回空 —— 调用方按「未知」处理，绝不据此删模型。
+    """
+    if not isinstance(snapshot, dict):
+        return []
+    rlm = snapshot.get("rateLimitsByModel")
+    if not isinstance(rlm, dict):
+        return []
+    return [str(k) for k in rlm.keys() if isinstance(k, str) and k]
+
+
+# ── 档位放行清单缓存（仅供显示名标注，绝不用于过滤）───────────────
+# 只在**已经有**快照的地方顺手记下（额度查询 / 健康探测），不额外发请求 ——
+# worker.js 明确警告过：为查状态而 GET /session 会顶掉正在进行的 chat。
+# 拿不到就当作「未知」，模型照常列出、照常可点名调用，失败由上游如实报错。
+_ENTITLED_CACHE: dict = {}          # token_hash -> (expires_monotonic, frozenset)
+ENTITLED_CACHE_TTL = 300.0
+
+
+def _token_fp(token: str) -> str:
+    return hashlib.sha256((token or "").encode()).hexdigest()[:20]
+
+
+def note_entitlement(token: str, snapshot: dict) -> None:
+    """把快照里的放行清单记进缓存（无信息则不动，避免用空表覆盖已知值）。"""
+    ids = entitled_model_ids(snapshot)
+    if not ids:
+        return
+    _ENTITLED_CACHE[_token_fp(token)] = (time.monotonic() + ENTITLED_CACHE_TTL, frozenset(ids))
+
+
+def known_entitlement(token: str):
+    """已知的放行模型集合；未知（缓存过期/从未探测）返回 None。
+
+    返回 None 与返回空集语义不同：None = 不知道（不标注），空集 = 上游明确说一个都不放行。
+    """
+    hit = _ENTITLED_CACHE.get(_token_fp(token))
+    if not hit or hit[0] <= time.monotonic():
+        return None
+    return hit[1]
 
 
 def _uuid4() -> str:

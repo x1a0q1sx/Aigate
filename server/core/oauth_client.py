@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -63,6 +64,40 @@ def _refresh_credential_dead(status_code: int, error_text: str = "") -> bool:
         return any(m in text for m in _DEAD_CREDENTIAL_MARKERS)
     # 429 限流、5xx 上游故障、其它 → 临时
     return False
+
+
+# ── 凭证身份（防止 A 账号的 token 覆盖 B 账号的连接）──────────────
+# 事故（2026-09-22，实测取证）：`一键连接` 走 device poll 时，轮询协程在拿到
+# token 前先按当时库里已有的 owner 分配（如 __default）；而用户是在**另一个
+# 账号**上完成登录。结果第二次登录把第一个账号的连接覆盖成了新账号的 token ——
+# 两条连接的 token 完全一致（sha1 相同）、JWT 的 sub 也相同，于是「两个账号」
+# 显示同一份额度，第一个账号的凭据被静默丢弃（只能从备份里捞回来）。
+# 这里做**写入侧身份守卫**：新 token 能解出身份、且与该行已有 token 的身份
+# 不同 → 拒绝覆盖并报错，由调用方另建 owner（account-N）。
+_IDENTITY_CLAIM_KEYS = ("preferred_username", "email", "sub")
+
+
+def token_identity(token: str) -> Optional[str]:
+    """从 JWT 形态的 token 里取账号标识；非 JWT / 无身份字段返回 None。
+
+    只读 payload，**不校验签名**（仅用于「是不是同一个账号」的比对，
+    不承担鉴权职责）。取不到就返回 None = 身份未知 → 不参与守卫。
+    """
+    if not token or token.count(".") < 2:
+        return None
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    for key in _IDENTITY_CLAIM_KEYS:
+        v = claims.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
 
 def gen_pkce_pair() -> Tuple[str, str]:
@@ -739,8 +774,26 @@ class OAuthClient:
                 }
                 try:
                     async with AsyncSessionLocal() as db:
-                        await self._save_token(db, "freebuff", owner, tok)
-                    logger.info("freebuff authToken acquired for %s", owner)
+                        # 身份守卫：freebuff 的 authToken 不是 JWT，token_identity()
+                        # 取不到 → 走 scope 里的 uid 兜底比对（同一次登录的 uid 不变）。
+                        target_owner = owner
+                        existing = await self._get_token_record(db, "freebuff", owner)
+                        if existing:
+                            new_uid = str(user.get("id") or "")
+                            old_uid = ""
+                            if existing.scope:
+                                try:
+                                    old_uid = str((json.loads(existing.scope) or {}).get("uid") or "")
+                                except (ValueError, TypeError):
+                                    old_uid = ""
+                            if new_uid and old_uid and new_uid != old_uid:
+                                target_owner = await self._next_free_owner(db, "freebuff")
+                                logger.warning(
+                                    "freebuff: 登录 uid「%s」与连接「%s」（uid「%s」）不同，"
+                                    "自动改存为新账号「%s」（不覆盖原凭据）",
+                                    new_uid, owner, old_uid, target_owner)
+                        await self._save_token(db, "freebuff", target_owner, tok)
+                    logger.info("freebuff authToken acquired for %s", target_owner)
                 except Exception as e:
                     logger.warning("freebuff token save failed: %s", e)
                 finally:
@@ -1330,9 +1383,23 @@ class OAuthClient:
                         "token_type": inner.get("tokenType") or "Bearer",
                         "scope": "codebuddy",
                     }
-                    await self._save_token(db, provider_code, owner, tok)
-                    logger.info("codebuddy %s token acquired after %d polls",
-                                  provider_code, attempt + 1)
+                    # 身份守卫：用户可能是在**另一个账号**上完成的登录（一键连接
+                    # 的 owner 在轮询开始时就已分配好）。此时自动挪到新 owner，
+                    # 绝不覆盖原账号凭据 —— 事故复现路径见 token_identity 注释。
+                    target_owner = owner
+                    existing = await self._get_token_record(db, provider_code, owner)
+                    if existing:
+                        new_id = token_identity(access)
+                        old_id = token_identity(self._crypto.decrypt(existing.access_token_enc))
+                        if new_id and old_id and new_id != old_id:
+                            target_owner = await self._next_free_owner(db, provider_code)
+                            logger.warning(
+                                "codebuddy %s: 登录账号「%s」与连接「%s」（属于「%s」）不同，"
+                                "自动改存为新账号「%s」（不覆盖原凭据）",
+                                provider_code, new_id, owner, old_id, target_owner)
+                    await self._save_token(db, provider_code, target_owner, tok)
+                    logger.info("codebuddy %s token acquired after %d polls (owner=%s)",
+                                  provider_code, attempt + 1, target_owner)
                     return
             except Exception as e:
                 logger.warning("codebuddy poll attempt %d failed: %s", attempt + 1, e)
@@ -1405,10 +1472,38 @@ class OAuthClient:
             logger.warning("get any active oauth token failed: %s", e)
             return None
 
+    async def _next_free_owner(self, db: AsyncSession, provider_code: str) -> str:
+        """给「这次登录其实换了账号」找一个新的 owner 名（与 authorize 入口同规则）。
+
+        规则：__default 被占则依次 account-2 / account-3 …（已有则跳过）。
+        只在身份守卫判定「登录账号 ≠ 连接账号」时使用 —— 这样一键连接的
+        语义就从「静默覆盖」变成「自动新增一个账号」，用户无需先手动改名。
+        """
+        try:
+            rows = (await db.execute(
+                select(OAuthToken.owner).where(OAuthToken.provider_code == provider_code)
+            )).scalars().all()
+        except Exception as e:
+            logger.warning("next free owner lookup failed: %s", e)
+            return provider_code + "-new"
+        existing = {r for r in rows if r}
+        if "__default" not in existing:
+            return "__default"
+        n = 2
+        while f"account-{n}" in existing:
+            n += 1
+        return f"account-{n}"
+
     async def _save_token(
         self, db: AsyncSession, provider_code: str, owner: str,
         tok: dict, update_existing: Optional[OAuthToken] = None,
+        allow_identity_change: bool = False,
     ) -> OAuthToken:
+        """落库 token。**默认拒绝把一条连接改成另一个账号**（见 token_identity 说明）。
+
+        `allow_identity_change=True` 仅用于「用户明确要替换这条连接的账号」的路径
+        （如导入 token 且显式确认），默认关闭 —— 静默换号正是 2026-09-22 的事故成因。
+        """
         expires_in = int(tok.get("expires_in") or 3600)
         refresh_expires_in = int(tok.get("refresh_token_expires_in") or tok.get("refresh_expires_in") or 0)
         access = tok.get("access_token", "")
@@ -1424,6 +1519,17 @@ class OAuthClient:
             row = update_existing
         else:
             row = await self._get_token_record(db, provider_code, owner)
+        # 身份守卫：同一条连接写入**另一个账号**的凭证 → 拒绝（宁可报错让用户改名，
+        # 也不能静默丢掉原账号凭据）。刷新路径（update_existing）带的是同一账号的
+        # 新 token，身份一致自然放行；身份取不到（非 JWT）不参与判定。
+        if row and not allow_identity_change:
+            new_id = token_identity(access)
+            old_id = token_identity(self._crypto.decrypt(row.access_token_enc)) if row.access_token_enc else None
+            if new_id and old_id and new_id != old_id:
+                raise ValueError(
+                    f"该连接（{provider_code}/{owner}）已属于账号「{old_id}」，"
+                    f"不能写入「{new_id}」的凭证 —— 请改用「新增账号」，"
+                    f"或先把这条连接改名/断开")
         if row:
             row.access_token_enc = enc_access
             row.refresh_token_enc = enc_refresh or row.refresh_token_enc

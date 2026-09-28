@@ -238,7 +238,12 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
         "scope": data.scope or "",
     }
     client = get_oauth_client()
-    saved = await client._save_token(db, data.provider_code, data.owner, tok)
+    try:
+        saved = await client._save_token(db, data.provider_code, data.owner, tok)
+    except ValueError as e:
+        # 身份守卫：该 owner 的连接已属于另一个账号（见 oauth_client.token_identity）。
+        # 返回 409 让用户改名或换 owner，而不是 500 或静默覆盖原账号凭据。
+        raise HTTPException(status_code=409, detail=str(e))
     return {"ok": True, "id": saved.id, "provider_code": data.provider_code, "owner": data.owner}
 
 

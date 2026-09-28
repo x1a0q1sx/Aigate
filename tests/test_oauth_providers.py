@@ -596,3 +596,261 @@ async def test_stream_chat_completion_applies_intl_shape(monkeypatch):
     assert sent["messages"][0] == {"role": "system", "content": "You are CodeBuddy Code."}
     assert sent["messages"][1]["content"] == [{"type": "text", "text": "hi"}]
     assert calls[0]["headers"]["X-IDE-Type"] == "IDE"
+
+
+# ── 凭证身份守卫（2026-09-22 事故回归锁）──────────────────────
+# 事故：`一键连接` 的 owner 在**轮询开始前**就已分配好，而用户可能在另一个账号上
+# 完成登录 → 第二次登录把第一个账号的连接覆盖成新账号的 token。实测后果：
+# 两条连接 token 完全相同（sha1 一致）、JWT sub 相同，于是「两个账号」显示同一份
+# 额度，第一个账号的凭据被静默丢弃（只能从备份捞回）。
+# 下面锁死：写入侧拒绝换号、轮询侧自动另建 owner、刷新路径不受影响。
+
+def _jwt(claims: dict) -> str:
+    def _b64(o):
+        import base64 as _b, json as _j
+        return _b.urlsafe_b64encode(_j.dumps(o).encode()).decode().rstrip("=")
+    return f"{_b64({'alg': 'RS256', 'typ': 'JWT'})}.{_b64(claims)}.sig"
+
+
+_TOK_135 = _jwt({"preferred_username": "13500818840", "sub": "86b50828-2ac5-42ed-a597"})
+_TOK_159 = _jwt({"preferred_username": "15944101987", "sub": "926eb892-1111-2222-3333"})
+
+
+def test_token_identity_reads_jwt_claims():
+    assert oc.token_identity(_TOK_135) == "13500818840"
+    assert oc.token_identity(_TOK_159) == "15944101987"
+    # 非 JWT / 无身份字段 / 空 → None（身份未知，不参与守卫）
+    assert oc.token_identity("u1s1-abc123") is None
+    assert oc.token_identity("") is None
+    assert oc.token_identity("a.b") is None
+    assert oc.token_identity(_jwt({"foo": "bar"})) is None
+    # email 兜底（国际服 JWT 只有 email 没有 preferred_username）
+    assert oc.token_identity(_jwt({"email": "x@y.com"})) == "x@y.com"
+
+
+class _RowDB:
+    """极简 DB：只支持 _save_token 需要的 commit/refresh。"""
+    def __init__(self, row):
+        self.row = row
+    async def commit(self):
+        pass
+    async def refresh(self, row):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_save_token_rejects_cross_account_overwrite():
+    """核心回归：把 A 账号的 token 写进属于 B 账号的连接 → 必须拒绝。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    row = SimpleNamespace(provider_code="codebuddy_cn", owner="15944101987",
+                          access_token_enc="enc:" + _TOK_159,
+                          refresh_token_enc="enc:RT", is_active=True,
+                          token_type="Bearer", scope="", expires_at=None,
+                          refresh_expires_at=None, last_refreshed_at=None, last_error="")
+    db = _RowDB(row)
+
+    async def _get(db_, code, owner):
+        return row
+    c._get_token_record = _get
+
+    with pytest.raises(ValueError) as ei:
+        await c._save_token(db, "codebuddy_cn", "15944101987",
+                            {"access_token": _TOK_135, "refresh_token": "RT2",
+                             "expires_in": 3600})
+    msg = str(ei.value)
+    assert "15944101987" in msg and "13500818840" in msg
+    # 原凭据**未被改动**（这是整个守卫的意义）
+    assert row.access_token_enc == "enc:" + _TOK_159
+
+
+@pytest.mark.asyncio
+async def test_save_token_allows_same_account_refresh():
+    """同账号换新 token（刷新路径）必须放行 —— 否则正常续期会被自己挡住。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    row = SimpleNamespace(provider_code="codebuddy_cn", owner="15944101987",
+                          access_token_enc="enc:" + _TOK_159,
+                          refresh_token_enc="enc:RT", is_active=True,
+                          token_type="Bearer", scope="", expires_at=None,
+                          refresh_expires_at=None, last_refreshed_at=None, last_error="")
+    db = _RowDB(row)
+
+    async def _get(db_, code, owner):
+        return row
+    c._get_token_record = _get
+
+    new_tok = _jwt({"preferred_username": "15944101987", "sub": "926eb892-1111-2222-3333",
+                    "jti": "rotated"})
+    await c._save_token(db, "codebuddy_cn", "15944101987",
+                        {"access_token": new_tok, "refresh_token": "RT2", "expires_in": 3600})
+    assert row.access_token_enc == "enc:" + new_tok, "同账号续期必须写进去"
+
+
+@pytest.mark.asyncio
+async def test_save_token_allows_identity_unknown_token():
+    """身份取不到（非 JWT，如 u1s1 api_key / freebuff authToken）→ 不参与守卫。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    row = SimpleNamespace(provider_code="u1s1", owner="__default",
+                          access_token_enc="enc:u1s1-old",
+                          refresh_token_enc="enc:RT", is_active=True,
+                          token_type="Bearer", scope="", expires_at=None,
+                          refresh_expires_at=None, last_refreshed_at=None, last_error="")
+    db = _RowDB(row)
+
+    async def _get(db_, code, owner):
+        return row
+    c._get_token_record = _get
+
+    await c._save_token(db, "u1s1", "__default",
+                        {"access_token": "u1s1-new-key", "expires_in": 3600})
+    assert row.access_token_enc == "enc:u1s1-new-key"
+
+
+@pytest.mark.asyncio
+async def test_save_token_allow_identity_change_escape_hatch():
+    """显式 allow_identity_change（用户确认要替换账号）时放行。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    row = SimpleNamespace(provider_code="codebuddy_cn", owner="__default",
+                          access_token_enc="enc:" + _TOK_159,
+                          refresh_token_enc="enc:RT", is_active=True,
+                          token_type="Bearer", scope="", expires_at=None,
+                          refresh_expires_at=None, last_refreshed_at=None, last_error="")
+    db = _RowDB(row)
+
+    async def _get(db_, code, owner):
+        return row
+    c._get_token_record = _get
+
+    await c._save_token(db, "codebuddy_cn", "__default",
+                        {"access_token": _TOK_135, "expires_in": 3600},
+                        allow_identity_change=True)
+    assert row.access_token_enc == "enc:" + _TOK_135
+
+
+@pytest.mark.asyncio
+async def test_next_free_owner_allocation():
+    c = OAuthClient(crypto=FakeCrypto())
+
+    class _Res:
+        def __init__(self, owners):
+            self._owners = owners
+        def scalars(self):
+            return self
+        def all(self):
+            return self._owners
+
+    class _DB2:
+        def __init__(self, owners):
+            self.owners = owners
+        async def execute(self, stmt):
+            return _Res(self.owners)
+
+    assert await c._next_free_owner(_DB2([]), "codebuddy_cn") == "__default"
+    assert await c._next_free_owner(_DB2(["__default"]), "codebuddy_cn") == "account-2"
+    assert await c._next_free_owner(_DB2(["__default", "account-2"]), "codebuddy_cn") == "account-3"
+    # 空洞可复用（account-2 已被改名/删除时不跳号到 4）
+    assert await c._next_free_owner(_DB2(["__default", "account-3"]), "codebuddy_cn") == "account-2"
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_relocates_owner_on_account_mismatch(monkeypatch):
+    """轮询侧自动挪 owner：用户在新账号上完成登录 → 新增连接而不是覆盖原账号。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": _TOK_135, "refreshToken": "RT-new",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+    saved = {}
+    old_row = SimpleNamespace(owner="__default", access_token_enc="enc:" + _TOK_159)
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved["args"] = (code, owner, tok)
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return old_row
+    c._get_token_record = fake_get
+
+    async def fake_next(db, code):
+        return "account-2"
+    c._next_free_owner = fake_next
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-1", "__default", 1)
+    assert saved["args"][0] == "codebuddy_cn"
+    assert saved["args"][1] == "account-2", "登录账号不同 → 必须改存到新 owner，不得覆盖 __default"
+    assert saved["args"][2]["access_token"] == _TOK_135
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_keeps_owner_when_same_account(monkeypatch):
+    """同账号重登（token 轮换）→ 仍写回原 owner，不误判成新账号。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": _TOK_159, "refreshToken": "RT-new",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+    saved = {}
+    old_row = SimpleNamespace(owner="15944101987", access_token_enc="enc:" + _TOK_159)
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved["args"] = (code, owner, tok)
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return old_row
+    c._get_token_record = fake_get
+
+    async def fake_next(db, code):
+        raise AssertionError("同账号不得触发改存")
+    c._next_free_owner = fake_next
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-1", "15944101987", 1)
+    assert saved["args"][1] == "15944101987"
+
+
+@pytest.mark.asyncio
+async def test_import_token_endpoint_returns_409_on_identity_conflict(tmp_path, monkeypatch):
+    """导入入口：撞身份守卫 → 409 而不是 500，且原凭据不动。"""
+    from fastapi import HTTPException
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from server.models.base import Base
+    from server.models.oauth_token import OAuthToken
+    from server.api import oauth_router as orr
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/imp.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[OAuthToken.__table__])
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    # 路由用的是模块级单例，其 crypto 是真实 Fernet —— 注入 FakeCrypto 客户端，
+    # 否则测试里的 "enc:" 前缀密文会 InvalidToken（与其它用例同口径）。
+    monkeypatch.setattr(orr, "get_oauth_client", lambda: OAuthClient(crypto=FakeCrypto()))
+    try:
+        async with Session() as db:
+            db.add(OAuthToken(provider_code="codebuddy_cn", owner="__default",
+                              access_token_enc="enc:" + _TOK_159, is_active=True))
+            await db.commit()
+            payload = orr.ImportedTokenPayload(provider_code="codebuddy_cn",
+                                               access_token=_TOK_135, owner="__default")
+            with pytest.raises(HTTPException) as ei:
+                await orr.import_oauth_token(payload, db)
+            assert ei.value.status_code == 409
+            assert "13500818840" in str(ei.value.detail)
+            row = (await db.execute(select(OAuthToken))).scalars().one()
+            assert row.access_token_enc == "enc:" + _TOK_159, "原凭据必须原封不动"
+    finally:
+        await engine.dispose()
+
+
+def test_save_token_signature_has_identity_guard_flag():
+    """源码守卫：守卫开关必须存在且默认为 False（默认拒绝换号）。"""
+    import inspect
+    sig = inspect.signature(OAuthClient._save_token)
+    p = sig.parameters["allow_identity_change"]
+    assert p.default is False
+    body = inspect.getsource(OAuthClient._save_token)
+    assert "token_identity(access)" in body
+    assert "不能写入" in body

@@ -32,6 +32,7 @@
       </div>
     </template>
 
+    <div v-if="noteText" class="quota-note text-xs">{{ noteText }}</div>
     <div v-if="entry && entry.message" class="usage-msg text-xs">{{ entry.message }}</div>
   </div>
 </template>
@@ -68,6 +69,12 @@ export default {
         total: Number(ex.credits_total) || 0,
         used: Number(ex.credits_used) || 0,
       }
+    },
+    // 上游档位/可用范围的说明（如 Freebuff limited 档只放行哪几个模型）。
+    // 放这里而不是各页各写一份：三处复用同一口径（与「积分总量」同理）。
+    noteText() {
+      const ex = (this.entry && this.entry.extra) || {}
+      return ex.note || ''
     },
     bonusAgg() {
       let total = 0, remaining = 0, first = null
@@ -186,4 +193,6 @@ export default {
 .bc-total { font-weight: 400; color: var(--text-muted, #7e8ea9); }
 .bc-exp { color: var(--text-muted, #7e8ea9); font-size: 10px; }
 .usage-msg { color: var(--text-muted, #7e8ea9); }
+/* 档位/可用范围说明：与 message 区分开（message 是错误态，note 是事实说明） */
+.quota-note { color: var(--text-muted, #7e8ea9); margin-top: 4px; line-height: 1.5; }
 </style>

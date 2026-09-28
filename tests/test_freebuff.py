@@ -563,3 +563,187 @@ def test_adapter_list_models_uses_release_when_available(monkeypatch):
     # 兜底表里有展示名的用展示名，没有的用 id
     assert models[0].display_name == "vendor/new-model"
     assert models[1].display_name == "MiMo 2.5"
+
+
+# ── 档位闸门（session_model_mismatch）────────────────────
+# 事故（2026-09-28）：用户点了一个不在 limited 档的模型，报
+#   HTTP 409 {"error":"session_model_mismatch","message":"Limited free access is
+#   only available with GLM 5.3 Flash or DeepSeek V4.1 Flash or ..."}
+# 旧代码把 409 一律当「session 脏」→ 清缓存重建重试一次。而 POST session 是
+# **扣费**的，等于白扣一次额度再报同样的错，且失败的 session 继续占着单会话锁。
+# 下面四条锁死：语义区分、不白重建、释放锁、报错可执行。
+
+_NOT_ENTITLED_BODY = {
+    "error": "session_model_mismatch",
+    "message": ("Limited free access is only available with GLM 5.3 Flash or "
+                "DeepSeek V4.1 Flash or MiMo 2.6 Flash or Solar Mini 4 or Solar Pro 4."),
+}
+
+
+def test_is_model_not_entitled_distinguishes_from_stale_session():
+    """`session_model_mismatch` ≠ session 脏；后者仍走重建重试。"""
+    assert fb.is_model_not_entitled(json.dumps(_NOT_ENTITLED_BODY)) is True
+    # 真正的 session 失效（要重建重试）不得被误判成档位拒绝
+    for stale in ({"error": "session_superseded"},
+                  {"error": "waiting_room_required"},
+                  {"error": "session_expired"}):
+        assert fb.is_model_not_entitled(json.dumps(stale)) is False
+    # 502 包装（旧上游）也识别
+    assert fb.is_model_not_entitled("not valid for limited access") is True
+    assert fb.is_model_not_entitled("") is False
+
+
+def test_model_gate_message_is_actionable_and_keeps_upstream_text():
+    msg = fb.model_gate_message("openai/gpt-6-luna", json.dumps(_NOT_ENTITLED_BODY))
+    assert "openai/gpt-6-luna" in msg          # 指出是哪个模型
+    assert "DeepSeek V4 Flash" in msg          # 给出可用模型（实测放行清单）
+    assert "走代理" in msg                     # 给出换出口这条路
+    assert "GLM 5.3 Flash" in msg              # 保留上游原文便于核对
+
+
+def test_create_session_409_not_entitled_raises_actionable_error(monkeypatch):
+    """session 阶段撞档位拒绝：报错要可执行，不能只说「模型锁冲突」。"""
+    calls = []
+    _patch(monkeypatch, calls, [(409, _NOT_ENTITLED_BODY)])
+    with pytest.raises(fb.SessionError) as ei:
+        asyncio.run(fb.create_session("tok", "openai/gpt-6-luna"))
+    msg = str(ei.value)
+    assert "openai/gpt-6-luna" in msg and "走代理" in msg
+    assert "session_model_mismatch:" not in msg, "不应再吐裸上游错误码给用户"
+    # 仍带 409 语义（上层据此判断不是 401/429）
+    assert ei.value.status == 409
+
+
+def test_create_session_409_stale_keeps_old_message(monkeypatch):
+    """session 脏（superseded）保持原样：上层要按 stale 分支重建重试。"""
+    calls = []
+    _patch(monkeypatch, calls, [(409, {"error": "session_superseded", "message": "taken over"})])
+    with pytest.raises(fb.SessionError) as ei:
+        asyncio.run(fb.create_session("tok", "m"))
+    assert "session_model_mismatch" in str(ei.value)
+    assert ei.value.status == 409
+
+
+def test_adapter_does_not_rebuild_session_on_model_gate(monkeypatch):
+    """chat 撞档位拒绝：**不得**清缓存重建重试（重建要扣费且必然再失败），
+    并且必须 DELETE 掉刚建的 session 释放单会话锁。"""
+    calls = []
+    _patch_adapter(monkeypatch, calls, [
+        (200, {"status": "active", "instanceId": "inst-1", "model": "openai/gpt-6-luna",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+        (200, {"runId": "run-1"}),
+        (200, {"runId": "run-2"}),
+        (409, _NOT_ENTITLED_BODY),
+    ])
+    a = FreebuffAdapter()
+
+    async def _run():
+        return [c async for c in a.stream_chat_completion(
+            {"model": "openai/gpt-6-luna", "messages": [{"role": "user", "content": "x"}]},
+            "tok", "")]
+
+    out = asyncio.run(_run())
+    assert out and out[0].get("error"), "应产出错误块而不是静默"
+    assert "走代理" in out[0]["error"], "报错要可执行"
+    session_posts = [c for c in calls if c["m"] == "POST"
+                     and c["url"].endswith("/api/v1/freebuff/session")]
+    assert len(session_posts) == 1, "档位拒绝不得重建 session（重建会再扣一次费）"
+    deletes = [c for c in calls if c["m"] == "DELETE"
+               and c["url"].endswith("/api/v1/freebuff/session")]
+    assert len(deletes) == 1, "必须 DELETE 释放单会话锁，否则下次换模型也被顶掉"
+
+
+def test_adapter_still_retries_on_genuine_stale_session(monkeypatch):
+    """反向对照：真正的 session 失效仍要重建重试（别把两个分支搞反）。"""
+    calls = []
+    _patch_adapter(monkeypatch, calls, [
+        (200, {"status": "active", "instanceId": "inst-old", "model": "m",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+        (200, {"runId": "run-1"}),
+        (200, {"runId": "run-2"}),
+        (409, {"error": "session_superseded", "message": "taken over"}),
+        (200, {"status": "active", "instanceId": "inst-new", "model": "m",
+               "expiresAt": "2099-01-01T00:00:00Z"}),
+        (200, {"_sse": ['data: {"choices":[{"delta":{"content":"ok"}}]}']}),
+    ])
+    a = FreebuffAdapter()
+
+    async def _run():
+        return [c async for c in a.stream_chat_completion(
+            {"model": "m", "messages": [{"role": "user", "content": "x"}]}, "tok", "")]
+
+    out = asyncio.run(_run())
+    assert out and out[0]["choices"][0]["delta"]["content"] == "ok"
+    session_posts = [c for c in calls if c["m"] == "POST"
+                     and c["url"].endswith("/api/v1/freebuff/session")]
+    assert len(session_posts) == 2, "真 stale 仍应重建一次"
+
+
+# ── 档位放行清单（只标注、不过滤）──────────────────────────
+
+def test_entitled_model_ids_reads_snapshot_and_ignores_garbage():
+    assert fb.entitled_model_ids({"rateLimitsByModel": {"a/b": {}, "c/d": {}}}) == ["a/b", "c/d"]
+    # 无信息一律返回空表（调用方按「未知」处理，绝不据此删模型）
+    assert fb.entitled_model_ids({}) == []
+    assert fb.entitled_model_ids(None) == []
+    assert fb.entitled_model_ids({"rateLimitsByModel": "nope"}) == []
+
+
+def test_entitlement_cache_none_means_unknown(monkeypatch):
+    """None（未知）与空集（明确一个都不放行）语义必须分开。"""
+    fb._ENTITLED_CACHE.clear()
+    assert fb.known_entitlement("tok-x") is None, "从未探测 = 未知"
+    fb.note_entitlement("tok-x", {"rateLimitsByModel": {"m/1": {}}})
+    assert fb.known_entitlement("tok-x") == frozenset({"m/1"})
+    # 空快照不得覆盖已知值（否则一次异常响应会把整列模型误标成不可用）
+    fb.note_entitlement("tok-x", {})
+    assert fb.known_entitlement("tok-x") == frozenset({"m/1"})
+    fb._ENTITLED_CACHE.clear()
+
+
+def test_adapter_annotates_but_does_not_filter_by_entitlement(monkeypatch):
+    """已知放行清单时：清单外模型加「当前档位不可用」标注，但**仍列在目录里**
+    （出口换区/升档后即可用；且失败时由上游如实报错）。"""
+    async def _net(proxy=None):
+        return ["mimo/mimo-v2.5", "openai/gpt-6-luna"]
+
+    monkeypatch.setattr(fb, "fetch_release_models", _net)
+    fb._ENTITLED_CACHE.clear()
+    fb.note_entitlement("tok", {"rateLimitsByModel": {"mimo/mimo-v2.5": {}}})
+    a = FreebuffAdapter()
+    models = asyncio.run(a.list_models("tok", ""))
+    ids = [m.model_id for m in models]
+    assert ids == ["mimo/mimo-v2.5", "openai/gpt-6-luna"], "不得过滤掉模型"
+    by_id = {m.model_id: m.display_name for m in models}
+    assert "不可用" not in by_id["mimo/mimo-v2.5"]
+    assert "不可用" in by_id["openai/gpt-6-luna"]
+    fb._ENTITLED_CACHE.clear()
+
+
+def test_adapter_annotates_nothing_when_entitlement_unknown(monkeypatch):
+    """从未探测过档位 → 一律不加标注（不能把「不知道」显示成「不可用」）。"""
+    async def _net(proxy=None):
+        return ["mimo/mimo-v2.5", "openai/gpt-6-luna"]
+
+    monkeypatch.setattr(fb, "fetch_release_models", _net)
+    fb._ENTITLED_CACHE.clear()
+    a = FreebuffAdapter()
+    models = asyncio.run(a.list_models("tok", ""))
+    assert all("不可用" not in m.display_name for m in models)
+
+
+def test_health_check_records_entitlement_for_later_listing(monkeypatch):
+    """健康探测的快照顺带记下放行清单（零额外请求）→ 模型页随即能标注。"""
+    calls = []
+    _patch_adapter(monkeypatch, calls, [
+        (200, {"status": "active", "accessTier": "limited",
+               "rateLimitsByModel": {"mimo/mimo-v2.5": {}, "upstage/solar-pro4": {}}}),
+    ])
+    fb._ENTITLED_CACHE.clear()
+    a = FreebuffAdapter()
+    res = asyncio.run(a.health_check("m", "tok-hc", ""))
+    assert res.status == "healthy"
+    assert fb.known_entitlement("tok-hc") == frozenset({"mimo/mimo-v2.5", "upstage/solar-pro4"})
+    # 只读：健康探测绝不 POST（POST 会扣 Freebucks）
+    assert not [c for c in calls if c["m"] == "POST"]
+    fb._ENTITLED_CACHE.clear()
