@@ -64,31 +64,39 @@ def _seed(*pairs):
 # v4.4 订阅制上游的"倍率"（credit multiplier）静态表。
 # 这类上游没有 USD 单价，按 credit 倍率计费（0.0 = 免费；越小越便宜）。
 #
+# ⚠️ F31（2026-09-28）：CodeBuddy **已有在线倍率源** —— 刷新时会调
+# `fetch_codebuddy_ratios()` 读 `/v3/config` 的 `models[].credits`（CN 实测 29 条、
+# Intl 21 条），在线值优先覆盖本表。**本表只是「在线拿不到时的兜底」**，
+# 不再是无条件真相源（旧值来自客户端产物，会随版本过期）。
+#
 # 数据来源（全部为实测值，无推测）：
-#   - WorkBuddy 桌面端 product.json（2026-08-17 版，endpoint=copilot.tencent.com，
-#     即 CN SaaS 版）：deepseek-v4-pro x0.16 / minimax-m3-play x0.25 /
-#     hy3-preview-agent x0.04 / default x2.00
-#   - CodeBuddy IDE 客户端日志实测（2026-08-20~09-05，含时间戳）：
-#     deepseek-v4-flash x0.17→x0.08（08-21 调价）/ hy3 x0.00 / hy4-preview x0.00
-#   - 同一模型在两处冲突时取**更新的实测值**（flash 用 0.08）。
+#   - 2026-09-28 在线 /v3/config 校准（当前表值已按在线值更新）
+#   - WorkBuddy 桌面端 product.json（2026-08-17 版，endpoint=copilot.tencent.com）
+#   - CodeBuddy IDE 客户端日志实测（2026-08-20~09-05，含时间戳）
 # 未列出的模型留 NULL（未知），由用户在模型页手动填——不猜。
 # 注意：客户端升级后倍率可能变化；Qoder 走在线目录（price_factor）不受此限。
 STATIC_PRICE_RATIOS: Dict[str, Dict[str, float]] = {
     # CodeBuddy 两版共用同一后端与模型目录（见 codebuddy_intl 注释）
     "codebuddy_cn": {
-        "deepseek-v4-pro": 0.16,
-        "deepseek-v4-flash": 0.08,
-        "minimax-m3": 0.25,          # product.json minimax-m3-play 同档
+        # 2026-09-28 按在线 /v3/config 校准（旧值 0.16/0.08/0.00 已过期）
+        "deepseek-v4-pro": 0.51,
+        "deepseek-v4-flash": 0.17,
+        "deepseek-v4.1-flash": 0.11,
+        "minimax-m3": 0.25,
         "hy3-preview-agent": 0.04,
-        "hy3": 0.00,                 # 免费（客户端日志实测）
-        "hy4-preview": 0.00,         # 免费（客户端日志实测）
+        "hy3": 0.00,                 # 免费（在线实测 x0.00）
+        "hy4-preview": 0.29,         # 旧客户端日志的 x0.00 已过期（在线 0.29）
     },
     "codebuddy_intl": {
         # 国际版种子已剔除 deepseek-v4-pro/flash 等（11102 下架，见 codebuddy_intl
         # 注释）——倍率表只列该版真实存在的模型，不给已下架模型留值。
+        # 2026-09-28 按在线 /v3/config（CLI UA）校准。
         "minimax-m3": 0.25,
         "hy3": 0.00,
-        "hy4-preview": 0.00,
+        "hy4-preview": 0.29,         # 旧值 0.00 已过期（在线 0.29）
+        "glm-5.3-flash": 0.06,
+        "glm-5.3": 0.79,
+        "glm-5.2": 0.79,
     },
 }
 

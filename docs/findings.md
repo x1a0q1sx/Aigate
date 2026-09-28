@@ -1065,3 +1065,67 @@ except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
   （**已验证：撤掉修复后其中 3 项立刻失败**）
 - `tests/test_freebuff.py` +5 项：limit=0 与档位内可区分、模型页分开标注、
   429 文案用结构化字段、create_session 的 429 文案可执行、额度面板 note 分述
+
+## F31 CodeBuddy 倍率大面积缺失 = 在线源一直存在但没接入（2026-09-28）
+
+**用户反馈**：「codebuddy 有很多模型的价格还是没显示倍率，啥情况？」
+
+**根因：上游一直有在线倍率源，但代码只读一张 6 条的手工表。**
+
+生产实测（`GET {base}/v3/config`，CodeBuddy 标准头）：
+
+| 版本 | `data.models[]` | 带 `credits` |
+|---|---|---|
+| CN (`copilot.tencent.com`) | 31 条 | **31 条全带** |
+| Intl (`www.codebuddy.ai`) | 22 条 | 21 条 |
+
+`models[].credits` 形态：`"x0.17 credits"` / `"x0.00"` / `"x2.00 credits"`。
+而 AIGate 的 `STATIC_PRICE_RATIOS` 只有 CN 6 条 / Intl 3 条（来自 2026-08 的
+客户端产物 `product.json` + IDE 日志），于是库里 **CN 27 个模型只有 6 个有倍率、
+Intl 29 个只有 3 个**。
+
+**另一处实测坑（决定成败）**：Intl 的返回集**由 UA 决定**：
+
+| User-Agent | models[] | 带 credits |
+|---|---|---|
+| `CLI/2.108.1 CodeBuddy/2.108.1` | **22** | **21** |
+| `IDE/2.108.1 CodeBuddy/2.108.1`（原注册表配置） | 13 | 7 |
+| `CodeBuddy/2.63.2` | 0 | 0 |
+
+→ 必须固定用 CLI UA（两个域名都验过）。
+
+**修复**：新增 `fetch_codebuddy_ratios()`（`server/core/model_catalog.py`）——
+刷新时读 `/v3/config` 的 `models[].credits`，**在线值优先覆盖**静态表；任何失败
+（非 200 / 网络异常 / 解析不出）返回空表，**保持既有值不动**（绝不因一次抖动清空倍率）。
+静态表降级为「在线拿不到时的兜底」并按在线值校准（`hy4-preview` 0.00 → **0.29**、
+`deepseek-v4-flash` 0.08 → **0.17**、`pro` 0.16 → **0.51** —— 旧客户端值已过期）。
+
+**⚠️ 一个必须守住的设计约束**：在线结果**只用于叠加倍率，绝不用它替换模型列表**。
+实测若把 `/v3/config` 的 `models[]` 当权威清单，CN/Intl 各会**误删 8 个模型**：
+
+```
+CN   : auto, balanced-model, deep-model, fast-model, hy3-preview,
+       hy3-preview-agent, kimi-k3, minimax-m3-pay
+Intl : auto, glm-5.1, glm-5v-turbo, gpt-5.3-codex, hy4-preview-f,
+       kimi-k2.5, kimi-k2.7, minimax-m3
+```
+
+（这些档位别名不在 `models[]` 里但**确实可用**）—— 对齐 Jet-Hub 教训
+「把某一刻的快照当判据会让后人误删可用模型」。测试里加了源码守卫锁死这一点。
+
+**预期效果**（生产 dry-run）：
+
+| 版本 | 在线倍率 | 可覆盖 | 新填 | 修正过期值 |
+|---|---|---|---|---|
+| CN | 29 条 | 18 | **13** | 3 |
+| Intl | 21 条 | 20 | **18** | 1 |
+
+前端来源标签从「客户端实测」改为「在线倍率」（tooltip 写明 `/v3/config`
+的 `models[].credits`）。
+
+### 测试
+
+新增 **13 项**（全量 **837 项全绿**）：credits 形态解析（含 `x0.00`/`0.50x`/
+不可解析必须 None 而非 0）、非 200 / 网络异常返回空表、base_url 带路径要裁剪到
+host、**必须用 CLI UA**、**叠加而非替换**（含源码守卫，已反向验证：注入
+「用在线列表替换清单」的错误实现后立刻失败）、只读（不得 POST）。

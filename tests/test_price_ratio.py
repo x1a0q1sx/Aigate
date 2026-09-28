@@ -2,7 +2,8 @@
 
 背景：CodeBuddy / Qoder 等订阅制上游没有 USD 单价，按 credit 倍率计费。
 - Qoder：在线目录 /algo/api/v2/model/list 每条带 price_factor（最可靠）
-- CodeBuddy：无服务端接口，用客户端 product.json / 日志实测的静态表
+- CodeBuddy：**在线** /v3/config 的 models[].credits（F31，2026-09-28 接入）；
+  静态表降级为「在线拿不到时的兜底」
 """
 import pytest
 
@@ -13,13 +14,16 @@ from server.core.oauth_registry import STATIC_PRICE_RATIOS, get_oauth_provider
 class TestStaticRatioTable:
     def test_codebuddy_entries_present(self):
         # CN 版含 deepseek 系（国际版已下架这几个，只保留通用档）
+        # 2026-09-28 按在线 /v3/config 校准（旧客户端值 0.16/0.08 已过期）
         cn = STATIC_PRICE_RATIOS["codebuddy_cn"]
-        assert cn["deepseek-v4-flash"] == 0.08
-        assert cn["deepseek-v4-pro"] == 0.16
-        # 免费模型倍率为 0（合法值，不能被当成"未设置"跳过）
+        assert cn["deepseek-v4-flash"] == 0.17
+        assert cn["deepseek-v4-pro"] == 0.51
+        # 倍率为 0（合法值，不能被当成"未设置"跳过）
         for code in ("codebuddy_cn", "codebuddy_intl"):
             assert STATIC_PRICE_RATIOS[code]["hy3"] == 0.0
-            assert STATIC_PRICE_RATIOS[code]["hy4-preview"] == 0.0
+        # ⚠️ hy4-preview 旧值 0.00 已过期（在线实测 0.29）—— 防回归
+        for code in ("codebuddy_cn", "codebuddy_intl"):
+            assert STATIC_PRICE_RATIOS[code]["hy4-preview"] == 0.29
 
     def test_ratio_values_are_non_negative(self):
         for table in STATIC_PRICE_RATIOS.values():
@@ -32,6 +36,14 @@ class TestStaticRatioTable:
             seed_ids = {m["model_id"] for m in (get_oauth_provider(code).static_models or [])}
             unknown = set(table) - seed_ids
             assert not unknown, f"{code} 倍率表含非种子模型: {unknown}"
+
+    def test_static_table_is_documented_as_fallback(self):
+        """静态表已降级为「在线拿不到时的兜底」——注释必须写明，防止后人当真相源维护。"""
+        import inspect
+        from server.core import oauth_registry
+        src = inspect.getsource(oauth_registry)
+        assert "fetch_codebuddy_ratios" in src
+        assert "只是「在线拿不到时的兜底」" in src or "兜底" in src.split("STATIC_PRICE_RATIOS")[0]
 
 
 class TestModelInfoField:
@@ -127,3 +139,212 @@ class TestManualEditProtection:
     def test_provider_source_allows_overwrite(self):
         for src in ("", "qoder", "provider"):
             assert (0.5 is not None and src != "manual") is True
+
+
+# ============ F31：CodeBuddy 在线倍率（/v3/config models[].credits）============
+
+class TestParseCodebuddyCredits:
+    """上游 credits 字段形态解析（实测：'x0.17 credits' / 'x0.00' / '0.50x'）。"""
+
+    def _p(self, v):
+        from server.core.model_catalog import parse_codebuddy_credits
+        return parse_codebuddy_credits(v)
+
+    def test_real_upstream_forms(self):
+        assert self._p("x0.17 credits") == 0.17      # 生产实测形态
+        assert self._p("x0.00") == 0.0               # 免费
+        assert self._p("x2.00 credits") == 2.0
+        assert self._p("x1.62") == 1.62
+        assert self._p("0.50x") == 0.5               # 促销表 discountedCredits 形态
+        assert self._p("0x") == 0.0
+
+    def test_plain_numbers(self):
+        assert self._p(0.25) == 0.25
+        assert self._p("0.25") == 0.25
+
+    def test_unparseable_is_none_not_zero(self):
+        """解析不出必须是 None（未知），绝不能猜 0 = 免费。"""
+        for bad in (None, "", "abc", "credits", "x credits", True, False, [], {}):
+            assert self._p(bad) is None, f"{bad!r} 应解析为 None"
+
+
+class TestOnlineRatioFetch:
+    """在线倍率抓取：只读、失败不抛、只产出倍率不产出模型列表。"""
+
+    def _patch_httpx(self, monkeypatch, status, payload):
+        import server.core.model_catalog as mc
+
+        class _Resp:
+            def __init__(self):
+                self.status_code = status
+                self._d = payload
+                self.content = b"{}"
+
+            def json(self):
+                return self._d
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, headers=None):
+                return _Resp()
+
+        import httpx
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    def test_parses_credits_map(self, monkeypatch):
+        import asyncio
+        self._patch_httpx(monkeypatch, 200, {"data": {"models": [
+            {"id": "deepseek-v4-flash", "credits": "x0.17 credits"},
+            {"id": "glm-5.3-flash", "credits": "x0.06"},
+            {"id": "hy3", "credits": "x0.00"},
+            {"id": "no-credits"},                       # 无 credits → 跳过
+            {"credits": "x1.0"},                        # 无 id → 跳过
+        ]}})
+        from server.core.model_catalog import fetch_codebuddy_ratios
+        out = asyncio.run(fetch_codebuddy_ratios("tok", "https://copilot.tencent.com"))
+        assert out == {"deepseek-v4-flash": 0.17, "glm-5.3-flash": 0.06, "hy3": 0.0}
+
+    def test_non_200_returns_empty(self, monkeypatch):
+        import asyncio
+        self._patch_httpx(monkeypatch, 500, {})
+        from server.core.model_catalog import fetch_codebuddy_ratios
+        assert asyncio.run(fetch_codebuddy_ratios("tok", "https://x.com")) == {}
+
+    def test_network_error_returns_empty_not_raise(self, monkeypatch):
+        """网络异常必须吞掉返回空表（调用方回退静态表），不得打断整个刷新。"""
+        import asyncio
+        import httpx
+        import server.core.model_catalog as mc
+
+        class _Boom:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                raise httpx.ConnectError("boom")
+
+            async def __aexit__(self, *a):
+                return False
+
+        monkeypatch.setattr(httpx, "AsyncClient", _Boom)
+        from server.core.model_catalog import fetch_codebuddy_ratios
+        assert asyncio.run(fetch_codebuddy_ratios("tok", "https://x.com")) == {}
+
+    def test_base_url_with_path_is_trimmed_to_host(self, monkeypatch):
+        """api_base_url 是 .../v2/chat/completions 形态 → 必须只取 scheme://host。"""
+        import asyncio
+        seen = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"models": []}}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, headers=None):
+                seen["url"] = url
+                return _Resp()
+
+        import httpx
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        from server.core.model_catalog import fetch_codebuddy_ratios
+        asyncio.run(fetch_codebuddy_ratios("tok", "https://copilot.tencent.com/v2/chat/completions"))
+        assert seen["url"] == "https://copilot.tencent.com/v3/config"
+
+    def test_uses_cli_user_agent(self, monkeypatch):
+        """UA 决定返回集（实测 Intl: CLI→22 条 / IDE→13 条 / 旧版→0 条）→ 必须用 CLI。"""
+        import asyncio
+        seen = {}
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"data": {"models": []}}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, url, headers=None):
+                seen["headers"] = headers or {}
+                return _Resp()
+
+        import httpx
+        monkeypatch.setattr(httpx, "AsyncClient", _Client)
+        from server.core.model_catalog import fetch_codebuddy_ratios
+        asyncio.run(fetch_codebuddy_ratios("tok", "https://www.codebuddy.ai"))
+        assert seen["headers"]["User-Agent"].startswith("CLI/")
+        assert seen["headers"]["X-Product-Code"] == "codebuddy"
+        assert seen["headers"]["X-Domain"] == "www.codebuddy.ai"
+
+
+class TestOnlineRatioDoesNotReplaceModelList:
+    """⚠️ 在线倍率**只叠加**，绝不用 /v3/config 的 models[] 替换模型清单。
+
+    实测：若当清单用，CN/Intl 各会误删 8 个模型（auto / balanced-model /
+    fast-model / deep-model 等档位别名不在 models[] 里但确实可用）。
+    """
+
+    def test_overlay_only_touches_existing_models(self):
+        import inspect
+        import server.core.model_catalog as mc
+        src = inspect.getsource(mc.ModelCatalog._refresh_models_inner)
+        # 叠加逻辑必须遍历 all_model_infos（已收集的列表）并只写 price_ratio/is_free
+        assert "_online = await fetch_codebuddy_ratios(" in src
+        assert "for _mid, _mi in all_model_infos.items()" in src
+        assert "_mi.price_ratio = _r" in src
+        # 不得把在线结果当模型清单（不出现 setdefault/add 到 all_model_infos）
+        seg = src.split("_online = await fetch_codebuddy_ratios(")[1].split("if not any_success")[0]
+        assert "all_model_infos.setdefault" not in seg
+        assert "all_model_infos[_" not in seg
+
+    def test_overlay_is_codebuddy_only(self):
+        import inspect
+        import server.core.model_catalog as mc
+        src = inspect.getsource(mc.ModelCatalog._refresh_models_inner)
+        assert 'if str(oauth_code).startswith("codebuddy"):' in src
+
+    def test_failure_keeps_existing_ratios(self):
+        """在线拉取失败 → 不得清空既有倍率（静态表/库里已有的值保留）。"""
+        import inspect
+        import server.core.model_catalog as mc
+        src = inspect.getsource(mc.ModelCatalog._refresh_models_inner)
+        seg = src.split("_online = await fetch_codebuddy_ratios(")[1].split("if not any_success")[0]
+        assert "if _online:" in seg, "必须仅在拿到数据时才覆盖（空表不动既有值）"
+
+
+class TestFetchCodebuddyRatiosIsReadOnly:
+    """抓取只读：只 GET /v3/config，绝不 POST（POST 会改上游状态）。"""
+
+    def test_only_get_requests(self):
+        import inspect
+        import server.core.model_catalog as mc
+        src = inspect.getsource(mc.fetch_codebuddy_ratios)
+        assert ".get(" in src
+        assert ".post(" not in src
+        assert "_CODEBUDDY_CONFIG_PATH" in src

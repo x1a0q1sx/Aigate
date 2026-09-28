@@ -77,6 +77,100 @@ async def _fetch_lobsterai_models(oauth_client, session: AsyncSession,
             supports_reasoning_effort=True,
         ))
     return out
+
+
+# ── CodeBuddy 在线倍率（/v3/config 的 models[].credits）──────────────
+# F31（2026-09-28）：此前倍率只来自 STATIC_PRICE_RATIOS 手工表（客户端产物，
+# CN 6 条 / Intl 3 条），而**上游其实有在线倍率源**：GET {base}/v3/config 的
+# data.models[].credits（形如 "x0.17 credits" / "x0.00"）。生产实测：
+#   · CN  (copilot.tencent.com) → 31 条模型，全部带 credits
+#   · Intl(www.codebuddy.ai)    → **UA 决定返回集**：
+#       CLI/2.108.1 → 22 条（21 带 credits）；IDE/2.108.1 → 13 条（仅 7 带）；
+#       CodeBuddy/2.63.2 → 0 条。故这里固定用 CLI UA（与 CN 一致）。
+#
+# ⚠️ **只用于倍率，绝不用它替换模型列表**：实测若把 /v3/config 的 models[] 当
+# 权威清单，CN/Intl 各会误删 8 个模型（`auto` / `balanced-model` / `fast-model` /
+# `deep-model` 等档位别名不在 models[] 里但**确实可用**）—— 对齐 Jet-Hub 教训：
+# 「把某一刻的快照当判据会让后人误删可用模型」。倍率是纯附加标注，没有这个风险。
+_CODEBUDDY_CONFIG_PATH = "/v3/config"
+# 实测唯一能拿到完整 models[] 的 UA（两个域名都验过）
+_CODEBUDDY_RATIO_UA = "CLI/2.108.1 CodeBuddy/2.108.1"
+
+
+def parse_codebuddy_credits(text) -> Optional[float]:
+    """'x0.17 credits' / 'x0.00' / '0.5x' / 0.17 → float；无法解析返回 None。
+
+    上游形态实测：models[].credits = "x0.17 credits"（带单位后缀）；
+    促销表里另有 "0.50x" / "0x" 形态。只认能明确解析出的数字，
+    解析不出返回 None（调用方按「未知」处理，绝不猜 0 = 免费）。
+    """
+    if isinstance(text, bool):
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    if not isinstance(text, str):
+        return None
+    s = text.strip().lower().replace("credits", "").strip()
+    s = s[1:] if s.startswith("x") else s
+    s = s[:-1] if s.endswith("x") else s
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _codebuddy_host(base_url: str) -> str:
+    """api_base_url（可能是 .../v2/chat/completions）→ scheme://host。"""
+    base = (base_url or "").rstrip("/")
+    if not base or "://" not in base:
+        return ""
+    scheme, rest = base.split("://", 1)
+    return f"{scheme}://{rest.split('/', 1)[0]}"
+
+
+async def fetch_codebuddy_ratios(token: str, base_url: str) -> Dict[str, float]:
+    """从 CodeBuddy /v3/config 取 {model_id: credits 倍率}（在线权威源）。
+
+    只读、**只产出倍率**（不产出模型列表，见上方警告）。任何失败返回空 dict，
+    由调用方回退静态表（绝不因一次网络抖动把倍率清空）。
+    """
+    import httpx
+    base = _codebuddy_host(base_url)
+    if not base:
+        return {}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-Domain": base.split("://", 1)[-1],
+        "X-Product": "SaaS",
+        "X-Product-Code": "codebuddy",
+        "User-Agent": _CODEBUDDY_RATIO_UA,
+        "x-requested-with": "XMLHttpRequest",
+        "x-codebuddy-request": "1",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as c:
+            r = await c.get(base + _CODEBUDDY_CONFIG_PATH, headers=headers)
+        if r.status_code != 200:
+            logger.info("codebuddy /v3/config HTTP %s（回退静态倍率表）", r.status_code)
+            return {}
+        data = (r.json() or {}).get("data") or {}
+    except Exception as e:
+        logger.warning("codebuddy /v3/config 拉取失败：%s", e)
+        return {}
+    out: Dict[str, float] = {}
+    for m in (data.get("models") or []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        ratio = parse_codebuddy_credits(m.get("credits"))
+        if isinstance(mid, str) and mid and ratio is not None:
+            out[mid] = ratio
+    return out
+
 # 内置价格参考表 (美元 / 百万 tokens)
 # fmt: off
 BUILTIN_PRICING = {
@@ -532,6 +626,31 @@ class ModelCatalog:
                         supports_streaming=True, context_length=4096,
                         price_ratio=_r,
                     ))
+            # ── F31：CodeBuddy 在线倍率叠加（只补倍率，不动模型列表）─────────
+            # 上游 /v3/config 的 models[].credits 是**在线权威倍率**（CN 实测 31 条），
+            # 远胜手工静态表（CN 6 条 / Intl 3 条，来自客户端产物、会过期）。
+            # ⚠️ 只叠加到已有模型上：/v3/config 的 models[] 不含 auto/balanced-model
+            # 等档位别名，若拿它当清单会误删 8 个可用模型（见 fetch_codebuddy_ratios
+            # 上方注释）。取不到就保持原值（静态表/既有值），绝不因此清空倍率。
+            if str(oauth_code).startswith("codebuddy"):
+                try:
+                    _online = await fetch_codebuddy_ratios(token, provider.base_url)
+                except Exception as e:
+                    _online = {}
+                    logger.warning("codebuddy 在线倍率叠加失败：%s", e)
+                if _online:
+                    _hit = 0
+                    for _mid, _mi in all_model_infos.items():
+                        _r = _online.get(_mid)
+                        if _r is None:
+                            continue
+                        _mi.price_ratio = _r
+                        _mi.is_free = (_r == 0.0)
+                        _hit += 1
+                    logger.info("codebuddy 在线倍率：%s 覆盖 %d/%d 个模型",
+                                provider.name, _hit, len(all_model_infos))
+                    if list_source == "seed":
+                        list_note = f"静态种子兜底（{len(oauth_p.static_models)}个）+ 在线倍率 {_hit} 条"
             if not any_success:
                 return {"error": f"OAuth provider '{oauth_code}' 未连接且无静态模型种子，请先在 /providers/oauth 完成连接"}
         else:
