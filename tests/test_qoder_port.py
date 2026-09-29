@@ -425,3 +425,169 @@ async def test_save_token_auto_registers_provider(tmp_path):
         rows = (await db.execute(select(Provider))).scalars().all()
         assert len(rows) == 1
     await engine.dispose()
+
+# ── 排队信号（10605 + isQueued）：2026-09-29「qoder 最新模型 403」修复 ──
+# 生产报文逐字节（三层嵌套）：statusCodeValue=403，body.code=10605，内层 isQueued。
+QUEUE_INNER = ('{"code":"403","message":"{\\"code\\":\\"10605\\",\\"message\\":'
+               '\\"{\\\\\\"isQueued\\\\\\":true,\\\\\\"modelKey\\\\\\":'
+               '\\\\\\"qfmodel\\\\\\",\\\\\\"queueCount\\\\\\":0,'
+               '\\\\\\"queueType\\\\\\":\\\\\\"p3\\\\\\",'
+               '\\\\\\"retryAfterSeconds\\\\\\":30,'
+               '\\\\\\"serviceAvailable\\\\\\":false,'
+               '\\\\\\"waitTime\\\\\\":30}\\"}"}')
+
+
+def _queue_frame():
+    return "data: " + json.dumps({"statusCodeValue": 403, "body": QUEUE_INNER})
+
+
+def test_parse_queue_signal_real_payload_and_not_billing():
+    from server.adapters.qoder_adapter import _parse_queue_signal
+    q = _parse_queue_signal(QUEUE_INNER)
+    assert q is not None, "生产原始报文必须能解出排队信号"
+    assert q["isQueued"] is True
+    assert q["retryAfterSeconds"] == 30
+    assert q["modelKey"] == "qfmodel" and q["queueType"] == "p3"
+    # ⚠️ 排队 ≠ 计费拦截（旧实现把两者混为一谈 = 用户看到的 403 失败）
+    assert _is_billing_block(QUEUE_INNER) is False
+    # 无排队字段的 10605 仍是计费拦截；112 仍是
+    assert _is_billing_block('{"code":"10605","message":"insufficient"}') is True
+    # ⚠️ 关键分歧点：**未转义**形态下（顶层即 "code":"10605"）正则本会命中，
+    # 但带 isQueued 就必须排除 —— 没有这道守卫会把排队当计费拦截抛错
+    unescaped = '{"code":"10605","message":"{\\"isQueued\\":true,\\"retryAfterSeconds\\":30}"}'
+    assert _parse_queue_signal(unescaped) is not None
+    assert _is_billing_block(unescaped) is False, "未转义队列报文也必须排除在计费拦截外"
+    assert _is_billing_block('{"code":"112","message":"quota"}') is True
+    # 解析器对非排队/非 JSON 输入安静返回 None
+    assert _parse_queue_signal('{"code":"112"}') is None
+    assert _parse_queue_signal("not json") is None
+    assert _parse_queue_signal(None) is None
+    # data 包裹形态
+    q2 = _parse_queue_signal('{"code":"10605","data":"{\\"isQueued\\":true,\\"retryAfterSeconds\\":5}"}')
+    assert q2 and q2["retryAfterSeconds"] == 5
+
+
+def _patch_stream_seq(monkeypatch, calls_lines):
+    """按调用顺序返回多组 SSE 行，并记录每次请求的头。"""
+    calls = []
+    seq = list(calls_lines)
+
+    class _Resp:
+        def __init__(self, lines):
+            self.status_code = 200
+            self._lines = lines
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def aread(self):
+            return b"err"
+
+        async def aiter_lines(self):
+            for ln in self._lines:
+                yield ln
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        def stream(self, method, url, headers=None, content=None):
+            calls.append({"headers": headers or {}, "content": content})
+            return _Resp(seq.pop(0) if seq else [])
+
+    monkeypatch.setattr(qa_mod.httpx, "AsyncClient", _Client)
+    return calls
+
+
+def test_stream_queue_signal_retries_with_fresh_signature(monkeypatch):
+    """排队信号 → 等待后**重新签名**重试（旧 Cosy-Date/requestId 会过期）。"""
+    a = _ready_adapter(monkeypatch)
+    ok_lines = [
+        "data: " + _env({"choices": [{"index": 0, "delta": {"content": "pong"}}]}),
+        "data: " + _env({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+    ]
+    calls = _patch_stream_seq(monkeypatch, [
+        [_queue_frame()],   # 第一次：排队
+        ok_lines,           # 第二次：正常内容
+    ])
+    slept = []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(qa_mod.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        out = []
+        async for chunk in a.stream_chat_completion(req, "dt-1", ""):
+            out.append(chunk)
+        return out
+
+    out = asyncio.run(run())
+    assert len(calls) == 2, "必须重试一次"
+    assert "pong" in json.dumps(out, ensure_ascii=False), "重试后内容必须透出"
+    assert slept and slept[0] == 30, "必须按 retryAfterSeconds 等待"
+    # ⚠️ 两次请求的签名必须不同（Cosy-Date / requestId / 签名体都含随机/时间）
+    h1, h2 = calls[0]["headers"], calls[1]["headers"]
+    assert h1["Cosy-Date"] != h2["Cosy-Date"] or h1["Authorization"] != h2["Authorization"],         "重试必须重新签名（复用旧签名会被 CDN 拒）"
+
+
+def test_stream_queue_retry_exhausted_reports_busy(monkeypatch):
+    """一直排队 → 上限后如实报「上游繁忙」（可识别，不再伪装成计费失败）。"""
+    a = _ready_adapter(monkeypatch)
+    n = qa_mod.QODER_QUEUE_MAX_RETRIES + 1
+    _patch_stream_seq(monkeypatch, [[_queue_frame()] for _ in range(n)])
+
+    async def fake_sleep(sec):
+        pass
+
+    monkeypatch.setattr(qa_mod.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        async for _ in a.stream_chat_completion(req, "dt-1", ""):
+            pass
+
+    with pytest.raises(RuntimeError, match="繁忙"):
+        asyncio.run(run())
+
+
+def test_stream_queue_after_content_is_not_retried(monkeypatch):
+    """已吐过内容再收排队帧：不得重试（否则用户看到重复输出），如实报错收尾。"""
+    a = _ready_adapter(monkeypatch)
+    calls = _patch_stream_seq(monkeypatch, [[
+        "data: " + _env({"choices": [{"index": 0, "delta": {"content": "部分内容"}}]}),
+        _queue_frame(),
+    ]])
+
+    async def fake_sleep(sec):
+        raise AssertionError("不得进入重试等待")
+
+    monkeypatch.setattr(qa_mod.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        out = []
+        async for chunk in a.stream_chat_completion(req, "dt-1", ""):
+            out.append(chunk)
+        return out
+
+    out = asyncio.run(run())
+    assert len(calls) == 1, "已输出内容后不得重试"
+    assert any("部分内容" in json.dumps(c, ensure_ascii=False) for c in out)

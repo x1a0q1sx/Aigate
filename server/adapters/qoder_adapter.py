@@ -8,7 +8,11 @@ shared/qoder/{sse,contextTier}.js。与原版差异（有意为之）：
 - 其余保持等价：WAF 编码（&Encode=1 + latin1 body）、COSY 17 头、
   服务端下发的 per-model model_config（缺失硬错误——发错 config 会被
   静默降级到别的模型）、{statusCodeValue, body} SSE 信封解包 +
-  finish/usage 合流、首帧计费拦截（112/10605/pricingUrl）直接抛错走回退。
+  finish/usage 合流、首帧计费拦截（112/10605 无排队字段/pricingUrl）直接抛错走回退。
+  ⚠️ 2026-09-29 起 `10605 + isQueued`（上游排队信号）**不再硬失败**：等
+  retryAfterSeconds 后**重新签名**重试（COSY 签名含时间戳与 requestId，必须重签），
+  上限 QODER_QUEUE_MAX_RETRIES 次；仍失败才如实报「上游繁忙」。根因：旧实现把
+  排队与计费拦截混为一谈，用户看到的是「qoder 最新模型 403 失败」。
 """
 from __future__ import annotations
 
@@ -36,6 +40,10 @@ PAT_TTL_MS_DEFAULT = 24 * 3600 * 1000
 MAX_INLINE_IMAGE_BYTES = 512 * 1024
 # 上下文档位自动升档（9router QODER_CONTEXT_TIER_HEADROOM）
 TIER_HEADROOM = 0.15
+# 上游排队信号（10605 + isQueued）的重试策略：最多重签重试几次、单次最长等多久
+# （上游 retryAfterSeconds 实测 30；封顶防上游给个离谱值把请求挂死）
+QODER_QUEUE_MAX_RETRIES = 3
+QODER_QUEUE_MAX_WAIT_SECONDS = 45
 _CJK_RE = re.compile(r"[ᄀ-ᇿ⺀-鿿가-힯豈-﫿＀-￯]")
 
 _CATALOG: Dict[str, tuple] = {}      # key -> (expires_monotonic, catalog dict)
@@ -59,9 +67,57 @@ def _stable_hash(prefix: str, *parts) -> str:
     return h.hexdigest()[:32]
 
 
+def _parse_queue_signal(inner):
+    """识别上游**排队信号**（10605 + isQueued）——返回 dict 或 None。
+
+    ⚠️ 2026-09-29 定根：`code 10605` 有**两种完全不同的语义**，旧实现一律当
+    「计费/额度拦截」硬抛错走回退，把排队信号误判成额度问题（用户投诉
+    「qoder 最新模型为啥失败」的真凶）：
+
+    报文（三层嵌套，SSE 信封 statusCodeValue=403）::
+
+        {"code":"403","message":"{\\"code\\":\\"10605\\",\\"message\\":\\"{\\\\\\"isQueued\\\\\\":true,
+          \\\\\\"modelKey\\\\\\":\\\\\\"qfmodel\\\\\\",\\\\\\"queueCount\\\\\\":0,
+          \\\\\\"queueType\\\\\\":\\\\\\"p3\\\\\\",\\\\\\"retryAfterSeconds\\\\\\":30,
+          \\\\\\"serviceAvailable\\\\\\":false,\\\\\\"waitTime\\\\\\":30}\\"}"}
+
+    - **排队（本条）**：`isQueued:true` + `serviceAvailable:false` + `retryAfterSeconds`
+      ——上游忙，等几十秒重试即可。生产实测：同一账号排队后**重签一次就通**
+      （历史日志也有 15:28:34 失败 → 15:28:41 成功的 7 秒间隔案例）。
+    - **计费/额度（112 或 10605 且无排队字段）**：真拦截，必须走回退换模型。
+    """
+    if not isinstance(inner, str) or "10605" not in inner:
+        return None
+    try:
+        obj = json.loads(inner)
+    except ValueError:
+        obj = None
+    if not isinstance(obj, dict):
+        return None
+    # 逐层下钻：{code,message:"{code,message:'{...queue payload...}'}"}
+    for _ in range(4):
+        if not isinstance(obj, dict):
+            break
+        if obj.get("isQueued") is True:
+            return obj
+        nxt = obj.get("message") or obj.get("data")
+        if isinstance(nxt, str) and nxt.strip().startswith("{"):
+            try:
+                obj = json.loads(nxt)
+            except ValueError:
+                return None
+        elif isinstance(nxt, dict):
+            obj = nxt
+        else:
+            return None
+    return None
+
+
 def _is_billing_block(inner) -> bool:
     if not isinstance(inner, str):
         return False
+    if _parse_queue_signal(inner) is not None:
+        return False   # 排队 ≠ 计费拦截（见 _parse_queue_signal）
     return bool(re.search(r'"code"\s*:\s*"(112|10605)"', inner)) or \
         "pricingurl" in inner.lower()
 
@@ -544,63 +600,94 @@ class QoderAdapter(BaseAdapter):
         token, creds = await self._resolve_credentials(api_key)
         model_config = await self._model_config(creds, qoder_key)
         payload = self._build_payload(body, qoder_key, model_config, creds)
-
         plain = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        encoded = qoder_encode_body(plain)
-        url = chat_url(creds["auth_token"])
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Accept-Encoding": "identity",  # gzip 会触发 CDN 签名校验
-            **self._request_headers(token, qoder_key, model_config),
-            **build_cosy_headers(encoded, url, creds),
-        }
-        co = self._Coalescer(f"qoder/{qoder_key}")
-        first_frame = True
-        timeout = httpx.Timeout(self._connect_timeout, read=self._read_timeout)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, headers=headers, content=encoded) as resp:
-                if resp.status_code != 200:
-                    detail = ""
-                    try:
-                        detail = (await resp.aread()).decode("utf-8", "replace")[:200]
-                    except Exception:
-                        pass
-                    raise RuntimeError(f"qoder http {resp.status_code}: {detail}")
-                async for line in resp.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data:
-                        continue
-                    if data == "[DONE]":
+
+        queue_tries = 0
+        while True:
+            # ⚠️ 每轮都要重新编码+签名：排队重试时旧 Cosy-Date/requestId 已过期，
+            # 复用会被 CDN 直接拒（签名含时间戳与 requestId）
+            encoded = qoder_encode_body(plain)
+            url = chat_url(creds["auth_token"])
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Accept-Encoding": "identity",  # gzip 会触发 CDN 签名校验
+                **self._request_headers(token, qoder_key, model_config),
+                **build_cosy_headers(encoded, url, creds),
+            }
+            timeout = httpx.Timeout(self._connect_timeout, read=self._read_timeout)
+            retry_after = None
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", url, headers=headers, content=encoded) as resp:
+                    if resp.status_code != 200:
+                        detail = ""
+                        try:
+                            detail = (await resp.aread()).decode("utf-8", "replace")[:200]
+                        except Exception:
+                            pass
+                        raise RuntimeError(f"qoder http {resp.status_code}: {detail}")
+                    # 每次重试都要一个新的合流器 —— 上一次可能已经吐了首帧
+                    co = self._Coalescer(f"qoder/{qoder_key}")
+                    first_frame = True
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if not data:
+                            continue
+                        if data == "[DONE]":
+                            for c in co.flush():
+                                yield c
+                            return
+                        try:
+                            envelope = json.loads(data)
+                        except ValueError:
+                            continue
+                        status_val = envelope.get("statusCodeValue")
+                        status_val = status_val if isinstance(status_val, int) else 200
+                        inner = envelope.get("body")
+                        if not isinstance(inner, str):
+                            inner = "" if inner is None else json.dumps(inner, ensure_ascii=False)
+                        if status_val != 200:
+                            # ① 排队信号（10605 + isQueued）：等 retryAfterSeconds
+                            #    重新签名重试（生产实证重签即通）；仅首帧可重试
+                            #    （已吐过内容再重试会给用户重复输出）
+                            qsig = _parse_queue_signal(inner) if first_frame else None
+                            if qsig is not None:
+                                if queue_tries >= QODER_QUEUE_MAX_RETRIES:
+                                    raise RuntimeError(
+                                        f"qoder 上游繁忙（排队重试 {queue_tries} 次仍未放行）：模型 "
+                                        f"{qsig.get('modelKey') or qoder_key}")
+                                queue_tries += 1
+                                retry_after = max(1, min(
+                                    int(qsig.get("retryAfterSeconds") or qsig.get("waitTime") or 10),
+                                    QODER_QUEUE_MAX_WAIT_SECONDS))
+                                logger.info(
+                                    "qoder 排队中（%s, queueType=%s, 第 %d 次重试，等 %ds）",
+                                    qsig.get("modelKey") or qoder_key, qsig.get("queueType"),
+                                    queue_tries, retry_after)
+                                break   # 跳出流读取 → 外层重签重试
+                            # ② 计费/额度拦截：首帧直接抛错走回退（换模型）
+                            if first_frame and _is_billing_block(inner):
+                                raise RuntimeError(f"qoder 计费/额度拦截：{inner[:200]}")
+                            for c in co.flush():
+                                yield c
+                            yield {"error": f"qoder upstream status {status_val}: {inner[:200]}"}
+                            return
+                        first_frame = False
+                        for c in co.handle(inner):
+                            yield c
+                        if co.terminal:
+                            return
+                    else:
+                        # 流正常读完（非 break）
                         for c in co.flush():
                             yield c
                         return
-                    try:
-                        envelope = json.loads(data)
-                    except ValueError:
-                        continue
-                    status_val = envelope.get("statusCodeValue")
-                    status_val = status_val if isinstance(status_val, int) else 200
-                    inner = envelope.get("body")
-                    if not isinstance(inner, str):
-                        inner = "" if inner is None else json.dumps(inner, ensure_ascii=False)
-                    if status_val != 200:
-                        if first_frame and _is_billing_block(inner):
-                            raise RuntimeError(f"qoder 计费/额度拦截：{inner[:200]}")
-                        for c in co.flush():
-                            yield c
-                        yield {"error": f"qoder upstream status {status_val}: {inner[:200]}"}
-                        return
-                    first_frame = False
-                    for c in co.handle(inner):
-                        yield c
-                    if co.terminal:
-                        return
-                for c in co.flush():
-                    yield c
+            # 排队等待后进入下一轮重签重试
+            if retry_after is not None:
+                await asyncio.sleep(retry_after)
 
     # ── 非流式：聚合自身流（Qoder 推理端点只有 SSE） ─────
     async def chat_completion(self, request, api_key, base_url, extra_headers=None) -> dict:
