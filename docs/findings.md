@@ -1347,3 +1347,56 @@ traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读�
   503 → failed 永不 already。
 - ⚠️ 此前 09-25~27 的 `already_claimed` 记录**不可信**（同一误报形态），那几天
   是否真有活动已无法追溯；修复后日志语义才真实。
+
+## F36 Qoder「最新模型失败」两层问题：排队信号误判 + 模型列表过期（2026-09-29）
+
+用户报 `Qoder/qfmodel` 报 `upstream status 403 ... code 10605 ... isQueued`。
+排查出**两个独立问题**，各自都会让「Qoder 最新模型」用不了。
+
+### 问题一：10605 有**两种语义**，旧实现一律当计费拦截（主因）
+
+`server/adapters/qoder_adapter.py` 的 `_is_billing_block` 匹配 `"code":"10605"` 就抛
+「计费/额度拦截」走回退。但生产抓到的完整报文（三层嵌套，SSE 信封
+`statusCodeValue=403`）是::
+
+    {"code":"403","message":"{\"code\":\"10605\",\"message\":\"{\\\"isQueued\\\":true,
+      \\\"modelKey\\\":\\\"qfmodel\\\",\\\"queueCount\\\":0,
+      \\\"queueType\\\":\\\"p3\\\",\\\"retryAfterSeconds\\\":30,
+      \\\"serviceAvailable\\\":false,\\\"waitTime\\\":30}\"}"}
+
+`isQueued:true + serviceAvailable:false + retryAfterSeconds:30` 是**上游排队信号**
+（忙，让我等着重试），不是额度问题。**生产实证**：同一账号同一模型，
+**重签一次就通**（`qfmodel` 3.7s 返回 "pong"）；历史日志也有 15:28:34 失败
+→ 15:28:41 成功的 7 秒间隔案例。
+
+**修复**：新增 `_parse_queue_signal()`（逐层下钻 message/data 最多 4 层，认
+`isQueued is True`）；`_is_billing_block` 先排除排队形态。流式主体改为可重试
+循环：排队 → 等 `retryAfterSeconds`（封顶 45s）→ **重新编码 + 重新签名**重试
+（⚠️ COSY 签名含 `Cosy-Date` 时间戳与随机 requestId，复用旧签名会被 CDN 拒），
+上限 3 次；仍失败如实报「上游繁忙」。
+**仅首帧可重试** —— 已吐过内容再重试会让用户看到重复输出。
+
+### 问题二：库里的 Qoder 模型列表停在 09-23（2 个），上游已 15 个
+
+刷新日志显示 09-23 那次 `list_source=online` 成功但 `total=2` —— 当时上游确实
+只有 2 个。之后上游扩到 15 个而我们**没有再刷**（全局定时刷新默认关
+`scheduled_enabled=false`）。生产手动刷新后：`added=13, updated=2, total=15`，
+倍率齐备（`qfmodel` 0.0 免费 / `qmodel` 0.1 / `auto` 0.5 / `ultimate` 2.0 …）。
+
+### 验证与观察（诚实记录）
+
+- `qfmodel` 走**新代码路径**实测通：3.7s 返回 `pong`。
+- 但 `auto` / `qmodel` / `kmodel_latest` / `gfmodel` / `performance` 在本次
+  测试时段**间歇性**排队（3 次重试 91s 仍不放行），而同一分钟内直接单发探针
+  又能秒通 —— 说明队列是**短时拥塞窗口**（约 2 分钟），不是永久不可用。
+  90s 的重试预算差几秒错过窗口属边界情况；已封顶 45s×3 是防挂死的取舍。
+- 7 天统计：`qfmodel` 318 成功 / 37 失败（10.4% 失败率，与排队窗口吻合）。
+
+### 测试
+
+新增 **4 项**（全量 **898 全绿**）：生产原始报文解析（含未转义形态 —— ⚠️ 首版
+用例是**弱断言**，修复前后都通过，已换成能真正区分新旧行为的形态）、
+排队 → 重签重试成功（断言两次签名不同 + 按 retryAfterSeconds 等待）、
+重试耗尽报「繁忙」、已输出内容后不重试。
+**反向验证**：注入「移除排队守卫」后 `test_parse_queue_signal_real_payload_and_not_billing`
+立刻失败。
