@@ -591,3 +591,39 @@ def test_stream_queue_after_content_is_not_retried(monkeypatch):
     out = asyncio.run(run())
     assert len(calls) == 1, "已输出内容后不得重试"
     assert any("部分内容" in json.dumps(c, ensure_ascii=False) for c in out)
+
+def test_stream_queue_counts_down_and_respects_budget(monkeypatch):
+    """倒计时语义：每次等待扣预算，超预算立刻报繁忙（不无限挂）。
+    上游 retryAfterSeconds 实测是倒计时（30→28→…），不是每次独立排队。"""
+    a = _ready_adapter(monkeypatch)
+
+    def frame(retry):
+        inner = json.dumps({"code": "403",
+                            "message": json.dumps({"code": "10605",
+                                                   "message": json.dumps({"isQueued": True,
+                                                                          "modelKey": "auto",
+                                                                          "retryAfterSeconds": retry})})})
+        return "data: " + json.dumps({"statusCodeValue": 403, "body": inner})
+
+    # 每次都给 60s（单次封顶），预算 300s → 第 6 次尝试时预算不足应报错
+    n = qa_mod.QODER_QUEUE_MAX_RETRIES + 2
+    calls = _patch_stream_seq(monkeypatch, [[frame(60)] for _ in range(n)])
+    slept = []
+
+    async def fake_sleep(sec):
+        slept.append(sec)
+
+    monkeypatch.setattr(qa_mod.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        req = SimpleNamespace(model="auto",
+                              model_dump=lambda: {"model": "auto",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        async for _ in a.stream_chat_completion(req, "dt-1", ""):
+            pass
+
+    with pytest.raises(RuntimeError, match="繁忙"):
+        asyncio.run(run())
+    # 等待总量不得超过总预算；且每次等的是上游给的值（60 封顶后）
+    assert sum(slept) <= qa_mod.QODER_QUEUE_TOTAL_BUDGET_SECONDS
+    assert all(w == 60 for w in slept), "必须尊重上游倒计时值（封顶 60）"

@@ -40,10 +40,15 @@ PAT_TTL_MS_DEFAULT = 24 * 3600 * 1000
 MAX_INLINE_IMAGE_BYTES = 512 * 1024
 # 上下文档位自动升档（9router QODER_CONTEXT_TIER_HEADROOM）
 TIER_HEADROOM = 0.15
-# 上游排队信号（10605 + isQueued）的重试策略：最多重签重试几次、单次最长等多久
-# （上游 retryAfterSeconds 实测 30；封顶防上游给个离谱值把请求挂死）
-QODER_QUEUE_MAX_RETRIES = 3
-QODER_QUEUE_MAX_WAIT_SECONDS = 45
+# 上游排队信号（10605 + isQueued）的重试策略。
+# ⚠️ 2026-09-29 实测：`retryAfterSeconds` 是**倒计时**（30→28→…→11，每 2s 减 2），
+# 说明上游是「同一队列窗口在走」而非每次独立排队 —— 早退早试会在窗口中途把
+# 重试次数耗尽（曾观察到窗口长达 7 分钟不缓解，北京晚间高峰）。
+# 因此：**尊重倒计时**（等它给的值，不在中途抢跑）+ 给足重试次数覆盖一个窗口，
+# 同时用总时长上限保证请求不会无限挂住（网关侧还有自己的超时）。
+QODER_QUEUE_MAX_RETRIES = 6
+QODER_QUEUE_MAX_WAIT_SECONDS = 60      # 单次等待封顶（上游实测给 30；防上游给离谱值）
+QODER_QUEUE_TOTAL_BUDGET_SECONDS = 300  # 排队重试总预算（超了如实报繁忙，不无限挂）
 _CJK_RE = re.compile(r"[ᄀ-ᇿ⺀-鿿가-힯豈-﫿＀-￯]")
 
 _CATALOG: Dict[str, tuple] = {}      # key -> (expires_monotonic, catalog dict)
@@ -603,6 +608,7 @@ class QoderAdapter(BaseAdapter):
         plain = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
         queue_tries = 0
+        queue_budget = QODER_QUEUE_TOTAL_BUDGET_SECONDS
         while True:
             # ⚠️ 每轮都要重新编码+签名：排队重试时旧 Cosy-Date/requestId 已过期，
             # 复用会被 CDN 直接拒（签名含时间戳与 requestId）
@@ -659,14 +665,22 @@ class QoderAdapter(BaseAdapter):
                                     raise RuntimeError(
                                         f"qoder 上游繁忙（排队重试 {queue_tries} 次仍未放行）：模型 "
                                         f"{qsig.get('modelKey') or qoder_key}")
-                                queue_tries += 1
-                                retry_after = max(1, min(
+                                # ⚠️ 尊重上游倒计时：retryAfterSeconds 是「还要等多久」，
+                                # 抢跑会在窗口中途耗尽重试次数（实测倒计时 30→11）
+                                wait_s = max(1, min(
                                     int(qsig.get("retryAfterSeconds") or qsig.get("waitTime") or 10),
                                     QODER_QUEUE_MAX_WAIT_SECONDS))
+                                if wait_s > queue_budget:
+                                    raise RuntimeError(
+                                        f"qoder 上游繁忙（排队已等 {QODER_QUEUE_TOTAL_BUDGET_SECONDS - queue_budget}s，"
+                                        f"还需 {wait_s}s，超出预算）：模型 {qsig.get('modelKey') or qoder_key}")
+                                queue_tries += 1
+                                queue_budget -= wait_s
+                                retry_after = wait_s
                                 logger.info(
-                                    "qoder 排队中（%s, queueType=%s, 第 %d 次重试，等 %ds）",
+                                    "qoder 排队中（%s, queueType=%s, 第 %d 次重试，等 %ds，剩余预算 %ds）",
                                     qsig.get("modelKey") or qoder_key, qsig.get("queueType"),
-                                    queue_tries, retry_after)
+                                    queue_tries, retry_after, queue_budget)
                                 break   # 跳出流读取 → 外层重签重试
                             # ② 计费/额度拦截：首帧直接抛错走回退（换模型）
                             if first_frame and _is_billing_block(inner):
