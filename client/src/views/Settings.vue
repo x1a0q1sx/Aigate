@@ -61,6 +61,49 @@
       </div>
     </section>
 
+    <!-- 接入信息（原仪表盘「连接密钥 / 快速开始」迁入，唯一入口） -->
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
+          <h2>接入信息</h2>
+          <p>下游客户端接入 AIGate 网关所需的基础信息与示例代码。</p>
+        </div>
+      </div>
+
+      <div class="access-rows">
+        <div class="access-row">
+          <span class="access-label">Base URL</span>
+          <code class="mono access-value">{{ baseUrl }}/v1</code>
+          <button class="btn btn-outline btn-sm" @click="copyText(baseUrl + '/v1')">
+            <AppIcon name="copy" :size="13" />复制
+          </button>
+        </div>
+        <div class="access-row">
+          <span class="access-label">API Key</span>
+          <code class="mono access-value">{{ showKey ? (aigateKey || '未配置') : maskedDisplay }}</code>
+          <button class="btn btn-outline btn-sm" :disabled="keyConfigured === false" @click="toggleKey">
+            <AppIcon :name="showKey ? 'eyeOff' : 'eye'" :size="13" />
+            {{ showKey ? '隐藏' : '显示' }}
+          </button>
+          <button v-if="showKey && aigateKey" class="btn btn-outline btn-sm" @click="copyText(aigateKey)">
+            <AppIcon name="copy" :size="13" />复制
+          </button>
+        </div>
+        <p class="access-hint">
+          所有请求需在 <code>Authorization: Bearer &lt;key&gt;</code> 头中携带此密钥。
+          密钥在 <code>config.yaml</code> 的 <code>security.aigate_api_key</code> 配置。
+        </p>
+      </div>
+
+      <div class="code-head">
+        <span class="text-sm text-muted">OpenAI SDK 接入</span>
+        <button class="btn btn-ghost btn-xs" @click="copyText(usageCode)">
+          <AppIcon name="copy" :size="12" />复制
+        </button>
+      </div>
+      <pre class="code-block">{{ usageCode }}</pre>
+    </section>
+
     <section class="settings-card" v-if="logTail">
       <div class="card-head">
         <div><h2>更新日志</h2><p>最近一次更新 / 正在执行的更新输出。</p></div>
@@ -331,9 +374,42 @@ export default {
       testResults: null,
       testOk: false,
       cacheInfo: null,
+      // 接入信息卡（原仪表盘迁入）
+      baseUrl: window.location.origin,
+      aigateKey: '',
+      keyMeta: null,
+      showKey: false,
+      usageCode: `from openai import OpenAI
+
+client = OpenAI(
+    base_url="${typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8000'}/v1",
+    api_key="<你的 AIGate 密钥>",
+)
+
+resp = client.chat.completions.create(
+    model="auto",          # 交给 AIGate 选最优模型
+    messages=[{"role": "user", "content": "你好！"}],
+)
+print(resp.choices[0].message.content)`,
     }
   },
   computed: {
+    // 接入信息卡：密钥掩码口径（未揭示明文时用后端返回的掩码）
+    maskedKey() {
+      const k = this.aigateKey
+      if (!k) return '未配置'
+      if (k.length <= 8) return '•'.repeat(k.length)
+      return k.slice(0, 4) + '•'.repeat(Math.min(k.length - 8, 12)) + k.slice(-4)
+    },
+    maskedDisplay() {
+      if (this.aigateKey) return this.maskedKey
+      if (this.keyMeta && this.keyMeta.configured === false) return '未配置'
+      return (this.keyMeta && this.keyMeta.masked) || '未配置'
+    },
+    keyConfigured() {
+      if (this.keyMeta) return this.keyMeta.configured !== false
+      return null
+    },
     updateRunning() {
       return this.updateState === 'running' || this.updateState === 'rolling_back'
     },
@@ -363,10 +439,56 @@ export default {
     if (this.pollTimer) clearInterval(this.pollTimer)
   },
   methods: {
+    // 接入信息卡：揭示明文密钥需管理员密码二次校验（按需揭示）
+    async toggleKey() {
+      if (this.showKey) {
+        this.showKey = false
+        return
+      }
+      if (!this.aigateKey) {
+        const pwd = prompt('揭示 AIGate 明文密钥需要管理员密码：')
+        if (pwd === null) return
+        try {
+          const d = await api.getAIGateKey(true, pwd)
+          this.aigateKey = (d && d.key) || ''
+        } catch (e) {
+          toast.error('获取密钥失败: ' + e.message)
+          return
+        }
+      }
+      if (!this.aigateKey) {
+        toast.error('未配置密钥')
+        return
+      }
+      this.showKey = true
+    },
+    async copyText(text) {
+      if (!text) return
+      try {
+        await navigator.clipboard.writeText(text)
+        toast.success('已复制到剪贴板')
+      } catch {
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        try {
+          document.execCommand('copy')
+          toast.success('已复制到剪贴板')
+        } catch {
+          toast.error('复制失败，请手动选中复制')
+        }
+        document.body.removeChild(ta)
+      }
+    },
     async load() {
       this.loading = true
       try {
         await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadModelRefresh(), this.loadOpenCode()])
+        // 接入信息卡：密钥掩码（明文按需揭示，见 toggleKey）
+        api.getAIGateKey(false).then((d) => { this.keyMeta = d || null }).catch(() => {})
       } finally {
         this.loading = false
       }
@@ -680,6 +802,33 @@ export default {
 .update-facts dd { margin: 4px 0 0; font-size: var(--text-sm); overflow-wrap: anywhere; }
 .text-danger { color: #ef4444; }
 .text-warning { color: #f59e0b; }
+
+/* 接入信息卡 */
+.access-rows { display: flex; flex-direction: column; gap: var(--space-3); margin-bottom: var(--space-3); }
+.access-row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.access-label { min-width: 72px; color: var(--text-muted); font-size: var(--text-sm, 0.875rem); }
+.access-value { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.access-hint {
+  margin: var(--space-2) 0 0;
+  color: var(--text-dim);
+  font-size: var(--text-xs, 0.75rem);
+  line-height: 1.7;
+}
+.access-hint code { font-family: var(--font-mono, monospace); font-size: var(--text-xs, 0.75rem); }
+.code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: var(--space-3) 0 var(--space-2);
+}
+/* SDK 示例代码块：保持暗色（内容为代码） */
+.code-block {
+  background: #0f172a; color: #e5e7eb;
+  padding: 16px; border-radius: 8px;
+  font-size: 13px; font-family: var(--font-mono, monospace);
+  white-space: pre-wrap; word-break: break-word; line-height: 1.6;
+  margin: 0; border: 1px solid #334155; overflow: auto;
+}
 .update-detail {
   margin-top: var(--space-4);
   border-top: 1px solid var(--border-base);

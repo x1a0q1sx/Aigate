@@ -9,17 +9,20 @@
     </div>
 
     <nav class="sidebar-nav" aria-label="主导航">
-      <router-link
-        v-for="r in routes"
-        :key="r.path"
-        :to="r.path"
-        class="nav-item"
-        :class="{ active: isActive(r.path) }"
-        :title="collapsed ? r.name : null"
-      >
-        <AppIcon :name="r.icon" :size="17" />
-        <span v-if="!collapsed" class="nav-label">{{ r.name }}</span>
-      </router-link>
+      <template v-for="g in navGroups" :key="g.label">
+        <div v-if="!collapsed" class="nav-group-label">{{ g.label }}</div>
+        <router-link
+          v-for="r in g.items"
+          :key="r.path"
+          :to="r.path"
+          class="nav-item"
+          :class="{ active: isActive(r.path) }"
+          :title="collapsed ? r.name : null"
+        >
+          <AppIcon :name="r.icon" :size="17" />
+          <span v-if="!collapsed" class="nav-label">{{ r.name }}</span>
+        </router-link>
+      </template>
     </nav>
 
     <div class="sidebar-foot">
@@ -71,23 +74,37 @@ export default {
       currentTheme: localStorage.getItem('aigate-theme') || 'dark',
       username: localStorage.getItem('aigate_username') || 'admin',
       version: '1.0.0',
-      routes: [
-        { path: '/dashboard', name: '仪表盘', icon: 'dashboard' },
-        { path: '/providers', name: '服务商', icon: 'server' },
-        { path: '/models', name: '模型', icon: 'cpu' },
-        { path: '/aliases', name: '别名', icon: 'tag' },
-        { path: '/keys', name: '网关密钥', icon: 'key' },
-        { path: '/health', name: '健康', icon: 'activity' },
-        { path: '/monitor', name: '监控', icon: 'pulse' },
-        { path: '/auto', name: 'Auto 选举', icon: 'scale' },
-        { path: '/route-decisions', name: '路由决策', icon: 'route' },
-        { path: '/token-saver', name: '省 Token', icon: 'zap' },
-        { path: '/combos', name: '组合路由', icon: 'layers' },
-        { path: '/proxies', name: '代理池', icon: 'globe' },
-        { path: '/media', name: '媒体', icon: 'image' },
-        { path: '/analytics', name: '分析', icon: 'chart' },
-        { path: '/playground', name: 'Playground', icon: 'message' },
-        { path: '/settings', name: '设置', icon: 'sliders' },
+      // 分组导航（2026-09-30 信息架构重构）：原 16 项平铺 → 6 组；OAuth/签到两个原隐藏页正式入导航
+      navGroups: [
+        { label: '概览', items: [
+          { path: '/dashboard', name: '仪表盘', icon: 'dashboard' },
+        ] },
+        { label: '流量与日志', items: [
+          { path: '/analytics', name: '分析', icon: 'chart' },
+          { path: '/route-decisions', name: '路由决策', icon: 'route' },
+        ] },
+        { label: '资源配置', items: [
+          { path: '/providers', name: '服务商', icon: 'server' },
+          { path: '/models', name: '模型', icon: 'cpu' },
+          { path: '/aliases', name: '别名', icon: 'tag' },
+          { path: '/combos', name: '组合路由', icon: 'layers' },
+          { path: '/keys', name: '网关密钥', icon: 'key' },
+        ] },
+        { label: '账号权益', items: [
+          { path: '/providers/oauth', name: 'OAuth 连接', icon: 'link' },
+          { path: '/providers/checkin', name: '签到与成长', icon: 'gift' },
+        ] },
+        { label: '工具', items: [
+          { path: '/playground', name: 'Playground', icon: 'message' },
+          { path: '/media', name: '媒体中心', icon: 'image' },
+        ] },
+        { label: '系统', items: [
+          { path: '/health', name: '健康监控', icon: 'activity' },
+          { path: '/auto', name: 'Auto 选举', icon: 'scale' },
+          { path: '/proxies', name: '代理池', icon: 'globe' },
+          { path: '/token-saver', name: '省 Token', icon: 'zap' },
+          { path: '/settings', name: '设置', icon: 'sliders' },
+        ] },
       ],
     }
   },
@@ -178,6 +195,15 @@ export default {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.nav-group-label {
+  margin: var(--space-2, 8px) var(--space-3, 12px) 2px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
 }
 .nav-item {
   display: flex;

@@ -15,7 +15,6 @@ import Media from './views/Media.vue'
 import TokenSaver from './views/TokenSaver.vue'
 import Settings from './views/Settings.vue'
 import Keys from './views/Keys.vue'
-import Monitor from './views/Monitor.vue'
 import Aliases from './views/Aliases.vue'
 import Login from './views/Login.vue'
 
@@ -32,7 +31,8 @@ const routes = [
   { path: '/aliases', component: Aliases, meta: { title: '模型别名' } },
   { path: '/keys', component: Keys, meta: { title: '网关密钥' } },
   { path: '/health', component: Health, meta: { title: '健康监控' } },
-  { path: '/monitor', component: Monitor, meta: { title: '实时监控' } },
+  // 实时监控已并入分析页实时区（2026-09-30）：旧地址重定向到锚点
+  { path: '/monitor', redirect: { path: '/analytics', hash: '#realtime' } },
   { path: '/auto', component: Auto, meta: { title: 'Auto 选举' } },
   { path: '/route-decisions', component: RouteDecisions, meta: { title: '路由决策' } },
   { path: '/analytics', component: Analytics, meta: { title: '分析' } },

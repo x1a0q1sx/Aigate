@@ -238,8 +238,21 @@ export default {
     const s = qs.toString()
     return apiGet(`/admin/api/analytics/summary/today${s ? '?' + s : ''}`)
   },
-  getAnalyticsTrend: (days = 7) => apiGet(`/admin/api/analytics/trend?days=${days}`),
-  getAnalyticsByProvider: () => apiGet('/admin/api/analytics/by-provider'),
+  getAnalyticsTrend: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.days) qs.append('days', params.days)
+    if (params.bucket) qs.append('bucket', params.bucket)
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
+    return apiGet(`/admin/api/analytics/trend?${qs.toString()}`)
+  },
+  getAnalyticsByProvider: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
+    const s = qs.toString()
+    return apiGet(`/admin/api/analytics/by-provider${s ? '?' + s : ''}`)
+  },
 
   // ── HTTP 代理池 ──
   getProxyPool: () => apiGet('/admin/api/proxy-pool'),

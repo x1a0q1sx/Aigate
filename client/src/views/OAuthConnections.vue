@@ -2,7 +2,7 @@
   <div class="oauth-page">
     <PageHeader
       title="OAuth 连接"
-      subtitle="连接支持 OAuth 的服务商（设备流一键连接 / 浏览器授权 / 手动导入 token）。本页不在常规界面提供入口，直接访问 /providers/oauth。"
+      subtitle="连接支持 OAuth 的服务商（设备流一键连接 / 浏览器授权 / 手动导入 token）。"
       icon="shield"
     >
       <template #actions>

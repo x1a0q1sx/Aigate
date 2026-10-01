@@ -2,7 +2,7 @@
   <div class="checkin-page">
     <PageHeader
       title="签到监控"
-      subtitle="一键领取各平台每日免费积分/额度，并查看账号额度与签到历史。本页不在常规界面提供入口，直接访问 /providers/checkin。"
+      subtitle="一键领取各平台每日免费积分/额度，并查看账号额度与签到历史。"
       icon="shield"
     >
       <template #actions>

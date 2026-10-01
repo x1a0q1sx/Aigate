@@ -684,9 +684,12 @@ async def analytics_today(
             func.coalesce(func.sum(RequestLog.completion_tokens), 0),
             func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0.0),
             func.coalesce(func.sum(RequestLog.cache_read_tokens), 0),
+            func.avg(RequestLog.latency_ms),
+            func.avg(RequestLog.ttft_ms),
+            func.count(RequestLog.ttft_ms),
         ).where(and_(*conditions))
     )).one()
-    total, success, pin, pout, cost, crd = row
+    total, success, pin, pout, cost, crd, avg_lat, avg_ttft, ttft_cnt = row
     total = int(total or 0)
     success = int(success or 0)
     pin = int(pin or 0)
@@ -704,49 +707,110 @@ async def analytics_today(
         "cost_usd": round(float(cost or 0), 4),
         "cache_read_tokens": crd,
         "cache_hit_rate": round(crd / pin * 100, 1) if pin > 0 else None,
+        "avg_latency_ms": round(float(avg_lat), 1) if avg_lat is not None else None,
+        "avg_ttft_ms": round(float(avg_ttft), 1) if avg_ttft is not None else None,
+        "ttft_samples": int(ttft_cnt or 0),
     }
 
 
+def _trend_slots(bucket: str, start_dt: datetime, end_dt: datetime):
+    """生成 day/hour 空桶槽位 key；超过 744 槽 → None（调用方改为只返回观测桶）"""
+    keys = []
+    cur = start_dt.replace(minute=0, second=0, microsecond=0)
+    step = timedelta(hours=1) if bucket == "hour" else timedelta(days=1)
+    while cur <= end_dt:
+        keys.append(cur.strftime("%Y-%m-%dT%H:00:00") if bucket == "hour" else cur.strftime("%Y-%m-%d"))
+        cur += step
+        if len(keys) > 744:
+            return None
+    return keys
+
+
 @router.get("/analytics/trend")
-async def analytics_trend(days: int = Query(7, ge=1, le=90), db: AsyncSession = Depends(get_db)):
-    """最近 N 天每日趋势：请求数 / Token / 成本（数据源 request_logs）"""
-    since = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days - 1)
-    # P2-11: 日聚合按方言选函数（SQLite: strftime / PostgreSQL: to_char）
+async def analytics_trend(
+    days: int = Query(7, ge=1, le=90),
+    bucket: str = Query("day", pattern="^(hour|day|week|month)$"),
+    start: Optional[str] = Query(None, description="起始时间（UTC），提供后覆盖 days"),
+    end: Optional[str] = Query(None, description="结束时间（含）"),
+    db: AsyncSession = Depends(get_db),
+):
+    """趋势序列：请求数 / Token / 成本（数据源 request_logs）。
+
+    bucket=hour|day|week|month（默认 day，向后兼容）；start/end 提供 → 精确窗口，否则「最近 N 天」。
+    周/月桶由天级分组在 Python 侧归并（跨年周正确 + 两方言一致）：周槽=所在周周一（UTC），月槽="YYYY-MM"。
+    空桶补零仅对 day/hour（≤744 槽）执行；week/month 稀疏桶不补。
+    """
+    # P2-11: 聚合按方言选函数（SQLite: strftime / PostgreSQL: to_char）
     from server.db import IS_SQLITE as _is_sqlite
     if _is_sqlite:
-        _day = func.strftime("%Y-%m-%d", RequestLog.created_at)
+        _grp = (func.strftime("%Y-%m-%dT%H:00:00", RequestLog.created_at) if bucket == "hour"
+                else func.strftime("%Y-%m-%d", RequestLog.created_at))
     else:
-        _day = func.to_char(RequestLog.created_at, "YYYY-MM-DD")
+        _grp = (func.to_char(RequestLog.created_at, 'YYYY-MM-DD"T"HH24":00:00"') if bucket == "hour"
+                else func.to_char(RequestLog.created_at, "YYYY-MM-DD"))
+    now = datetime.utcnow()
+    start_dt = _parse_dt_param(start)
+    end_dt = _parse_dt_param(end, end_of_day=True)
+    if start_dt is None:
+        if bucket == "hour":
+            start_dt = (now - timedelta(days=days)).replace(minute=0, second=0, microsecond=0)
+        else:
+            start_dt = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    if end_dt is None:
+        end_dt = now
     rows = (await db.execute(
         select(
-            _day,
+            _grp,
             func.count(RequestLog.id),
             func.coalesce(func.sum(RequestLog.prompt_tokens + RequestLog.completion_tokens), 0),
             func.coalesce(func.sum(RequestLog.estimated_cost_usd), 0.0),
-        ).where(RequestLog.created_at >= since)
-        .group_by(_day)
-        .order_by(_day)
+        ).where(RequestLog.created_at >= start_dt, RequestLog.created_at <= end_dt,
+                RequestLog.is_health_check.is_(False))
+        .group_by(_grp)
+        .order_by(_grp)
     )).all()
-    day_map = {str(r[0]): {"day": str(r[0]), "requests": int(r[1] or 0),
-                           "tokens": int(r[2] or 0), "cost_usd": round(float(r[3] or 0), 4)} for r in rows}
+    raw = {str(r[0]): {"requests": int(r[1] or 0), "tokens": int(r[2] or 0),
+                       "cost_usd": round(float(r[3] or 0), 4)} for r in rows}
+    if bucket in ("week", "month"):
+        merged = {}
+        for k, v in raw.items():
+            try:
+                d = datetime.strptime(k[:10], "%Y-%m-%d")
+            except ValueError:
+                continue
+            slot = ((d - timedelta(days=d.weekday())).strftime("%Y-%m-%d") if bucket == "week"
+                    else d.strftime("%Y-%m"))
+            m = merged.setdefault(slot, {"requests": 0, "tokens": 0, "cost_usd": 0.0})
+            for f in ("requests", "tokens", "cost_usd"):
+                m[f] += v[f]
+        raw = merged
     result = []
-    for i in range(days):
-        d = (since + timedelta(days=i)).strftime("%Y-%m-%d")
-        result.append(day_map.get(d, {"day": d, "requests": 0, "tokens": 0, "cost_usd": 0.0}))
+    if bucket in ("day", "hour"):
+        slots = _trend_slots(bucket, start_dt, end_dt)
+        if slots is not None:
+            zero = {"requests": 0, "tokens": 0, "cost_usd": 0.0}
+            result = [{"day": s, **(raw.get(s) or zero)} for s in slots]
+    if not result:  # week/month 或超 744 槽：只返回观测桶（已排序）
+        result = [{"day": k, **raw[k]} for k in sorted(raw)]
     return result
 
 
 @router.get("/analytics/by-provider")
-async def analytics_by_provider(db: AsyncSession = Depends(get_db)):
-    """按服务商拆分今日用量（请求 / Token / 成本 / 占比%）
+async def analytics_by_provider(
+    start: Optional[str] = Query(None, description="起始时间（UTC），默认今日零点"),
+    end: Optional[str] = Query(None, description="结束时间（含）"),
+    db: AsyncSession = Depends(get_db),
+):
+    """按服务商拆分窗口用量（请求 / Token / 成本 / 占比%）
 
     统一走 `aggregate_usage_by_provider`：按 id 优先、名称兜底聚合。
     此前直接 `WHERE routed_provider_id IS NOT NULL`，把只写了名称的历史行
     （直连流式等路径，生产实测占当日 95%）整行丢弃 → 面板显示不全（2026-09-24 修）。
     """
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_dt = _parse_dt_param(start) or datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt = _parse_dt_param(end, end_of_day=True)
     from server.core.provider_usage import aggregate_usage_by_provider
-    items = await aggregate_usage_by_provider(db, since=today_start)
+    items = await aggregate_usage_by_provider(db, since=start_dt, until=end_dt)
     total_tokens = sum(it["tokens"] for it in items)
     for it in items:
         it["share_pct"] = round(it["tokens"] / (total_tokens or 1) * 100, 1)
