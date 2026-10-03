@@ -302,7 +302,7 @@ export default {
         const [combosRes, providers, models] = await Promise.all([
           api.getCombos(),
           api.getProviders(),
-          api.getModels()
+          api.getModelsLight()
         ])
         this.combos = combosRes.items || []
         this.providers = providers || []

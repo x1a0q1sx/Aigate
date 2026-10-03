@@ -600,6 +600,10 @@ app.add_middleware(AuthMiddleware)
 # 转发进既有 /v1 端点，请求强制走该组合；详见 server/core/combo_prefix.py
 from server.core.combo_prefix import ComboPrefixMiddleware
 app.add_middleware(ComboPrefixMiddleware)
+# Admin 面板 JSON gzip（最外层，压最终响应）：只压 /admin 的缓冲 JSON，
+# 不碰推理流式路径；详见 server/core/admin_gzip.py
+from server.core.admin_gzip import AdminGZipMiddleware
+app.add_middleware(AdminGZipMiddleware)
 # ============================================================
 # 注册 API 路由（必须在 SPA 回退之前注册，确保 API 优先匹配）
 # ============================================================

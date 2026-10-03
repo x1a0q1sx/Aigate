@@ -160,6 +160,8 @@ export default {
     if (params && params.offset) qs.append('offset', params.offset)
     return apiGet(`/admin/api/models?${qs.toString()}`)
   },
+  // 组合路由等选择器专用：只回 9 个字段，避免整包 2.4MB 目录
+  getModelsLight: () => apiGet('/admin/api/models/light'),
   updateModel: (id, data) => apiPut(`/admin/api/models/${id}`, data),
   // 分组复选：Auto + 所属 combo 名称列表（一个模型可属多个分组）
   setModelGroups: (id, data) => apiPut(`/admin/api/models/${id}/groups`, data),

@@ -1208,6 +1208,26 @@ async def list_models(
     if limit and limit > 0:
         result = result[offset:offset + limit]
     return result
+
+
+@router.get("/models/light")
+async def list_models_light(db: AsyncSession = Depends(get_db)):
+    """组合路由等选择器专用轻量模型列表：只回候选选择所需的 9 个字段。
+
+    全量 /admin/api/models 附带 40+ 字段与 TPS 聚合（生产实测 ~2.4MB/476ms），
+    组合页只用 9 个字段，整包拉取是该页秒开慢的主因之一。
+    """
+    rows = (await db.execute(
+        select(Model.id, Model.provider_id, Model.model_id, Model.display_name,
+               Model.is_free, Model.input_price, Model.output_price,
+               Model.avg_latency_ms, Model.enabled)
+        .order_by(Model.provider_id, Model.model_id)
+    )).all()
+    keys = ("id", "provider_id", "model_id", "display_name", "is_free",
+            "input_price", "output_price", "avg_latency_ms", "enabled")
+    return [dict(zip(keys, r)) for r in rows]
+
+
 @router.put("/models/{model_id}")
 async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depends(get_db)):
     model = await _model_catalog.update_model(
