@@ -21,3 +21,11 @@
 ### 说明
 - 本文件此前停在 2025-07-17，近期任务结论实际记录于项目记忆（MEMORY.md）与 git 历史；自本条起恢复收尾记录
 - 两份 08-22「接管」小会话仅为迁移期只读验证，无独立结论
+
+## Session 3 - 2026-10-03
+### 完成
+- ✅ 组合路由页 10 秒加载定位并修复（011aebf）：根因 = /admin/api/models 全量目录 2.4MB 裸传（服务端仅 476ms，公网实测 6.7s）
+- ✅ AdminGZipMiddleware：只压 /admin 缓冲 JSON（content-length 门控天然排除流式，/v1 推理路径实测零接触）
+- ✅ 新增 GET /admin/api/models/light（9 字段轻量端点），Combos 页切换
+- ✅ 验收（本机走隧道）：models+gzip 6.7s/2.4MB→0.70s/82KB；models/light+gzip 0.50s/42.6KB；/v1 无 content-encoding
+- ✅ 测试 906→914 全绿；服务器 PID==pm2 PID 已核对；探针临时会话已删除
