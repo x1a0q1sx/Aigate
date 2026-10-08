@@ -198,3 +198,13 @@ x-opencode-session: ses_<28 chars>
 - 该免费候选的回复质量受 CLI agent 行为影响（已用自定义 agent 缓解），
   定位是 combo/auto 里的**免费候选**，不保证与付费 API 服务商完全一致的指令跟随
 - 上游若再次收紧（例如要求 CLI 交互式确认），sidecar 可能失效——届时看本文件重新取证
+
+## 六、2026-10-08 复核：上游再次收紧，sidecar 模式已死
+
+**现象**：combo 里 OpenCode Free 候选持续报 502 `free_provider_failed: opencode sidecar 上游报错: ... Upstream request failed: Endpoint is unavailable`（实为 180s 等待超时的包装）；重启 sidecar 拿到全新 CLI 会话后错误变清晰：**HTTP 403 FreeTierError "OpenCode's free tier can only be used from within OpenCode"**。
+
+**结论**：上游判据再次收紧——连「官方 CLI 进程经 `opencode serve` 的 prompt API 发起的会话」都不再放行（此前取证实验 6/8/10/11 全部失效）。大概率要求完整交互式 TUI 形态或彻底关闭程序化入口。**sidecar 架构当前无法工作**，属上游政策，非网关 bug。
+
+**处置（生产已生效）**：`config.yaml` 的 `opencode_bridge` 设 `enabled: false` + `auto_start: false`（经 `PUT /admin/api/opencode`，热生效且持久）；闲置 `opencode serve` 进程已清（省 ~460MB 内存）。combo 撞到 OpenCode Free 候选时**即时降级**（实测 0.1s，此前 180s），不再拖慢整体响应。要恢复：设置页「OpenCode 免费层桥接」卡片重新开启并「重启 sidecar」；若上游放宽，按本文件第一节方法重新取证。
+
+**运维注脚**：`pkill -f 'opencode serve'` 的匹配串会同时命中携带该字符串的 ssh 命令行使会话自杀（本次实证）——清孤儿进程应按 PID。
