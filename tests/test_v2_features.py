@@ -154,6 +154,11 @@ def test_transient_upstream_error_predicate():
     assert _is_transient_upstream_error("upstream_stream_failed: cache-only admission rejected a cold request")
     assert _is_transient_upstream_error("httpx.ConnectError: connection reset")
     assert _is_transient_upstream_error("Request timed out after 30s")
+    # 上游静默掐流（tokenharbor 实测挂 ~30s 后零字节关闭）——正文未出时必须可重试
+    assert _is_transient_upstream_error(
+        "RemoteProtocolError: peer closed connection without sending complete message body "
+        "(incomplete chunked read)")
+    assert _is_transient_upstream_error("httpx.ServerDisconnectedError: Server disconnected")
     # 不可重试：参数错误 / 鉴权失败
     assert not _is_transient_upstream_error("HTTPStatusError: Client error '400 Bad Request'")
     assert not _is_transient_upstream_error("Invalid API key")

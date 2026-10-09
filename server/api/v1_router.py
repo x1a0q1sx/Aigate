@@ -283,6 +283,10 @@ _TRANSIENT_UPSTREAM_RE = re.compile(
     r"|temporarily unavailable|overloaded|too many requests"
     r"|cache-only|admission rejected"
     r"|(?:connect|read|send)[a-z]*\s*(?:error|timeout|timed out|reset|closed)"
+    # 流被上游静默掐断（httpx RemoteProtocolError / ServerDisconnected）：实测 tokenharbor
+    # 会挂 ~30s 后零字节关闭（2026-10-09，mimo#0 chunks=0 复现）。正文未出时重试安全，
+    # 此前文案不在表内 → 「首字前重试一次」保护漏判成不可重试直接透传（2026-10-09 实证）
+    r"|peer\s+closed|incomplete\s+chunked\s+read|remoteprotocolerror|server\s+disconnected"
     r"|timed?\s?out",
     re.IGNORECASE,
 )
