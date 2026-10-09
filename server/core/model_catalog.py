@@ -560,6 +560,12 @@ class ModelCatalog:
         refresh_timeout = get_config().model_refresh.timeout_seconds
         adapter = create_adapter_for_provider(provider.api_type, timeout=refresh_timeout)
         extra_headers = provider.headers if provider.headers else None
+        # 与推理侧（v1_router._outbound_headers）对齐：服务商开启「走代理」时，刷新同样强制走代理池。
+        # 否则上游按国别封锁（如 tokenharbor 拒 CN 出口）时推理能通而刷新永远拉不到在线列表，
+        # 只能掉进定价页兜底（2026-10-09 实证）。__proxy_force 是内部标记，出站前被 outbound_headers 剥离。
+        if getattr(provider, "proxy_enabled", False):
+            extra_headers = dict(extra_headers or {})
+            extra_headers["__proxy_force"] = True
 
         # v3.5：多 key 拉取 —— 该 provider 下每把 active key 都调 list_models
         # 模型存在性取并集；key 归属按各 key 实际返回写 model_api_keys
@@ -680,33 +686,41 @@ class ModelCatalog:
 
         models = list(all_model_infos.values())
         list_ok = any_success
+        # 批量预加载该 provider 现有模型（此前每个 model_info 一次 select，N+1）；
+        # 提前到定价兜底之前——兜底建模需要先知道库里有没有真清单
+        existing_models_map = {
+            m.model_id: m for m in (await session.execute(
+                select(Model).where(Model.provider_id == provider.id)
+            )).scalars().all()
+        }
         # 获取定价信息（可用于模型名称回退）
         pricing_result = await fetch_provider_pricing(provider.base_url, timeout=refresh_timeout)
         provider_metadata = pricing_result.pricing
-        # 如果 list_models 失败或无结果，尝试从 pricing API 提取模型名
+        # 如果 list_models 失败或无结果，尝试从 pricing API 提取模型名。
+        # 仅限「库里还没有模型」的场景：已有清单时上游临时故障/封锁，绝不拿页面猜名
+        # 重建——文本兜底会把营销页残渣（SVG 坐标等）当模型入库（2026-10-09 tokenharbor 实证）。
         if not models and provider_metadata:
-            models = [ModelInfo(
-                model_id=name,
-                display_name=name,
-                is_free=False,
-                input_price=0.0,
-                output_price=0.0,
-                supports_streaming=True,
-                context_length=4096
-            ) for name in provider_metadata]
-            logger.info(f"Fallback: using {len(models)} models from pricing API for {provider.name}")
+            if existing_models_map:
+                list_note = f"在线列表失败；已有 {len(existing_models_map)} 个模型，不做定价页猜名兜底"
+                logger.warning(f"Skip pricing fallback for {provider.name}: list failed but {len(existing_models_map)} models exist")
+            else:
+                models = [ModelInfo(
+                    model_id=name,
+                    display_name=name,
+                    is_free=False,
+                    input_price=0.0,
+                    output_price=0.0,
+                    supports_streaming=True,
+                    context_length=4096
+                ) for name in provider_metadata]
+                list_source = "pricing"
+                logger.info(f"Fallback: using {len(models)} models from pricing API for {provider.name}")
         added = 0
         updated = 0
         pricing_updated = 0
         metric_updated = 0
         added_models = []
         removed_models = []
-        # 批量预加载该 provider 现有模型（此前每个 model_info 一次 select，N+1）
-        existing_models_map = {
-            m.model_id: m for m in (await session.execute(
-                select(Model).where(Model.provider_id == provider.id)
-            )).scalars().all()
-        }
         for model_info in models:
             # 价格来源只有两个：服务商自己的 /api/pricing（公益站自定义价）> 内置表；
             # 拿不到就留 0（未知），由用户在管理面板手动填，不用第三方"标准价"猜测
@@ -947,7 +961,8 @@ class ModelCatalog:
             "pricing_updated": pricing_updated,
             "metric_updated": metric_updated,
             "pricing_source": pricing_result.source_url,
-            "list_source": list_source if any_success else None,  # online/seed/pricing
+            # online/seed/pricing；全部失败且未兜底时为 None（日志记 unknown）
+            "list_source": list_source if (any_success or list_source != "online") else None,
             "list_note": list_note if list_note else (
                 "在线列表成功" if list_ok else ("上游不可用（种子兜底）" if list_source=="seed" else None)
             ),

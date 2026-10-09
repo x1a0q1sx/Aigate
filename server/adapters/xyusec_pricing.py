@@ -170,7 +170,10 @@ def _extract_metrics_from_json(data: Any) -> Dict[str, dict]:
 
 def _extract_pricing_from_text(text: str) -> Dict[str, dict]:
     pricing: Dict[str, dict] = {}
-    compact = re.sub(r"<[^>]+>", " ", text)
+    # 先整块剥掉 SVG：路径坐标序列（`640 780 856 1156`、`l645 220 175`…）在剥标签后
+    # 会被下面的「名称+两价格」正则误当成模型（2026-10-09 tokenharbor 实证：87 个数字假模型名）
+    compact = re.sub(r"<svg\b[^>]*>.*?</svg>", " ", text, flags=re.S | re.I)
+    compact = re.sub(r"<[^>]+>", " ", compact)
     compact = re.sub(r"\s+", " ", compact)
     model_pattern = re.compile(
         r"([a-zA-Z0-9][a-zA-Z0-9._:/+-]{2,100})\s+"
@@ -184,6 +187,9 @@ def _extract_pricing_from_text(text: str) -> Dict[str, dict]:
         if not model_key or in_price is None or out_price is None:
             continue
         if model_key in {"http", "https", "pricing", "api/pricing"}:
+            continue
+        # 真实模型 id 不会是纯数字，也几乎不会是「单字母+多位数字」（那是 SVG 路径命令 m/l/h/v/c…+坐标）
+        if model_key.isdigit() or re.fullmatch(r"[a-z]\d{2,}", model_key):
             continue
         pricing[model_key] = {
             "input": in_price,
