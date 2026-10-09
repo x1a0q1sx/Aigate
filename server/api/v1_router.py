@@ -2355,10 +2355,13 @@ async def _chat_completions_impl(
                     _kid, api_key = key.id, get_crypto_service().decrypt(key.key_encrypted)
             from server.core.model_catalog import create_adapter_for_provider
             adapter = create_adapter_for_provider(provider.api_type)
+            # 直连同样经 _merge_oauth_headers 合并路由标记：oauth 之外还要覆盖
+            # 「服务商开代理 → __proxy_force」——此前直连漏了该标记，国别封锁站
+            # 走 combo 能过而 provider/model 直连永远直发 403（2026-10-09 tokenharbor 实证）。
             route_result = RouteResult(
                 success=True, model=model, provider=provider, api_key=api_key, key_id=_kid,
                 adapter=adapter, fallback_count=0,
-                extra_headers=_direct_extra,   # oauth 的 __dpop/__oauth 标记随行（直连不再裸发设备凭证）
+                extra_headers=_merge_oauth_headers(provider, _direct_extra),   # oauth 的 __dpop/__oauth 标记随行（直连不再裸发设备凭证）
             )
             _decision_candidates(conversation_id, [{
                 "rank": 1,
