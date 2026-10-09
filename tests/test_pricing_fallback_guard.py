@@ -150,6 +150,48 @@ async def test_pricing_fallback_creates_and_logs_pricing_source(tmp_path, monkey
         await engine.dispose()
 
 
+# ── 4) 统一凭证解析器：标准 api_key 路径同样合并 proxy_enabled ──
+
+@pytest.mark.asyncio
+async def test_resolver_standard_path_merges_proxy_force(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from server.core import credential_resolver as cr
+
+    class FakeCrypto:
+        @staticmethod
+        def decrypt(_enc):
+            return "sk-fake"
+
+    class FakeRotator:
+        async def pick_key_for_model(self, db, model):
+            return None
+
+    monkeypatch.setattr("server.core.crypto_service.get_crypto_service", lambda: FakeCrypto())
+    monkeypatch.setattr("server.core.key_rotator.get_key_rotator", lambda: FakeRotator())
+    engine, Session, pid = await _setup(tmp_path, proxy_enabled=True,
+                                        headers={"X-Route-Tag": "th"})
+    try:
+        async with Session() as db:
+            p = await db.get(Provider, pid)
+            rc = await cr.resolve_credential_async(
+                p, SimpleNamespace(model_id="apex", id=1), db)
+        assert rc.ok and rc.api_key == "sk-fake"
+        eh = rc.extra_headers or {}
+        assert eh.get("__proxy_force") is True
+        assert eh.get("X-Route-Tag") == "th"
+        assert "__oauth" not in eh
+        # 关掉开关则不应带 force 标记
+        async with Session() as db:
+            p = await db.get(Provider, pid)
+            p.proxy_enabled = False
+            await db.commit()
+            rc2 = await cr.resolve_credential_async(
+                p, SimpleNamespace(model_id="apex", id=1), db)
+        assert "__proxy_force" not in (rc2.extra_headers or {})
+    finally:
+        await engine.dispose()
+
+
 async def _no_pricing(base_url, timeout=None):
     return PricingSyncResult({}, "https://x.example", None)
 

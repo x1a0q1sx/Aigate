@@ -156,6 +156,11 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             return rc
         rc.key_id = key.id
         rc.api_key = get_crypto_service().decrypt(key.key_encrypted)
+    # 与 oauth 分支/推理旧路径对齐：标准 api_key 也要合并服务商头与路由标记
+    # （__proxy_force 等）。否则服务商开「走代理」只对旧调用点生效，经统一解析器的
+    # /v1 直连仍裸直发，国别封锁站 403（2026-10-09 tokenharbor 实证）。
+    from server.api.v1_router import _merge_oauth_headers
+    rc.extra_headers = _merge_oauth_headers(provider, getattr(provider, "headers", None))
     rc.adapter = create_adapter_for_provider(api_type)
     return rc
 
