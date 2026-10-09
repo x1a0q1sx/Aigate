@@ -402,12 +402,22 @@ class OpenAICompatAdapter(BaseAdapter):
                         if isinstance(_im, list) and _im else None)
                 _ctx = int(item.get("context_length") or 0)
                 _mo = int(item.get("max_completion_tokens") or 0)
+                # 部分上游 /models 条目自带展示名（label，如 tokenharbor）与自声明单价
+                # （pricing.input_usd_per_1m，单位=每百万 token 美元）；缺字段时维持 0=未知。
+                # 自声明价在后续定价匹配（/api/pricing 或内置表）命中时会被覆盖，优先级不变。
+                _label = item.get("name") or item.get("label") or model_id
+                _pr = item.get("pricing") if isinstance(item.get("pricing"), dict) else {}
+                try:
+                    _in_p = float(_pr.get("input_usd_per_1m") or 0)
+                    _out_p = float(_pr.get("output_usd_per_1m") or 0)
+                except (TypeError, ValueError):
+                    _in_p = _out_p = 0.0
                 models.append(ModelInfo(
                     model_id=model_id,
-                    display_name=item.get("name") or model_id,
+                    display_name=_label,
                     is_free=is_free,
-                    input_price=0.0,
-                    output_price=0.0,
+                    input_price=_in_p,
+                    output_price=_out_p,
                     supports_streaming=True,
                     context_length=_ctx,
                     input_modalities=mods,
