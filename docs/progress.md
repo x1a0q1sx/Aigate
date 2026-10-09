@@ -54,3 +54,13 @@
 - ✅ 记忆更新：aigate-opencode-free-tier 判为当前失效；pkill -f 误杀 ssh 会话教训入档
 ### 待用户决策
 - 是否把 OpenCode Free 从 combo 918 候选里摘除（现在只是秒失败降级，不拖慢响应；保留=上游若放宽自动复活）
+
+## Session 5 - 2026-10-09
+### 完成
+- ✅ tokenharbor「乱码模型名」定性：乱码=87 个纯数字/字母数字串（124、2765、l645…），来源是官网 /pricing 营销页里 **SVG 折线图的坐标数字**。链路=该站 /v1/models 按国别封锁（服务器 CN 出口 403 region_blocked）→ 刷新在线列表失败 → 定价文本兜底（xyusec_pricing._extract_pricing_from_text）正则把 SVG 坐标当「模型名+两价格」抓进库。连带定性：**该服务商当前所有推理请求从服务器出去都会 403**（封锁在鉴权前），现不可用；provider 99 于当日 07:41 添加、07:42 手动刷新入库
+- ✅ OpenCode Free 桥接重开 + 上游复测（findings 第七节）：10-08 的「一刀切收紧」已演变为**按模型分策略**——space-bunny-free 实测可用；mimo/nemotron/longcat 等仍 403 FreeTierError、muse-spark RegionError、**exo-free 已下架（410）**。`opencode_bridge.enabled=true`+`auto_start=true` 已生效，sidecar 存活；combo 失败候选秒级降级
+- ✅ 运维坑入档：`POST /admin/api/models/refresh` 的 provider_id 是查询参数非 JSON body——误用会触发全量刷新（本次核对刷新日志：无破坏性偏移，删除均为上游真实下架）
+### 待用户决策
+- tokenharbor 三选一：a) 保持现状（87 行垃圾名不影响别处，但该服务商实际打不通）；b) 给 provider 配海外出口代理后重刷（在线列表成功会自动清掉垃圾行；对方明确拒绝受制裁地区访问，用前自行评估条款/合规）；c) 禁用服务商并删除 87 行
+- 代码加固建议（防同类站再污染，未动代码）：定价文本兜底先剥 `<svg>…</svg>` 块、纯数字键拒当模型名、兜底建模 list_source 记 `pricing` 而非 unknown
+- OpenCode Free 已下架模型（exo-free 等）是否从目录/combo 918 清理（free_tier 分支刷新不删模型，会一直挂着 410 失败）

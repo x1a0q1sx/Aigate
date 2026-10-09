@@ -208,3 +208,25 @@ x-opencode-session: ses_<28 chars>
 **处置（生产已生效）**：`config.yaml` 的 `opencode_bridge` 设 `enabled: false` + `auto_start: false`（经 `PUT /admin/api/opencode`，热生效且持久）；闲置 `opencode serve` 进程已清（省 ~460MB 内存）。combo 撞到 OpenCode Free 候选时**即时降级**（实测 0.1s，此前 180s），不再拖慢整体响应。要恢复：设置页「OpenCode 免费层桥接」卡片重新开启并「重启 sidecar」；若上游放宽，按本文件第一节方法重新取证。
 
 **运维注脚**：`pkill -f 'opencode serve'` 的匹配串会同时命中携带该字符串的 ssh 命令行使会话自杀（本次实证）——清孤儿进程应按 PID。
+
+## 七、2026-10-09 复测：「一刀切」演变为「按模型分策略」，桥接已重新开启
+
+**触发**：用户要求重开桥接（`RuntimeError: opencode 桥接已停用`）。
+
+**实测矩阵**（重开桥接 + 重启 sidecar，全新 CLI 会话逐模型探）：
+
+| 模型 | 结果 |
+|---|---|
+| space-bunny-free | ✅ finish=stop 正常回复 |
+| mimo-v2.6-flash-free / nemotron-3-ultra-free / nemotron-3.5-lightning-free / longcat-2.5-preview-free | 403 FreeTierError（仍未放行） |
+| muse-spark-1.2/1.3-contributor-free | 403 RegionError（国家限制） |
+| exo-free（用户最初所报） | **410 ModelDeprecated**（上游已下架；此前的 503 "Endpoint is unavailable" 是同一情形的旧包装） |
+| deepseek-v4-flash-free / mimo-v2.5-free / fledge-alpha-free | 401 ModelError not supported（已下架） |
+| ling-3.0-flash-fin-free | 400 Model unavailable |
+| jev-1.13-free | 45s 无响应超时（经网关时有停滞检测 + interrupt 止损，不会挂满 180s） |
+
+**结论**：上游不再是 10-08 判定的全面封禁，而是**按模型逐个执行策略**——个别免费模型经 CLI sidecar 可通。生产桥接已重开（`enabled=true` + `auto_start=true`，sidecar 存活）。combo 撞失败候选现在**秒级快速失败**（finish=error 直传）。
+
+**遗留**：free_tier 分支的刷新**从不删模型**（定向刷新 provider 26 结果 updated=87/removed=0），exo-free 等已下架 id 仍留在目录与 combo 918 候选里，当前以 410/403 失败。
+
+**运维坑（本次实证）**：`POST /admin/api/models/refresh` 的 `provider_id` 是**查询参数**，按 JSON body 传会被忽略 → 变成「手动全量刷新」。本次误触发一次全量，核对刷新日志无破坏性偏移（删除只发生在在线列表成功的 provider、且均为上游真实下架），但定向刷新务必 `?provider_id=<id>`。
