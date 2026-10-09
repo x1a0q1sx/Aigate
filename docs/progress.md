@@ -61,6 +61,11 @@
 - ✅ OpenCode Free 桥接重开 + 上游复测（findings 第七节）：10-08 的「一刀切收紧」已演变为**按模型分策略**——space-bunny-free 实测可用；mimo/nemotron/longcat 等仍 403 FreeTierError、muse-spark RegionError、**exo-free 已下架（410）**。`opencode_bridge.enabled=true`+`auto_start=true` 已生效，sidecar 存活；combo 失败候选秒级降级
 - ✅ 运维坑入档：`POST /admin/api/models/refresh` 的 provider_id 是查询参数非 JSON body——误用会触发全量刷新（本次核对刷新日志：无破坏性偏移，删除均为上游真实下架）
 ### 待用户决策
-- tokenharbor 三选一：a) 保持现状（87 行垃圾名不影响别处，但该服务商实际打不通）；b) 给 provider 配海外出口代理后重刷（在线列表成功会自动清掉垃圾行；对方明确拒绝受制裁地区访问，用前自行评估条款/合规）；c) 禁用服务商并删除 87 行
-- 代码加固建议（防同类站再污染，未动代码）：定价文本兜底先剥 `<svg>…</svg>` 块、纯数字键拒当模型名、兜底建模 list_source 记 `pricing` 而非 unknown
 - OpenCode Free 已下架模型（exo-free 等）是否从目录/combo 918 清理（free_tier 分支刷新不删模型，会一直挂着 410 失败）
+
+### 补充（同日）：tokenharbor 处置完成（10310e7/9114124/e68c408/fa794b6/2231ade）
+- ✅ 模型获取：经服务器 mihomo(7890) 出口拉 `/v1/models` 成功，**87 行 SVG 坐标垃圾全删、68 个真实模型入库**（display_name/单价采纳上游自声明 label 与 pricing.input_usd_per_1m）；后续刷新在线列表成功即自动维护
+- ✅ 排查中揪出「服务商走代理开关」只在 combo/旧调用点生效的**四处旁路漏洞**并全收口：刷新 list_models（10310e7）、playground api_key 分支（e68c408）、统一凭证解析器标准分支（fa794b6）、**/v1 直连路由**（2231ade）——此前 CN 出口站点对这些路径永远直发；全套 946 项绿（含新增 6 项回归）
+- ✅ 定价兜底三防：文本兜底剥 `<svg>` 块 + 拒纯数字/「单字母+数字」键；库里已有模型时列表失败**禁止猜名重建**；兜底建模 list_source 记 `pricing`（10310e7）
+- ⚠️ 服务商「代理」语义澄清：provider 的开关=**强制走全局代理池**（设置→代理池要有可用出口）；`proxy_url` 列是历史死字段（无消费点）。mihomo 抖动时表现为 pool 冷却→直连→403，症状与「没开代理」相同，看错误码区分（403=国别封锁/直发，402/401=已过代理）
+- ℹ️ tokenharbor 现状：`:free` 免费模型经 /v1 直连实测 200；付费模型报 402 **账户余额 $0**（需去其 dashboard 充值；期间一度报 401 Invalid or revoked key，当前 key 可用）
