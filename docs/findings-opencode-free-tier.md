@@ -230,3 +230,13 @@ x-opencode-session: ses_<28 chars>
 **遗留**：free_tier 分支的刷新**从不删模型**（定向刷新 provider 26 结果 updated=87/removed=0），exo-free 等已下架 id 仍留在目录与 combo 918 候选里，当前以 410/403 失败。
 
 **运维坑（本次实证）**：`POST /admin/api/models/refresh` 的 `provider_id` 是**查询参数**，按 JSON body 传会被忽略 → 变成「手动全量刷新」。本次误触发一次全量，核对刷新日志无破坏性偏移（删除只发生在在线列表成功的 provider、且均为上游真实下架），但定向刷新务必 `?provider_id=<id>`。
+
+## 八、2026-10-09 追加：守护「自动拉起」漏 await 从未生效（bde00a4 已修）
+
+**触发**：用户报 tokenharbor 流式断流，顺带发现 request_logs 09:02 有 `OpenCode Free`「sidecar 未运行」——`auto_start=true`，但 sidecar 死了半小时没任何进程拉起。
+
+**根因**（`server/main.py` `_guard_opencode_sidecar`）：`_aio.create_subprocess_exec(...)` **漏了 `await`**——它是协程函数，裸调用只产生一个永不执行的协程对象，子进程从未启动；error log 累积 14 条 `coroutine ... never awaited` 警告坐实。此前 sidecar「活着」全靠设置页「重启 sidecar」按钮（`admin_ops_router` 里的实现带 await，是对的），守护的自愈能力形同虚设。
+
+**修复**：补 `await` 并记录子进程 pid；加**静态回归测试**（扫 main.py 源码，出现裸 `_aio.create_subprocess_exec` 即红）。部署后守护第一个 tick 即成功拉起：日志「… 尝试启动 → ✓ 已就绪」、4096 监听、`space-bunny-free` 真实会话 finish=stop。
+
+**教训**：`create_subprocess_exec`/`open_connection` 这类「返回协程的工厂函数」在循环里忘 await 完全静默——自检手段是看 `RuntimeWarning: coroutine ... never awaited` 是否出现在 stderr。

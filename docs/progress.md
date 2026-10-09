@@ -69,3 +69,8 @@
 - ✅ 定价兜底三防：文本兜底剥 `<svg>` 块 + 拒纯数字/「单字母+数字」键；库里已有模型时列表失败**禁止猜名重建**；兜底建模 list_source 记 `pricing`（10310e7）
 - ⚠️ 服务商「代理」语义澄清：provider 的开关=**强制走全局代理池**（设置→代理池要有可用出口）；`proxy_url` 列是历史死字段（无消费点）。mihomo 抖动时表现为 pool 冷却→直连→403，症状与「没开代理」相同，看错误码区分（403=国别封锁/直发，402/401=已过代理）
 - ℹ️ tokenharbor 现状：`:free` 免费模型经 /v1 直连实测 200；付费模型报 402 **账户余额 $0**（需去其 dashboard 充值；期间一度报 401 Invalid or revoked key，当前 key 可用）
+
+### 补充 2（同日）：流式断流定性 + sidecar 守护修复（bde00a4）
+- ✅ 用户报 `RemoteProtocolError: peer closed connection ... (incomplete chunked read)` 定性=tokenharbor 直连流式**偶发断流**（09:02 仅一条；随后 6/6 流式探测全过、ttft 1.6~2.5s；与 9-18 烁公益站/9-03 基元律动同类）。网关已内置「首字前断流自动重试一次」；首字后断流原样报给客户端（重试会造成重复输出，不可透明）——非网关缺陷
+- ✅ 顺带揪出并修复真 bug：`main.py` OpenCode 守护 `create_subprocess_exec` **漏 await** → 协程永不执行、**sidecar 自动拉起从未生效**（14 条 never-awaited 警告；此前存活全靠设置页「重启 sidecar」按钮）。修复+记 pid+静态回归测试锁死；部署后守护第一个 tick 即拉起，4096 监听、`space-bunny-free` 真实会话 finish=stop。09:02:01 combo 里「sidecar 未运行」即源于此
+- ℹ️ 通用教训：循环里裸调协程工厂函数（create_subprocess_exec 等）完全静默，自检看 stderr 的 `RuntimeWarning: coroutine ... never awaited`
