@@ -691,3 +691,16 @@ async def test_free_executor_opencode_respects_disabled_bridge(monkeypatch):
     with pytest.raises(RuntimeError) as ei:
         await ex.execute_non_stream(req)
     assert "已停用" in str(ei.value)
+
+
+def test_guard_subprocess_spawn_is_awaited():
+    """main.py 守护的 create_subprocess_exec 必须 await——漏 await 时协程对象
+    永不执行，自动拉起静默失效（2026-10-09 实证，error log 14 条 never-awaited）。"""
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "server" / "main.py").read_text(
+        encoding="utf-8")
+    bad = re.findall(r"(?<!await )(?<!await\n)\b_aio\.create_subprocess_exec", src)
+    assert not bad, "create_subprocess_exec 未 await（守护拉不起子进程）"
+    guarded = re.findall(r"await\s+_aio\.create_subprocess_exec", src)
+    assert guarded, "守护应存在 await 的子进程启动"

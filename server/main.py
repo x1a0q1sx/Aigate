@@ -517,10 +517,14 @@ async def lifespan(app: FastAPI):
                         if exe:
                             if first:
                                 print(f"… OpenCode sidecar 未运行，尝试启动：{exe}")
-                            _aio.create_subprocess_exec(
+                            # 必须 await：create_subprocess_exec 是协程函数，裸调用只会
+                            # 产生永不执行的协程对象（2026-10-09 实证：守护自动拉起
+                            # 从未生效，error log 累积 14 条 coroutine-never-awaited）
+                            _aio_sidecar_proc = await _aio.create_subprocess_exec(
                                 exe, "serve", "--port", port, "--hostname", "127.0.0.1",
                                 stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
                                 start_new_session=True)
+                            logger.info("opencode sidecar 已拉起 pid=%s", _aio_sidecar_proc.pid)
                             await _aio.sleep(8)
                             alive = await _sc.sidecar_alive()
                             print("✓ OpenCode sidecar 已就绪" if alive
