@@ -2116,9 +2116,16 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             from server.core.model_catalog import create_adapter_for_provider
             from server.core.auto_router import RouteResult
             adapter = create_adapter_for_provider(provider.api_type)
+            # 与 /v1 生产路径（_outbound_headers）对齐：服务商开「走代理」时 playground 同样强制走代理池，
+            # 否则国别封锁站点在 /v1 可用而 playground 测试永远 403，行为分裂（2026-10-09 实证）。
+            _pg_eh = None
+            if getattr(provider, "proxy_enabled", False):
+                _pg_eh = dict(_pg_eh or {})
+                _pg_eh["__proxy_force"] = True
             route_result = RouteResult(
                 success=True, model=model, provider=provider,
-                api_key=api_key, adapter=adapter, fallback_count=0
+                api_key=api_key, adapter=adapter, fallback_count=0,
+                extra_headers=_pg_eh
             )
     elif data.stream and is_auto:
         # 统一 cascade：内部转调 /v1 核心流式（候选回退/首块超时/实质锁定/日志全量一致）。
