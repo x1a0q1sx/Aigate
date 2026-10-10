@@ -21,6 +21,7 @@ from server.api.v1_router import verify_aigate_api_key
 from server.core.client_ip import real_client_ip
 from server.core.alias_service import resolve_alias
 from server.core.credential_resolver import resolve_credential_async
+from server.core.error_text import err_text
 from server.core.request_logger import write_log
 
 router = APIRouter(prefix="/v1")
@@ -118,14 +119,16 @@ async def _passthrough(
     except Exception as e:
         # error_msg 全量落库（只留防御上限）：用户排障要看上游原文，
         # 截断到 500 会迫使人去翻 pm2 日志。HTTP 响应给客户端的仍是简短形态。
+        # 空消息异常（ConnectError: 等）经 err_text 兜底成可读描述（2026-10-10 实证）。
+        _pt_err = err_text(e)
         await write_log(db, requested_model=name, routed_provider=provider.name,
                         routed_provider_id=provider.id,
                         routed_model=model.model_id, status="error",
                         media_type=media_type, error_type="upstream_error",
-                        error_msg=str(e)[:20000], latency_ms=int((time.time() - _t0) * 1000),
+                        error_msg=_pt_err[:20000], latency_ms=int((time.time() - _t0) * 1000),
                         user_ip=real_client_ip(raw_request),
                         used_proxy=bool(_proxy_kwargs(provider)))
-        return JSONResponse(status_code=502, content={"error": {"message": f"上游请求失败: {str(e)[:200]}"}})
+        return JSONResponse(status_code=502, content={"error": {"message": f"上游请求失败: {_pt_err[:300]}"}})
     latency_ms = int((time.time() - _t0) * 1000)
     try:
         payload = resp.json()

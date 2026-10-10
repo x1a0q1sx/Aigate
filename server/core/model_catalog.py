@@ -23,6 +23,7 @@ from server.adapters.github_adapter import GitHubAdapter
 from server.adapters.image_adapter import ImageAdapter
 from server.adapters.atomcode_adapter import AtomCodeAdapter
 from server.adapters.xyusec_pricing import fetch_provider_pricing, match_model_metadata
+from server.core.error_text import err_text
 from .key_manager import KeyManager
 from server.config import get_config
 
@@ -451,7 +452,7 @@ class ModelCatalog:
             result = await self._refresh_models_inner(session, provider, key_manager)
         except Exception as e:
             await self._record_refresh(session, provider,
-                                       {"error": f"{type(e).__name__}: {e}"[:400]}, trigger, t0)
+                                       {"error": err_text(e)[:400]}, trigger, t0)
             raise
         await self._record_refresh(session, provider, result, trigger, t0)
         return result
@@ -514,7 +515,8 @@ class ModelCatalog:
                 try:
                     fetched_ids = await exec_.list_models()
                 except Exception as e:
-                    logger.warning(f"free_tier list_models failed for {provider.name}: {e}")
+                    _ft_err = err_text(e)
+                    logger.warning(f"free_tier list_models failed for {provider.name}: {_ft_err}")
                     # 拉取失败：保留已有模型（不报错、不删除），避免误删手动种子模型
                     total_rows = (await session.execute(
                         select(Model).where(Model.provider_id == provider.id)
@@ -524,7 +526,7 @@ class ModelCatalog:
                         "added_models": [], "removed_models": [],
                         "total": len(list(total_rows)), "pricing_updated": 0,
                         "metric_updated": 0, "pricing_source": None,
-                        "pricing_error": f"free_tier fetch failed: {e}",
+                        "pricing_error": f"free_tier fetch failed: {_ft_err}",
                     }
                 if fetched_ids:
                     added = 0
@@ -674,7 +676,8 @@ class ModelCatalog:
                 try:
                     return k.id, await adapter.list_models(ak, provider.base_url, extra_headers)
                 except Exception as e:
-                    logger.warning(f"list_models failed for key {k.id} of {provider.name}: {e}")
+                    # err_text 兜底：代理抖动时 httpx 异常消息可能为空（'ConnectError: '）
+                    logger.warning(f"list_models failed for key {k.id} of {provider.name}: {err_text(e)}")
                     return k.id, []
             results = await asyncio.gather(*[_fetch_one(k) for k in keys]) if keys else []
             for kid, _m in results:

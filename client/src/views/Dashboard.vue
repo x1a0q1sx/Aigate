@@ -132,7 +132,7 @@
                 <td class="dim">{{ shortTime(r.created_at) }}</td>
                 <td class="mono">{{ r.requested_model || '—' }}</td>
                 <td class="dim mono">{{ r.routed_provider || '' }}/{{ r.routed_model || '' }}</td>
-                <td class="err-text" :title="r.error_msg">{{ r.error_type || (r.error_msg || '—').slice(0, 60) }}</td>
+                <td class="err-text" :title="r.error_msg">{{ errBrief(r) }}</td>
               </tr>
             </tbody>
           </table>
@@ -238,6 +238,14 @@ export default {
     },
     fmtNum(n) { return Number(n || 0).toLocaleString('zh-CN') },
     shortTime(v) { return v ? String(v).slice(11, 19) : '—' },
+    /** 失败行摘要：优先 error_msg 首行（可读原因），兜底 error_type。
+     *  此前直接显示 error_type（如 "upstream_error"）用户看不出发生了什么；
+     *  error_msg 里才有 err_text 兜底后的可读描述（2026-10-10）。 */
+    errBrief(r) {
+      const msg = String(r.error_msg || '').split('\n')[0].trim()
+      if (msg) return msg.length > 80 ? msg.slice(0, 80) + '…' : msg
+      return r.error_type || '—'
+    },
     async load() {
       this.loading = true
       const [live, summary, current, failures, errs, checkin] = await Promise.all([

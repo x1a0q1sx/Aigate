@@ -33,6 +33,7 @@ from server.schemas.admin import (
 from server.core.key_manager import KeyManager
 from server.core.model_catalog import ModelCatalog
 from server.core.model_capabilities import infer_reasoning_effort_support
+from server.core.error_text import err_text
 from server.core.health_checker import HealthChecker
 from server.core.crypto_service import get_crypto_service
 from server.config import get_config, save_config
@@ -2044,9 +2045,10 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                             yield b"data: [DONE]\n\n"
                             await _write_log("success", None, _send_dur())
                         except Exception as e:
-                            yield _format_sse_chunk({"error": f"free_provider_stream_failed: {e}"}, f"{provider.name}/{model.model_id}")
+                            _pg_err = err_text(e)[:300]
+                            yield _format_sse_chunk({"error": f"free_provider_stream_failed: {_pg_err}"}, f"{provider.name}/{model.model_id}")
                             yield b"data: [DONE]\n\n"
-                            await _write_log("error", None, _send_dur(), str(e)[:500])
+                            await _write_log("error", None, _send_dur(), _pg_err[:500])
                     return StreamingResponse(_playground_free_stream(), media_type="text/event-stream")
                 try:
                     upstream_result = await free_exec.execute_non_stream(free_req)
@@ -2055,8 +2057,9 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     await _write_log("success", upstream_result, _send_dur())
                     return upstream_result
                 except Exception as e:
-                    await _write_log("error", None, _send_dur(), str(e)[:500])
-                    return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {e}"})
+                    _pg_err = err_text(e)[:300]
+                    await _write_log("error", None, _send_dur(), _pg_err[:500])
+                    return JSONResponse(status_code=502, content={"error": f"free_provider_failed: {_pg_err}"})
             # 没匹配上 free_code — 不再回退 adapter（避免 URL 被错误二次追加 / 403）
             known_codes = ", ".join(f"'{c}' ({_FPM[c]['name']})" for c in _FPM)
             await _write_log("error", None, 0,
@@ -2161,15 +2164,17 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     yield _format_sse_chunk(chunk, model_id_full)
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 from server.api.v1_router import _api_error as _api_error_fn
-                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"), model_id_full)
-                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), str(e)[:500])
+                _pg_err = err_text(e)[:300]
+                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
+                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             except Exception as e:
                 # 适配器自抛的业务错误（SessionError / RuntimeError 等）也必须变成
                 # SSE error 事件：否则异常穿透生成器 → 前端只看到流中断，原因丢失。
                 # 对齐 /v1 的宽捕获口径（那边 except Exception → _api_error）。
                 from server.api.v1_router import _api_error as _api_error_fn
-                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {type(e).__name__}: {str(e)[:200]}"), model_id_full)
-                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), str(e)[:500])
+                _pg_err = err_text(e)[:300]
+                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
+                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             yield b"data: [DONE]\n\n"
         return StreamingResponse(wrap_stream(), media_type="text/event-stream")
 
@@ -2182,17 +2187,19 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
             )
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
-            await _write_log("error", None, int((time.time() - _send_time)*1000), str(e)[:500])
-            return JSONResponse(status_code=503, content={"error": f"upstream_call_failed: {type(e).__name__}: {str(e)[:200]}"})
+            _pg_err = err_text(e)[:300]
+            await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
+            return JSONResponse(status_code=503, content={"error": f"upstream_call_failed: {_pg_err}"})
         except Exception as e:
             # ⚠️ 此前只捕获 httpx 三类异常，适配器自抛的业务错误（如 freebuff 的
             # SessionError「Freebucks 额度已用尽」/「模型不在此档」）会穿透成
             # **HTTP 500 Internal Server Error** —— 用户只看到 500，看不到真正原因
             # （生产实测：glm-5.3-flash 因额度用尽报 500，日志里才有可读文案）。
             # 对齐 /v1 的宽捕获：一律转成 503 + 可读 error 文案。
-            await _write_log("error", None, int((time.time() - _send_time)*1000), str(e)[:500])
+            _pg_err = err_text(e)[:300]
+            await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
             return JSONResponse(status_code=503,
-                                content={"error": f"upstream_call_failed: {type(e).__name__}: {str(e)[:300]}"})
+                                content={"error": f"upstream_call_failed: {_pg_err}"})
 
 
     if isinstance(result, dict) and "model" in result:

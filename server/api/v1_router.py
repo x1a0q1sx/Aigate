@@ -43,6 +43,7 @@ from server.core.context_guard import (
     record_context_overflow,
 )
 from server.config import get_config, save_config
+from server.core.error_text import err_text
 
 
 def _openai_completion_is_empty(result) -> bool:
@@ -297,6 +298,20 @@ def _is_transient_upstream_error(text) -> bool:
     if not text:
         return False
     return bool(_TRANSIENT_UPSTREAM_RE.search(str(text)))
+
+
+# 连接阶段故障（连接从未建立成功）中的「快速失败」类：重试会重建客户端与 TCP 连接，
+# 瞬断多为偶发，多给一次机会值得。2026-10-10 实证：tokenharbor 两次尝试都撞上
+# 抖动线路（376ms/1658ms 快速失败）。ConnectTimeout 不给额外预算——黑洞型故障
+# 每次要等满超时，多一次重试代价太大。
+_FAST_CONN_ERRORS = (httpx.ConnectError, httpx.ProxyError)
+
+
+def _retry_budget_for(e: BaseException) -> int:
+    """本次故障允许的额外重试次数（1=原样重试一次，2=两次）。"""
+    if isinstance(e, _FAST_CONN_ERRORS):
+        return 2
+    return 1
 
 
 def _api_error(message, *, status=None, type_=None, **extra) -> dict:
@@ -721,14 +736,18 @@ def _full_err_text(e: Exception) -> str:
 
     与 `err_short` 的分工：`err_short` 供冷却/上下文判据与「尝试下一个候选」的
     提示文案（要短）；本函数供 `error_msg` 落库（要全，用户排障直接看详情弹窗）。
-    """
+
+    空消息异常（httpcore 把 str 为空的底层异常直接包进 ConnectError 等）经
+    `err_text` 兜底成可读描述 —— 否则日志里只有 `ConnectError: ` 空壳
+    （2026-10-10 tokenharbor 实证）。"""
     raw = _extract_error_body(e)
     if raw and raw != str(e):
         # 有上游原文时，异常概要 + 原文都要（概要含状态码/URL，原文含上游错误码）
-        head = f"{type(e).__name__}: {str(e).split(chr(10) + 'Response: ', 1)[0]}"
+        head_src = str(e).split(chr(10) + 'Response: ', 1)[0]
+        head = (f"{type(e).__name__}: {head_src}" if head_src.strip() else err_text(e))
         full = f"{head}\n{raw}"
     else:
-        full = f"{type(e).__name__}: {str(e)}"
+        full = err_text(e)
     if len(full) > ERROR_MSG_MAX_CHARS:
         return full[:ERROR_MSG_MAX_CHARS] + f"\n... [错误信息超过 {ERROR_MSG_MAX_CHARS} 字符已截断]"
     return full
@@ -863,7 +882,7 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
                 fallback_count=attempt,
             ), attempt_errors
         except Exception as e:
-            err_short = f"{type(e).__name__}: {str(e)[:120]}"
+            err_short = err_text(e)[:120]
             _full = _full_err_text(e)
             _ent = {
                 "attempt": attempt,
@@ -1146,7 +1165,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
             ctx_by_attempt[attempt]["cancelled"] = True
             raise
         except Exception as e:
-            raise _AFail(f"{type(e).__name__}: {str(e)[:200]}", candidate,
+            raise _AFail(err_text(e)[:300], candidate,
                          raw=_extract_error_body(e)) from e
         ctx_by_attempt[attempt]["send_end"] = time.time()
         # 校验返回内容有效性（含 tool_calls）
@@ -2175,7 +2194,7 @@ async def _chat_completions_impl(
                     ctx["cancelled"] = True
                     raise
                 except Exception as e:
-                    raise _NFail(f"{type(e).__name__}: {str(e)[:200]}", ctx) from e
+                    raise _NFail(err_text(e)[:300], ctx) from e
                 ctx["send_end"] = time.time()
                 if isinstance(result, dict):
                     result["model"] = f"{provider.name}/{model.model_id}"
@@ -2405,8 +2424,8 @@ async def _chat_completions_impl(
                                     yield _format_sse_chunk(ck, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             except Exception as e:
-                                _free_err = f"{type(e).__name__}: {str(e)[:200]}"
-                                err_data = _api_error(f"free_provider_stream_failed: {e}")
+                                _free_err = err_text(e)[:300]
+                                err_data = _api_error(f"free_provider_stream_failed: {_free_err}")
                                 yield _format_sse_chunk(err_data, model.full_id)
                                 yield b"data: [DONE]\n\n"
                             finally:
@@ -2444,11 +2463,11 @@ async def _chat_completions_impl(
                             return JSONResponse(content=data)
                         except Exception as e:
                             _free_latency = int((time.time() - _free_started) * 1000)
-                            _free_err = f"{type(e).__name__}: {str(e)[:200]}"
+                            _free_err = err_text(e)[:300]
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
                             await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
-                            await _early_error_log(conversation_id, request, raw_request, f"free_provider_failed: {e}", err_type="upstream_error")
-                            return JSONResponse(status_code=502, content=_api_error(f"free_provider_failed: {e}", status=502))
+                            await _early_error_log(conversation_id, request, raw_request, f"free_provider_failed: {_free_err}", err_type="upstream_error")
+                            return JSONResponse(status_code=502, content=_api_error(f"free_provider_failed: {_free_err}", status=502))
                         finally:
                             _FORCE_PROXY.reset(_proxy_token)
                 else:
@@ -2647,7 +2666,7 @@ async def _chat_completions_impl(
                     ctx["cancelled"] = True
                     raise
                 except Exception as e:
-                    raise _AFail(f"{type(e).__name__}: {str(e)[:200]}", ctx,
+                    raise _AFail(err_text(e)[:300], ctx,
                                  raw=_extract_error_body(e)) from e
                 finally:
                     if not ctx["committed"] and ctx["gen"] is not None:
@@ -2882,10 +2901,15 @@ async def _chat_completions_impl(
             async def wrap_stream():
                 nonlocal _stream_usage, _stream_err, _stream_ttft_ms
                 _diag(conversation_id, "direct_stream_generator_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
-                # 直连流对“正文出现前断流”（内容校验失败 / 空闲超时等）最多重试一次：
+                # 直连流对“正文出现前断流”（内容校验失败 / 空闲超时等）自动重试：
                 # 只有尚未向客户端吐出任何实质 chunk 时才重试，避免重复输出对客户端可见。
+                # 重试预算按故障类型定（_retry_budget_for）：连接阶段故障（连接从未建立，
+                # 如代理 TLS 被掐）允许 2 次——重建客户端与 TCP 连接，瞬断多为偶发，
+                # 多一次机会；其余瞬态故障仍 1 次。2026-10-10 tokenharbor 实证：两次尝试
+                # 都撞上抖动线路（376ms/1658ms 快速失败），第三次本可换路。
                 try:
-                    for _attempt_no in range(2):
+                    _retries_used = 0  # 正文未出前的自动重试已用次数（连接阶段预算 2、其余 1）
+                    for _attempt_no in range(3):
                         _attempt_gen = generator if _attempt_no == 0 else route_result.adapter.stream_chat_completion(
                             upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
                         )
@@ -2914,13 +2938,15 @@ async def _chat_completions_impl(
                                     _stream_chunks_log.append(chunk)
                                 yield _format_sse_chunk(chunk, model_id_full)
                             if stream_has_error:
+                                # 站内错误（上游在 SSE 里返回 error dict）：无法判定为连接阶段，预算恒 1
                                 _retry_now = (
-                                    _attempt_no == 0
+                                    _retries_used < 1
                                     and _stream_content_is_empty(_stream_chunks_log)
                                     and (_is_stream_content_validation_error(stream_err_detail)
                                          or _is_transient_upstream_error(stream_err_detail))
                                 )
                                 if _retry_now:
+                                    _retries_used += 1
                                     if _is_transient_upstream_error(stream_err_detail):
                                         await asyncio.sleep(1.0)  # 429/503 类瞬态故障稍候再试
                                     continue
@@ -2930,14 +2956,15 @@ async def _chat_completions_impl(
                             return
                         except Exception as e:
                             _diag(conversation_id, "upstream_stream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, error=type(e).__name__)
-                            _err_text = f"{type(e).__name__}: {str(e)[:200]}"
+                            _err_text = err_text(e)[:300]
                             _retry_now = (
-                                _attempt_no == 0
+                                _retries_used < _retry_budget_for(e)
                                 and _stream_content_is_empty(_stream_chunks_log)
                                 and (_is_stream_content_validation_error(_err_text)
                                      or _is_transient_upstream_error(_err_text))
                             )
                             if _retry_now:
+                                _retries_used += 1
                                 if _is_transient_upstream_error(_err_text):
                                     await asyncio.sleep(1.0)  # 429/503 类瞬态故障稍候再试
                                 continue
@@ -3066,7 +3093,7 @@ async def _chat_completions_impl(
                 _done = False
                 _last_err = None
                 result = None
-                _same_key_retried = False   # 瞬态故障（429/5xx/断连）允许同一把 key 原样重试一次
+                _same_key_retries = 0   # 同 key 原样重试已用次数（瞬态故障：连接阶段预算 2、其余 1）
                 _force_same_key = False
                 _cur_kid, _cur_key = route_result.key_id, route_result.api_key
                 for _attempt in range(8):
@@ -3102,6 +3129,7 @@ async def _chat_completions_impl(
                         break
                     except Exception as e:
                         _last_err = e
+                        _err_now = err_text(e)[:300]
                         _decision_attempt(
                             conversation_id,
                             provider=route_result.provider.name,
@@ -3109,7 +3137,7 @@ async def _chat_completions_impl(
                             status="failed",
                             attempt=_attempt,
                             latency_ms=int((time.time() - _direct_attempt_started) * 1000),
-                            error=f"{type(e).__name__}: {str(e)[:200]}",
+                            error=_err_now,
                             reason="retrying another key",
                         )
                         # P1-3: httpx.HTTPStatusError 的状态码在 .response.status_code，
@@ -3119,8 +3147,10 @@ async def _chat_completions_impl(
                             _e_status = getattr(getattr(e, "response", None), "status_code", None)
                         _rot.mark_failure(_cur_kid, _e_status)
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
-                        if not _same_key_retried and _is_transient_upstream_error(f"{type(e).__name__}: {str(e)[:200]}"):
-                            _same_key_retried = True
+                        # 瞬态故障同 key 原样重试（连接阶段预算 2：重建 httpx 客户端与连接，
+                        # 瞬断多为偶发，多一次机会——2026-10-10 两次都撞抖动线路的实证）
+                        if _same_key_retries < _retry_budget_for(e) and _is_transient_upstream_error(_err_now):
+                            _same_key_retries += 1
                             _force_same_key = True
                             await asyncio.sleep(1.0)  # 瞬态故障稍候原样重试
                         continue
@@ -3133,8 +3163,9 @@ async def _chat_completions_impl(
             except Exception as e:
                 _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                 http_status_code = 503
-                raw_err = _extract_error_body(e) or f"{type(e).__name__}: {str(e)[:200]}"
-                response = _api_error(f"upstream_call_failed: {type(e).__name__}: {str(e)[:200]}", status=503)
+                _err_full = err_text(e)
+                raw_err = _extract_error_body(e) or _err_full
+                response = _api_error(f"upstream_call_failed: {_err_full[:300]}", status=503)
                 response["_raw_response"] = raw_err
     else:
         # 级联回退已完成实际调用，用返回的 model 信息构建标识
