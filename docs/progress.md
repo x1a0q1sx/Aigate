@@ -79,3 +79,14 @@
 - ✅ 复现关键证据：直连上游对照组里 `mimo-v2.6-flash:free` 挂 **30s 后零字节掐断**（chunks=0 时 RemoteProtocolError）——上游拿到 200 后静默关闭，属上游/线路偶发（haiku 长文 8/8 全过、gateway 路径 12/12 过）
 - ✅ 真缺陷在**分类表**：`peer closed connection ... incomplete chunked read` / `ServerDisconnected` 不在 `_TRANSIENT_UPSTREAM_RE` → 「首字前自动重试一次」的保护漏判成不可重试、直接透传给客户端。补进正则后，正文未出的掐流会自动原样重试一次（首字后仍如实报错，避免重复输出）；测试锁死 + 部署复验 6/6
 - ⚠️ 部署提醒：本地→GitHub 通道今天明显不稳（直连常 443 拒、SOCKS 偶发 TLS 断），push 必须**循环重试直到看到 `main -> main`**，不能凭一次失败就认为已同步
+
+## Session 6 - 2026-10-10
+### 完成（用户报「09:26:31 tokenharbor/claude-haiku-5.5:free」日志 → 空消息异常 + 重试预算优化，86baa01）
+- ✅ 定性：该请求（request_logs.id=37477，UTC 01:26:31=北京 09:26:31）两次尝试都经代理 7890 → mihomo `🇯🇵|日本-中转 01` 节点，TCP 连上后 TLS 握手阶段被掐（376ms/1658ms 快速失败，错误类型 ConnectError）。mihomo journal 实证两次拨号同节点；同日 10:12 该节点还有一次拨号超时——**代理线路抖动，非网关缺陷、非模型问题**
+- ✅ 真缺陷 1「错误文案不可读」：`error_msg` 落库为 `ConnectError: ` **空消息**——httpcore `map_exceptions` 把 str 为空的底层异常（anyio.BrokenResourceError/EndOfStream）直接包进 ConnectError（本地+服务器双向复现签名）；历史库同类空消息形态（`ReadError: ` / `WriteTimeout: `）各 19 条。新增 `server/core/error_text.py::err_text()`：沿异常链兜底出人话描述 + 传输层异常追加「（本次经代理 <url>）」
+- ✅ 真缺陷 2「重试撞同一线路」：原「首字前重试一次」两次都撞同一抖动线路。新增 `_retry_budget_for()`：快速连接类故障（ConnectError/ProxyError）预算 2 次（重建 httpx 客户端与 TCP 连接，瞬断多为偶发）；流式循环 range(2)→range(3)、非流式 `_same_key_retried` 布尔→`_same_key_retries` 计数。ConnectTimeout 不给额外预算（黑洞型故障每次等满超时，代价太大）
+- ✅ 全链路接入 err_text：v1_router（流式/非流式/auto 级联/combo 失败点）、admin_router（playground 流式+非流式）、passthrough_router（embeddings/images/audio.speech）、model_catalog（刷新 list_models 失败日志）；前端 Dashboard 失败行改显示 error_msg 首行摘要（此前只显示 error_type 如 "upstream_error"，用户看不懂）
+- ✅ 测试 947→956（9 项新增：兜底/预算/瞬态耦合/源码守卫）；部署三验：非流式 200 'ok'（2159ms via 7890）、流式 5 chunks 全过（1939ms via 7891 round-robin 生效）、/admin 引用新 bundle（errBrief）
+- ⚠️ 服务器存量教训：服务器 passthrough_router.py 有未提交的 `/audio/speech` TTS 路由（Moss 媒体工作遗留）→ stash→pull→pop 干净合并，两改动共存已核验
+### 待用户决策（沿用）
+- OpenCode Free 已下架模型（exo-free 等）是否从目录/combo 918 清理
