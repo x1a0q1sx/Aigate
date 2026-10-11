@@ -240,3 +240,54 @@ x-opencode-session: ses_<28 chars>
 **修复**：补 `await` 并记录子进程 pid；加**静态回归测试**（扫 main.py 源码，出现裸 `_aio.create_subprocess_exec` 即红）。部署后守护第一个 tick 即成功拉起：日志「… 尝试启动 → ✓ 已就绪」、4096 监听、`space-bunny-free` 真实会话 finish=stop。
 
 **教训**：`create_subprocess_exec`/`open_connection` 这类「返回协程的工厂函数」在循环里忘 await 完全静默——自检手段是看 `RuntimeWarning: coroutine ... never awaited` 是否出现在 stderr。
+
+## 九、2026-10-11 重大更正：403 的两道真实门是「出口国别」+「agent 工具清单」
+
+**触发**：用户报 `muse-spark-1.3-contributor-free` 调用失败（403 RegionError）。复查发现 10-09 的「按模型分策略」结论**部分是被我们自己的配置误导的**——当时的探针全部用 `aigate` agent（全工具 deny），而 deny 核心工具本身就是 403 触发点。
+
+### 9.1 第一道门：出口 IP 国别（RegionError）
+
+- 服务器直连出口 = 腾讯云上海（CN）；经 mihomo 7890/7891 = 东京（JP）
+- `muse-spark-1.3/1.2-contributor-free` 直连报 `403 RegionError: This model is not available in your country`；**挂代理后即通**
+- 修复：`opencode_bridge.proxy_url` 配置（空=直连）；守护启动与「重启 sidecar」都把 `HTTP(S)_PROXY/ALL_PROXY`（大小写双份）注入 CLI 子进程环境变量；设置页有输入框。生产已设 `http://127.0.0.1:7890`
+- ⚠️ mihomo `AUTO-sabusuku` 是 url-test 每 300s 自动换节点：**换到某些节点时段代理路径反而全失败**（实测 LA 窗口期 muse/space-bunny 全挂、东京窗口期全通）。代理不是万能药，是「国别门 + 节点质量」双重依赖
+
+### 9.2 第二道门：agent 工具清单（FreeTierError「can only be used from within OpenCode」）
+
+**逐项二分实证**（同一模型 muse，代理固定东京）：
+
+| agent 配置 | 结果 |
+|---|---|
+| 单字符串 `permission: "deny"`（旧实现） | ❌ 403 FreeTierError |
+| 对象形式逐工具：仅 deny `bash` | ❌ 403 |
+| 对象形式逐工具：仅 deny `read` | ❌ 403 |
+| 对象形式逐工具：仅 deny `glob` | ✅ 通过 |
+| 对象形式：deny grep/edit/write 等其余 10 项 | ✅ 通过 |
+| agent 名不同 / 提示词不同 | ✅ 无影响 |
+| **核心三件套（bash/read/glob）保持 `ask` + 其余 deny** | ✅ **通过（采用）** |
+
+**判定**：上游检查请求携带的工具清单——把 bash/read 这类核心工具 deny 掉后，请求"不像真 CLI 会话"，第二道门随即 403。名字与提示词无关。
+
+**修复**：`bridge_agent_config` 改为对象形式（核心 ask + 其余 deny）；`_cli_config_problem` 校验新形态，旧配置启动时自动迁移；核心工具的挂起权限请求由既有 `auto_reject_tools` + 停滞检测兜底（不会挂满超时）。
+
+### 9.3 修复后生产实测（2026-10-11，全部 200）
+
+| 模型 | 10-09 判定 | 10-11 实测 |
+|---|---|---|
+| muse-spark-1.3-contributor-free | RegionError | ✅ `4` |
+| muse-spark-1.2-contributor-free | RegionError | ✅ |
+| ling-3.1-flash-free | FreeTierError（被判死） | ✅ `4` |
+| mimo-v2.6-flash-free | FreeTierError（被判死） | ✅ `4` |
+| nemotron-3-ultra-free | FreeTierError（被判死） | ✅ `4` |
+| longcat-2.5-preview-free | FreeTierError（被判死） | ✅ `4` |
+| space-bunny-free | ✅（回归） | ✅ `4` |
+
+流式路径同样验证通过（muse 流式返回 `1\n2\n3\n4\n5` + finish=stop）。
+
+**教训**：判「上游封了某模型」前，先排除**我们自己的请求形态**（agent 定义/工具清单）——本次 6 个「被上游判死」的模型实际全部可用，是网关侧配置触发的误伤。
+
+### 9.4 顺带修复：free_tier 非流式成功漏写完成日志
+
+实证：muse 非流式成功返回 200，`request_logs` 行永远卡 `pending`。根因：请求开始预落 pending 行，本路径只写路由决策、没写完成日志——流式有 `_write_stream_log`、错误有 `_early_error_log`，唯独成功路径没有写入者，只能等 30 分钟清扫。修复：成功分支补 `enqueue_log`（usage 归一化 + 服务商 id/名称 + 代理字段），原位收尾。静态回归测试锁死。
+
+**限流提醒（复证）**：高频试探（本次上百次）会触发上游临时 429 `FreeUsageLimitError`，**所有**模型一律 429、与配置无关；静置数分钟自愈。生产验证请节制，避免把限流误判为修复失败。

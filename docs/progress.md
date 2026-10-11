@@ -90,3 +90,16 @@
 - ⚠️ 服务器存量教训：服务器 passthrough_router.py 有未提交的 `/audio/speech` TTS 路由（Moss 媒体工作遗留）→ stash→pull→pop 干净合并，两改动共存已核验
 ### 待用户决策（沿用）
 - OpenCode Free 已下架模型（exo-free 等）是否从目录/combo 918 清理
+
+## Session 7 - 2026-10-11
+### 完成（用户报「OpenCode 调用了一下还是失败」→ 双层根因定性 + 全线打通，966876f/fdadac9/4fe4cdd）
+- ✅ 定性第一道门「出口 IP 国别」：最新失败行 id=39834 muse-spark-1.3-contributor-free 报 `403 RegionError: This model is not available in your country`。服务器直连出口=腾讯云上海(CN)、经 mihomo=东京(JP)；CLI 挂代理后 muse/ling/mimo/nemotron/step-5 **全部打通**。实现 `opencode_bridge.proxy_url`（守护与重启接口都注入大小写双份代理 env；设置页输入框；GET /opencode effective 暴露）；生产已设 7890
+- ✅ 定性第二道门「agent 工具清单」（**推翻 10-09「按模型分策略」部分结论**）：逐项二分实证——单字符串 `permission:"deny"`（旧实现）或 deny `bash`/`read` 任一核心工具 → 403 FreeTierError "can only be used from within OpenCode"；deny glob/grep/edit/write 等无害；agent 名/提示词无害。**核心三件套（bash/read/glob）保持 ask + 其余 deny 即放行**。修复 `bridge_agent_config` 为对象形态、`_cli_config_problem` 校验新形态（旧配置启动自动迁移）
+- ✅ 修复后生产实测 7/7 全通（muse 1.2/1.3、ling-3.1、mimo-v2.6、nemotron-3-ultra、longcat-2.5、space-bunny 回归），非流式 + 流式双验
+- ✅ 顺带修复真 bug：free_tier 非流式成功路径**漏写完成日志**——muse 成功 200 但 request_logs 行永远 pending（流式有 _write_stream_log、错误有 _early_error_log，唯独成功路径没写入者）；补 enqueue_log + 静态回归测试
+- ⚠️ mihomo `AUTO-sabusuku` url-test 每 300s 换节点：LA 窗口期代理路径反而全失败（muse/space-bunny 全挂）、东京窗口期全通——代理不是万能药，国别门 + 节点质量双重依赖
+- ⚠️ 复证限流：本次上百次试探触发上游 429 FreeUsageLimitError（所有模型一律 429、与配置无关，静置自愈）；生产验证要节制
+- ✅ 测试 956→963（proxy 4 + 权限形态 6 - 旧断言替换 + 日志回归 1）；三端同步（本地/GitHub/服务器 = 4fe4cdd），前端 bundle index-D3YYIJb-.js 已含代理输入框
+### 教训（长期有效）
+- **判「上游封了某模型」前先排除自己的请求形态**：6 个被 10-09 判死的模型实际全部可用，是网关 agent 配置（deny 核心工具）触发的误伤
+- 免费层这类「真 CLI 会话」校验是**多层组合**：出口国别 + 工具清单 + 会话前缀（9-22 结论），任何一层不满足都可能以不同错误包装出现
