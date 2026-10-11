@@ -983,3 +983,27 @@ def test_redact_text_masks_secrets():
     # 非字符串/短文本原样
     assert redact_text(123) == 123
     assert redact_text("short") == "short"
+
+
+# ===================== free_tier 非流式成功必须收尾日志（2026-10-11） =====================
+
+def test_free_tier_nonstream_success_writes_completion_log():
+    """free_tier 非流式成功路径必须落完成日志。
+
+    2026-10-11 实证：muse-spark 成功返回 200，但 request_logs 行永远卡 pending
+    ——请求开始预落 pending 行，本路径此前只写路由决策、没写完成日志，
+    没有别的写入者会去原位更新它（流式有 _write_stream_log、错误有
+    _early_error_log，唯独成功路径漏了）。
+    """
+    import pathlib
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "server" / "api" /
+           "v1_router.py").read_text(encoding="utf-8")
+    # 定位 free_tier 非流式成功分支：execute_non_stream 之后的 success 收尾
+    idx = src.index("data = await free_exec.execute_non_stream(free_req)")
+    tail = src[idx: idx + 3500]
+    assert "enqueue_log" in tail, \
+        "free_tier 非流式成功路径必须调用 enqueue_log 收尾 pending 行"
+    assert 'status="success"' in tail, "完成日志应为 success 状态"
+    # 流式路径的收尾（_write_stream_log）与错误路径（_early_error_log）保持存在
+    assert "_write_stream_log" in src and "_early_error_log" in src

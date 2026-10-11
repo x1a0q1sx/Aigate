@@ -2460,6 +2460,35 @@ async def _chat_completions_impl(
                             _free_latency = int((time.time() - _free_started) * 1000)
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=0, latency_ms=_free_latency)
                             await _decision_finish(conversation_id, status="success", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency)
+                            # 成功也要收尾请求日志：请求开始预落的 pending 行必须原位更新，
+                            # 否则该行永远挂 pending（2026-10-11 实证：muse 成功返回但日志
+                            # 卡待响应——本路径此前只写了路由决策，没写完成日志）。
+                            try:
+                                from server.core.log_queue import enqueue_log as _enq_free
+                                _fu = _normalize_usage((data or {}).get("usage") or {}) if isinstance(data, dict) else None
+                                _fpt = int(getattr(_fu, "prompt_tokens", 0) or 0) if _fu else 0
+                                _fct = int(getattr(_fu, "completion_tokens", 0) or 0) if _fu else 0
+                                _fcrd = _fcwt = None
+                                if _fu is not None:
+                                    _fcrd = int(getattr(_fu, "cache_read_tokens", 0) or 0) or None
+                                    _fcwt = int(getattr(_fu, "cache_write_tokens", 0) or 0) or None
+                                await _enq_free(
+                                    conversation_id=conversation_id,
+                                    requested_model=request.model,
+                                    routed_provider=provider.name,
+                                    routed_provider_id=getattr(provider, "id", None),
+                                    routed_model=model.model_id,
+                                    status="success",
+                                    latency_ms=_free_latency,
+                                    prompt_tokens=_fpt,
+                                    completion_tokens=_fct,
+                                    cache_read_tokens=_fcrd,
+                                    cache_write_tokens=_fcwt,
+                                    user_ip=_real_client_ip(raw_request, getattr(config.security, 'trust_proxy_headers', False)),
+                                    **_proxy_log_fields(),
+                                )
+                            except Exception:
+                                pass
                             return JSONResponse(content=data)
                         except Exception as e:
                             _free_latency = int((time.time() - _free_started) * 1000)
