@@ -704,3 +704,44 @@ def test_guard_subprocess_spawn_is_awaited():
     assert not bad, "create_subprocess_exec 未 await（守护拉不起子进程）"
     guarded = re.findall(r"await\s+_aio\.create_subprocess_exec", src)
     assert guarded, "守护应存在 await 的子进程启动"
+
+
+# ─────────────────── 出口代理（2026-10-11：RegionError 根治） ───────────────────
+# 背景：部分免费模型按请求出口 IP 判国别（CN 直连出口报 RegionError /
+# 变体 FreeTierError；挂日本节点代理后 muse/ling/mimo/nemotron/step-5 全通）。
+# 实现 = opencode_bridge.proxy_url → sidecar 子进程注入标准代理环境变量。
+
+def test_bridge_config_has_proxy_url_default_empty():
+    """配置默认直连（proxy_url 空串），老 config.yaml 无该字段也能加载。"""
+    from server.config import OpenCodeBridgeConfig
+    assert OpenCodeBridgeConfig().proxy_url == ""
+
+
+def test_guard_injects_proxy_env_when_configured():
+    """守护拉起 sidecar 时：配置了 proxy_url 必须把代理注入子进程环境变量。"""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "server" / "main.py").read_text(
+        encoding="utf-8")
+    assert 'proxy_url' in src, "守护应读取 opencode_bridge.proxy_url"
+    assert 'HTTP_PROXY' in src and 'HTTPS_PROXY' in src and 'ALL_PROXY' in src, \
+        "守护应注入大写代理环境变量"
+    assert 'http_proxy' in src and 'https_proxy' in src, "守护应同时注入小写代理环境变量"
+    assert 'env=_env' in src, "代理环境变量应传给 create_subprocess_exec"
+
+
+def test_restart_endpoint_injects_proxy_env():
+    """设置页「重启 sidecar」同样要带代理（否则改代理后点重启仍是直连）。"""
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1] / "server" / "api" /
+           "admin_ops_router.py").read_text(encoding="utf-8")
+    assert 'proxy_url' in src, "重启接口应读取 proxy_url"
+    assert 'HTTP_PROXY' in src and 'HTTPS_PROXY' in src, "重启接口应注入代理环境变量"
+    assert 'env=env' in src, "代理环境变量应传给 create_subprocess_exec"
+
+
+def test_bridge_model_accepts_proxy_url():
+    """PUT /admin/api/opencode 的 body 模型需接受 proxy_url（否则保存被静默丢弃）。"""
+    from server.api.admin_ops_router import OpenCodeBridgeModel
+    m = OpenCodeBridgeModel(proxy_url="http://127.0.0.1:7890")
+    assert m.proxy_url == "http://127.0.0.1:7890"
+    assert OpenCodeBridgeModel().proxy_url is None  # 未传 = 不修改（exclude_unset 语义）

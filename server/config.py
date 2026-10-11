@@ -247,6 +247,11 @@ class OpenCodeBridgeConfig(BaseModel):
     # 而 CLI 默认 permission=ask 会无限期等待人工批准 → 消息永不 completed → 网关超时。
     # 开启后自动拒绝挂起的权限请求，CLI 立刻收到工具错误并继续把答案写完。
     auto_reject_tools: bool = True
+    # sidecar 出口代理：部分免费模型按请求出口 IP 判国别（RegionError /
+    # FreeTierError「can only be used from within OpenCode」在 CN 直连出口下同样出现）。
+    # 填 http://127.0.0.1:7890 这类地址即让 CLI 子进程走代理；留空 = 直连。
+    # 改动需重启 sidecar 生效（设置页有按钮）。
+    proxy_url: str = ""
 
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)

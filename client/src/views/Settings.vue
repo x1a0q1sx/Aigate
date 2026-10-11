@@ -273,11 +273,17 @@
         <label>sidecar 地址<input v-model.trim="oc.base_url" placeholder="http://127.0.0.1:4096" /></label>
         <label>监听端口<input v-model.number="oc.port" type="number" min="1" max="65535" /></label>
         <label>CLI 路径（留空自动探测）<input v-model.trim="oc.bin_path" placeholder="~/opencode/bin/opencode" /></label>
+        <label>出口代理（留空直连，改后需重启 sidecar）<input v-model.trim="oc.proxy_url" placeholder="http://127.0.0.1:7890" /></label>
       </div>
       <p class="field-hint" style="margin-top: 4px;">
         「自动拒绝挂起的工具权限」= 客户端把编码 agent 的 system prompt 发过来时，模型会去调 bash/glob，
         而 CLI 默认要人工批准 → 无人值守会一直等到超时（表现为 180s 后报「等待回复超时」）。
         开启后网关自动拒绝，模型立刻改用文本作答。
+      </p>
+      <p class="field-hint" style="margin-top: 4px;">
+        「出口代理」= 部分免费模型按请求出口 IP 判国别（如 muse-spark 报 RegionError
+        "not available in your country"）。服务器直连出口在境内时，填代理地址
+        （如 <code class="mono">http://127.0.0.1:7890</code>）可解开地区限制；改后点「重启 sidecar」生效。
       </p>
       <p class="field-hint" v-if="ocStatus?.agent_note">
         CLI agent：{{ ocStatus.agent_note }}
@@ -365,7 +371,7 @@ export default {
       oc: {
         enabled: true, timeout_seconds: 180, poll_interval_ms: 600, stall_grace_seconds: 20,
         agent: 'aigate', base_url: 'http://127.0.0.1:4096', port: 4096, bin_path: '',
-        auto_start: true, manage_agent_config: true, auto_reject_tools: true,
+        auto_start: true, manage_agent_config: true, auto_reject_tools: true, proxy_url: '',
       },
       ocStatus: null,
       ocSaving: false,

@@ -412,6 +412,7 @@ class OpenCodeBridgeModel(BaseModel):
     auto_start: Optional[bool] = None
     manage_agent_config: Optional[bool] = None
     auto_reject_tools: Optional[bool] = None
+    proxy_url: Optional[str] = None
 
 
 @router.get("/opencode")
@@ -446,6 +447,7 @@ async def get_opencode_bridge():
                 "stall_grace_seconds": int(sc.stall_grace_seconds()),
                 "agent": sc.sidecar_agent(),
                 "auto_reject_tools": sc.auto_reject_tools(),
+                "proxy_url": (getattr(bridge, "proxy_url", "") or "").strip(),
             },
         },
     }
@@ -477,6 +479,8 @@ async def put_opencode_bridge(body: OpenCodeBridgeModel):
         patch["agent"] = (patch["agent"] or "").strip()
     if "base_url" in patch:
         patch["base_url"] = (patch["base_url"] or "").strip()
+    if "proxy_url" in patch:
+        patch["proxy_url"] = (patch["proxy_url"] or "").strip()
     for k, v in patch.items():
         setattr(bridge, k, v)
     save_config()
@@ -518,14 +522,25 @@ async def restart_opencode_bridge():
         raise HTTPException(status_code=400, detail="未找到 opencode 可执行文件（可设置 bin_path）")
     if bridge.manage_agent_config:
         sc.ensure_bridge_agent_config()
+    # sidecar 出口代理：部分免费模型按出口 IP 判国别（RegionError / 变体
+    # FreeTierError），配置了 proxy_url 就注入标准代理环境变量给 CLI 子进程。
+    env = None
+    proxy = (getattr(bridge, "proxy_url", "") or "").strip()
+    if proxy:
+        import os as _os_env
+        env = dict(_os_env.environ)
+        env["HTTP_PROXY"] = env["HTTPS_PROXY"] = env["ALL_PROXY"] = proxy
+        env["http_proxy"] = env["https_proxy"] = env["all_proxy"] = proxy
     await _aio.create_subprocess_exec(
         exe, "serve", "--port", str(int(bridge.port)), "--hostname", "127.0.0.1",
         stdout=_aio.subprocess.DEVNULL, stderr=_aio.subprocess.DEVNULL,
-        start_new_session=True)
+        start_new_session=True, env=env)
     await _aio.sleep(8)
     alive = await sc.sidecar_alive()
     return {"ok": alive, "sidecar_alive": alive,
-            "detail": "sidecar 已重启" if alive else "启动后仍不可用，请检查 CLI 是否可执行"}
+            "proxy": proxy or None,
+            "detail": "sidecar 已重启" + (f"（经代理 {proxy}）" if proxy else "")
+                      if alive else "启动后仍不可用，请检查 CLI 是否可执行"}
 
 
 @router.post("/notify/test")
