@@ -352,7 +352,9 @@ async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_m
     2) 偶发把**历史会话内容**带出（首轮实测见过返回无关的 "## Intuition ... linked list"），
        故 assistant 必须 created ≥ 本次提问时间。
     3) **工具调用会占满整轮**：客户端 system prompt 若是编码 agent 模板，模型会去调工具。
-       agent 已把工具权限全 deny（减少发生），但一旦发生，腿会停在 `finish=tool-calls`
+       agent 侧核心工具（bash/read/glob）保持 ask、其余 deny（2026-10-11 实证：核心工具
+       全 deny 会触发上游 403，见 bridge_agent_config），故核心工具仍可能发起调用；
+       一旦发生，腿会停在 `finish=tool-calls`
        且正文为空——CLI 会继续产出下一条腿，需要整轮归并（见 _merge_turn）。
     4) **权限挂起是最坏情况**：腿永远缺 time.completed。实测 `reply: reject` 只清掉挂起请求、
        **并不会让生成继续**；只有 `interrupt` 能让它收尾。故这里用「停滞检测 + interrupt
