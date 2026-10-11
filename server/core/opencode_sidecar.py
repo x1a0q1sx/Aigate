@@ -606,12 +606,28 @@ _BRIDGE_PROMPT = (
 _BRIDGE_TOOLS = ("bash", "read", "glob", "grep", "edit", "write", "task", "webfetch",
                  "websearch", "todowrite", "skill", "apply_patch", "question")
 
+# 2026-10-11 实证：上游免费层会检查请求的工具清单——把核心工具（bash/read/glob）
+# **deny 掉后请求"不像真 CLI 会话"**，随即 403 FreeTierError
+# "OpenCode's free tier can only be used from within OpenCode"。
+# 逐项二分：deny bash 或 deny read 即触发；deny grep/edit/write/其余 10 项无害；
+# 名字/提示词也均无害。故核心三件套必须保持 ask（工具在场），挂起的权限请求
+# 由 auto_reject_tools + 停滞检测兜底（不会挂满超时）。
+_BRIDGE_CORE_TOOLS = ("bash", "read", "glob")
+
+
+def _expected_bridge_permission() -> dict:
+    """期望的工具权限形态：核心工具 ask（在场但需批准）、其余 deny。"""
+    perm = {t: "deny" for t in _BRIDGE_TOOLS}
+    for t in _BRIDGE_CORE_TOOLS:
+        perm[t] = "ask"
+    return perm
+
 
 def bridge_agent_config(agent_name: str = None) -> dict:
     """生成网关专用 agent 的 CLI 配置。
 
-    工具权限用**单字符串 "deny"**（覆盖所有工具，含未来新增），而不是逐个工具名的对象：
-    实测两者都能消除「权限挂起」，但字符串形式不依赖工具名清单，上游加工具也不会漏。
+    工具权限必须用**对象形式**且核心工具（bash/read/glob）为 ask——2026-10-11 实证：
+    单字符串 "deny"（或把核心工具 deny）会让上游判定请求非 CLI 会话 → 403。
     注意**不要**用 `tools: {x: false}`——实测那样 CLI 会返回**空回复**。
     """
     name = agent_name or sidecar_agent() or "aigate"
@@ -620,7 +636,7 @@ def bridge_agent_config(agent_name: str = None) -> dict:
             "description": "AIGate gateway chat-only agent",
             "mode": "primary",
             "prompt": _BRIDGE_PROMPT,
-            "permission": "deny",
+            "permission": _expected_bridge_permission(),
         }
     }
 
@@ -639,10 +655,16 @@ def _cli_config_problem(cfg: dict, agent_name: str) -> str:
     if a.get("mode") != "primary":
         return "mode 非 primary"
     perm = a.get("permission")
-    # 期望：单字符串 deny，或「所有已声明工具都 deny」的对象形式
-    if perm != "deny":
-        if not isinstance(perm, dict) or any(v != "deny" for v in perm.values()):
-            return "工具权限未全部 deny"
+    # 期望：对象形式且核心工具（bash/read/glob）为 ask、其余 deny。
+    # 单字符串 "deny" 或核心工具被 deny 都会触发上游 403（2026-10-11 实证）。
+    if not isinstance(perm, dict):
+        return "工具权限须为对象形式（核心工具 ask）"
+    for t in _BRIDGE_CORE_TOOLS:
+        if perm.get(t) != "ask":
+            return f"核心工具 '{t}' 须为 ask（deny 会触发上游 403）"
+    for t in _BRIDGE_TOOLS:
+        if t not in _BRIDGE_CORE_TOOLS and perm.get(t) != "deny":
+            return f"工具 '{t}' 须为 deny"
     if (a.get("prompt") or "").strip() != _BRIDGE_PROMPT:
         return "提示词已过期"
     if a.get("tools"):

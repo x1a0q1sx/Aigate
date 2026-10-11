@@ -565,18 +565,25 @@ async def test_close_session_uses_unprefixed_path(monkeypatch):
     assert not calls[0].endswith("/api/session/ses_1")
 
 
-def test_bridge_agent_config_denies_all_tools():
-    """CLI agent 定义：权限用单字符串 deny（覆盖所有工具，含未来新增）。
+def test_bridge_agent_config_keeps_core_tools_ask():
+    """CLI agent 定义：核心工具（bash/read/glob）必须 ask、其余 deny。
 
-    实测要点：
-    - 对象形式 {工具名: "deny"} 也能消除挂起，但依赖工具名清单；
-    - 单字符串 "deny" 覆盖面更全，故采用它；
-    - **不能**用 tools:{x:false}——实测那样 CLI 会返回空回复。
+    2026-10-11 实证：上游免费层检查请求的工具清单——核心工具被 deny 后
+    请求"不像真 CLI 会话"，403 FreeTierError "can only be used from within
+    OpenCode"。逐项二分：deny bash / deny read 即触发；名字与提示词无害。
+    核心工具保持 ask 后，挂起权限由 auto_reject_tools + 停滞检测兜底。
+    另注：**不能**用 tools:{x:false}——实测那样 CLI 会返回空回复。
     """
     cfg = sc.bridge_agent_config("aigate")
     a = cfg["aigate"]
     assert a["mode"] == "primary"
-    assert a["permission"] == "deny"
+    perm = a["permission"]
+    assert isinstance(perm, dict), "必须是对象形式（单字符串 deny 会触发 403）"
+    for t in ("bash", "read", "glob"):
+        assert perm[t] == "ask", f"核心工具 {t} 必须 ask"
+    for t in ("grep", "edit", "write", "task", "webfetch", "websearch",
+              "todowrite", "skill", "apply_patch", "question"):
+        assert perm[t] == "deny", f"工具 {t} 应 deny"
     assert "tools" not in a, "tools 开关会导致空回复"
 
 
@@ -584,15 +591,34 @@ def test_cli_config_problem_detects_tools_switch():
     """tools 显式开关必须被判为「需要修正」（它会让回复变空）。"""
     cfg = {"agent": {"aigate": {
         "mode": "primary", "prompt": sc._BRIDGE_PROMPT,
-        "permission": "deny", "tools": {"bash": False}}}}
+        "permission": sc._expected_bridge_permission(), "tools": {"bash": False}}}}
     assert "tools" in sc._cli_config_problem(cfg, "aigate")
 
 
-def test_cli_config_problem_accepts_object_deny():
-    """对象形式全 deny 视为合规（用户手写的等价配置不该被反复改写）。"""
+def test_cli_config_problem_rejects_string_deny():
+    """单字符串 "deny" 必须被判为「需要修正」——它会触发上游 403（2026-10-11 实证）。"""
     cfg = {"agent": {"aigate": {
         "mode": "primary", "prompt": sc._BRIDGE_PROMPT,
-        "permission": {"bash": "deny", "read": "deny"}}}}
+        "permission": "deny"}}}
+    problem = sc._cli_config_problem(cfg, "aigate")
+    assert problem and "对象形式" in problem
+
+
+def test_cli_config_problem_rejects_denied_core_tool():
+    """核心工具被 deny（上游 403 触发点）必须判为「需要修正」。"""
+    perm = sc._expected_bridge_permission()
+    perm["bash"] = "deny"
+    cfg = {"agent": {"aigate": {
+        "mode": "primary", "prompt": sc._BRIDGE_PROMPT, "permission": perm}}}
+    problem = sc._cli_config_problem(cfg, "aigate")
+    assert problem and "bash" in problem
+
+
+def test_cli_config_problem_accepts_expected_permission():
+    """期望形态（核心 ask + 其余 deny）视为合规（不反复改写）。"""
+    cfg = {"agent": {"aigate": {
+        "mode": "primary", "prompt": sc._BRIDGE_PROMPT,
+        "permission": sc._expected_bridge_permission()}}}
     assert sc._cli_config_problem(cfg, "aigate") == ""
 
 
@@ -604,18 +630,20 @@ def test_ensure_bridge_agent_config_writes_and_is_idempotent(tmp_path):
     assert ok, note
     cfg = _json.loads(p.read_text(encoding="utf-8"))
     assert cfg["agent"]["aigate"]["mode"] == "primary"
-    assert cfg["agent"]["aigate"]["permission"] == "deny"
+    perm = cfg["agent"]["aigate"]["permission"]
+    assert perm["bash"] == "ask" and perm["edit"] == "deny"
     # ② 再跑一次 → 保持就绪且不重复写
     before = p.read_text(encoding="utf-8")
     ok2, note2 = sc.ensure_bridge_agent_config("aigate", path=str(p))
     assert ok2 and "已就绪" in note2
     assert p.read_text(encoding="utf-8") == before
-    # ③ 工具权限被改坏 → 自动修回
-    cfg["agent"]["aigate"]["permission"] = {"bash": "ask"}
+    # ③ 工具权限被改坏（旧的单字符串 deny）→ 自动修回期望形态
+    cfg["agent"]["aigate"]["permission"] = "deny"
     p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
     ok3, _ = sc.ensure_bridge_agent_config("aigate", path=str(p))
     assert ok3
-    assert _json.loads(p.read_text(encoding="utf-8"))["agent"]["aigate"]["permission"] == "deny"
+    fixed = _json.loads(p.read_text(encoding="utf-8"))["agent"]["aigate"]["permission"]
+    assert fixed["bash"] == "ask", "旧单字符串 deny 配置应被自动迁移"
     # ④ 被塞进 tools 开关（会导致空回复）→ 也要修掉
     cfg["agent"]["aigate"]["tools"] = {"bash": False}
     p.write_text(_json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
