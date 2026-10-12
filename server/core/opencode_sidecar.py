@@ -342,6 +342,31 @@ def _turn_signature(st: dict) -> str:
     return ";".join(parts)
 
 
+def _turn_in_tool_wait(st: dict) -> bool:
+    """本轮是否卡在「工具阶段」——只有这种停滞才允许 interrupt 收尾。
+
+    必须区分两种「长时间无进展」：
+    - **工具阶段停滞**（finish=tool-calls，或腿里有未完成的 tool part）：无人值守下
+      权限请求永远不会被批准、工具结果永远等不到 → 必须 interrupt 收尾（否则挂满
+      deadline）。
+    - **普通生成缓慢**（慢模型/长思考）：CLI 的 message API 在生成中会**长时间无任何
+      增量**，随后一次性 flush。2026-10-12 实测：鹈鹕长动画在 70s 内 message API 完全
+      无进度（仅空 reasoning part），140s 时才一次性给出 24k 字符。旧逻辑在 20s 停滞
+      即 interrupt，误杀真实生成，上游报 "Provider turn interrupted" —— 长输出
+      （代码/长文）全被截死。
+    """
+    last = st.get("last") or {}
+    if (last.get("finish") or "") == "tool-calls":
+        return True
+    for c in (last.get("content") or []):
+        if not isinstance(c, dict) or c.get("type") != "tool":
+            continue
+        status = ((c.get("state") or {}).get("status") or "").lower()
+        if status not in ("completed", "error"):
+            return True
+    return False
+
+
 async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_ms: int,
                                  poll_interval: float = None, deadline_s: float = None) -> dict:
     """轮询到「本轮回复彻底结束」，返回整轮状态 dict（见 _turn_state）。
@@ -357,8 +382,12 @@ async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_m
        一旦发生，腿会停在 `finish=tool-calls`
        且正文为空——CLI 会继续产出下一条腿，需要整轮归并（见 _merge_turn）。
     4) **权限挂起是最坏情况**：腿永远缺 time.completed。实测 `reply: reject` 只清掉挂起请求、
-       **并不会让生成继续**；只有 `interrupt` 能让它收尾。故这里用「停滞检测 + interrupt
-       收尾」，确保任何情况下都能在有限时间内返回，而不是干等到 deadline。
+       **并不会让生成继续**；只有 `interrupt` 能让它收尾。故这里用「**工具阶段**停滞检测 +
+       interrupt 收尾」，确保任何情况下都能在有限时间内返回，而不是干等到 deadline。
+       ⚠️ 2026-10-12 修正：停滞判定必须区分「工具阶段」与「普通慢生成」——CLI 的
+       message API 在正常生成中会长时间零增量（实测 70s），旧逻辑 20s 即 interrupt，
+       把长输出（代码/长文）误杀成 "Provider turn interrupted"。现仅在
+       `_turn_in_tool_wait`（finish=tool-calls 或末腿有未完成 tool part）时才 interrupt。
     """
     interval = poll_interval if poll_interval is not None else sidecar_poll_interval()
     timeout = deadline_s if deadline_s is not None else sidecar_timeout()
@@ -390,11 +419,17 @@ async def _await_assistant_state(client: httpx.AsyncClient, sid: str, *, since_m
                     elif not st["pending"] and st["finish"] in _STOP_FINISH:
                         return st               # 正常收尾（含 error）
                     elif time.monotonic() - last_change > stall_grace:
-                        # 停滞：先 interrupt 收尾，拿回已有内容
-                        if not interrupted and await interrupt_session(client, sid):
+                        if not _turn_in_tool_wait(st):
+                            # 普通慢生成：CLI 的 message API 长时间无增量是常态
+                            # （2026-10-12 实测：长动画 70s 无进度、140s 一次性 flush
+                            # 24k 字符）。旧逻辑在此 interrupt → 误杀长输出，上游报
+                            # "Provider turn interrupted"。此处不打断，等 deadline 兜底。
+                            pass
+                        # 工具阶段停滞：先 interrupt 收尾，拿回已有内容
+                        elif not interrupted and await interrupt_session(client, sid):
                             interrupted = True
                             last_change = time.monotonic()
-                            logger.info("opencode sidecar: 本轮停滞，已 interrupt 收尾")
+                            logger.info("opencode sidecar: 本轮停滞在工具阶段，已 interrupt 收尾")
                         else:
                             # interrupt 也没进展（或已被拒）→ 不再空等
                             logger.info(

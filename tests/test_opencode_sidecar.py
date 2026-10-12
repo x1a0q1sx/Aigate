@@ -425,6 +425,94 @@ def test_turn_signature_changes_with_progress():
     assert sc._turn_signature(sc._turn_state(base, since_ms=1000)) == s1
 
 
+def test_turn_in_tool_wait_only_for_tool_phases():
+    """工具阶段判定：只有 finish=tool-calls 或末腿有未完成 tool part 才可 interrupt。
+
+    2026-10-12 实证：普通慢生成（长动画/长文）在 CLI message API 上会长时间零增量
+    （实测 70s），若按「停滞」误判 interrupt，上游报 "Provider turn interrupted"，
+    长输出全被截死。此函数是「误杀防线」。
+    """
+    # 慢生成：有 created、无 completed、无 tool part、finish 为空 → 不算工具阶段
+    slow = sc._turn_state([
+        {"type": "assistant", "id": "a1", "time": {"created": 2100},
+         "content": [{"type": "reasoning", "text": ""}]},
+    ], since_ms=1000)
+    assert sc._turn_in_tool_wait(slow) is False
+
+    # tool-calls 收尾（有 completed）→ 工具阶段
+    tool_calls = sc._turn_state([
+        {"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 2200},
+         "finish": "tool-calls", "content": [{"type": "tool", "name": "bash"}]},
+    ], since_ms=1000)
+    assert sc._turn_in_tool_wait(tool_calls) is True
+
+    # 末腿带未完成 tool part（权限挂起态，无 finish）→ 工具阶段
+    pending_tool = sc._turn_state([
+        {"type": "assistant", "id": "a1", "time": {"created": 2100},
+         "content": [{"type": "reasoning", "text": "让我跑一下"},
+                     {"type": "tool", "name": "bash", "state": {"status": "pending"}}]},
+    ], since_ms=1000)
+    assert sc._turn_in_tool_wait(pending_tool) is True
+
+    # tool part 已完成 → 不算挂起（模型在正常续写）
+    done_tool = sc._turn_state([
+        {"type": "assistant", "id": "a1", "time": {"created": 2100},
+         "content": [{"type": "tool", "name": "bash", "state": {"status": "completed"}}]},
+    ], since_ms=1000)
+    assert sc._turn_in_tool_wait(done_tool) is False
+
+
+@pytest.mark.asyncio
+async def test_await_assistant_does_not_interrupt_slow_generation(monkeypatch):
+    """回归（2026-10-12）：慢生成期间停滞**不得** interrupt——等它自然收尾。
+
+    现场：鹈鹕长动画提示词在 CLI 里正常生成（140s、24k 字符），但 message API 前
+    70s 完全无增量。旧逻辑 20s 停滞即 interrupt → CLI 报 "Provider turn interrupted"，
+    长输出全灭。修复后：无工具痕迹的停滞只等待，模型最终一次性 flush 出完整文本。
+    """
+    monkeypatch.setattr(sc, "auto_reject_tools", lambda: True)
+    monkeypatch.setattr(sc, "sidecar_poll_interval", lambda: 0.01)
+    # 把停滞容忍压到很小（测试态），验证即便停滞判定触发也不会 interrupt
+    monkeypatch.setattr(sc, "stall_grace_seconds", lambda: 0.05)
+    state = {"interrupted": 0, "polls": 0}
+
+    class FakeResp:
+        status_code = 200
+        def __init__(self, payload=None):
+            self._p = payload or {}
+        def json(self):
+            return self._p
+
+    class FakeClient:
+        async def get(self, url):
+            if "/permission" in url:
+                return FakeResp({"data": []})
+            state["polls"] += 1
+            if state["polls"] < 8:
+                # 前若干轮：慢生成中（空 reasoning、无 finish、无 tool）
+                return FakeResp({"data": [
+                    {"type": "assistant", "id": "a1", "time": {"created": 2100},
+                     "content": [{"type": "reasoning", "text": ""}]},
+                ]})
+            # 最终一次性 flush 完整正文
+            return FakeResp({"data": [
+                {"type": "assistant", "id": "a1", "time": {"created": 2100, "completed": 9999},
+                 "finish": "stop",
+                 "content": [{"type": "reasoning", "text": "想好了"},
+                             {"type": "text", "text": "<html>长动画</html>"}]},
+            ]})
+        async def post(self, url, json=None):
+            if url.endswith("/interrupt"):
+                state["interrupted"] += 1
+            return FakeResp()
+
+    st = await sc._await_assistant_state(FakeClient(), "sid", since_ms=1000,
+                                         poll_interval=0.01, deadline_s=30)
+    assert state["interrupted"] == 0, "慢生成不得被 interrupt（会触发上游 Provider turn interrupted）"
+    assert st["finish"] == "stop"
+    assert sc._pick_text(st)[0] == "<html>长动画</html>"
+
+
 @pytest.mark.asyncio
 async def test_chat_completion_raises_on_empty_turn(monkeypatch):
     """空结果必须显式失败（否则 combo/auto 会把空壳当成功锁定该候选）。"""
