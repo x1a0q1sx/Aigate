@@ -177,6 +177,7 @@ export default {
       st.abort = abort
       let buf = ''
       let served = ''
+      let reasoning = ''
       try {
         const stream = await apiStream('/admin/api/playground', {
           model: reqModel,
@@ -204,11 +205,12 @@ export default {
                 continue
               }
               if (obj && obj.model) served = obj.model
-              const delta = obj?.choices?.[0]?.delta?.content || ''
-              if (delta) {
-                buf += delta
+              const delta = obj?.choices?.[0]?.delta || {}
+              if (delta.content) {
+                buf += delta.content
                 st.chars = buf.length
               }
+              if (delta.reasoning_content) reasoning += delta.reasoning_content
             }
           }
         }
@@ -220,9 +222,14 @@ export default {
         consume(decoder.decode())          // 冲刷解码器尾字节
         if (pending) consume('\n\n')       // 末事件可能无尾随空行
         st.served = served || reqModel
-        st.raw = buf
+        st.raw = buf || reasoning
         st.elapsed = ((Date.now() - startedAt) / 1000).toFixed(1)
-        if (!buf.trim()) throw new Error(streamError || '模型没有返回任何内容')
+        if (!buf.trim()) {
+          // 只有思考没有正文：OpenCode 类慢模型常见（长时间规划后撞上网关超时）
+          throw new Error(streamError || (reasoning
+            ? `模型只输出思考、没有正文（${this.fmtNum(reasoning.length)} 字符思考，可能是生成太慢撞到超时）。可查看下方原始输出，或换一个模型重试`
+            : '模型没有返回任何内容'))
+        }
         const html = extractHtml(buf)
         st.html = html
         if (streamError) {
@@ -239,8 +246,8 @@ export default {
         st.done = true
       } catch (e) {
         if (e?.name === 'AbortError') {
-          st.note = '已取消（已生成 ' + this.fmtNum(buf.length) + ' 字符）'
-          st.raw = buf
+          st.note = '已取消（已生成 ' + this.fmtNum(buf.length || reasoning.length) + ' 字符）'
+          st.raw = buf || reasoning
         } else {
           st.error = String(e?.message || e)
         }

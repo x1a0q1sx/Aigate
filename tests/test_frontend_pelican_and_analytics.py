@@ -43,6 +43,13 @@ def test_pelican_uses_stream_and_extracts_html():
     assert "<!DOCTYPE" in src and "<svg" in src
 
 
+def test_pelican_captures_reasoning_for_timeout_diagnosis():
+    """慢模型只有思考没有正文时，必须能提示「生成太慢撞超时」而非裸报空。"""
+    src = _read("views/Playground.vue")
+    assert "reasoning_content" in src
+    assert "只有思考" in src or "没有正文" in src
+
+
 def test_pelican_preview_iframe_is_sandboxed():
     src = _read("views/Playground.vue")
     assert 'sandbox="allow-scripts"' in src
