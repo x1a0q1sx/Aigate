@@ -121,3 +121,15 @@
 - ✅ 超时默认 180→300s（生产 PUT 设为 300；慢生成实测 140~242s）
 - ✅ 生产复验：OpenCode space-bunny 鹈鹕提示词 242s 成功返回 22k 字符（含 `<svg>`）；CodeBuddy deepseek-v4.1-flash 19s 返回 12k 字符（提取 fence → 12k HTML）。300s deadline 撞线场景（模型陷入 50KB 规划循环）返回 reasoning-only——前端现捕获 `reasoning_content`，提示「只输出思考、可能生成太慢撞超时」并可在原始输出查看
 - ℹ️ 部署顺序：先发后端（interrupt 修复 + 超时），再发前端（reasoning 捕获）；三端同步 6005fb0，bundle index-BP5guqoD.js
+
+## Session 9 - 2026-10-13
+### 完成（CodeBuddy 新模型刷新看不到：step-5-preview 修复，d1a4055）
+- ✅ 根因（F37）：CodeBuddy 无 /v2/models → 刷新永远落静态种子（09-23 死数据）→ 官方新模型（step-5-preview，10-12~25 限免）进不来；此前 F31 只接了「在线倍率叠加」，叠加只作用于已有模型，救不了新模型
+- ✅ 生产探针（真实账号）：scoped `personal/models` 与 `/v3/config` 两端点均 200 且都含 step-5-preview（x0.00/1M ctx/64k out/vision；chat 实测 200）
+- ✅ 目录质量实测：33 条里 11 条不可用（8 死条目 11102 + 2 生图 11103 + glm-5.0-turbo 11150 需 effort）；档位别名（auto/balanced-model 等 8 个）不在目录里但实测全可用 → 只能「目录 ∪ 种子」
+- ✅ 实现：`fetch_codebuddy_catalog()` 两端点并行拉取取并集 + 三类过滤；刷新链路目录∪种子（只补不删）+ 倍率 overlay 保留；种子/倍率表按 10-13 探测再校准
+- ✅ 线上验证：CN 刷新 `+6（含 step-5-preview）~27 -0 total=33 online`；Intl `+1 ~29 -0 total=30 online`；DB ratio=0.0/free/1M 落库；网关真实调用流式 200；模型列表 API 透出；刷新日志 id=850/851 落库
+- ✅ 测试 966→992 全绿（新增 tests/test_codebuddy_catalog.py 17 项）；pm2 已重启（aigate online）
+### 备注
+- 前端无需改动（模型页自带「在线倍率」标签 path 已支持 codebuddy source）
+- 留在服务器 /tmp 的探针脚本已清理；cb_check.py（09-22 旧会话遗留）未动

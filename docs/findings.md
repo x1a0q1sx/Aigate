@@ -1400,3 +1400,84 @@ traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读�
 重试耗尽报「繁忙」、已输出内容后不重试。
 **反向验证**：注入「移除排队守卫」后 `test_parse_queue_signal_real_payload_and_not_billing`
 立刻失败。
+
+## F37 CodeBuddy 新模型刷新看不到 = 在线目录一直存在但没接（2026-10-13）
+
+**用户反馈**：「codebuddy CN 官方通报有新模型（Step-5-Preview，10月12日-10月25日
+独家限时免费），实际也有，但刷新模型列表没有」。
+
+### 根因链
+
+1. 刷新代码对 OAuth 服务商先试 `adapter.list_models` —— 但 CodeBuddy 家族
+   **没有 /v2/models 端点**（`_build_models_url` 拼出 `.../v2/models` 必 404），
+   于是 `any_success=False` → **直接落静态种子**（CN 27 个，来自 09-23 探测）。
+2. 种子表是死数据：官方 10-12 上的 `step-5-preview` 不在里面 → 永远看不到。
+3. 更早的 F31 只接了「在线**倍率**叠加」，而叠加只作用于**已有**模型——
+   新模型连条目都没有，倍率自然救不了。
+
+**在线目录其实一直存在**（F24 已实证，但当时只用于调研未接入刷新）：
+- `GET {base}/console/enterprises/personal/models`（scoped，官方客户端目录）
+- `GET {base}/v3/config` 的 `data.models[]`
+
+### 生产探针（2026-10-13，真实账号）
+
+| 端点 | CN | Intl | 备注 |
+|---|---|---|---|
+| scoped `personal/models` | 200（32 条） | 500（openresty） | 含 auto/别名，无 credits 字段（部分条目） |
+| `/v3/config` models[] | 200（33 条） | 200（22 条） | 全部带 credits；缺 auto/hy3-x 等 |
+
+- `step-5-preview` 两端点都返回：`x0.00 credits`（限免）、1M 上下文、
+  `maxOutputTokens=64000`、`supportsImages=true`、徽章 `badge:独家限免`。
+- chat 实测（stream + system 首条）：**200**，`reasoning_content` 正常流出。
+- **目录混着死条目**：`glm-4.6` / `glm-4.6v` / `glm-4.7` / `glm-5.0` /
+  `minimax-m2.5` / `hy4-preview-x` / `kimi-k2-thinking` / `lite` 全部 11102
+  （service info not found，双重复核）；生图条目 `hunyuan-image-alpha*` 报
+  11103（hunyuan-stream 不支持）；`glm-5.0-turbo` 不带 effort 恒 11150、
+  带 effort 才 200（官方客户端总带 effort，网关默认不带）。
+- **档位别名必须保留**：`auto` / `balanced-model` / `deep-model` /
+  `fast-model` / `hy3-preview` / `hy3-preview-agent` / `kimi-k3` /
+  `minimax-m3-pay` 实测全部 200 可用，但**不在任何目录端点**里——只用目录
+  当清单会重蹈 F31「误删 8 个可用模型」。
+- agents 并集（/v3/config `data.agents[].models[]`）只额外带来死条目 `lite`，
+  不采用。
+
+### 修复（d1a4055）
+
+`server/core/model_catalog.py` 新增 `fetch_codebuddy_catalog()`：
+- 两端点**并行**拉取（12s 超时，45s 单服务商硬超时下预算 44s 内），取并集，
+  scoped 优先；字段映射 context/maxOutput/vision/name；端点级容错，
+  全挂返回 [] 由调用方回退种子。
+- 过滤 _CODEBUDDY_DELISTED_IDS（11102）、_CODEBUDDY_IMAGE_TAGS（11103）、
+  _CODEBUDDY_NEEDS_EFFORT_IDS（11150）——上游目录清理滞后于真实下架是常态。
+- 刷新链路：目录成功 → **目录 ∪ 静态种子**（种子只补不删，保住档位别名）；
+  倍率 overlay 照旧叠加；`list_note` 记「在线目录 N 个 + 种子补充 M 个 + 倍率」。
+- 种子表再校准：CN 补 step-5-preview / space-bunny / hy3-x /
+  hunyuan-2.0-thinking / hunyuan-chat / default（33 个）；Intl 补
+  deepseek-v4.1-flash-sg。两版倍率表按在线值重校（Intl 3→19 条）。
+
+### 线上验证（生产刷新，真实请求）
+
+| 项 | 结果 |
+|---|---|
+| CN 刷新 | `added=6`（step-5-preview/hy3-x/default/hunyuan-2.0-thinking/hunyuan-chat/space-bunny）、`updated=27`、`removed=0`、`total=33`、`list_source=online` |
+| Intl 刷新 | `added=1`、`updated=29`、`removed=0`、`total=30`、`online` |
+| DB 复核 | step-5-preview：`ratio=0.0`、`source=codebuddy`、`is_free=true`、ctx=1M、vision=true |
+| 真实调用 | 网关 OAuth token 流式 200，reasoning_content 正常 |
+| 模型列表 API | `?provider_id=82&q=step` 正确返回 |
+| 刷新日志 | id=850 `+6/~27/-0 online 在线目录 25 个 + 种子补充 8 个 + 在线倍率 23 条` |
+
+### 测试
+
+新增 17 项（`tests/test_codebuddy_catalog.py`）：两端点并集/字段映射/三类过滤/
+端点容错（单挂、全挂、传输异常）/只读守卫（无 POST）/刷新链路端到端（目录∪
+种子+倍率 overlay+seed 回退回归）/种子含新模型且无死条目。全量 **992 项全绿**。
+
+### 教训（可复用）
+
+- 「OAuth 服务商没有 list_models 端点 → 种子兜底」是 F14 时代的结论；
+  F24 发现在线目录后**只用于调研，忘了升级刷新链路**——种子兜底成了
+  「静默过期」的温床。凡「种子兜底」路径都要问一句：是不是有在线源没接？
+- 在线目录**永远不要当唯一清单**（Jet-Hub 教训二连）：目录缺别名、混死条目，
+  正确姿态 = 目录 ∪ 种子 − 探测确认的不可用条目。
+- 上游目录里的条目 ≠ 可用：本次实测 8 个死条目 + 2 个生图 + 1 个 effort 特性
+  共 11 个不可用条目混在 33 个里（1/3 虚报）。
