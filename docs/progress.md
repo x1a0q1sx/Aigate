@@ -115,3 +115,9 @@
 - ✅ `api.js` 新增命名导出 `apiStream`（POST → ReadableStream，401 统一处理，支持 AbortSignal）
 - ✅ 测试 963→972（9 项前端静态回归：按钮/prompt/流式/提取/sandbox/文件名/最近请求清除/日志区在趋势上方/看日志滚动）；本地 build 通过（bundle index-3ZgLNa-Q.js 含「鹈鹕」）
 - ℹ️ SSE 消费细节：跨分片缓冲 + 末事件无尾随空行时冲刷（node 模拟不规则切分实测通过）
+### Session 8 补充：鹈鹕测试暴露的 sidecar 停滞误杀（同日，339d75e/1db6b24/6005fb0）
+- ✅ 端到端验证鹈鹕提示词（长输出）时揪出真 bug：**CLI message API 在正常生成中会长时间零增量**（实测 70s 仅空 reasoning part，140s 一次性 flush 24k 字符）——旧停滞检测 20s 即判「工具挂起」发 interrupt → CLI 报 `Provider turn interrupted`，**所有长输出（长代码/长文）都会被截死**
+- ✅ 修复：新增 `_turn_in_tool_wait()`——只有 `finish=tool-calls` 或末腿有未完成 tool part（真权限挂起）才允许 interrupt；普通慢生成只等待，deadline 兜底。2 项回归测试（含 FakeClient 模拟「前 7 轮零增量、第 8 轮 flush」场景断言 interrupt 计数为 0）
+- ✅ 超时默认 180→300s（生产 PUT 设为 300；慢生成实测 140~242s）
+- ✅ 生产复验：OpenCode space-bunny 鹈鹕提示词 242s 成功返回 22k 字符（含 `<svg>`）；CodeBuddy deepseek-v4.1-flash 19s 返回 12k 字符（提取 fence → 12k HTML）。300s deadline 撞线场景（模型陷入 50KB 规划循环）返回 reasoning-only——前端现捕获 `reasoning_content`，提示「只输出思考、可能生成太慢撞超时」并可在原始输出查看
+- ℹ️ 部署顺序：先发后端（interrupt 修复 + 超时），再发前端（reasoning 捕获）；三端同步 6005fb0，bundle index-BP5guqoD.js
