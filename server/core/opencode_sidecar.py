@@ -63,7 +63,7 @@ def bridge_enabled() -> bool:
 
 
 def sidecar_timeout() -> float:
-    return float(_setting("timeout_seconds", "AIGATE_OPENCODE_TIMEOUT", 180))
+    return float(_setting("timeout_seconds", "AIGATE_OPENCODE_TIMEOUT", 300))
 
 
 def sidecar_agent() -> str:
@@ -88,7 +88,7 @@ def auto_reject_tools() -> bool:
 
 # 兼容旧引用（模块级常量语义已变为「启动时快照」，运行期请用上面的函数）
 SIDECAR_BASE = os.environ.get("AIGATE_OPENCODE_SIDECAR", "http://127.0.0.1:4096")
-_SIDECAR_TIMEOUT = float(os.environ.get("AIGATE_OPENCODE_TIMEOUT", "180"))
+_SIDECAR_TIMEOUT = float(os.environ.get("AIGATE_OPENCODE_TIMEOUT", "300"))
 SIDECAR_AGENT = os.environ.get("AIGATE_OPENCODE_AGENT", "aigate")
 
 

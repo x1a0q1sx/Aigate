@@ -790,7 +790,7 @@ def test_sidecar_settings_fall_back_to_defaults(monkeypatch):
     monkeypatch.setattr(sc, "_cfg", lambda: None)
     monkeypatch.delenv("AIGATE_OPENCODE_TIMEOUT", raising=False)
     monkeypatch.delenv("AIGATE_OPENCODE_AGENT", raising=False)
-    assert sc.sidecar_timeout() == 180
+    assert sc.sidecar_timeout() == 300   # 2026-10-12: 180→300（慢生成长输出兜底）
     assert sc.sidecar_agent() == "aigate"
     assert sc.auto_reject_tools() is True
     assert sc.bridge_enabled() is True

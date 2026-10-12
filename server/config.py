@@ -234,9 +234,12 @@ class OpenCodeBridgeConfig(BaseModel):
     环境变量仍可覆盖（AIGATE_OPENCODE_*），本配置段优先。
     """
     enabled: bool = True
-    timeout_seconds: int = 180          # 单次请求最长等待（CLI 生成完成为止）
+    timeout_seconds: int = 300          # 单次请求最长等待（CLI 生成完成为止）。
+                                        # 2026-10-12：180→300——慢生成（长代码/长文）实测
+                                        # 需 140~240s；停滞检测已改为仅工具阶段 interrupt，
+                                        # 普通慢生成不再被误杀，deadline 才是真正的兜底。
     poll_interval_ms: int = 600         # 轮询 sidecar 消息列表的间隔
-    stall_grace_seconds: int = 20       # 本轮多久没有新进展即判停滞（interrupt 收尾，不再空等）
+    stall_grace_seconds: int = 20       # 工具阶段多久无进展即 interrupt 收尾（普通慢生成只等待）
     agent: str = "aigate"               # CLI 侧 agent 名（决定人格与工具权限）
     base_url: str = "http://127.0.0.1:4096"   # sidecar 地址（仅本机可达）
     port: int = 4096                    # 守护任务拉起 CLI 时监听的端口
