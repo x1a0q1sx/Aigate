@@ -82,12 +82,11 @@ class TestSeedFallbackCarriesRatio:
                 elif mi.price_ratio is not None:
                     assert mi.is_free is False
 
-    def test_unknown_models_stay_none(self):
-        """没有实测数据的模型保持 None（未知），不猜值。"""
+    def test_gpt_ratios_from_online_calibration(self):
+        """2026-10-13 在线 /v3/config 校准：gpt-* / gemini 有实测倍率（旧断言已过期）。"""
         infos = {mi.model_id: mi for mi in self._seed_infos("codebuddy_intl")}
-        # gpt-* 系列没有客户端倍率证据
-        assert infos["gpt-5.5"].price_ratio is None
-        assert infos["gemini-3.5-flash"].price_ratio is None
+        assert infos["gpt-5.5"].price_ratio == 3.31
+        assert infos["gemini-3.5-flash"].price_ratio == 0.99
 
 
 class TestQoderCatalogRatio:

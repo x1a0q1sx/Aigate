@@ -80,22 +80,49 @@ async def _fetch_lobsterai_models(oauth_client, session: AsyncSession,
     return out
 
 
-# ── CodeBuddy 在线倍率（/v3/config 的 models[].credits）──────────────
-# F31（2026-09-28）：此前倍率只来自 STATIC_PRICE_RATIOS 手工表（客户端产物，
+# ── CodeBuddy 在线目录与倍率（scoped ∪ /v3/config）──────────────────
+# F31（2026-09-28）：倍率原先只来自 STATIC_PRICE_RATIOS 手工表（客户端产物，
 # CN 6 条 / Intl 3 条），而**上游其实有在线倍率源**：GET {base}/v3/config 的
 # data.models[].credits（形如 "x0.17 credits" / "x0.00"）。生产实测：
-#   · CN  (copilot.tencent.com) → 31 条模型，全部带 credits
+#   · CN  (copilot.tencent.com) → 31+ 条模型，全部带 credits
 #   · Intl(www.codebuddy.ai)    → **UA 决定返回集**：
 #       CLI/2.108.1 → 22 条（21 带 credits）；IDE/2.108.1 → 13 条（仅 7 带）；
 #       CodeBuddy/2.63.2 → 0 条。故这里固定用 CLI UA（与 CN 一致）。
 #
-# ⚠️ **只用于倍率，绝不用它替换模型列表**：实测若把 /v3/config 的 models[] 当
-# 权威清单，CN/Intl 各会误删 8 个模型（`auto` / `balanced-model` / `fast-model` /
-# `deep-model` 等档位别名不在 models[] 里但**确实可用**）—— 对齐 Jet-Hub 教训：
-# 「把某一刻的快照当判据会让后人误删可用模型」。倍率是纯附加标注，没有这个风险。
+# F37（2026-10-13，step-5-preview 刷新不出现的根因）：`adapter.list_models` 对
+# CodeBuddy 家族必然失败（无 /v2/models 端点，404），旧逻辑直接落静态种子 →
+# 种子过期就表现为「官方上了新模型，刷新却看不到」。上游真实目录有两个端点：
+#   - GET {base}/console/enterprises/personal/models（scoped；CN 200 / Intl 500）
+#   - GET {base}/v3/config（CN+Intl 200；另含 agents[].models[] 档位绑定，
+#     但 agents 并集只额外带来死条目 `lite`（11102 实测），不采用）
+# **单端点都不完整**：CN scoped 32 条（缺 minimax-m2.7 / glm-5.0-turbo /
+# hunyuan-image-alpha-edit），CN config 33 条（缺 auto / hunyuan-2.0-thinking）；
+# 且目录不含 auto/balanced-model/fast-model/deep-model 等档位别名（F31 实测当
+# 唯一清单会误删、且 2026-10-13 复核这些别名确实全部可用）——故刷新时目录与
+# 静态种子取**并集**（见 fetch_codebuddy_catalog；种子只补不删）。倍率 overlay
+# 保留：对种子补充的别名同样生效。对齐 Jet-Hub 教训：「把某一刻的快照当判据
+# 会让后人误删可用模型」。
 _CODEBUDDY_CONFIG_PATH = "/v3/config"
+_CODEBUDDY_SCOPED_PATH = "/console/enterprises/personal/models"
 # 实测唯一能拿到完整 models[] 的 UA（两个域名都验过）
 _CODEBUDDY_RATIO_UA = "CLI/2.108.1 CodeBuddy/2.108.1"
+# 生图模型标签：聊天端点不支持（11103 Backend [hunyuan-stream] is not supported），
+# 目录拉取时过滤，不把生图模型挂进聊天服务商。
+_CODEBUDDY_IMAGE_TAGS = ("text-to-image", "image-to-image")
+# 目录里仍残留、但聊天端点已下架的死条目（2026-10-13 生产探测：stream+system 首条
+# → 11102 "service info not found"；复核方法见 docs/findings.md F14）。
+# 上游目录清理滞后于真实下架——与「种子含已下架模型」是同一类问题，拉取时过滤。
+# 注意：本表是 CN 实测；Intl 的目录（config）当前不含这些 id（已对照）。
+_CODEBUDDY_DELISTED_IDS = frozenset({
+    "lite", "glm-4.6", "glm-4.6v", "glm-4.7", "glm-5.0",
+    "minimax-m2.5", "hy4-preview-x", "kimi-k2-thinking",
+})
+# 目录在线、但**当前网关请求形态**不可用：glm-5.0-turbo 不带 reasoning_effort 时
+# 恒 11150「the reasoning effort value is not supported by the current model」，
+# 带上 low/medium/high 则 200（2026-10-13 三重复核）——官方客户端总带 effort，
+# 而网关默认请求不带。过滤掉，避免「列表里有、一发就报错」。
+# 将来若要支持：在 provider_quirks 的 CodeBuddy 方言里对该模型注入默认 effort。
+_CODEBUDDY_NEEDS_EFFORT_IDS = frozenset({"glm-5.0-turbo"})
 
 
 def parse_codebuddy_credits(text) -> Optional[float]:
@@ -135,8 +162,8 @@ def _codebuddy_host(base_url: str) -> str:
 async def fetch_codebuddy_ratios(token: str, base_url: str) -> Dict[str, float]:
     """从 CodeBuddy /v3/config 取 {model_id: credits 倍率}（在线权威源）。
 
-    只读、**只产出倍率**（不产出模型列表，见上方警告）。任何失败返回空 dict，
-    由调用方回退静态表（绝不因一次网络抖动把倍率清空）。
+    只读、**只产出倍率**（模型清单见 fetch_codebuddy_catalog）。任何失败返回空 dict，
+    由调用方保留既有值（绝不因一次网络抖动把倍率清空）。
     """
     import httpx
     base = _codebuddy_host(base_url)
@@ -171,6 +198,114 @@ async def fetch_codebuddy_ratios(token: str, base_url: str) -> Dict[str, float]:
         if isinstance(mid, str) and mid and ratio is not None:
             out[mid] = ratio
     return out
+
+
+def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
+    """目录条目（scoped 或 /v3/config 的 models[]）→ ModelInfo。
+
+    两端点字段同构（id / name / credits / maxInputTokens / maxOutputTokens /
+    supportsImages / tags / reasoning）。无法识别的条目返回 None；
+    倍率统一由 fetch_codebuddy_ratios 的 overlay 叠加（本函数不管倍率）。
+    """
+    mid = m.get("id")
+    if not isinstance(mid, str) or not mid:
+        return None
+    if mid in _CODEBUDDY_DELISTED_IDS or mid in _CODEBUDDY_NEEDS_EFFORT_IDS:
+        return None
+    tags = m.get("tags")
+    tags = [str(t) for t in tags] if isinstance(tags, list) else []
+    if any(t in _CODEBUDDY_IMAGE_TAGS for t in tags):
+        return None  # 生图模型：聊天端点 11103，不挂进聊天服务商
+
+    def _int(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ctx = _int(m.get("maxInputTokens")) or _int(m.get("contextWindow"))
+    max_out = _int(m.get("maxOutputTokens")) or None
+    supports_images = bool(m.get("supportsImages"))
+    # supports_reasoning_effort：只有条目声明了 `reasoning` 配置块（含
+    # supportedEfforts / defaultEffort 等调度信息）才标 True——那是「可配 effort」
+    # 的正面证据；其余保持 None（未知），由既有名称启发式兜底。
+    # 注意：True 只是「允许客户端传 effort」；网关默认请求不带该参数，
+    # 不会改变既有可用模型的请求形态。
+    sup_effort = True if isinstance(m.get("reasoning"), dict) else None
+    return ModelInfo(
+        model_id=mid,
+        display_name=m.get("name") or mid,
+        is_free=False,
+        input_price=0.0,
+        output_price=0.0,
+        supports_streaming=True,
+        context_length=ctx or 4096,
+        # 上游声明 supportsImages 是权威证据（capability_source=provider）；
+        # 声明 False 不给 ["text"]——避免把「上游没提」误当「硬闸只认文本」。
+        input_modalities=["text", "image"] if supports_images else None,
+        max_output_tokens=max_out,
+        supports_vision=supports_images,
+        supports_reasoning_effort=sup_effort,
+    )
+
+
+async def fetch_codebuddy_catalog(token: str, base_url: str) -> List[ModelInfo]:
+    """从 CodeBuddy 两个在线目录端点拉取模型清单（详情信息以两端点并集为准）。
+
+    只读。任何失败（非 200 / 网络异常 / 解析不出）端点级忽略；两端点全挂返回 []，
+    由调用方回退静态种子（与倍率同一防御姿态：绝不因一次抖动清空清单）。
+
+    实测要点（2026-10-13 生产探针，见 docs/findings.md F37）：
+    - scoped 端点是官方客户端目录（CN 200 / Intl 500），/v3/config 两域名都活。
+      端点都会带 id/name/maxInputTokens/maxOutputTokens/supportsImages/tags。
+    - 死条目（11102）与生图条目（11103）、effort 强依赖条目在 _codebuddy_entry_to_info
+      里过滤——上游目录清理滞后于真实下架是常态。
+    - **调用方必须与静态种子取并集**：目录不含 auto/balanced-model 等档位别名，
+      单独用会误删（F31 教训）。
+    """
+    import httpx
+    base = _codebuddy_host(base_url)
+    if not base:
+        return []
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "X-Domain": base.split("://", 1)[-1],
+        "X-Product": "SaaS",
+        "X-Product-Code": "codebuddy",
+        "User-Agent": _CODEBUDDY_RATIO_UA,
+        "x-requested-with": "XMLHttpRequest",
+        "x-codebuddy-request": "1",
+    }
+    models: Dict[str, ModelInfo] = {}
+    # 两端点并行拉取（单服务商刷新有 45s 硬超时：串行 12s×2+倍率 12s+定价 20s
+    # 最坏 56s 会撞顶，并行把目录段压到 12s，总预算 44s 留有余量）。
+    # 生产实测两域名响应均 <2s，12s 是 6 倍余量。
+    async with httpx.AsyncClient(timeout=12.0) as c:
+        results = await asyncio.gather(
+            *[c.get(base + path, headers=headers)
+              for path in (_CODEBUDDY_SCOPED_PATH, _CODEBUDDY_CONFIG_PATH)],
+            return_exceptions=True,
+        )
+    for path, r in zip((_CODEBUDDY_SCOPED_PATH, _CODEBUDDY_CONFIG_PATH), results):
+        if isinstance(r, Exception):
+            logger.info("codebuddy 目录 %s 拉取失败：%s", path, r)
+            continue
+        if r.status_code != 200:
+            logger.info("codebuddy 目录 %s HTTP %s", path, r.status_code)
+            continue
+        try:
+            data = (r.json() or {}).get("data") or {}
+        except Exception:
+            continue
+        # 顺序即优先级：scoped（官方客户端目录）在前，config 只补缺
+        for m in (data.get("models") or []):
+            if not isinstance(m, dict):
+                continue
+            mi = _codebuddy_entry_to_info(m)
+            if mi is not None and mi.model_id not in models:
+                models[mi.model_id] = mi
+    return list(models.values())
 
 # 内置价格参考表 (美元 / 百万 tokens)
 # fmt: off
@@ -604,21 +739,57 @@ class ModelCatalog:
             except Exception as e:
                 logger.warning(f"oauth pick_access_token failed for {provider.name}: {e}")
             if token:
-                try:
-                    eh = dict(extra_headers or {})
-                    eh["__oauth"] = True
-                    # LobsterAI：模型列表在 /api/models/available（非标准 /v1/models），
-                    # 且 query 是身份载荷（keyfrom）+ 需客户端能力头 —— 走专属路径
-                    if oauth_code == "lobsterai":
-                        _m = await _fetch_lobsterai_models(_goc(), session, _owner)
-                    else:
-                        _m = await adapter.list_models(token, provider.base_url, eh)
-                    if _m:
+                if str(oauth_code).startswith("codebuddy"):
+                    # F37：CodeBuddy 家族没有 /v2/models 端点（adapter.list_models 必 404），
+                    # 在线清单走专属目录（scoped ∪ /v3/config 并集），成功后与静态种子
+                    # **取并集**——目录缺档位别名（auto/balanced-model 等实测可用），
+                    # 种子只补不删（F31 教训：单一快照当清单会误删可用模型）。
+                    try:
+                        _cat = await fetch_codebuddy_catalog(token, provider.base_url)
+                    except Exception as e:
+                        _cat = []
+                        logger.warning("codebuddy 在线目录拉取失败：%s", e)
+                    if _cat:
                         any_success = True
-                        for mi in _m:
+                        for mi in _cat:
                             all_model_infos.setdefault(mi.model_id, mi)
-                except Exception as e:
-                    logger.warning(f"oauth list_models failed for {provider.name}: {e}")
+                        # 种子并集：补目录缺失的档位别名/特殊渠道模型（全部经探测校准）。
+                        # 已在目录里的以目录元数据为准（不覆盖）；倍率由下方 overlay 统一叠加。
+                        _seeded = 0
+                        if oauth_p and oauth_p.static_models:
+                            from server.core.oauth_registry import STATIC_PRICE_RATIOS as _SPR
+                            _seed_ratio = _SPR.get(oauth_code) or {}
+                            for sm in oauth_p.static_models:
+                                if sm["model_id"] in all_model_infos:
+                                    continue
+                                _sr = _seed_ratio.get(sm["model_id"])
+                                all_model_infos[sm["model_id"]] = ModelInfo(
+                                    model_id=sm["model_id"],
+                                    display_name=sm.get("display_name") or sm["model_id"],
+                                    is_free=(_sr == 0.0), input_price=0.0, output_price=0.0,
+                                    supports_streaming=True, context_length=4096,
+                                    price_ratio=_sr,
+                                )
+                                _seeded += 1
+                        list_note = f"在线目录 {len(_cat)} 个"
+                        if _seeded:
+                            list_note += f" + 种子补充 {_seeded} 个（档位别名）"
+                else:
+                    try:
+                        eh = dict(extra_headers or {})
+                        eh["__oauth"] = True
+                        # LobsterAI：模型列表在 /api/models/available（非标准 /v1/models），
+                        # 且 query 是身份载荷（keyfrom）+ 需客户端能力头 —— 走专属路径
+                        if oauth_code == "lobsterai":
+                            _m = await _fetch_lobsterai_models(_goc(), session, _owner)
+                        else:
+                            _m = await adapter.list_models(token, provider.base_url, eh)
+                        if _m:
+                            any_success = True
+                            for mi in _m:
+                                all_model_infos.setdefault(mi.model_id, mi)
+                    except Exception as e:
+                        logger.warning(f"oauth list_models failed for {provider.name}: {e}")
             if not any_success and oauth_p and oauth_p.static_models:
                 list_source = "seed"  # 在线列表失败，改用静态种子兜底
                 list_note = f"静态种子兜底（{len(oauth_p.static_models)}个）"
@@ -634,12 +805,11 @@ class ModelCatalog:
                         supports_streaming=True, context_length=4096,
                         price_ratio=_r,
                     ))
-            # ── F31：CodeBuddy 在线倍率叠加（只补倍率，不动模型列表）─────────
-            # 上游 /v3/config 的 models[].credits 是**在线权威倍率**（CN 实测 31 条），
-            # 远胜手工静态表（CN 6 条 / Intl 3 条，来自客户端产物、会过期）。
-            # ⚠️ 只叠加到已有模型上：/v3/config 的 models[] 不含 auto/balanced-model
-            # 等档位别名，若拿它当清单会误删 8 个可用模型（见 fetch_codebuddy_ratios
-            # 上方注释）。取不到就保持原值（静态表/既有值），绝不因此清空倍率。
+            # ── F31：CodeBuddy 在线倍率叠加（只补倍率，不动模型清单）─────────
+            # 上游 /v3/config 的 models[].credits 是**在线权威倍率**（CN 实测 33 条），
+            # 远胜手工静态表（在线拿不到时兜底）。⚠️ 只叠加到已有模型上：
+            # 清单由目录 ∪ 种子决定（fetch_codebuddy_catalog），倍率层不增删模型。
+            # 取不到就保持原值（静态表/既有值），绝不因此清空倍率。
             if str(oauth_code).startswith("codebuddy"):
                 try:
                     _online = await fetch_codebuddy_ratios(token, provider.base_url)
@@ -659,6 +829,8 @@ class ModelCatalog:
                                 provider.name, _hit, len(all_model_infos))
                     if list_source == "seed":
                         list_note = f"静态种子兜底（{len(oauth_p.static_models)}个）+ 在线倍率 {_hit} 条"
+                    elif list_note:
+                        list_note += f" + 在线倍率 {_hit} 条"
             if not any_success:
                 return {"error": f"OAuth provider '{oauth_code}' 未连接且无静态模型种子，请先在 /providers/oauth 完成连接"}
         else:

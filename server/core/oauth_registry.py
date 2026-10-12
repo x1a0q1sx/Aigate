@@ -71,6 +71,7 @@ def _seed(*pairs):
 #
 # 数据来源（全部为实测值，无推测）：
 #   - 2026-09-28 在线 /v3/config 校准（当前表值已按在线值更新）
+#   - 2026-10-13 在线 /v3/config 再校准（补 step-5-preview 等新条目；见 F37）
 #   - WorkBuddy 桌面端 product.json（2026-08-17 版，endpoint=copilot.tencent.com）
 #   - CodeBuddy IDE 客户端日志实测（2026-08-20~09-05，含时间戳）
 # 未列出的模型留 NULL（未知），由用户在模型页手动填——不猜。
@@ -78,25 +79,53 @@ def _seed(*pairs):
 STATIC_PRICE_RATIOS: Dict[str, Dict[str, float]] = {
     # CodeBuddy 两版共用同一后端与模型目录（见 codebuddy_intl 注释）
     "codebuddy_cn": {
-        # 2026-09-28 按在线 /v3/config 校准（旧值 0.16/0.08/0.00 已过期）
+        # 2026-10-13 按在线 /v3/config 再校准（旧值 0.16/0.08/0.00 已过期）
         "deepseek-v4-pro": 0.51,
         "deepseek-v4-flash": 0.17,
         "deepseek-v4.1-flash": 0.11,
+        "deepseek-v3-2-volc": 0.29,
+        "minimax-m2.7": 0.19,
         "minimax-m3": 0.25,
-        "hy3-preview-agent": 0.04,
+        "glm-5.3": 0.79,
+        "glm-5.3-flash": 0.06,
+        "glm-5.2": 0.79,
+        "glm-5.1": 0.79,
+        "glm-5v-turbo": 0.71,
+        "kimi-k3-1": 1.62,
+        "kimi-k2.8-preview": 0.77,
+        "kimi-k2.7": 0.57,
+        "kimi-k2.6": 0.52,
+        "kimi-k2.5": 0.45,
         "hy3": 0.00,                 # 免费（在线实测 x0.00）
+        "hy3-x": 0.05,
+        "hy3-preview-agent": 0.04,   # 档位别名：无新在线值，保留 09-28 校准值
         "hy4-preview": 0.29,         # 旧客户端日志的 x0.00 已过期（在线 0.29）
+        "hunyuan-2.0-thinking": 0.04,
+        "space-bunny": 0.08,
+        "step-5-preview": 0.00,      # 限时免费 2026-10-12~25（在线 x0.00）
     },
     "codebuddy_intl": {
         # 国际版种子已剔除 deepseek-v4-pro/flash 等（11102 下架，见 codebuddy_intl
         # 注释）——倍率表只列该版真实存在的模型，不给已下架模型留值。
-        # 2026-09-28 按在线 /v3/config（CLI UA）校准。
+        # 2026-10-13 按在线 /v3/config（CLI UA）再校准。
         "minimax-m3": 0.25,
         "hy3": 0.00,
         "hy4-preview": 0.29,         # 旧值 0.00 已过期（在线 0.29）
         "glm-5.3-flash": 0.06,
         "glm-5.3": 0.79,
         "glm-5.2": 0.79,
+        "deepseek-v4.1-flash": 0.00,
+        "deepseek-v4.1-flash-sg": 0.03,
+        "kimi-k3": 1.62,
+        "kimi-k2.8-preview": 0.77,
+        "kimi-k2.6": 0.52,
+        "gpt-6-astra": 6.67,
+        "gpt-5.6-sol": 3.47,
+        "gpt-5.6-terra": 1.39,
+        "gpt-5.6-luna": 0.14,
+        "gpt-5.5": 3.31,
+        "gpt-5.4": 1.65,
+        "gemini-3.5-flash": 0.99,
     },
 }
 
@@ -323,10 +352,18 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "poll_interval_ms": 5000,
         },
         api_base_url="https://copilot.tencent.com/v2/chat/completions",
-        # 种子表在「在线列表不可用」时使用（copilot.tencent.com 无公开 list 端点，只能兜底）。
-        # 2026-09-23 用真实账号逐模型探测校正（探测法：stream 请求 + system 首条，
-        # 11102 service info not found = 已下架，须移出）。
+        # 种子表双重用途：①在线目录（scoped ∪ /v3/config）失败时兜底；
+        # ②在线成功时**补充**目录缺失的档位别名（auto/balanced-model 等，见
+        # model_catalog.fetch_codebuddy_catalog 注释——只补不删）。
+        # 2026-09-23 首轮探测校准；2026-10-13 再校准：补 step-5-preview /
+        # space-bunny / hy3-x / hunyuan-2.0-thinking / hunyuan-chat / default
+        # （全部 stream 实测 200）；已下架（11102）的不入种子。
         static_models=_seed(
+            ("step-5-preview", "Step-5-Preview"),
+            ("space-bunny", "Space-Bunny"),
+            ("hunyuan-2.0-thinking", "Hunyuan-2.0-Thinking"),
+            ("hunyuan-chat", "Hunyuan-Turbos"),
+            ("default", "Default"),
             ("glm-5.2", "GLM-5.2"), ("glm-5.1", "GLM-5.1"), ("glm-5.3", "GLM-5.3"),
             ("glm-5.3-flash", "GLM-5.3-Flash"), ("glm-5v-turbo", "GLM-5v-Turbo"),
             ("minimax-m3", "MiniMax-M3"), ("minimax-m2.7", "MiniMax-M2.7"),
@@ -334,7 +371,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             ("kimi-k2.7", "Kimi-K2.7-Code"),
             ("kimi-k2.6", "Kimi-K2.6"), ("kimi-k2.5", "Kimi-K2.5"),
             ("kimi-k3", "Kimi-K3"), ("kimi-k3-1", "Kimi-K3"),
-            ("hy3", "Hy3"), ("hy3-preview", "Hy3 Preview"),
+            ("hy3", "Hy3"), ("hy3-x", "Hy3"), ("hy3-preview", "Hy3 Preview"),
             ("hy3-preview-agent", "Hy3 Preview Agent"),
             ("hy4-preview", "Hy4-Preview"), ("hy4-preview-f", "Hy4-Preview-F"),
             ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
@@ -386,6 +423,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             ("kimi-k2.5", "Kimi-K2.5"),
             ("hy3", "Hy3"), ("hy4-preview", "Hy4-Preview"), ("hy4-preview-f", "Hy4-Preview-F"),
             ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+            ("deepseek-v4.1-flash-sg", "DeepSeek-V4.1-Flash"),
             ("gpt-6-astra", "GPT-6 Astra"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"), ("gpt-5.6-terra", "GPT-5.6 Terra"),
             ("gpt-5.6-luna", "GPT-5.6 Luna"),
