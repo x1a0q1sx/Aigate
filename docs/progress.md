@@ -107,3 +107,11 @@
 ### Session 7 冷却后终验（同日 12:55+）
 - ✅ 429 限流冷却后终验通过：space-bunny 非流式 200 `cooled-final`（2596ms），**日志行 id=40166 正常落库**（success / 892+6 tokens / routed_provider_id=26）——修复前此路径的完成日志缺失（永远 pending），现已原位收尾。修复前失败的 muse/ling/mimo/nemotron/longcat 5 模型也在冷却前实测全通
 - ℹ️ 限流窗口实测：上百次试探触发 429 后约需 25+ 分钟冷却（8min/20min 两次探测仍 429，~25min 后恢复）
+
+## Session 8 - 2026-10-12
+### 完成（用户两项需求：Playground 鹈鹕一键测试 + 分析页布局调整）
+- ✅ Playground「🐦 鹈鹕一键测试」按钮（发送键旁）：按固定提示词（SVG 鹈鹕骑自行车 2D 动画）流式请求当前所选模型（auto/具体模型均可）→ 前端 SSE 增量累积 → `extractHtml` 提取（``` 围栏 → `<!DOCTYPE/<html` 截到末 `</html>` → `<svg…</svg>` 兜底；尾随说明文字剥离）→ iframe `sandbox="allow-scripts"` srcdoc 内嵌预览 + Blob 下载，文件名 `服务商-模型-日期时间.html`（非法字符清洗）；另有「新标签打开」、取消（AbortController）、原始输出折叠、流中途报错显示已接收部分
+- ✅ 分析页：实时区「最近请求」表删除（与请求日志重复）；请求日志（LogsPanel）从页面底部移至用量趋势上方；「看日志」按钮因日志区在上方改为 `scrollIntoView` 联动；页面副标题同步
+- ✅ `api.js` 新增命名导出 `apiStream`（POST → ReadableStream，401 统一处理，支持 AbortSignal）
+- ✅ 测试 963→972（9 项前端静态回归：按钮/prompt/流式/提取/sandbox/文件名/最近请求清除/日志区在趋势上方/看日志滚动）；本地 build 通过（bundle index-3ZgLNa-Q.js 含「鹈鹕」）
+- ℹ️ SSE 消费细节：跨分片缓冲 + 末事件无尾随空行时冲刷（node 模拟不规则切分实测通过）

@@ -80,6 +80,20 @@ async function apiPatch(path, data) {
   }
   return res.json()
 }
+/** POST 并返回原始 ReadableStream（SSE 流式；调用方自行解析 data: 行）。
+ *  401 处理与其它 api* 一致；signal 可选（AbortController 取消）。 */
+async function apiStream(path, data, signal) {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: 'POST',
+    headers: _addAuthHeader({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(data),
+    ...(signal ? { signal } : {}),
+  })
+  if (_handle401(res)) throw new Error('未登录或 session 已过期')
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`)
+  if (!res.body) throw new Error('当前浏览器不支持流式读取')
+  return res.body
+}
 async function apiDownload(path) {
   const res = await fetch(`${BASE_URL}${path}`, { headers: _addAuthHeader() })
   if (_handle401(res)) throw new Error('未登录或 session 已过期')
@@ -100,7 +114,8 @@ export {
   apiPut,
   apiDelete,
   apiPatch,
-  apiDownload
+  apiDownload,
+  apiStream
 }
 export default {
   // 认证

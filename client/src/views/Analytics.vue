@@ -3,7 +3,7 @@
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
       <div>
         <h1>分析 📊</h1>
-        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、趋势、按服务商用量与失败分析；实时区与请求日志已并入本页</p>
+        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、请求日志、趋势、按服务商用量与失败分析；实时区已并入本页</p>
       </div>
       <div style="display: flex; align-items: center; gap: 14px;">
         <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--gray-500); cursor: pointer;" :title="diagVerbose ? '全量输出所有诊断阶段（控制台日志会变多）' : '仅输出关键里程碑，关闭多余日志'">
@@ -58,7 +58,12 @@
     </div>
     <p v-else style="color: var(--gray-500); font-size: 13px; padding: 8px 0;">统计加载中...</p>
 
-    <!-- ② 用量趋势（跟随范围 + 粒度可切换） -->
+    <!-- ② 请求日志 + 归档（折叠，均在 LogsPanel 内）——置顶于趋势之上（2026-10-12 用户偏好） -->
+    <div style="margin-top: 20px;">
+      <LogsPanel ref="logs" />
+    </div>
+
+    <!-- ③ 用量趋势（跟随范围 + 粒度可切换） -->
     <div class="card" style="margin-top: 20px;">
       <div class="usage-header" style="margin-bottom: 12px;">
         <h2>用量趋势</h2>
@@ -71,7 +76,7 @@
       <p v-else style="text-align: center; padding: 16px; color: var(--gray-500); font-size: 13px;">当前范围暂无趋势数据</p>
     </div>
 
-    <!-- ③ 按服务商用量（跟随范围） -->
+    <!-- ④ 按服务商用量（跟随范围） -->
     <div class="card" style="margin-top: 20px;" v-if="providerData.length">
       <div class="usage-header" style="margin-bottom: 12px;">
         <h2>按服务商用量</h2>
@@ -108,7 +113,7 @@
       </table>
     </div>
 
-    <!-- ④ 失败分析（跟随范围换算 hours，可手动覆盖） -->
+    <!-- ⑤ 失败分析（跟随范围换算 hours，可手动覆盖） -->
     <div class="card" style="margin-top: 20px;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
         <h2 style="margin: 0;">失败分析 🔍</h2>
@@ -173,13 +178,8 @@
       <p v-else style="text-align: center; padding: 16px; color: var(--gray-500); font-size: 13px;">加载中...</p>
     </div>
 
-    <!-- ⑤ 实时区（原实时监控页并入，3s 轮询） -->
+    <!-- ⑥ 实时区（原实时监控页并入，3s 轮询；「最近请求」已删，请求日志见上方） -->
     <RealtimePanel />
-
-    <!-- ⑥ 请求日志 + ⑦ 归档（折叠，均在 LogsPanel 内） -->
-    <div style="margin-top: 20px;">
-      <LogsPanel ref="logs" />
-    </div>
   </div>
 </template>
 
@@ -263,7 +263,10 @@ export default {
       catch (e) { console.error('failures load failed', e) }
     },
     seeLogs(name) {
-      if (this.$refs.logs) this.$refs.logs.setProviderFilter(name)
+      if (!this.$refs.logs) return
+      this.$refs.logs.setProviderFilter(name)
+      // 日志区已移至本表上方：滚动过去让用户看到筛选结果
+      this.$refs.logs.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     },
     async loadDiag() {
       try { this.diagVerbose = !!(await api.getDiag()).verbose } catch (e) { console.error('diag load failed', e) }

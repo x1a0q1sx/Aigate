@@ -34,22 +34,6 @@
     </table>
     <div v-else class="empty">没有模型处于冷却状态 ✅</div>
 
-    <h3 class="rt-sub">最近请求</h3>
-    <table v-if="recent.length">
-      <thead><tr><th>时间</th><th>请求模型</th><th>路由到</th><th>状态</th><th>延迟</th><th>错误</th></tr></thead>
-      <tbody>
-        <tr v-for="r in recent" :key="r.id">
-          <td class="dim">{{ shortTime(r.created_at) }}</td>
-          <td>{{ r.requested_model || '—' }}</td>
-          <td><code>{{ r.routed_provider || '' }}/{{ r.routed_model || '' }}</code></td>
-          <td><span class="pill" :class="r.status === 'success' ? 'ok' : 'error'">{{ r.status === 'success' ? '成功' : '失败' }}</span></td>
-          <td>{{ r.latency_ms != null ? r.latency_ms + 'ms' : '—' }}<span v-if="r.ttft_ms" class="dim"> / 首字 {{ r.ttft_ms }}ms</span></td>
-          <td class="err-text" :title="r.error">{{ r.error || '—' }}</td>
-        </tr>
-      </tbody>
-    </table>
-    <div v-else class="empty">暂无请求</div>
-
     <div class="comp-row">
       <span class="dim">日志队列：待写 {{ lq.queued || 0 }} / 已写 {{ lq.flushed || 0 }} / 丢弃 {{ lq.dropped || 0 }}</span>
       <span class="dim">响应缓存：{{ cache.size || 0 }} 条（命中 {{ fmtNum(cache.hits) }}）</span>
@@ -62,11 +46,11 @@
 import api from '../api.js'
 
 // 原实时监控页（Monitor.vue）的面板主体：轻量尾随视图，自管 3s 轮询。
-// 重查询（筛选/详情/归档）在日志区（LogsPanel），两者职责不同。
+// 「最近请求」表已删（2026-10-12，与下方请求日志重复），改由 LogsPanel 统一承载。
 export default {
   name: 'RealtimePanel',
   data() {
-    return { d: {}, cooling: [], recent: [], lq: {}, cache: {}, paused: false, timer: null }
+    return { d: {}, cooling: [], lq: {}, cache: {}, paused: false, timer: null }
   },
   mounted() {
     this.load()
@@ -79,13 +63,11 @@ export default {
         const r = await api.getLiveSummary()
         this.d = r.today || {}
         this.cooling = r.cooling || []
-        this.recent = r.recent || []
         this.lq = r.log_queue || {}
         this.cache = r.cache || {}
         this.paused = false
       } catch (e) { this.paused = true }
     },
-    shortTime(v) { return v ? String(v).slice(11, 19) : '—' },
     fmtNum(n) { return Number(n || 0).toLocaleString('zh-CN') },
   },
 }
@@ -114,7 +96,6 @@ export default {
 table { width: 100%; border-collapse: collapse; font-size: var(--text-sm, 13px); }
 th, td { padding: 7px 10px; text-align: left; border-bottom: 1px solid var(--border-soft); white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 th { color: var(--text-muted); font-weight: 500; font-size: var(--text-xs, 12px); }
-.err-text { color: #ef4444; font-size: var(--text-xs, 12px); white-space: normal; }
 .empty { padding: 14px; text-align: center; color: var(--text-dim, var(--gray-500)); font-size: var(--text-sm, 13px); }
 .dim { color: var(--text-dim, var(--gray-500)); font-size: var(--text-xs, 12px); }
 code { font-family: var(--font-mono, monospace); font-size: var(--text-xs, 12px); }
