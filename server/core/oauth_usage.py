@@ -119,6 +119,81 @@ def sort_quotas(quotas: dict) -> dict:
     return dict(items)
 
 
+# ── 多账号路由选号：按积分最近到期排序（2026-10-13 用户要求）─────────
+# 自动模式（provider.oauth_owner 为空）下同一 oauth_code 有多条连接时，不再
+# 固定用 id 最早的账号，而是：
+#   1) 有可用余额、且积分包到期最近的账号优先（先用快过期的，避免浪费）；
+#   2) 无额度数据（未查到/查询失败）的次之（可能是新账号，仍应被尝试）；
+#   3) 明确全部耗尽的排最后。
+# 只读进程内缓存（oauth_usage._CACHE，5 分钟 TTL）——请求路径上绝不同步
+# 打上游额度接口；缓存冷启动时退化为「__default 优先、id 最早」（保持旧语义，
+# 后台预热任务负责把额度数据补齐，见 oauth_router._prewarm_multi_account_usage）。
+
+
+def _quota_remaining(q) -> Optional[float]:
+    """单条额度的剩余量；无法判定返回 None。unlimited 用 inf 表示。"""
+    if not isinstance(q, dict):
+        return None
+    if q.get("unlimited"):
+        return float("inf")
+    rem = q.get("remaining")
+    if rem is None and q.get("total") is not None and q.get("used") is not None:
+        try:
+            rem = max(0.0, float(q["total"]) - float(q["used"]))
+        except (TypeError, ValueError):
+            return None
+    try:
+        return float(rem)
+    except (TypeError, ValueError):
+        return None
+
+
+def quota_rank_key(result: Optional[dict]):
+    """账号级额度查询结果 → 选号排序键（较小者优先使用）。
+
+    返回 (余额档位, 最早到期时间戳, -剩余合计)：
+      档位 0 = 有可用余额（有包 remaining>0 或 unlimited）——按「最早到期」升序，
+               到期最近的先用；最早到期只统计**仍有余额**的包（已耗尽的包
+               不参与，与展示层 QuotaPanel「最早到期」口径一致）。
+      档位 1 = 无额度数据 / 无法判定（未查到、查询失败、字段缺失）。
+      档位 2 = 明确全部耗尽。
+    """
+    quotas = (result or {}).get("quotas") or {}
+    if not quotas:
+        return (1, float("inf"), 0.0)
+    earliest = float("inf")
+    remaining_sum = 0.0
+    has_balance = False
+    all_known = True
+    for q in quotas.values():
+        rem = _quota_remaining(q)
+        if rem is None:
+            all_known = False
+            continue
+        if rem > 0:
+            has_balance = True
+        if rem != float("inf"):
+            remaining_sum += rem
+        no_exp, ts = _reset_key(q if isinstance(q, dict) else {})
+        if rem > 0 and not no_exp and ts < earliest:
+            earliest = ts
+    if has_balance:
+        return (0, earliest, -remaining_sum)
+    if all_known:
+        return (2, float("inf"), 0.0)
+    return (1, float("inf"), 0.0)
+
+
+def cached_usage_for_token(provider_code: str, token: str) -> Optional[dict]:
+    """读额度缓存的**纯内存**查询（不触发任何网络请求）；未命中/过期返回 None。"""
+    if not token:
+        return None
+    hit = _CACHE.get(_key(provider_code, token))
+    if hit and hit[0] > time.monotonic():
+        return hit[1]
+    return None
+
+
 async def _get_json(url: str, headers: dict, params: dict = None):
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         r = await client.get(url, headers=headers, params=params)

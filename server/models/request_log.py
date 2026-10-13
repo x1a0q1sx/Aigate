@@ -28,6 +28,7 @@ class RequestLog(Base):
     requested_model = Column(String(200), nullable=True)
     routed_provider = Column(String(100), nullable=True)
     routed_model = Column(String(200), nullable=True)
+    routed_account = Column(String(100), nullable=True)  # OAuth 多账号：本次实际使用的账号（owner）
     status = Column(String(20), nullable=False, default="success")  # success/error
     media_type = Column(String(10), nullable=True)  # null=chat / "image" / "video"
     http_status = Column(Integer, nullable=True)

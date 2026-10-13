@@ -28,6 +28,9 @@ class OAuthToken(Base):
     is_active = Column(Boolean, default=True)
     last_refreshed_at = Column(DateTime, nullable=True)
     last_error = Column(String(500), default="")
+    # 账号级冷却（多账号路由：某账号 429/鉴权失败后短期跳过它，路由自动换号）
+    cooldown_until = Column(DateTime, nullable=True)
+    fail_count = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -229,6 +229,10 @@ async def init_db():
         "ON growth_logs(provider_code, owner, created_at)",
         "CREATE INDEX IF NOT EXISTS idx_growth_action_time "
         "ON growth_logs(action, created_at)",
+        # v4.5: OAuth 多账号治理（按积分到期选号 / 报错账号冷却 / 日志落账号）
+        "ALTER TABLE oauth_tokens ADD COLUMN cooldown_until TIMESTAMP DEFAULT NULL",
+        "ALTER TABLE oauth_tokens ADD COLUMN fail_count INTEGER DEFAULT 0",
+        "ALTER TABLE request_logs ADD COLUMN routed_account VARCHAR(100) DEFAULT NULL",
     ]
     for sql in _migrations:
         try:

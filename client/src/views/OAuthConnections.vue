@@ -42,6 +42,7 @@
             <span class="conn-owner" :title="'连接 id ' + c.id + '，可改名区分多账号'">{{ c.owner }}</span>
             <span class="badge" :class="connStatus(c).cls">{{ connStatus(c).label }}</span>
             <span class="conn-expire text-xs" :title="'到期 ' + (c.expires_at || '未知')">{{ expireText(c) }}</span>
+            <span v-if="cooldownText(c)" class="conn-expire text-xs" style="color:#f59e0b">{{ cooldownText(c) }}</span>
             <span class="conn-actions">
               <button class="btn btn-ghost btn-xs" @click="loadUsage(c, false)">查询余额</button>
               <button class="btn btn-ghost btn-xs" @click="startRename(c)">改名</button>
@@ -227,8 +228,20 @@ export default {
     },
     connStatus(c) {
       if (!c.is_active) return { label: '已停用', cls: 'badge-error' }
+      if (c.cooldown_until && new Date(c.cooldown_until).getTime() > Date.now()) {
+        // 账号级冷却（多账号路由失败后自动跳过该号，到期自动恢复）
+        return { label: '冷却中', cls: 'badge-warning' }
+      }
       if (c.expires_at && new Date(c.expires_at).getTime() < Date.now()) return { label: '已过期', cls: 'badge-warning' }
       return { label: '正常', cls: 'badge-success' }
+    },
+    cooldownText(c) {
+      if (!c.cooldown_until) return ''
+      const ms = new Date(c.cooldown_until).getTime() - Date.now()
+      if (ms <= 0) return ''
+      const m = Math.ceil(ms / 60000)
+      const fail = c.fail_count ? `（连续失败 ${c.fail_count} 次）` : ''
+      return `冷却 ${m} 分钟后恢复${fail}`
     },
     expireText(c) {
       if (!c.expires_at) return '长效'

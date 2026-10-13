@@ -40,6 +40,7 @@ class RouteResult:
     fallback_count: int = 0
     error: Optional[str] = None
     selection_reason: Optional[str] = None
+    account: Optional[str] = None   # OAuth 多账号：本次选中的账号（owner），写日志/账号冷却用
 class AutoRouter:
     """Auto 智能路由器"""
     def __init__(
@@ -318,6 +319,7 @@ class AutoRouter:
             api_key = None
             key = None
             _cand_extra = None
+            _cand_account = None
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                 if provider.credential_type == "oauth":
                     # 统一解析器：u1s1 需 __dpop 标记随行，裸 token 会被当 Bearer 拒收
@@ -331,6 +333,7 @@ class AutoRouter:
                     else:
                         api_key = _rc_c.api_key
                         _cand_extra = _rc_c.extra_headers
+                        _cand_account = getattr(_rc_c, "account", None) or None
                     if not api_key:
                         # OAuth 未连接，跳过此候选
                         if conversation_id:
@@ -438,6 +441,7 @@ class AutoRouter:
                 adapter=adapter,
                 fallback_count=0,
                 extra_headers=_extra_a,
+                account=_cand_account,
                 selection_reason="highest ranked available candidate",
             )
         print(f"[AUTO] get_best_candidate exhausted all candidates (rate-limited or no key)")
@@ -481,6 +485,7 @@ class AutoRouter:
         api_key = None
         key_id_for_rate = None
         _sticky_extra = None
+        _sticky_account = None
         if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
             if provider.credential_type == "oauth":
                 # 走统一解析器：u1s1 需在附加头里带 __dpop 标记，
@@ -494,6 +499,7 @@ class AutoRouter:
                     return None   # OAuth 未连接，放走
                 api_key = _rc_s.api_key
                 _sticky_extra = _rc_s.extra_headers
+                _sticky_account = getattr(_rc_s, "account", None) or None
             else:
                 api_key = ""
         else:
@@ -548,6 +554,7 @@ class AutoRouter:
             adapter=adapter,
             fallback_count=0,
             extra_headers=_extra,
+            account=_sticky_account,
             selection_reason="session sticky",
         )
 

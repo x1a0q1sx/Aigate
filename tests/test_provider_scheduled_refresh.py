@@ -174,11 +174,18 @@ async def test_pick_prefers_default_row(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolver_passes_oauth_owner(tmp_path, monkeypatch):
-    """credential_resolver 必须把 provider.oauth_owner 透传给 pick_access_token"""
+    """credential_resolver 必须把 provider.oauth_owner 透传给取号入口（多账号选号）
+
+    2026-10-13 起解析器走 pick_access_token_ex（额外返回实际选中的 owner），
+    spy 两个入口都要提供（pick_access_token 为兼容封装）。"""
     import server.core.oauth_client as oc_mod
     captured = {}
 
     class _Spy:
+        async def pick_access_token_ex(self, code, db, owner="__default"):
+            captured["owner"] = owner
+            return (owner if owner != "__default" else "acct-chosen", "tok")
+
         async def pick_access_token(self, code, db, owner="__default"):
             captured["owner"] = owner
             return "tok"
@@ -194,7 +201,9 @@ async def test_resolver_passes_oauth_owner(tmp_path, monkeypatch):
                                headers=None, proxy_enabled=False)
     rc = await resolve_credential_async(provider, SimpleNamespace(model_id="m"), None)
     assert rc.ok and captured["owner"] == "13800000000"
-    # 未点名 → 自动 __default
+    assert rc.account == "13800000000"   # 实际选中的账号随解析结果出行
+    # 未点名 → 自动 __default（多账号自动选号；account 为实际选中者）
     provider.oauth_owner = None
-    await resolve_credential_async(provider, SimpleNamespace(model_id="m"), None)
+    rc2 = await resolve_credential_async(provider, SimpleNamespace(model_id="m"), None)
     assert captured["owner"] == "__default"
+    assert rc2.account == "acct-chosen"

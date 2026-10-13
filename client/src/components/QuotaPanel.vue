@@ -81,7 +81,11 @@ export default {
       for (const [, q] of this.bonusRows) {
         total += Number(q.total) || 0
         remaining += Number(q.remaining) || 0
-        if (q.reset_at && (first === null || q.reset_at < first)) first = q.reset_at
+        // 「最早到期」只统计**仍有余额**的包（2026-10-13 用户要求）：
+        // 已耗尽的包还挂在列表里，但其到期时间已无意义（不会再消耗）；
+        // 把它们算进来会显示一个早已不影响用户的「最早到期」。
+        const rem = Number(q.remaining) || 0
+        if (rem > 0 && q.reset_at && (first === null || q.reset_at < first)) first = q.reset_at
       }
       return { count: this.bonusRows.length, total, remaining, firstExpiry: first }
     },

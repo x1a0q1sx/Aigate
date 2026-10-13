@@ -19,6 +19,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import secrets
 import time
 import httpx
@@ -32,6 +33,26 @@ from server.core.crypto_service import get_crypto_service, CryptoService
 from server.core.oauth_registry import OAuthProviderConfig, get_oauth_provider
 
 logger = logging.getLogger(__name__)
+
+# 账号级脏标记：某账号失败过（冷却写入 DB）才置位；成功清理时只有脏账号
+# 才查库写库 —— 让正常成功路径保持零 DB 开销（多账号冷却的常用情形）。
+_ACCOUNT_DIRTY: set = set()
+
+_STATUS_CODE_RE = re.compile(r"(?<![\d.])([45]\d{2})(?![\d.])")
+
+
+def status_from_error_text(text) -> Optional[int]:
+    """从错误文案里提取 HTTP 状态码（429/401/403/5xx…），提取不到返回 None。
+
+    用于账号级冷却的分级（429=短冷却、401/403=长冷却）：上游错误在网关内
+    以字符串形态流转，此处是仅有的结构化兜底。"""
+    m = _STATUS_CODE_RE.search(str(text or ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
 
 
 def _now_utc() -> datetime:
@@ -1468,34 +1489,183 @@ class OAuthClient:
     ) -> Optional[str]:
         """供 v1_router 使用：返回有效 access_token；必要时主动刷新。
 
-        owner=__default（自动模式）时，主账号被改名/停用/删除后回退该服务商
-        任一 active 连接（id 最早）——否则路由会报"未连接"（实测踩坑：连接
-        改名成手机号后 codebuddy_cn 全部候选失效）。显式指定 owner 查不到
-        时返回 None：用户点名要这个账号，不能悄悄换号。"""
-        existing = await self._get_token_record(db, provider_code, owner)
-        if (not existing or not existing.is_active) and owner == "__default":
-            existing = await self._get_any_active_token_record(db, provider_code)
-            if existing:
-                owner = existing.owner
-        if not existing or not existing.is_active:
+        owner=__default（自动模式）时按多账号自动选号（见 pick_access_token_ex），
+        主账号被改名/停用/删除后回退该服务商任一 active 连接——否则路由会报
+        "未连接"（实测踩坑：连接改名成手机号后 codebuddy_cn 全部候选失效）。
+        显式指定 owner 查不到时返回 None：用户点名要这个账号，不能悄悄换号。
+        需要知道本次实际选中的账号（写日志/账号级冷却）时用 pick_access_token_ex。"""
+        got = await self.pick_access_token_ex(provider_code, db, owner=owner)
+        return got[1] if got else None
+
+    # ── 多账号自动选号 + 账号级冷却（2026-10-13 用户要求）──────────────
+    # 多账号（同一 oauth_code 下多条连接）时：
+    #   1) 自动模式不再固定用 id 最早的账号，而是优先「有余额且积分最近到期」
+    #      的账号（先用快过期的，避免浪费）。只读 oauth_usage 的内存缓存——
+    #      请求路径绝不同步打上游额度接口；缓存冷启动时退化为旧语义。
+    #   2) 某账号请求失败（429/401/403/5xx…）后进入账号级冷却（指数退避），
+    #      自动选号跳过它、改用其他账号；全部冷却时仍回退使用（避免饿死）。
+    #      点名（provider.oauth_owner）的账号不受冷却影响——用户明确指定就照用。
+
+    _ACCOUNT_COOLDOWN_CAP = 3600
+
+    @staticmethod
+    def _account_cooldown_seconds(status_code: Optional[int], fail_count: int) -> int:
+        """失败 → 冷却秒数：429=60s 起、401/403=300s 起、其余=120s 起，指数退避封顶 1h。"""
+        if status_code == 429:
+            base = 60
+        elif status_code in (401, 403):
+            base = 300
+        else:
+            base = 120
+        return min(base * (2 ** max(int(fail_count or 1) - 1, 0)), OAuthClient._ACCOUNT_COOLDOWN_CAP)
+
+    def _rank_auto_rows(self, provider_code: str, rows: list) -> list:
+        """自动模式候选排序键（升序取第一）：(是否冷却, 额度排序键, __default 优先, id)。
+
+        额度排序键来自 oauth_usage.quota_rank_key：有余额按最早到期升序 →
+        无数据 → 已耗尽。缓存冷启动时全部为「无数据」，退化为 __default
+        优先、其次 id 最早（完全保持旧语义）。"""
+        from server.core.oauth_usage import cached_usage_for_token, quota_rank_key
+        now = _now_utc()
+        ranked = []
+        for row in rows:
+            cooling = 1 if (row.cooldown_until and row.cooldown_until > now) else 0
+            token = None
+            try:
+                token = self._crypto.decrypt(row.access_token_enc) if row.access_token_enc else None
+            except Exception:
+                token = None
+            usage = cached_usage_for_token(provider_code, token) if token else None
+            pref = 0 if row.owner == "__default" else 1
+            ranked.append((cooling, quota_rank_key(usage), pref, row.id, row))
+        ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+        return ranked
+
+    async def _row_token_ready(self, db: AsyncSession, provider_code: str, row) -> Optional[str]:
+        """取该行可用的 access_token（临期主动刷新；刷新失败用旧 token 兜底）。"""
+        try:
+            token_plain = self._crypto.decrypt(row.access_token_enc) if row.access_token_enc else None
+        except Exception:
             return None
-        # 解密
-        token_plain = self._crypto.decrypt(existing.access_token_enc)
-        # 检查是否到期前需要刷新
         provider = get_oauth_provider(provider_code)
         lead = provider.refresh_lead_seconds if provider else 600
-        exp = existing.expires_at
+        exp = row.expires_at
         if exp:
             now = _now_utc()
             threshold = exp - timedelta(seconds=lead)
             if now >= threshold:
-                refresh_ok, _ = await self.refresh_token(provider_code, db, owner)
+                refresh_ok, _ = await self.refresh_token(provider_code, db, row.owner)
                 if refresh_ok:
-                    refreshed = await self._get_token_record(db, provider_code, owner)
+                    refreshed = await self._get_token_record(db, provider_code, row.owner)
                     if refreshed:
-                        token_plain = self._crypto.decrypt(refreshed.access_token_enc)
-                # 刷新失败也用旧 token 试一次（兜底）
+                        try:
+                            token_plain = self._crypto.decrypt(refreshed.access_token_enc)
+                        except Exception:
+                            pass
         return token_plain
+
+    async def pick_access_token_ex(
+        self,
+        provider_code: str,
+        db: AsyncSession,
+        owner: str = "__default",
+    ) -> Optional[Tuple[str, str]]:
+        """同 pick_access_token，但返回 (实际选中的 owner, access_token)。
+
+        显式 owner：精确取号（不受冷却影响）。
+        自动模式（__default）：加载全部 active 连接 → 账号级冷却/额度到期排序 →
+        依序尝试取 token（某行解密失败自动落到下一行）。"""
+        if owner and owner != "__default":
+            row = await self._get_token_record(db, provider_code, owner)
+            if not row or not row.is_active:
+                return None
+            token = await self._row_token_ready(db, provider_code, row)
+            if not token:
+                return None
+            # 该行有残留冷却/失败计数 → 预置脏标记，本次成功可清库（与自动分支一致）
+            try:
+                if (row.fail_count or 0) or row.cooldown_until:
+                    _ACCOUNT_DIRTY.add((provider_code, row.owner))
+            except Exception:
+                pass
+            return (owner, token)
+        try:
+            rows = (await db.execute(
+                select(OAuthToken).where(
+                    OAuthToken.provider_code == provider_code,
+                    OAuthToken.is_active == True,  # noqa: E712
+                ).order_by(OAuthToken.id)
+            )).scalars().all()
+        except Exception as e:
+            logger.warning("pick access token list failed: %s", e)
+            return None
+        if not rows:
+            return None
+        ranked = self._rank_auto_rows(provider_code, rows)
+        for _cool, _qk, _pref, _rid, row in ranked:
+            token = await self._row_token_ready(db, provider_code, row)
+            if token:
+                # 该行有 DB 残留状态（如重启前写入的冷却）→ 本次若成功应能清掉：
+                # 预置脏标记，让 note_request_result(ok=True) 的常规路径也去清库。
+                try:
+                    if (row.fail_count or 0) or row.cooldown_until:
+                        _ACCOUNT_DIRTY.add((provider_code, row.owner))
+                except Exception:
+                    pass
+                return (row.owner, token)
+        return None
+
+    async def note_request_result(
+        self,
+        provider_code: str,
+        owner: str,
+        ok: bool,
+        status_code: Optional[int] = None,
+        error: str = "",
+    ) -> None:
+        """账号级健康记录（多账号路由用；永不抛异常）。
+
+        ok=False → fail_count+1 并按错误类型设置 cooldown_until（指数退避）；
+        ok=True  → 仅当该账号曾失败过（脏标记）才查库清零——成功路径零成本。
+        """
+        if not provider_code or not owner:
+            return
+        mark = (provider_code, owner)
+        if ok:
+            if mark not in _ACCOUNT_DIRTY:
+                return
+            _ACCOUNT_DIRTY.discard(mark)
+        else:
+            _ACCOUNT_DIRTY.add(mark)
+            if status_code is None:
+                status_code = status_from_error_text(error)
+        try:
+            from server.db import AsyncSessionLocal
+            async with AsyncSessionLocal() as db:
+                row = (await db.execute(
+                    select(OAuthToken).where(
+                        OAuthToken.provider_code == provider_code,
+                        OAuthToken.owner == owner,
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if not row:
+                    return
+                if ok:
+                    row.fail_count = 0
+                    row.cooldown_until = None
+                    await db.commit()
+                    return
+                fc = int(row.fail_count or 0) + 1
+                row.fail_count = fc
+                row.cooldown_until = _now_utc() + timedelta(
+                    seconds=self._account_cooldown_seconds(status_code, fc))
+                await db.commit()
+                logger.info(
+                    "oauth account %s/%s entering cooldown %ss (fail#%d status=%s)",
+                    provider_code, owner,
+                    self._account_cooldown_seconds(status_code, fc), fc, status_code)
+        except Exception as e:
+            logger.debug("note_request_result failed: %s", e)
 
     # ── 持久化辅助 ──
     async def _get_token_record(self, db: AsyncSession, provider_code: str, owner: str) -> Optional[OAuthToken]:
@@ -1702,6 +1872,8 @@ class OAuthClient:
                 "refresh_expires_at": row.refresh_expires_at.isoformat() + "Z" if row.refresh_expires_at else None,
                 "last_refreshed_at": row.last_refreshed_at.isoformat() + "Z" if row.last_refreshed_at else None,
                 "last_error": row.last_error,
+                "cooldown_until": row.cooldown_until.isoformat() + "Z" if getattr(row, "cooldown_until", None) else None,
+                "fail_count": int(getattr(row, "fail_count", 0) or 0),
             })
         return out
 

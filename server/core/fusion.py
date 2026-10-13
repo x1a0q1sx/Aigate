@@ -48,12 +48,31 @@ def _extract_text(result) -> Optional[str]:
 
 
 async def default_call(db, provider, model, request, timeout: float):
-    """生产路径单候选调用：统一凭证解析 + 非流式（free/oauth/atomcode/标准一个入口）。"""
-    from server.core.credential_resolver import resolve_credential_async, call_via
+    """生产路径单候选调用：统一凭证解析 + 非流式（free/oauth/atomcode/标准一个入口）。
+
+    OAuth 多账号：结果记到实际选中的账号（失败进冷却/成功清零），与主路由一致。"""
+    from server.core.credential_resolver import (
+        resolve_credential_async, call_via, note_account_result, error_status_code)
     rc = await resolve_credential_async(provider, model, db)
     if not rc.ok:
         raise RuntimeError(rc.error or "no credential")
-    return await asyncio.wait_for(call_via(rc, request, provider, model), timeout)
+    account = getattr(rc, "account", None)
+    try:
+        result = await asyncio.wait_for(call_via(rc, request, provider, model), timeout)
+    except Exception as e:
+        if account:
+            try:
+                await note_account_result(provider, account, ok=False,
+                                          status_code=error_status_code(e), error=str(e)[:300])
+            except Exception:
+                pass
+        raise
+    if account:
+        try:
+            await note_account_result(provider, account, ok=True)
+        except Exception:
+            pass
+    return result
 
 
 async def _intel_rows(db):

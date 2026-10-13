@@ -483,6 +483,84 @@ async def _refresh_scheduler_loop():
 _scheduler_task: Optional[asyncio.Task] = None
 
 
+# ── 多账号额度预热（按积分到期选号的缓存来源，2026-10-13）───────────
+# auto 选号（pick_access_token_ex → oauth_usage.cached_usage_for_token）只读
+# 进程内 5 分钟 TTL 缓存，绝不在请求路径打上游额度接口。本任务周期性把多账号
+# provider 的额度数据预取进缓存：
+#   - 每 300s（= USAGE_TTL_SECONDS，缓存刚好过期时刷新）扫一次；
+#   - 仅扫「同一 oauth_code 有 ≥2 条 active 连接」的（单账号无需排序）；
+#   - 串行 + 失败静默；首次启动延迟 20s（让服务先起来）。
+_PREWARM_INTERVAL = 300
+_prewarm_task: Optional[asyncio.Task] = None
+
+
+async def _prewarm_multi_account_usage_once():
+    from sqlalchemy import func
+    from server.core.oauth_usage import get_connection_usage
+    try:
+        async with AsyncSessionLocal() as db:
+            multi = (await db.execute(
+                select(OAuthToken.provider_code)
+                .where(OAuthToken.is_active == True)  # noqa: E712
+                .group_by(OAuthToken.provider_code)
+                .having(func.count(OAuthToken.id) >= 2)
+            )).scalars().all()
+            if not multi:
+                return
+            rows = (await db.execute(
+                select(OAuthToken).where(
+                    OAuthToken.is_active == True,  # noqa: E712
+                    OAuthToken.provider_code.in_(list(multi)),
+                ).order_by(OAuthToken.id)
+            )).scalars().all()
+            client = get_oauth_client()
+            for row in rows:
+                try:
+                    token = client._crypto.decrypt(row.access_token_enc)
+                    await get_connection_usage(row.provider_code, token, force=True)
+                except Exception as e:
+                    logger.debug("usage prewarm failed %s/%s: %s",
+                                 row.provider_code, row.owner, e)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("usage prewarm loop error: %s", e)
+
+
+async def _usage_prewarm_loop():
+    logger.info("OAuth multi-account usage prewarm started (every %ss)", _PREWARM_INTERVAL)
+    await asyncio.sleep(20)   # 启动期让位给服务初始化
+    while True:
+        try:
+            await _prewarm_multi_account_usage_once()
+        except asyncio.CancelledError:
+            logger.info("OAuth usage prewarm cancelled")
+            break
+        except Exception as e:
+            logger.warning("usage prewarm iteration error: %s", e)
+        try:
+            await asyncio.sleep(_PREWARM_INTERVAL)
+        except asyncio.CancelledError:
+            logger.info("OAuth usage prewarm cancelled")
+            break
+
+
+def start_oauth_usage_prewarm():
+    """启动多账号额度预热（在 main.py lifespan 里调用；幂等）。"""
+    global _prewarm_task
+    if _prewarm_task is None or _prewarm_task.done():
+        try:
+            _prewarm_task = asyncio.create_task(_usage_prewarm_loop())
+        except RuntimeError:
+            pass
+
+
+def stop_oauth_usage_prewarm():
+    global _prewarm_task
+    if _prewarm_task and not _prewarm_task.done():
+        _prewarm_task.cancel()
+
+
 def start_oauth_refresh_scheduler():
     """启动后台刷新调度器（在 main.py lifespan 里调用）"""
     global _scheduler_task

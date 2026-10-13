@@ -1042,6 +1042,15 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 candidate.model.id,
                 ar.config.cooling_period_seconds,
             )
+        # OAuth 多账号：失败 → 对应账号冷却（与模型冷却独立；上下文超限不是账号问题）
+        if cooling and not is_context_error(err_short) and getattr(candidate, "account", None):
+            try:
+                from server.core.credential_resolver import note_account_result as _nar
+                from server.core.oauth_client import status_from_error_text as _sfe
+                await _nar(candidate.provider, candidate.account, ok=False,
+                           status_code=_sfe(err_short), error=err_short or "")
+            except Exception:
+                pass
         # 写一条失败日志，方便在分析页看到每次尝试（含冷却信息）
         cd_seconds = ar.config.cooling_period_seconds
         fc = (ar.health_checker._fail_count.get(candidate.model.id, 0) if ar.health_checker else 0)
@@ -1058,6 +1067,7 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                     routed_provider=candidate.provider.name,
                     routed_provider_id=candidate.provider.id,
                     routed_model=candidate.model.model_id,
+                    routed_account=getattr(candidate, "account", None),
                     status="error",
                     error_type="upstream_error",
                     error_msg=(full_error or err_short) + cooldown_note,
@@ -1135,6 +1145,9 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 if not _rc.ok:
                     raise _AFail(_rc.error, candidate)
                 _cred = _rc
+                # OAuth 多账号：把实际选中的账号挂到候选上（日志 + 冷却寻址）
+                if _rc.kind == "oauth" and getattr(_rc, "account", None):
+                    candidate.account = getattr(_rc, "account", None)
         # 发起完整业务请求（非探测）——HTTP 在锁外
         upstream_request = _without_unsupported_reasoning(
             request.model_copy(update={"model": candidate.model.model_id}), candidate.model
@@ -1239,7 +1252,15 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         api_key=candidate.api_key,
         adapter=candidate.adapter,
         fallback_count=attempt,
+        account=getattr(candidate, "account", None),   # OAuth 多账号：本次实际使用的账号（日志用）
     )
+    # OAuth 多账号：成功 → 清该账号冷却/失败计数
+    if getattr(candidate, "account", None):
+        try:
+            from server.core.credential_resolver import note_account_result as _nar
+            await _nar(candidate.provider, candidate.account, ok=True)
+        except Exception:
+            pass
     # 确保返回结果中的 model 字段已设为完整标识
     if isinstance(result, dict):
         result["model"] = f"{candidate.provider.name}/{candidate.model.model_id}"
@@ -1260,7 +1281,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                            routed_provider, routed_model, error_msg, fallback_count, attempt_errors,
                            stream_body=None, prompt_tokens=0, completion_tokens=0, latency_ms=None,
                            ttft_ms=None, cache_read_tokens=0, cache_write_tokens=0, diag_start_ts=None,
-                           est_prompt_tokens=None, routed_provider_id=None):
+                           est_prompt_tokens=None, routed_provider_id=None, routed_account=None):
     """在流式生成器内异步写请求日志。
 
     routed_provider_id：调用方已知服务商主键时传入（免一次按名查询）；为 None 时
@@ -1346,6 +1367,7 @@ async def _write_stream_log(conversation_id, request, raw_request, status,
                     routed_provider=routed_provider,
                     routed_provider_id=_prov_id,
                     routed_model=routed_model,
+                    routed_account=routed_account,
                     status=status,
                     prompt_tokens=pt,
                     completion_tokens=ct,
@@ -1921,6 +1943,7 @@ async def _chat_completions_impl(
                         ctx = {"gen": gen, "buf": [], "committed": False, "usage": {},
                                "ttft_ms": None, "attempt_ttft_ms": None,
                                "prov": _prov, "mdl": _mdl, "mid_full": mid_full,
+                               "account": (getattr(_rc, "account", None) or None) if _rc.kind == "oauth" else None,
                                "start": _start, "attempt": st_attempt}
                         ctx_by_idx[st_attempt] = ctx
                         try:
@@ -1981,11 +2004,21 @@ async def _chat_completions_impl(
                         elif ar.health_checker and not _is_stream_content_validation_error(et):
                             ar.health_checker.mark_failure(ctx["mdl"].id)
                             ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
+                        # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
+                        if ctx.get("account") and not is_context_error(et):
+                            try:
+                                from server.core.credential_resolver import note_account_result as _nar
+                                from server.core.oauth_client import status_from_error_text as _sfe
+                                await _nar(ctx["prov"], ctx["account"], ok=False,
+                                           status_code=_sfe(et), error=et or "")
+                            except Exception:
+                                pass
                         raw_err = getattr(exc, "raw_err", None) or getattr(exc, "stream_body", None) or et
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             ctx["prov"].name, ctx["mdl"].model_id, et[:500], st_attempt, None,
                             stream_body=raw_err, diag_start_ts=_diag_start,
-                            routed_provider_id=getattr(ctx["prov"], "id", None))
+                            routed_provider_id=getattr(ctx["prov"], "id", None),
+                            routed_account=ctx.get("account"))
                         print(f"[组合流式] 第{st_attempt + 1}次尝试 服务商={ctx['prov'].name} "
                               f"模型={ctx['mdl'].model_id} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
 
@@ -2088,9 +2121,17 @@ async def _chat_completions_impl(
                             latency_ms=_combo_latency, ttft_ms=_cb_ttft_ms,
                             diag_start_ts=_diag_start,
                             est_prompt_tokens=est_req_tokens,
-                            routed_provider_id=getattr(_prov, "id", None))
+                            routed_provider_id=getattr(_prov, "id", None),
+                            routed_account=ctx.get("account"))
                         if ar.health_checker:
                             ar.health_checker.mark_success(_mdl.id)
+                        # OAuth 多账号：成功 → 清该账号冷却/失败计数
+                        if ctx.get("account"):
+                            try:
+                                from server.core.credential_resolver import note_account_result as _nar
+                                await _nar(_prov, ctx["account"], ok=True)
+                            except Exception:
+                                pass
                         yield b"data: [DONE]\n\n"
                     except Exception as se:
                         # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端
@@ -2179,6 +2220,7 @@ async def _chat_completions_impl(
                 )
                 upstream_req, extra_hdr = _apply_request_overrides(upstream_req, model, extra_hdr)
                 ctx = {"t_idx": t_idx, "full_id": full_id, "provider": provider, "model": model,
+                       "account": (getattr(_rc, "account", None) or None) if _rc.kind == "oauth" else None,
                        "start": time.time()}
                 _ns_ctx_by_idx[t_idx] = ctx
                 _decision_select(conversation_id, provider=provider.name, model=model.model_id,
@@ -2230,6 +2272,15 @@ async def _chat_completions_impl(
                 elif ar.health_checker:
                     ar.health_checker.mark_failure(ctx["model"].id)
                     ar.health_checker.mark_cooling(ctx["model"].id, ar.config.cooling_period_seconds)
+                # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
+                if ctx.get("account") and not is_context_error(et):
+                    try:
+                        from server.core.credential_resolver import note_account_result as _nar
+                        from server.core.oauth_client import status_from_error_text as _sfe
+                        await _nar(ctx["provider"], ctx["account"], ok=False,
+                                   status_code=_sfe(et), error=et or "")
+                    except Exception:
+                        pass
                 print(f"[组合路由] 目标 {ctx['full_id']} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
 
             async def _ns_on_loser(t_idx):
@@ -2281,8 +2332,16 @@ async def _chat_completions_impl(
             _w_provider = _wctx["provider"] if _wctx else None
             _w_model = _wctx["model"] if _wctx else None
             _w_start = _wctx["start"] if _wctx else _diag_start
+            _w_account = _wctx.get("account") if _wctx else None
             if ar.health_checker and _w_model is not None:
                 ar.health_checker.mark_success(_w_model.id)
+            # OAuth 多账号：成功 → 清该账号冷却/失败计数
+            if _w_account:
+                try:
+                    from server.core.credential_resolver import note_account_result as _nar
+                    await _nar(_w_provider, _w_account, ok=True)
+                except Exception:
+                    pass
             _decision_attempt(conversation_id, provider=_w_provider.name, model=_w_model.model_id,
                               status="success", attempt=winner_idx,
                               latency_ms=int((time.time() - _w_start) * 1000))
@@ -2304,6 +2363,7 @@ async def _chat_completions_impl(
                     latency_ms=int((time.time() - _w_start) * 1000),
                     diag_start_ts=_diag_start,
                     routed_provider_id=getattr(_w_provider, "id", None),
+                    routed_account=_w_account,
                 )
             except Exception:
                 pass
@@ -2335,6 +2395,7 @@ async def _chat_completions_impl(
             api_key = None
             _kid = None
             _direct_extra = None
+            _direct_account = None    # OAuth 多账号：本次选中的账号（写日志 + 账号级冷却）
             if getattr(provider, "credential_type", "api_key") in ("free_tier", "oauth") or provider.api_type == "atomcode":
                 _diag(conversation_id, "direct_key_skipped_" + provider.credential_type, _diag_start, provider=provider.name)
                 if provider.credential_type == "oauth":
@@ -2351,6 +2412,7 @@ async def _chat_completions_impl(
                         return JSONResponse(status_code=503, content=_api_error(f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)", status=503))
                     api_key = _rc_d.api_key
                     _direct_extra = _rc_d.extra_headers
+                    _direct_account = getattr(_rc_d, "account", None) or None
                 else:
                     api_key = ""   # free_tier：decoder 时 adapter 用空字符串鉴权头
             else:
@@ -2384,6 +2446,7 @@ async def _chat_completions_impl(
             route_result = RouteResult(
                 success=True, model=model, provider=provider, api_key=api_key, key_id=_kid,
                 adapter=adapter, fallback_count=0,
+                account=_direct_account,   # OAuth 多账号：本次选中的账号随结果流转（日志 + 账号冷却）
                 extra_headers=_merge_oauth_headers(provider, _direct_extra),   # oauth 的 __dpop/__oauth 标记随行（直连不再裸发设备凭证）
             )
             _decision_candidates(conversation_id, [{
@@ -2451,6 +2514,19 @@ async def _chat_completions_impl(
                                             routed_provider_id=getattr(provider, "id", None))
                                 except Exception:
                                     pass
+                                # free_tier 失败也进模型冷却（2026-10-13）：上游拒服务/限流时
+                                # 旧逻辑不冷却 → auto/combo 每轮都来撞同一个坏模型；上游端点
+                                # 不可用（Endpoint is unavailable）与已下架（ModelDeprecated）
+                                # 靠实测冷却 5~10 分钟自然退场，比每次都白等一个失败的 sidecar 快。
+                                if _free_err and model is not None:
+                                    from server.core.free_providers import is_free_failure_coolable
+                                    if is_free_failure_coolable(_free_err):
+                                        try:
+                                            if ar.health_checker:
+                                                ar.health_checker.mark_failure(model.id)
+                                                ar.health_checker.mark_cooling(model.id, 300)
+                                        except Exception:
+                                            pass
                         return StreamingResponse(_free_stream(), media_type="text/event-stream")
                     else:
                         try:
@@ -2494,6 +2570,15 @@ async def _chat_completions_impl(
                             _free_latency = int((time.time() - _free_started) * 1000)
                             _free_err = err_text(e)[:300]
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="failed", attempt=0, latency_ms=_free_latency, error=_free_err)
+                            # free_tier 失败进模型冷却（同流式路径；可冷却错误才冷却）
+                            from server.core.free_providers import is_free_failure_coolable
+                            if model is not None and is_free_failure_coolable(_free_err):
+                                try:
+                                    if ar.health_checker:
+                                        ar.health_checker.mark_failure(model.id)
+                                        ar.health_checker.mark_cooling(model.id, 300)
+                                except Exception:
+                                    pass
                             await _decision_finish(conversation_id, status="error", provider=provider.name, model=model.model_id, fallback_count=0, total_latency_ms=_free_latency, failure_reason=_free_err)
                             await _early_error_log(conversation_id, request, raw_request, f"free_provider_failed: {_free_err}", err_type="upstream_error")
                             return JSONResponse(status_code=502, content=_api_error(f"free_provider_failed: {_free_err}", status=502))
@@ -2646,6 +2731,7 @@ async def _chat_completions_impl(
                     ctx = {"attempt": st_attempt, "full_id": mid_full, "prov": _prov_ns, "mdl": _mdl_ns,
                            "rc": _rc0, "up_req": up_req,
                            "is_free_channel": _rc0.kind == "free_tier",
+                           "account": (getattr(_rc0, "account", None) or None) if _rc0.kind == "oauth" else None,
                            "start": time.time(), "gen": None, "buf": [], "committed": False,
                            "usage": {}, "ttft_ms": None, "attempt_ttft_ms": None,
                            "first_chunk_timeout": max(5.0, min(first_chunk_timeout, remaining_first_response))}
@@ -2720,10 +2806,21 @@ async def _chat_completions_impl(
                 err_annotated = f"{full_error or et} | cooldown={cd_actual}s fail#{fc}"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
                     ctx["prov"].name, ctx["mdl"].model_id, err_annotated, st_attempt, None,
-                    stream_body=raw_body or et, diag_start_ts=_diag_start)
+                    stream_body=raw_body or et, diag_start_ts=_diag_start,
+                    routed_provider_id=getattr(ctx["prov"], "id", None),
+                    routed_account=ctx.get("account"))
                 if cooling and ar.health_checker and not _is_stream_content_validation_error(et) and ctx["mdl"].id:
                     ar.health_checker.mark_failure(ctx["mdl"].id)
                     ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
+                # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题/超限不算账号故障）
+                if cooling and not is_context_error(et) and ctx.get("account"):
+                    try:
+                        from server.core.credential_resolver import note_account_result as _nar
+                        from server.core.oauth_client import status_from_error_text as _sfe
+                        await _nar(ctx["prov"], ctx["account"], ok=False,
+                                   status_code=_sfe(et), error=et or "")
+                    except Exception:
+                        pass
                 print(f"[CASCADE] attempt {st_attempt} failed ({et[:60]}), trying next (tried={tried_sids})", flush=True)
 
             async def _on_fail(st_attempt, et, exc):
@@ -2809,9 +2906,18 @@ async def _chat_completions_impl(
                     cache_read_tokens=_crd, cache_write_tokens=_cwt,
                     latency_ms=int((time.time() - _send_time) * 1000),
                     ttft_ms=ctx["ttft_ms"], diag_start_ts=_diag_start,
-                    est_prompt_tokens=est_req_tokens)
+                    est_prompt_tokens=est_req_tokens,
+                    routed_provider_id=getattr(ctx["prov"], "id", None),
+                    routed_account=ctx.get("account"))
                 if ar.health_checker and ctx["mdl"].id:
                     ar.health_checker.mark_success(ctx["mdl"].id)
+                # OAuth 多账号：成功 → 清该账号冷却/失败计数
+                if ctx.get("account"):
+                    try:
+                        from server.core.credential_resolver import note_account_result as _nar
+                        await _nar(ctx["prov"], ctx["account"], ok=True)
+                    except Exception:
+                        pass
                 yield b"data: [DONE]\n\n"
             except Exception as se:
                 # 已外发实质内容后中途失败 → 无法无感回退，截断并告知客户端
@@ -3055,6 +3161,17 @@ async def _chat_completions_impl(
                         )
                     except Exception as e:
                         print(f"⚠️ 路由决策记录失败 conv={str(conversation_id)[:8]}: {type(e).__name__}: {str(e)[:150]}", flush=True)
+                    # OAuth 多账号：流式结束按结果记账号（成功清冷却 / 失败进冷却）
+                    if _direct_account:
+                        try:
+                            from server.core.credential_resolver import note_account_result as _nar
+                            from server.core.oauth_client import status_from_error_text as _sfe
+                            await _nar(route_result.provider, _direct_account,
+                                       ok=not _stream_err,
+                                       status_code=_sfe(_stream_err) if _stream_err else None,
+                                       error=_stream_err or "")
+                        except Exception:
+                            pass
                     # 决策收尾已移到独立的 shielded 调用（原来混在本 try 里，决策一挂日志就丢）
                     _diag(conversation_id, "stream_log_start", _diag_start, provider=_prov_name, model=_mdl_name, status="error" if _stream_err else "success")
                     from server.db import AsyncSessionLocal as _LS
@@ -3067,6 +3184,7 @@ async def _chat_completions_impl(
                                 routed_provider=_prov_name,
                                 routed_provider_id=_rt_prov_id,
                                 routed_model=_mdl_name,
+                                routed_account=_direct_account,   # OAuth 多账号：本次实际使用的账号
                                 status="error" if _stream_err else "success",
                                 prompt_tokens=pt,
                                 completion_tokens=ct,
@@ -3144,6 +3262,10 @@ async def _chat_completions_impl(
                         route_result.api_key = _cur_key
                         route_result.key_id = _cur_kid
                         _rot.mark_success(_cur_kid)
+                        # OAuth 多账号：成功 → 清该账号冷却/失败计数
+                        if getattr(route_result, "account", None):
+                            from server.core.credential_resolver import note_account_result as _nar
+                            await _nar(route_result.provider, route_result.account, ok=True)
                         _decision_attempt(
                             conversation_id,
                             provider=route_result.provider.name,
@@ -3175,6 +3297,11 @@ async def _chat_completions_impl(
                         if _e_status is None:
                             _e_status = getattr(getattr(e, "response", None), "status_code", None)
                         _rot.mark_failure(_cur_kid, _e_status)
+                        # OAuth 多账号：失败 → 该账号进入冷却（多账号路由自动换号）
+                        if getattr(route_result, "account", None):
+                            from server.core.credential_resolver import note_account_result as _nar, error_status_code as _esc
+                            await _nar(route_result.provider, route_result.account, ok=False,
+                                       status_code=_e_status or _esc(e), error=_err_now)
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                         # 瞬态故障同 key 原样重试（连接阶段预算 2：重建 httpx 客户端与连接，
                         # 瞬断多为偶发，多一次机会——2026-10-10 两次都撞抖动线路的实证）
@@ -3240,6 +3367,7 @@ async def _chat_completions_impl(
                 routed_provider=route_result.provider.name if (route_result and route_result.success) else None,
                 routed_provider_id=route_result.provider.id if (route_result and route_result.success) else None,
                 routed_model=route_result.model.model_id if (route_result and route_result.success) else None,
+                routed_account=getattr(route_result, "account", None) if (route_result and route_result.success) else None,
                 status="error" if is_err else "success",
                 latency_ms=_latency,
                 prompt_tokens=int(pt) if pt else 0,

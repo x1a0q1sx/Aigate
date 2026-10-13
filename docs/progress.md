@@ -154,3 +154,18 @@
 - mihomo 补丁 `/opt/clash/clash_config.yaml`（属主 clashm:clashm，模式 rule 分流）；重载后组 alive=100%（JP/SG 各候选延迟~600~1000ms）
 - ⚠️ 修复验证后（14:26 起）出现 429 `FreeUsageLimitError` 持续限流：**两个不同日本节点（日本-中转 01、日本原生-中转 01）同样 429** → 账号级限流（`Bearer public` 免费层），与本次修复无关；同 10-11 先例（高频试探触发、静置自愈，冷却 25min+）。生产使用不受影响（正常调用频次远低于验证探针）
 - ⚠️ 本地 push 通道变化：直连与 10889 SOCKS 均 SSL eof，本次经本地 Clash Verge **7897** 端口成功推送（`7de080a..3437809`）；SSH 到服务器不受影响
+
+## Session 11 - 2026-10-13
+### 完成（用户六项需求：OpenCode 全模型 429 / CodeBuddy Intl 总断 / 日志显示账号 / 按到期选号 / 耗尽包不统计到期 / 报错账号冷却）
+- ✅ **OpenCode 全 free 模型 429 定性**（任务1，F40 §1）：15:16 批量探测实为**三类错误混合**——真限流（429 FreeUsageLimitError，muse/space-bunny）、上游端点不可用（429/400 "Endpoint/Model is unavailable"，step-5/ling）、模型已下架（410 ModelDeprecated，exo/fledge）；mihomo journal 证实当时全走 JP 出口（**非** F39 的地区门复发）。机理=匿名 `Bearer public` 共享池 + 官方 CLI 指纹按「出口 IP+模型」分别限流；16:20 复测 muse/space-bunny/nemotron/longcat **全部恢复**（静置 ~50min 自愈；10-11 先例 ~25min）。**网关侧修复**：free_tier 直连失败（流式+非流式）补模型冷却——`is_free_failure_coolable` 判据（429/端点不可用/下架/5xx/超时→冷却 300s；FreeTierError 配置类→不冷却），auto/combo 不再每轮撞坏模型
+- ✅ **CodeBuddy Intl「总断」根因**（任务2）：`codebuddy_intl` 有 2 账号（id=9/10），自动模式固定打 **id 最早**（旧兜底=id 最小）→ 账号 9 被上游 429 频控（code 6004/14003）后全量 429，12 条连败实证（10-12 14:08-14:15）；且无账号级冷却/切换。修复=多账号治理机制（任务4/6）
+- ✅ **日志显示所用账号**（任务3）：`request_logs.routed_account` 列 + 全路径写入（直连非流式/流式、auto 级联非流式/流式、combo 非流式/流式、playground、fusion 经 `ResolvedCredential.account`/`RouteResult.account` 链路）；列表+详情 API 返回；前端列表行 `👤 账号` 徽标 + 详情「使用账号」行
+- ✅ **按积分最近到期选号**（任务4）：自动模式（`oauth_owner` 空）排序键 `(冷却, 额度档位, __default, id)`——有余额且**到期最近**优先（先用快过期的）；额度数据由新增预热任务 `_usage_prewarm_loop`（300s，仅多账号 provider）填充 `oauth_usage` 进程内缓存，**请求路径只读缓存零网络**；无数据时退化为旧语义（__default/id 最早）
+- ✅ **耗尽包不参与最早到期**（任务5）：QuotaPanel `bonusAgg.firstExpiry` 只统计 `remaining>0` 的包（后端 `quota_rank_key` 同口径）
+- ✅ **报错账号冷却**（任务6）：`oauth_tokens.cooldown_until/fail_count` 列；`note_request_result`（429→60s/401·403→300s/其余→120s，指数退避封顶 1h；成功走脏标记零开销清零）；选号跳过冷却账号（**全冷却仍回退**防 503；**点名不受冷却**——用户明确指定）；资格闸 `is_account_worthy_error`（空输出/race 取消/上下文超限不冷却）；接入全部 8 条调用路径
+- ✅ **测试 1005→1028 全绿**（新增 `tests/test_oauth_multi_account.py` 23 项：排序键/冷却跳过/退避清零/资格闸/状态码提取/free 判据/DB 列/全路径静态锁/前端静态锁）；改写 `test_resolver_passes_oauth_owner`（`pick_access_token_ex`）；前端 build 通过（bundle `index-Igfu_2y0.js`）；E2E 冒烟（临时 DB：到期排序选中 → 冷却切换）通过
+- ✅ **文档**：新增 `docs/findings-oauth-multi-account.md`（F40 全文）
+### 备注
+- 匿名共享池限流的唯一缓解=静置/换 IP/降频；生产正常频次远低于探针，无需额外动作
+- `getattr(rc, "account", None)` 全链兼容旧替身对象（测试桩无该属性也不会炸）
+- 预热任务启动延迟 20s（让位服务初始化）；单账号 provider 不预热（无需排序）

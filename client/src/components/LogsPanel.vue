@@ -78,6 +78,9 @@
             <td style="font-family: monospace; font-size: 12px;">
               <span v-if="r.routed_provider">{{ r.routed_provider }}/{{ r.routed_model }}</span>
               <span v-else style="color: var(--text-muted);">-</span>
+              <!-- OAuth 多账号：显示本次实际使用的账号（owner） -->
+              <span v-if="r.routed_account" :title="'本次请求使用的账号：' + r.routed_account"
+                    class="badge badge-neutral" style="font-size: 10px; margin-left: 4px;">👤 {{ r.routed_account }}</span>
             </td>
             <td>
               <span :class="['badge', r.status === 'pending' ? 'badge-info' : (r.status === 'success' ? 'badge-success' : 'badge-danger')]" style="font-size: 11px;">{{ r.status === 'pending' ? '⏳ 待响应' : (r.status === 'success' ? '成功' : '失败') }}</span>
@@ -253,6 +256,10 @@
           <tr>
             <td class="k">路由服务商</td><td class="v">{{ detailRow.routed_provider || '-' }}</td>
             <td class="k">延迟</td><td class="v">{{ fmtLatency(detailRow.ttft_ms, detailRow.latency_ms) }}</td>
+          </tr>
+          <tr v-if="detailRow.routed_account">
+            <td class="k">使用账号</td>
+            <td class="v" colspan="3" style="font-family: monospace;">👤 {{ detailRow.routed_account }}<span style="color: var(--text-muted); font-size: 11px; margin-left: 6px;">（OAuth 多账号：本次请求实际使用的账号）</span></td>
           </tr>
           <tr>
             <td class="k">Prompt Token</td><td class="v">{{ detailRow.prompt_tokens || 0 }}</td>

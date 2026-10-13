@@ -34,11 +34,87 @@ class ResolvedCredential:
     free_executor = None
     free_code: str = ""
     base_url: str = ""
+    account: str = ""               # OAuth 多账号：本次实际选中的账号（owner），写日志/账号冷却用
+    oauth_code: str = ""            # OAuth registry code（账号冷却寻址用）
     error: Optional[str] = None
 
     @property
     def ok(self) -> bool:
         return self.error is None
+
+
+def error_status_code(e: BaseException) -> Optional[int]:
+    """尽力从异常链里提取 HTTP 状态码（供账号级冷却分级）。
+
+    顺序：异常自身 status_code → 其 response.status_code → __cause__/__context__
+    链 → 文案中的 4xx/5xx 数字。提取不到返回 None。"""
+    cur = e
+    for _ in range(5):
+        if cur is None:
+            break
+        sc = getattr(cur, "status_code", None)
+        if sc is None:
+            sc = getattr(getattr(cur, "response", None), "status_code", None)
+        if sc:
+            try:
+                return int(sc)
+            except (TypeError, ValueError):
+                pass
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    try:
+        from server.core.oauth_client import status_from_error_text
+        return status_from_error_text(str(e))
+    except Exception:
+        return None
+
+
+def is_account_worthy_error(error, status_code: Optional[int] = None) -> bool:
+    """该失败是否值得记到「账号级冷却」（账号故障 vs 内容/请求问题）。
+
+    真：401/403/429、5xx、含限流语义的错误文案（rate limit / too many requests /
+    quota / usage limit / FreeUsageLimitError）——说明这个账号现在打不通，换号有用。
+    假：空输出、race 取消、上下文超限（调用方已排除）等——模型/内容侧问题，
+    把账号冷却了反而白白减少可用账号。"""
+    try:
+        sc = status_code if status_code is not None else error_status_code(
+            error if isinstance(error, BaseException) else Exception(str(error)))
+    except Exception:
+        sc = status_code
+    try:
+        if sc is not None:
+            sc = int(sc)
+            if sc in (401, 403, 429) or sc >= 500:
+                return True
+    except (TypeError, ValueError):
+        pass
+    text = str(error or "").lower()
+    return any(k in text for k in (
+        "rate limit", "too many requests", "quota", "usage limit",
+        "freeusagelimiterror", "usage exceeds frequency"))
+
+
+async def note_account_result(provider, account: str, ok: bool,
+                              status_code: Optional[int] = None, error: str = "") -> None:
+    """把一次上游调用的结果记到 OAuth 账号（失败→账号级冷却；成功→清零）。
+
+    仅对 OAuth 多账号路由有意义；account 为空（标准 key/free_tier/未选号）直接跳过。
+    失败时先过 `is_account_worthy_error` 闸：空输出/内容校验类失败不冷却账号。
+    永不抛异常、永不阻塞主流程（内部吞掉一切错误）。"""
+    if not account:
+        return
+    if not ok and not is_account_worthy_error(error, status_code):
+        return
+    try:
+        from server.core.oauth_client import get_oauth_client
+        code = getattr(provider, "oauth_code", None) if provider is not None else None
+        if not code and provider is not None:
+            code = getattr(provider, "name", None)
+        if not code:
+            return
+        await get_oauth_client().note_request_result(
+            code, account, ok=ok, status_code=status_code, error=error or "")
+    except Exception as e:
+        logger.debug("note_account_result failed: %s", e)
 
 
 async def resolve_credential_async(provider, model, db: AsyncSession) -> ResolvedCredential:
@@ -62,15 +138,17 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             oauth_code = getattr(provider, "oauth_code", None) or provider.name
             oauth_p = _get_oauth_p(oauth_code)
             # v4.2: 多账号连接时按 provider.oauth_owner 点名取号；
-            # 空=自动（pick_access_token 内部 __default→任一 active 兜底）
+            # 空=自动（多账号时按「余额最近到期 + 账号冷却」排序选号，见 pick_access_token_ex）
             owner = (getattr(provider, "oauth_owner", None) or "").strip() or "__default"
-            token = (await get_oauth_client().pick_access_token(oauth_code, db, owner=owner)
-                     if oauth_p else None)
-            if not token:
+            got = (await get_oauth_client().pick_access_token_ex(oauth_code, db, owner=owner)
+                   if oauth_p else None)
+            if not got:
                 rc.error = (f"OAuth provider '{oauth_code}' not connected"
                             if owner == "__default"
                             else f"OAuth provider '{oauth_code}' account '{owner}' not connected")
                 return rc
+            rc.account, token = got[0], got[1]
+            rc.oauth_code = oauth_code
             rc.api_key = token
             # oauth 请求需要 __oauth 标记（adapter 侧据此用 Bearer token 并处理专属头）
             from server.api.v1_router import _merge_oauth_headers
@@ -78,9 +156,11 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             # u1s1：登录时若已持久化设备密钥，则切换为官方 DPoP 形态
             #（Authorization: DPoP <u1s1d-…> + 逐请求 dpop proof），赠送额度才放行
             if oauth_code == "u1s1":
+                # 多账号：签名材料必须跟随**实际选中的账号**（rc.account），
+                # 否则 A 账号的 token 配 B 账号的设备密钥 → DPoP 验签失败
                 try:
                     material = await get_oauth_client().get_device_signing_material(
-                        oauth_code, db, owner=owner)
+                        oauth_code, db, owner=(rc.account or owner))
                 except Exception:
                     material = None
                 if material:

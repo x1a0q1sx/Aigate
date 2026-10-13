@@ -225,6 +225,41 @@ def _surface_free_error(provider_code: str, resp, mode: str):
     raise RuntimeError(f"free provider {provider_code} {mode} HTTP {resp.status_code}: " + body[:300])
 
 
+def is_free_failure_coolable(err_text: str) -> bool:
+    """free_tier 失败是否值得进模型冷却（2026-10-13）。
+
+    上游对 opencode 免费层的失败有三大类，网关侧应对不同：
+      - **限流/服务端故障**（429 FreeUsageLimitError / Endpoint is unavailable /
+        5xx / transport）：值得冷却 5 分钟——auto/combo 不再每轮都来撞，等上游
+        恢复或别人家的配额窗口过去。生产实证：15:16 批量测试打爆共享池后，
+        每个模型都持续 429 数十分钟（10-11 记录约 25 分钟）。
+      - **模型已下架**（410 ModelDeprecated）与**确定性 400/403 业务错误**：
+        冷却同样有益（让 auto 候选池自然跳过死模型）；下次模型刷新会自动清理。
+      - **会话/权限类的确定性错误**（FreeTierError 等）不冷却：这是配置问题
+        （如 agent 工具清单），改配置即恢复，冷却反而误导。
+    文案判据只做保守的「含哪个关键词」，不确定时**冷却**（宁愿 5 分钟后重试，
+    也不要每轮连续打爆限流）。
+    """
+    t = str(err_text or "").lower()
+    if not t:
+        return False
+    # 会话/权限类确定性错误：不冷却（靠改配置恢复）
+    if "freetiererror" in t:
+        return False
+    for marker in (
+        "429", "too many requests", "rate limit", "freeusagelimiterror",
+        "endpoint is unavailable", "endpoint is temporarily unavailable",
+        "modeldeprecated", "has been deprecated", "410",
+        "model is unavailable", "model is not available",
+        "service unavailable", "bad gateway", "gateway timeout", "502", "503", "504",
+        "transport failed", "timeout", "timed out", "503",
+    ):
+        if marker in t:
+            return True
+    # 未知错误：保守冷却（宁可短冷却后重试，也不让 auto 反复撞坏模型）
+    return True
+
+
 class FreeProviderExecutor:
     """简化的 free provider 执行器 — 内部用 httpx。
 

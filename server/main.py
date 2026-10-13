@@ -419,9 +419,12 @@ async def lifespan(app: FastAPI):
     # 每日维护调度器（日志归档 / 数据库备份 / 每周智力评分同步）
     _schedule_maintenance()
     # 启动 OAuth token 主动刷新调度器
-    from server.api.oauth_router import start_oauth_refresh_scheduler
+    from server.api.oauth_router import start_oauth_refresh_scheduler, start_oauth_usage_prewarm
     start_oauth_refresh_scheduler()
     print("✓ OAuth token 主动刷新调度器已启动（60s 扫一次）")
+    # 多账号额度预热（按积分最近到期选号的数据来源；请求路径只读缓存）
+    start_oauth_usage_prewarm()
+    print("✓ OAuth 多账号额度预热已启动（300s 扫一次，仅多账号 provider）")
     # 存量 OAuth 连接回填服务商（自动登记上线前的旧连接补建，幂等）
     import asyncio as _aio
 

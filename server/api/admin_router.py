@@ -2000,6 +2000,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     # 主键必须一起写：分析页「按服务商用量」/headroom 按 routed_provider_id 聚合
                     routed_provider_id=getattr(_route_result.provider, "id", None) if (_route_result and _route_result.success) else None,
                     routed_model=_route_result.model.model_id if (_route_result and _route_result.success) else None,
+                    routed_account=getattr(_route_result, "account", None) if (_route_result and _route_result.success) else None,
                     status=status, latency_ms=latency_ms,
                     prompt_tokens=int(pt) if pt else 0,
                     completion_tokens=int(ct) if ct else 0,
@@ -2086,6 +2087,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             route_result = RouteResult(
                 success=True, model=model, provider=provider,
                 api_key=_rc_p.api_key, adapter=adapter, fallback_count=0,
+                account=getattr(_rc_p, "account", None) or None,   # OAuth 多账号：本次选中的账号（日志 + 账号冷却）
                 extra_headers=_rc_p.extra_headers,   # __dpop 标记随行
             )
         elif cred_type == "atomcode":
@@ -2154,6 +2156,21 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     if getattr(route_result, "extra_headers", None):
         extra_headers = {**(extra_headers or {}), **route_result.extra_headers}
 
+    async def _note_pg_account(ok, error: str = ""):
+        """OAuth 多账号：本次 playground 调用结果记到所选账号（成功清零/失败冷却）。"""
+        acct = getattr(route_result, "account", None)
+        if not acct:
+            return
+        try:
+            from server.core.credential_resolver import note_account_result
+            from server.core.oauth_client import status_from_error_text
+            await note_account_result(
+                route_result.provider, acct, ok=ok,
+                status_code=(None if ok else status_from_error_text(error)),
+                error=error)
+        except Exception:
+            pass
+
     if data.stream:
         async def wrap_stream():
             resp_dict = None
@@ -2162,9 +2179,11 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
                 ):
                     yield _format_sse_chunk(chunk, model_id_full)
+                await _note_pg_account(True)   # OAuth 多账号：流正常走完 → 清账号冷却
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 from server.api.v1_router import _api_error as _api_error_fn
                 _pg_err = err_text(e)[:300]
+                await _note_pg_account(False, _pg_err)
                 yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             except Exception as e:
@@ -2173,6 +2192,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 # 对齐 /v1 的宽捕获口径（那边 except Exception → _api_error）。
                 from server.api.v1_router import _api_error as _api_error_fn
                 _pg_err = err_text(e)[:300]
+                await _note_pg_account(False, _pg_err)
                 yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             yield b"data: [DONE]\n\n"
@@ -2186,8 +2206,10 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             result = await route_result.adapter.chat_completion(
                 upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
             )
+            await _note_pg_account(True)   # OAuth 多账号：成功 → 清账号冷却
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
             _pg_err = err_text(e)[:300]
+            await _note_pg_account(False, _pg_err)
             await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
             return JSONResponse(status_code=503, content={"error": f"upstream_call_failed: {_pg_err}"})
         except Exception as e:
@@ -2197,6 +2219,7 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             # （生产实测：glm-5.3-flash 因额度用尽报 500，日志里才有可读文案）。
             # 对齐 /v1 的宽捕获：一律转成 503 + 可读 error 文案。
             _pg_err = err_text(e)[:300]
+            await _note_pg_account(False, _pg_err)
             await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
             return JSONResponse(status_code=503,
                                 content={"error": f"upstream_call_failed: {_pg_err}"})
