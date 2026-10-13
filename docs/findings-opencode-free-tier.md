@@ -291,3 +291,20 @@ x-opencode-session: ses_<28 chars>
 实证：muse 非流式成功返回 200，`request_logs` 行永远卡 `pending`。根因：请求开始预落 pending 行，本路径只写路由决策、没写完成日志——流式有 `_write_stream_log`、错误有 `_early_error_log`，唯独成功路径没有写入者，只能等 30 分钟清扫。修复：成功分支补 `enqueue_log`（usage 归一化 + 服务商 id/名称 + 代理字段），原位收尾。静态回归测试锁死。
 
 **限流提醒（复证）**：高频试探（本次上百次）会触发上游临时 429 `FreeUsageLimitError`，**所有**模型一律 429、与配置无关；静置数分钟自愈。生产验证请节制，避免把限流误判为修复失败。
+
+## 十、2026-10-13 追加：RegionError 复发 → mihomo 域名路由修复（F39）
+
+**触发**：用户报 muse-spark 再次 RegionError（行 id=45844，10:45 CST）。
+
+**根因**：mihomo journal 回溯该时刻 `opencode.ai:443 ... using PROXY[🇭🇰|香港-中转 01]`——`AUTO-sabusuku` url-test 每 300s 自动换节点飘到香港，而 muse 的地区门在 HK 出口判 403（JP/SG 出口通过；当天出口分布 HK 15 次 / JP 8 次 / SG 6 次，只有 HK 时段失败）。即第 9.1 节「国别门 + 节点飘移」在生产复发。
+
+**修复（mihomo 配置级）**：
+- 新增 `OPENCODE-REGION` 组：`use: sabusuku` + `filter: "(日本|新加坡)"`，**测速 url 用 `https://opencode.ai/`**（gstatic 测速选点不代表业务可用——曾选中能 ping 但被地区门拦的节点）
+- 新增规则 `DOMAIN-SUFFIX,opencode.ai,OPENCODE-REGION`（覆盖 `models.opencode.ai` 子域）
+- 热重载：`systemctl reload clash.service`；配置属主需恢复 `clashm:clashm`
+
+**验证**：rule match 日志命中；网关真实路径（free executor → sidecar）非流式×2 + 流式×1 全通（3.0s/2.3s/1.7s）；一般流量 google/github/ipinfo 不受影响。
+
+**坑**：SIGHUP 重载后首个请求可能瞬断（`HTTP transport failed`），重试即恢复；space-bunny 429 是上游限流与本次修复无关。
+
+详见 `docs/findings-muse-region-error.md`。
