@@ -152,3 +152,5 @@
 - CN 登出必须打 `www.codebuddy.cn`（SSO cookie 域；copilot.tencent.com/login 301 跳过去）
 - space-bunny-free 报 429 `FreeUsageLimitError` → 上游限流，与本 fix 无关
 - mihomo 补丁 `/opt/clash/clash_config.yaml`（属主 clashm:clashm，模式 rule 分流）；重载后组 alive=100%（JP/SG 各候选延迟~600~1000ms）
+- ⚠️ 修复验证后（14:26 起）出现 429 `FreeUsageLimitError` 持续限流：**两个不同日本节点（日本-中转 01、日本原生-中转 01）同样 429** → 账号级限流（`Bearer public` 免费层），与本次修复无关；同 10-11 先例（高频试探触发、静置自愈，冷却 25min+）。生产使用不受影响（正常调用频次远低于验证探针）
+- ⚠️ 本地 push 通道变化：直连与 10889 SOCKS 均 SSL eof，本次经本地 Clash Verge **7897** 端口成功推送（`7de080a..3437809`）；SSH 到服务器不受影响
