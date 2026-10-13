@@ -100,8 +100,9 @@ export default {
   name: 'PlaygroundView',
   data() { return { providers: [], modelStats: {}, models: [], loadedPid: null, modelsLoading: false, selectedProviderId: 'auto', selectedModelId: '', form: { model: 'auto', message: '' }, sending: false, response: '', error: '', loadError: '', pelican: { running: false, done: false, chars: 0, raw: '', html: '', error: '', note: '', url: '', filename: '', served: '', elapsed: 0, abort: null } } },
   computed: {
-    // 懒加载：服务商下拉只依赖轻量的 model-stats（每家模型数），不再等全量模型列表
-    providersWithModels() { return this.providers.filter(p => (this.modelStats[p.id] || 0) > 0) },
+    // 懒加载：服务商下拉只依赖轻量的 model-stats（每家模型数），不再等全量模型列表。
+    // 已关闭服务商隐藏（2026-10-13 用户要求）：路由层跳过它们，选了也必失败。
+    providersWithModels() { return this.providers.filter(p => p.enabled !== false && (this.modelStats[p.id] || 0) > 0) },
     filteredModels() { return this.models.filter(m => String(m.provider_id) === String(this.selectedProviderId)) }
   },
   mounted() {

@@ -1481,3 +1481,53 @@ traveling→不动 / 无 Buddy→跳过 / 达上限→跳过）、快照只读�
   正确姿态 = 目录 ∪ 种子 − 探测确认的不可用条目。
 - 上游目录里的条目 ≠ 可用：本次实测 8 个死条目 + 2 个生图 + 1 个 effort 特性
   共 11 个不可用条目混在 33 个里（1/3 虚报）。
+
+---
+
+## F38. CodeBuddy 新增账号「强制选号」机制（2026-10-13）
+
+**背景（用户反馈）**：OAuth 连接页给 CodeBuddy (International) 新增账号时，
+新窗口打开后自动登录了**已经登录的账号**，无法选择另一个账号；且新连接默认名
+是 `account-N`，用户要求默认用账号邮箱。
+
+### 根因（前端 bundle 逆向取证）
+
+官方登录页（`/login?platform=ide&state=...`）在检测到浏览器已有 SSO 会话时
+**静默复用**已登录账号直接完成授权（`requireAccountSelection` 逻辑只在多账号
+企业场景触发 `/login/select`，个人号不弹）。官方自己的「切换账号」按钮实现是
+**先调 `/console/logout`（→ Keycloak logout）再跳 `/login`** —— 即换号的前提
+是先清掉 SSO 会话。
+
+### 探针结论（真实 HTTP 实测）
+
+| 探针 | 结果 |
+|---|---|
+| `POST /v2/plugin/auth/state`（CN/Intl） | 200，`authUrl = {host}/login?platform=...&state=...` |
+| KC `end_session` + `client_id=console` + `post_logout_redirect_uri=<login>` | **302 直达登录页**（CN / Intl 两域名均验证） |
+| KC logout 缺 `client_id` | 400（必填） |
+| `/console/logout` 转发 redirect 参数（5 种参数名试探） | 全部忽略，只 302 到 KC logout（无参数） |
+| CN 登录页实际 host | `copilot.tencent.com/login` 301→ `www.codebuddy.cn/login/`；SSO cookie 在 `www.codebuddy.cn`，登出必须打该域 |
+| 生产 JWT claims | Intl 带 `email`（可作默认名）；CN 只有 `preferred_username`（手机号） |
+
+### 实现
+
+1. **强制选号**：registry 的 `extra_params` 增加 `sso_logout_url` + `sso_client_id`；
+   `POST /admin/oauth/authorize/{code}` 在「已有连接」（=新增账号流程）时返回
+   `sso_logout_url`（KC logout + `post_logout_redirect_uri` 指回 authUrl）；前端
+   device_poll 分支优先打开它 —— 先登出 SSO → 302 回登录页 → 用户可选任意账号。
+   首次连接不带（复用已有会话是合理路径）。
+2. **默认名用邮箱**：`_poll_codebuddy_token` 拿到 token 后，若 owner 还是自动名
+   （`__default` / `account-N`）→ 替换为 `email`（Intl）/`preferred_username`（CN）
+   命名；手动改过的名字绝不自动改；同名冲突时保留原名。
+3. **身份归一（防重复连接）**：新增 `_find_owner_by_identity` —— 同账号再次登录
+   （token 轮换/重新授权）写回**已有的那条连接**（即使改过名），而不是每次多一条
+   `account-N` 重复行。
+
+### 教训
+
+- 「浏览器已登录 → 登录页静默复用」是 SSO 应用的默认行为，不是 bug；换号必须
+  显式登出（官方切换账号也这么干）。
+- 登出链必须打在**持有 SSO cookie 的域名**上（CN 是 `www.codebuddy.cn`，不是
+  `copilot.tencent.com`）。
+- 自动命名只应替换**自动生成的名字**；用户手动改过的名字在任何自动化里都必须
+  原样保留。

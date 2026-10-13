@@ -49,7 +49,7 @@
       </button>
       <select v-model="filterProvider" @change="load">
         <option value="">全部服务商</option>
-        <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
+        <option v-for="p in enabledProviders" :key="p.id" :value="p.id">{{ p.name }}</option>
       </select>
       <label class="checkbox-label text-sm">
         <input type="checkbox" v-model="filterFree" @change="load" /> 仅免费
@@ -373,7 +373,7 @@
         <label class="form-label">服务商 *</label>
         <select v-model="addModelForm.provider_id">
           <option :value="null">-- 选择服务商 --</option>
-          <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
+          <option v-for="p in enabledProviders" :key="p.id" :value="p.id">{{ p.name }}</option>
         </select>
       </div>
       <div class="form-group">
@@ -466,6 +466,11 @@ export default {
     }
   },
   computed: {
+    // 服务商选择（筛选/添加模型）：只列启用中的——已关闭服务商不再可选，
+    // 避免给「路由永远跳过」的服务商建模型或按它筛选（2026-10-13 用户要求）。
+    enabledProviders() {
+      return (this.providers || []).filter((p) => p.enabled !== false)
+    },
     pingProgress() {
       if (this.pingTotal === 0) return 0
       return Math.round((this.pingDone / this.pingTotal) * 100)

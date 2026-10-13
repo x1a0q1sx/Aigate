@@ -77,12 +77,8 @@ def _refresh_credential_dead(status_code: int, error_text: str = "") -> bool:
 _IDENTITY_CLAIM_KEYS = ("preferred_username", "email", "sub")
 
 
-def token_identity(token: str) -> Optional[str]:
-    """从 JWT 形态的 token 里取账号标识；非 JWT / 无身份字段返回 None。
-
-    只读 payload，**不校验签名**（仅用于「是不是同一个账号」的比对，
-    不承担鉴权职责）。取不到就返回 None = 身份未知 → 不参与守卫。
-    """
+def _jwt_claims(token: str) -> Optional[dict]:
+    """解码 JWT payload（只读、不验签）；非 JWT / 解析失败返回 None。"""
     if not token or token.count(".") < 2:
         return None
     try:
@@ -91,13 +87,52 @@ def token_identity(token: str) -> Optional[str]:
         claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode("utf-8", "replace"))
     except Exception:
         return None
-    if not isinstance(claims, dict):
+    return claims if isinstance(claims, dict) else None
+
+
+def token_identity(token: str) -> Optional[str]:
+    """从 JWT 形态的 token 里取账号标识；非 JWT / 无身份字段返回 None。
+
+    只读 payload，**不校验签名**（仅用于「是不是同一个账号」的比对，
+    不承担鉴权职责）。取不到就返回 None = 身份未知 → 不参与守卫。
+    """
+    claims = _jwt_claims(token)
+    if not claims:
         return None
     for key in _IDENTITY_CLAIM_KEYS:
         v = claims.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
+
+
+def default_owner_name(token: str) -> Optional[str]:
+    """新连接的默认账号名（2026-10-13 用户要求）：优先 email（Intl），
+    其次 preferred_username（CN 即手机号）。都取不到返回 None（保留自动分配名）。
+
+    owner 是路由寻址键也是展示名；仅用于**新账号**的默认命名 —— 已存在的
+    连接名（含用户手动改名）绝不因本函数改动。长度截到 100（owner 列宽）。
+    """
+    claims = _jwt_claims(token)
+    if not claims:
+        return None
+    for key in ("email", "preferred_username"):
+        v = claims.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:100]
+    return None
+
+
+def _is_auto_allocated_owner(owner: str) -> bool:
+    """owner 是否为系统自动分配名（__default / account-N）——用户要求默认名
+    用邮箱时，只替换自动名，绝不改动用户手动改过的名字。"""
+    if not owner:
+        return False
+    if owner == "__default":
+        return True
+    if owner.startswith("account-"):
+        return owner[8:].isdigit()
+    return False
 
 
 def gen_pkce_pair() -> Tuple[str, str]:
@@ -1383,20 +1418,38 @@ class OAuthClient:
                         "token_type": inner.get("tokenType") or "Bearer",
                         "scope": "codebuddy",
                     }
-                    # 身份守卫：用户可能是在**另一个账号**上完成的登录（一键连接
-                    # 的 owner 在轮询开始时就已分配好）。此时自动挪到新 owner，
-                    # 绝不覆盖原账号凭据 —— 事故复现路径见 token_identity 注释。
+                    # 身份归一（2026-10-13 用户要求 + 2026-09-22 事故守卫）：
+                    # ① 该账号已有连接（可能被改过名）→ 写回那条，防重复连接；
+                    # ② 目标槽位属于**另一个账号** → 挪到新槽位，绝不覆盖原凭据；
+                    # ③ 全新连接且名字还是自动名（__default/account-N）→ 默认名改用
+                    #    账号邮箱/手机号（用户要求）；已有名字（含手动改名）绝不自动改。
+                    new_id = token_identity(access)
                     target_owner = owner
-                    existing = await self._get_token_record(db, provider_code, owner)
-                    if existing:
-                        new_id = token_identity(access)
-                        old_id = token_identity(self._crypto.decrypt(existing.access_token_enc))
-                        if new_id and old_id and new_id != old_id:
-                            target_owner = await self._next_free_owner(db, provider_code)
-                            logger.warning(
-                                "codebuddy %s: 登录账号「%s」与连接「%s」（属于「%s」）不同，"
-                                "自动改存为新账号「%s」（不覆盖原凭据）",
-                                provider_code, new_id, owner, old_id, target_owner)
+                    if new_id:
+                        _matched = await self._find_owner_by_identity(db, provider_code, new_id)
+                        if _matched:
+                            target_owner = _matched
+                    if target_owner == owner:
+                        existing = await self._get_token_record(db, provider_code, owner)
+                        if existing:
+                            old_id = token_identity(self._crypto.decrypt(existing.access_token_enc))
+                            if new_id and old_id and new_id != old_id:
+                                target_owner = await self._next_free_owner(db, provider_code)
+                                logger.warning(
+                                    "codebuddy %s: 登录账号「%s」与连接「%s」（属于「%s」）不同，"
+                                    "自动改存为新账号「%s」（不覆盖原凭据）",
+                                    provider_code, new_id, owner, old_id, target_owner)
+                    if _is_auto_allocated_owner(target_owner):
+                        _row_here = await self._get_token_record(db, provider_code, target_owner)
+                        if _row_here is None:
+                            _email_name = default_owner_name(access)
+                            if _email_name and _email_name != target_owner:
+                                _clash = await self._get_token_record(db, provider_code, _email_name)
+                                if _clash is None:
+                                    logger.info(
+                                        "codebuddy %s: 新连接默认名「%s」→「%s」（账号标识）",
+                                        provider_code, target_owner, _email_name)
+                                    target_owner = _email_name
                     await self._save_token(db, provider_code, target_owner, tok)
                     logger.info("codebuddy %s token acquired after %d polls (owner=%s)",
                                   provider_code, attempt + 1, target_owner)
@@ -1471,6 +1524,33 @@ class OAuthClient:
         except Exception as e:
             logger.warning("get any active oauth token failed: %s", e)
             return None
+
+    async def _find_owner_by_identity(
+        self, db: AsyncSession, provider_code: str, identity: str,
+    ) -> Optional[str]:
+        """按账号身份（token_identity）找已存在的连接 owner（2026-10-13）。
+
+        同一账号再次登录（token 轮换 / 重新授权）应写回**已有的那条连接**
+        （即使它被改过名）——否则每重登一次就多一条重复连接。解密失败、
+        非 JWT（identity=None）的行跳过；找不到返回 None。
+        """
+        if not identity:
+            return None
+        try:
+            rows = (await db.execute(
+                select(OAuthToken).where(OAuthToken.provider_code == provider_code)
+            )).scalars().all()
+        except Exception as e:
+            logger.warning("find owner by identity failed: %s", e)
+            return None
+        for row in rows:
+            try:
+                tok = self._crypto.decrypt(row.access_token_enc) if row.access_token_enc else ""
+            except Exception:
+                continue
+            if token_identity(tok) == identity:
+                return row.owner
+        return None
 
     async def _next_free_owner(self, db: AsyncSession, provider_code: str) -> str:
         """给「这次登录其实换了账号」找一个新的 owner 名（与 authorize 入口同规则）。

@@ -31,8 +31,8 @@ const routes = [
   { path: '/aliases', component: Aliases, meta: { title: '模型别名' } },
   { path: '/keys', component: Keys, meta: { title: '网关密钥' } },
   { path: '/health', component: Health, meta: { title: '健康监控' } },
-  // 实时监控已并入分析页实时区（2026-09-30）：旧地址重定向到锚点
-  { path: '/monitor', redirect: { path: '/analytics', hash: '#realtime' } },
+  // 实时监控页已下线（2026-10-13 用户要求删掉分析页实时区）：旧地址重定向到分析页
+  { path: '/monitor', redirect: { path: '/analytics' } },
   { path: '/auto', component: Auto, meta: { title: 'Auto 选举' } },
   { path: '/route-decisions', component: RouteDecisions, meta: { title: '路由决策' } },
   { path: '/analytics', component: Analytics, meta: { title: '分析' } },

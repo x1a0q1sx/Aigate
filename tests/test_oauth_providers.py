@@ -854,3 +854,154 @@ def test_save_token_signature_has_identity_guard_flag():
     body = inspect.getsource(OAuthClient._save_token)
     assert "token_identity(access)" in body
     assert "不能写入" in body
+
+
+# ── 新账号默认命名 + 身份归一 + SSO 登出链（2026-10-13）────────
+
+def test_default_owner_name_prefers_email():
+    """新连接默认名：优先 email（Intl），其次 preferred_username（CN 手机号）。"""
+    assert oc.default_owner_name(_jwt({"email": "a@b.com", "preferred_username": "13800000000"})) == "a@b.com"
+    assert oc.default_owner_name(_jwt({"preferred_username": "13800000000"})) == "13800000000"
+    # 非 JWT / 空 / 无字段 → None（调用方保留自动分配名）
+    assert oc.default_owner_name("") is None
+    assert oc.default_owner_name("a.b") is None
+    assert oc.default_owner_name(_jwt({"sub": "uuid-only"})) is None
+    # 超长截断到 100（owner 列宽）
+    assert len(oc.default_owner_name(_jwt({"email": "x" * 150}))) == 100
+
+
+def test_is_auto_allocated_owner():
+    assert oc._is_auto_allocated_owner("__default")
+    assert oc._is_auto_allocated_owner("account-2")
+    assert oc._is_auto_allocated_owner("account-17")
+    # 手动改过的名字（邮箱/手机号/自定义）不视为自动名
+    assert not oc._is_auto_allocated_owner("x@y.com")
+    assert not oc._is_auto_allocated_owner("13800000000")
+    assert not oc._is_auto_allocated_owner("account-x")
+    assert not oc._is_auto_allocated_owner("")
+    assert not oc._is_auto_allocated_owner(None)
+
+
+@pytest.mark.asyncio
+async def test_find_owner_by_identity_matches_renamed_connection():
+    """同账号重登：按身份找回**改名后**的连接 owner（防重复连接）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    row = SimpleNamespace(owner="我的主号", access_token_enc="enc:" + _TOK_135)
+
+    class _Res:
+        def scalars(self):
+            return self
+        def all(self):
+            return [row]
+
+    class _DB:
+        async def execute(self, stmt):
+            return _Res()
+
+    assert await c._find_owner_by_identity(_DB(), "codebuddy_cn", "13500818840") == "我的主号"
+    # 身份不匹配 / None → None
+    assert await c._find_owner_by_identity(_DB(), "codebuddy_cn", "99999999999") is None
+    assert await c._find_owner_by_identity(_DB(), "codebuddy_cn", None) is None
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_new_connection_uses_email_as_default_name(monkeypatch):
+    """新账号默认名用邮箱（2026-10-13 用户要求）：owner 还是自动名时替换。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    tok_email = _jwt({"email": "user@example.com", "sub": "u-1"})
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": tok_email, "refreshToken": "RT",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+    saved = {}
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved["args"] = (code, owner, tok)
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return None  # 全新连接：目标槽位没有任何行
+    c._get_token_record = fake_get
+
+    async def fake_find(db, code, ident):
+        return None
+    c._find_owner_by_identity = fake_find
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_intl", "S-1", "account-2", 1)
+    assert saved["args"][1] == "user@example.com", "自动分配名应被邮箱替换"
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_keeps_manual_name(monkeypatch):
+    """手动改过的名字不因邮箱命名而改动（owner 已不是自动名）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    tok_email = _jwt({"email": "user@example.com", "sub": "u-1"})
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": tok_email, "refreshToken": "RT",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+    saved = {}
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved["args"] = (code, owner, tok)
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return None
+    c._get_token_record = fake_get
+
+    async def fake_find(db, code, ident):
+        return None
+    c._find_owner_by_identity = fake_find
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_intl", "S-1", "工作号", 1)
+    assert saved["args"][1] == "工作号", "手动名不得被自动替换"
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_same_account_reuses_renamed_owner(monkeypatch):
+    """同账号重登写回改名后的原连接（而非新增 account-N 重复连接）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": _TOK_135, "refreshToken": "RT-new",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+    saved = {}
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved["args"] = (code, owner, tok)
+    c._save_token = fake_save
+
+    async def fake_find(db, code, ident):
+        return "我的主号"  # 该身份已有连接（改名过）
+    c._find_owner_by_identity = fake_find
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-1", "__default", 1)
+    assert saved["args"][1] == "我的主号"
+
+
+def test_registry_has_sso_logout_url_for_codebuddy():
+    """新增账号强制选号依赖 registry 的 sso_logout_url 配置（CN/Intl 都要有）。"""
+    for code in ("codebuddy_cn", "codebuddy_intl"):
+        ep = get_oauth_provider(code).extra_params or {}
+        assert ep.get("sso_logout_url", "").endswith("/protocol/openid-connect/logout")
+        assert ep.get("sso_client_id") == "console"
+
+
+def test_build_sso_logout_url_appends_redirect():
+    """SSO 登出链接：client_id + post_logout_redirect_uri 编码进 query。"""
+    from server.api.oauth_router import _build_sso_logout_url
+    p = get_oauth_provider("codebuddy_intl")
+    url = _build_sso_logout_url(p, "https://www.codebuddy.ai/login?platform=ide&state=X1")
+    assert url.startswith("https://www.codebuddy.ai/auth/realms/copilot/protocol/openid-connect/logout?")
+    assert "client_id=console" in url
+    assert "post_logout_redirect_uri=https%3A%2F%2Fwww.codebuddy.ai%2Flogin" in url
+    # 无配置 / 无 login_url → None
+    assert _build_sso_logout_url(SimpleNamespace(extra_params={}), "https://x") is None
+    assert _build_sso_logout_url(p, None) is None

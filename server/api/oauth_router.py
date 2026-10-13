@@ -85,6 +85,25 @@ async def _next_owner_for_provider(db: AsyncSession, provider_code: str) -> str:
     return f"account-{n}"
 
 
+def _build_sso_logout_url(provider, login_url: Optional[str]) -> Optional[str]:
+    """构造「先登出 SSO 再登录」的链接（新增账号强制选号，2026-10-13 用户要求）。
+
+    官方「切换账号」= 先 logout 再 login；登录页检测到浏览器已有 SSO 会话时会
+    静默复用已登录账号，不清会话无法换号。实测 Keycloak logout 带 client_id +
+    post_logout_redirect_uri 直接 302 到登录页（CN / Intl 两域名均验证）。
+    无配置（未配置 sso_logout_url）返回 None。
+    """
+    ep = (getattr(provider, "extra_params", None) or {})
+    base = ep.get("sso_logout_url")
+    if not base or not login_url:
+        return None
+    from urllib.parse import urlencode
+    return base + "?" + urlencode({
+        "client_id": ep.get("sso_client_id") or "console",
+        "post_logout_redirect_uri": login_url,
+    })
+
+
 @router.post("/authorize/{provider_code}")
 async def start_oauth_authorize(provider_code: str, request: Request,
                                 owner: Optional[str] = None, new_account: bool = False):
@@ -105,16 +124,36 @@ async def start_oauth_authorize(provider_code: str, request: Request,
     if (provider.extra_params or {}).get("auth_mode") == "device_poll":
         async with AsyncSessionLocal() as db:
             r = await get_oauth_client().start_device_poll(provider_code, db, owner=owner)
+            # 已有连接 → 本次是「新增账号」流程（用于决定是否先登出 SSO）
+            _has_existing = False
+            if "error" not in r:
+                try:
+                    _rows = (await db.execute(
+                        select(OAuthToken).where(OAuthToken.provider_code == provider_code)
+                    )).scalars().all()
+                    _has_existing = bool(_rows)
+                except Exception as e:
+                    logger.warning("device_poll existing-connection check failed: %s", e)
         if "error" in r:
             raise HTTPException(status_code=400, detail=r["error"])
-        # 前端用 login_url 弹窗，后端已经在轮询
-        return {
+        resp = {
             "device_poll": True,
             "state": r["state"],
             "login_url": r["login_url"],
             "poll_interval_ms": r["poll_interval_ms"],
             "message": "请在新窗口完成登录，登录成功后系统会自动获取 token",
         }
+        # 新增账号强制选号（2026-10-13 用户要求）：登录页检测到已有 SSO 会话会
+        # 静默复用已登录账号、无法换号 → 返回 SSO 登出链接（官方「切换账号」同
+        # 机制：先 logout 再 login），前端在新增账号时先走它。首次连接不带
+        # （复用浏览器已有会话是合理路径）。
+        if _has_existing:
+            _logout = _build_sso_logout_url(provider, r.get("login_url"))
+            if _logout:
+                resp["sso_logout_url"] = _logout
+                resp["message"] = ("新增账号：请在新窗口先退出当前登录会话，"
+                                   "然后登录【另一个账号】，成功后系统会自动新增一条连接")
+        return resp
     # ── u1s1 设备登录（浏览器批准 → 轮询收 api_key，免客户端）────
     if (provider.extra_params or {}).get("auth_mode") == "u1s1_device":
         async with AsyncSessionLocal() as db:

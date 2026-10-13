@@ -93,7 +93,7 @@
         <section class="card">
           <div class="card-header">
             <span class="card-title"><AppIcon name="gauge" :size="16" />组件状态</span>
-            <router-link to="/analytics" class="text-sm">实时详情</router-link>
+            <router-link to="/analytics" class="text-sm">分析页</router-link>
           </div>
           <div class="comp-facts">
             <div>

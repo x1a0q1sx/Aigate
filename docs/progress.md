@@ -133,3 +133,15 @@
 ### 备注
 - 前端无需改动（模型页自带「在线倍率」标签 path 已支持 codebuddy source）
 - 留在服务器 /tmp 的探针脚本已清理；cb_check.py（09-22 旧会话遗留）未动
+
+## Session 10 - 2026-10-13
+### 完成（用户四项需求：分析页删实时区 / 隐藏已关闭服务商 / 服务商页排序 / 新增账号强制选号）
+- ✅ 分析页实时区整体删除：`RealtimePanel.vue` 删文件、Analytics 引用与副标题清理、`/monitor` 重定向去掉 `#realtime` 锚点、Dashboard「实时详情」链接改「分析页」
+- ✅ 模型管理（筛选下拉 + 添加模型下拉）与 Playground 服务商选择只列**启用中**的服务商（`enabled !== false`）——已关闭的从选择器隐藏
+- ✅ 服务商页默认排序改「固定+开启优先」：tier = 开启(2)+固定(1) 降序 → 固定且开启 → 开启 → 固定关闭 → 关闭（`providerSort` 值仍为 `pinned`，旧 localStorage 无需迁移）
+- ✅ CodeBuddy 新增账号强制选号（F38）：官方登录页检测到已有 SSO 会话会静默复用账号 → registry 加 `sso_logout_url`，已有连接时 authorize 接口返回 KC 登出链（实测 302 直达登录页），前端新增账号先登出再登录；新连接默认名用邮箱（Intl）/手机号（CN）；同账号重登按身份写回改名后的原连接（防重复连接）
+- ✅ 测试 992→1005 全绿：新增 8 项后端（默认名/自动名判定/身份归一/邮箱命名/手动名保护/重登复用/registry 登出配置/登出链构造）+ 6 项前端静态（三处 UI 改动），改写 2 项（RealtimePanel 删除后）
+- ✅ 本地 build 通过（bundle index-23QP0_BZ.js）
+### 备注
+- 登出链只在「已有连接」时返回（首次连接复用浏览器会话是合理路径）
+- CN 登出必须打 `www.codebuddy.cn`（SSO cookie 域；copilot.tencent.com/login 301 跳过去）

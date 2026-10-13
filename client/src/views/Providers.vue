@@ -67,7 +67,7 @@
             <input v-model.trim="providerSearch" placeholder="搜索服务商 / URL" />
           </div>
           <select v-model="providerSort">
-            <option value="pinned">固定优先</option>
+            <option value="pinned">固定+开启优先</option>
             <option value="type">按类型</option>
             <option value="models">模型数</option>
             <option value="failures">失败数</option>
@@ -967,7 +967,12 @@ export default {
       }
       const byName = (a, b) => a.name.localeCompare(b.name)
       rows.sort((a, b) => {
-        if (this.providerSort === 'pinned') return Number(this.isPinned(b.id)) - Number(this.isPinned(a.id)) || byName(a, b)
+        if (this.providerSort === 'pinned') {
+          // 默认排序（2026-10-13 用户要求）：固定且开启 → 开启 → 固定关闭 → 关闭。
+          // 开启优先、固定次之：tier = 开启(2) + 固定(1)，降序。
+          const tier = (x) => (this.isProviderDisabled(x) ? 0 : 2) + (this.isPinned(x.id) ? 1 : 0)
+          return tier(b) - tier(a) || byName(a, b)
+        }
         if (this.providerSort === 'type') return (a.credential_type || 'api_key').localeCompare(b.credential_type || 'api_key') || byName(a, b)
         if (this.providerSort === 'models') return this.modelCount(b.id) - this.modelCount(a.id) || byName(a, b)
         if (this.providerSort === 'failures') return this.failCount(b.id) - this.failCount(a.id) || byName(a, b)

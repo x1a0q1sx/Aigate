@@ -3,8 +3,8 @@
 
 1. Playground「鹈鹕一键测试」：发送键旁按钮 → 流式生成（apiStream SSE 解析）
    → extractHtml 提取 → iframe sandbox 预览 + Blob 下载（文件名 服务商-模型-日期时间）
-2. 分析页：实时区「最近请求」删除（与请求日志重复）；请求日志（LogsPanel）
-   移至用量趋势上方。
+2. 分析页：实时区整体删除（2026-10-13 用户要求）；请求日志（LogsPanel）
+   位于用量趋势上方。
 
 均为纯前端改动，按仓库既有约定做源码静态扫描锁死（无 JS 测试运行时）。
 """
@@ -74,15 +74,18 @@ def test_api_js_exports_stream_helper():
 
 # ── 2. 分析页布局调整 ──────────────────────────────────────
 
-def test_realtime_panel_drops_recent_requests_table():
-    src = _read("components/RealtimePanel.vue")
-    # 模板里不得再有「最近请求」表头；数据与渲染双双清除（注释除外）
-    assert "<h3 class=\"rt-sub\">最近请求</h3>" not in src
-    code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("//"))
-    assert "recent" not in code
-    # 但保留冷却表与组件状态行
-    assert "冷却中模型" in src
-    assert "日志队列" in src
+def test_analytics_realtime_panel_removed():
+    """实时区整体删除（2026-10-13 用户要求）：组件文件 + 页面引用都不在。"""
+    src = _read("views/Analytics.vue")
+    assert "RealtimePanel" not in src
+    assert "实时区已并入本页" not in src
+    assert not (_CLIENT / "components/RealtimePanel.vue").exists()
+
+
+def test_monitor_route_no_realtime_hash():
+    """旧 /monitor 地址仍重定向到分析页，但不再带 #realtime 锚点。"""
+    src = _read("router.js")
+    assert "{ path: '/monitor', redirect: { path: '/analytics' } }" in src
 
 
 def test_analytics_logs_panel_moved_above_trend():

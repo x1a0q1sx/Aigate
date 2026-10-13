@@ -3,7 +3,7 @@
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
       <div>
         <h1>分析 📊</h1>
-        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、请求日志、趋势、按服务商用量与失败分析；实时区已并入本页</p>
+        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、请求日志、趋势、按服务商用量与失败分析</p>
       </div>
       <div style="display: flex; align-items: center; gap: 14px;">
         <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--gray-500); cursor: pointer;" :title="diagVerbose ? '全量输出所有诊断阶段（控制台日志会变多）' : '仅输出关键里程碑，关闭多余日志'">
@@ -177,9 +177,6 @@
       </template>
       <p v-else style="text-align: center; padding: 16px; color: var(--gray-500); font-size: 13px;">加载中...</p>
     </div>
-
-    <!-- ⑥ 实时区（原实时监控页并入，3s 轮询；「最近请求」已删，请求日志见上方） -->
-    <RealtimePanel />
   </div>
 </template>
 
@@ -187,14 +184,13 @@
 import api from '../api.js'
 import RangePicker from '../components/RangePicker.vue'
 import TrendChart from '../components/TrendChart.vue'
-import RealtimePanel from '../components/RealtimePanel.vue'
 import LogsPanel from '../components/LogsPanel.vue'
 
 // 编排层：全局范围状态（range）驱动 ①-④ 联动；
-// ⑤ 实时区与 ⑥ 日志区自管轮询/筛选（子组件内部状态）。
+// 日志区自管轮询/筛选（子组件内部状态）。实时区已删（2026-10-13 用户要求）。
 export default {
   name: 'AnalyticsView',
-  components: { RangePicker, TrendChart, RealtimePanel, LogsPanel },
+  components: { RangePicker, TrendChart, LogsPanel },
   data() {
     return {
       range: null,          // {key,label,bucket,start,end,hours}（RangePicker emit）

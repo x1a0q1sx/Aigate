@@ -255,7 +255,9 @@ export default {
             callback_url: '', busy: false, error: '',
           }
         } else if (r.device_poll && r.login_url) {
-          window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          // 已有连接时后端会带 sso_logout_url（先登出 SSO 再 302 回登录页，
+          // 官方「切换账号」同机制）→ 不先登出，登录页会静默复用已登录账号。
+          window.open(r.sso_logout_url || r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
           toast.info(r.message || '请在新窗口完成登录，成功后系统自动收取 token')
           this.watchDeviceFlow(p.code)
         } else if (r.authorize_url) {
@@ -286,8 +288,10 @@ export default {
             callback_url: '', busy: false, error: '',
           }
         } else if (r.device_poll && r.login_url) {
-          window.open(r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
-          toast.info('请在新窗口登录【另一个账号】，成功后自动新增一条连接')
+          // 强制新增：优先走 SSO 登出链（先登出再 302 回登录页），
+          // 否则登录页会静默复用浏览器已登录账号，无法选另一个账号。
+          window.open(r.sso_logout_url || r.login_url, '_blank', 'noopener,noreferrer,width=900,height=720')
+          toast.info(r.message || '请在新窗口登录【另一个账号】，成功后自动新增一条连接')
           this.watchDeviceFlow(p.code)
         } else if (r.authorize_url) {
           window.open(r.authorize_url, '_blank', 'noopener,noreferrer,width=900,height=720')

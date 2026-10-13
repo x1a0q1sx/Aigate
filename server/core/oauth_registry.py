@@ -350,6 +350,13 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "x_domain": "copilot.tencent.com",
             "x_product": "SaaS",
             "poll_interval_ms": 5000,
+            # 新增账号强制选号（2026-10-13）：先登出 SSO 会话再进登录页。
+            # 官方「切换账号」同机制；实测 KC logout 带 post_logout_redirect_uri
+            # 302 直达登录页（否则浏览器已登录账号会被登录页静默复用，无法换号）。
+            # 注意 host：CN 登录页实际在 www.codebuddy.cn（copilot.tencent.com/login
+            # 301/302 跳过去），SSO cookie 也在这个域，登出必须打它才有效。
+            "sso_logout_url": "https://www.codebuddy.cn/auth/realms/copilot/protocol/openid-connect/logout",
+            "sso_client_id": "console",
         },
         api_base_url="https://copilot.tencent.com/v2/chat/completions",
         # 种子表双重用途：①在线目录（scoped ∪ /v3/config）失败时兜底；
@@ -407,6 +414,11 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "x_domain": "www.codebuddy.ai",
             "x_product": "SaaS",
             "poll_interval_ms": 5000,
+            # 新增账号强制选号（2026-10-13，用户要求）：先登出 SSO 会话再进登录页。
+            # 官方「切换账号」同机制；实测 KC logout 带 post_logout_redirect_uri
+            # 302 直达登录页（否则浏览器已登录账号会被登录页静默复用，无法换号）。
+            "sso_logout_url": "https://www.codebuddy.ai/auth/realms/copilot/protocol/openid-connect/logout",
+            "sso_client_id": "console",
         },
         api_base_url="https://www.codebuddy.ai/v2/chat/completions",
         # 2026-09-23 实测：workbuddy.ai 与 codebuddy.ai 是同一后端（同 token 同结果），
