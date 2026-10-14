@@ -169,3 +169,16 @@
 - 匿名共享池限流的唯一缓解=静置/换 IP/降频；生产正常频次远低于探针，无需额外动作
 - `getattr(rc, "account", None)` 全链兼容旧替身对象（测试桩无该属性也不会炸）
 - 预热任务启动延迟 20s（让位服务初始化）；单账号 provider 不预热（无需排序）
+
+## Session 12 - 2026-10-14
+### 完成（用户需求：清理A机上本项目的无用数据残留，日志留近3天）
+- ✅ **「A机」认定与私钥定位**：A机=**182.254.147.87**（Ali/AIGate 生产，key=`id_a.pem`，可登录）。历史曾称 114.55.170.147 为「机器A」（8 月前 AIGate 旧部署点，codex/aigate-V2）；182.92.141.30 是 7 月代理隧道机器（当时称「A机」）。**.30 与 .147 今天均无法登录**（主机密钥均变、x1a0q1sx.pem 全用户名被拒 → 疑似重装），无处可清，清理在 182.254.147.87 执行。`x1a0q1sx.pem` 现存副本在本地 WPS 云盘目录（Downloads 原件已丢；指纹 `SHA256:XtRAhUgsZVyI3J9y7CDdp86cA6xSwVeRT6bET/5uRTw`；对应公钥已在会话中给出，可重装到 .30/.147 恢复访问）
+- ✅ **清理执行（182.254.147.87）**：①pm2 日志 `aigate-out/error.log` 保留近 3 天（截断到 10-11 12:01 启动点；旧 25MB→5.6MB，err 2.7MB→41KB）②`data/backups` 删 28 个孤儿 `.db-shm/.db-wal`（对应 .db 已在 9-28 被保留策略清掉）+ 5 个 8-26 更新暂存目录（411M）；保留 14 份每日备份（与 `backup.keep=14` 策略一致）③删一次性修复产物 `repair_prompt_double_count-*.json`、`client/build_err.log`、根级 0 字节 `aigate.db`、`.wb-bridge/context-handoff.jsonl`（WBBridge 域、6 周未动）④`freebuff-login.log` 截为尾部（留近 3 天）⑤项目 `__pycache__/.pytest_cache` 清理 ⑥journal `--vacuum-time=3d`（1.1G→64M）+ `/var/log` 轮转旧件 >3 天删除 47 个（1.3G→143M）⑦clash 遗留 pm2 时代日志 71M 删除（clash 现为 systemd 服务，输出走 journal，已核验 journal 实时写入）
+- ⚠️ **pm2 日志截断的坑（本次实踩并修复）**：pm2 God Daemon 以 O_APPEND 持有日志 fd，**直接替换/删除文件会让写入继续落到旧 inode**（新路径不再增长，且旧 inode 空间不释放）。正确做法：`/proc/<daemon>/fd` 找到被标 `(deleted)` 的旧 inode → `cat` 抢救内容 → 写新文件 → `pm2 reloadLogs` 重挂句柄。本次已完整执行：旧句柄内容零丢失找回（含替换后增量），重建 3 天窗口后 reloadLogs，探针验证新文件实时增长（5658879→5658931 字节）
+- ✅ **未动项（非本项目资产）**：`wb-bridge-*` 日志（WBBridge 项目，10-14 仍在写）、服务器 home 目录下 trendradar/opencode/LSJ/Meridian 等他项目目录、`/var/log/btmp`（安全审计留证）
+- ✅ **磁盘对比**：22G used/59% → **21G/54%**（释放约 1.6G：journal 1.1G + /var/log 47 个旧件 + backups 411M + 日志截断 28M）；服务全程存活（aigate pid 3653694 online，HTTP 200，wb-bridge online）
+- ✅ **安全网**：删除前小文件备份至服务器 `/tmp/aigate-cleanup-20261014-125055/`（含 `passthrough_router.py.bak-audio` 副本——与当前版本有 diff，确认是旧版；已剥除其中的 config/credential 副本并 chmod 700；确认无需回滚后可删）
+### 备注
+- 服务器上两个未提交改动（media_router 视频超时头、passthrough /audio/speech 路由）为既有工作遗留，**未动**
+- 182.92.141.30 上原「本项目残留」无从核实——该机不可登录；114.55.170.147 同理（主机密钥变更+密钥被拒）。若用户需要，可先在云控制台 VNC 装回公钥再清
+- 本地临时文件（key 副本/known_hosts 测试件）已全部清除
