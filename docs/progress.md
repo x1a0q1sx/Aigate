@@ -182,3 +182,15 @@
 - 服务器上两个未提交改动（media_router 视频超时头、passthrough /audio/speech 路由）为既有工作遗留，**未动**
 - 182.92.141.30 上原「本项目残留」无从核实——该机不可登录；114.55.170.147 同理（主机密钥变更+密钥被拒）。若用户需要，可先在云控制台 VNC 装回公钥再清
 - 本地临时文件（key 副本/known_hosts 测试件）已全部清除
+
+## Session 13 - 2026-10-15
+### 完成（排查 aigate 访问不到）
+- ✅ **根因链（已实锤）**：10-15 02:56 内核 OOM killer 杀掉 aigate（anon-rss 2.4GB，机器仅 3.7GB 内存、swap 已用 1GB）→ 同机 PM2 God Daemon 一并消失，且当时 PM2 **无开机自启服务**、`dump.pm2` 停在 10-03 → 无人拉起 → 8000 无监听、Web 全不可达。磁盘/网络/nginx 均正常（nginx 80 仍在，仅代理 wb-bridge；aigate 走 8000 直连）
+- ✅ **压力来源=同机本地进程 artex**（ARTEX AI 渗透平台，systemd 服务，非本项目）：持续打 `/v1/chat/completions`，实测 ~60-120 次/分钟、8+ 并发连接；保留窗口内 28,235 次 chat POST 全部来自 127.0.0.1（19,400 成功 / 8,686 个 500 / 128 个 503）。artex 日志显示其多 worker 做上下文压缩且频繁遇到 `empty body from model` → 客户端重试形成放大回路
+- ✅ **崩溃前症状取证**：`aigate-error.log` 14 小时从 41KB 涨到 174MB、含 17,908 次 `QueuePool limit of size 20 overflow 10 reached ... timeout 30.00`；调用栈高度集中在 `chat_completions → auth.dispatch → model_catalog.get_by_full_id`（每请求一次查库）；定时任务 `_run_model_refresh_tick` 被饿 16 分钟（事件循环/内存压力已极端）；日志停写导致 10-14 15:37 之后请求无落库
+- ✅ **恢复**：`pm2 resurrect` 从 dump 拉回 aigate + wb-bridge，HTTP 200 验证通过（`/`、`/health`、`/admin/`）
+- ✅ **防复发（运维层，本次已落地）**：①`max_memory_restart`：aigate 1024M / wb-bridge 512M（此前无闸，进程只能被内核 OOM 杀）②`pm2 save` 刷新 dump（原存档陈旧）③`pm2 startup systemd` 生成并 enable `pm2-ubuntu.service`（Type=forking + PIDFile），另加 drop-in `Restart=always/RestartSec=5`；`pm2 kill` + `systemctl start pm2-ubuntu` 已把守护进程迁入 `system.slice/pm2-ubuntu.service`（此前跑在 SSH 登录会话 scope 内）
+### 未完成 / 建议
+- artex 属另一项目，**未动其进程**。若其调用不降频，aigate 在 1GB 内存闸下会周期性重启（实测当前负载下 RSS 约 30-35MB/分钟爬升）；建议与用户确认限流/重试退避
+- 网关侧硬化（**待确认后再做**，属代码改动）：①chat 热路径 `get_by_full_id` 改用进程内目录缓存，消除每请求 DB session ②`admin_gzip`/`combo_prefix` 为 `BaseHTTPMiddleware`，高压下缓存响应体，可改原生 ASGI 中间件或加并发背压 ③连接池 20+10 与 30s 等待在洪峰下无背压，考虑排队上限与快速失败
+- 风暴期证据保留在服务器 `~/.pm2/logs/aigate-error.log`（174MB），磁盘无压力，暂留查证
