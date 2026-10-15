@@ -354,6 +354,9 @@ export default {
   updateDroolGuard: (data) => apiPut('/admin/api/drool-guard', data),
   getRace: () => apiGet('/admin/api/race'),
   updateRace: (data) => apiPut('/admin/api/race', data),
+  // 推理并发闸（过载保护，2026-10-15）
+  getConcurrency: () => apiGet('/admin/api/concurrency'),
+  updateConcurrency: (data) => apiPut('/admin/api/concurrency', data),
   // 模型刷新：超时与并发配置（2026-09 并发化）
   getModelRefresh: () => apiGet('/admin/api/model-refresh'),
   updateModelRefresh: (data) => apiPut('/admin/api/model-refresh', data),

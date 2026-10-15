@@ -626,6 +626,15 @@ app.add_middleware(ComboPrefixMiddleware)
 # 不碰推理流式路径；详见 server/core/admin_gzip.py
 from server.core.admin_gzip import AdminGZipMiddleware
 app.add_middleware(AdminGZipMiddleware)
+# 推理入口全局并发闸（过载保护）：生成类入口在途数超限即快速失败 503，
+# 让压力在入口泄掉而不是打穿 DB 连接池/内存；详见 server/core/inflight_gate.py
+from server.core.inflight_gate import InflightGateMiddleware
+app.add_middleware(InflightGateMiddleware)
+# 兜底异常护栏 + 错误日志防洪（最外层）：资源类异常转 503 短响应，
+# 未处理异常的日志按 (类型,路径) 窗口限流，杜绝每请求 180 行 traceback 洪泛；
+# 详见 server/core/exception_guard.py
+from server.core.exception_guard import ExceptionGuardMiddleware
+app.add_middleware(ExceptionGuardMiddleware)
 # ============================================================
 # 注册 API 路由（必须在 SPA 回退之前注册，确保 API 优先匹配）
 # ============================================================

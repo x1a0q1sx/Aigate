@@ -459,6 +459,23 @@ async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
 
+async def _release_db(db) -> None:
+    """提前归还 DB 连接（连接池治理，2026-10-15）。
+
+    AsyncSession 只在执行语句时签出连接，但一旦开启事务就**持续持有到
+    close/commit/rollback**。FastAPI 的 yield 依赖要等整个请求（含流式
+    生成器全程）结束才收尾 → 流式请求在上游生成期间（可达分钟级）一直
+    握着一条池连接；高并发下 20+10 的池被瞬间打满（生产事故：81 条并发
+    流式请求 → 17,908 次 QueuePool timeout 30s → 94% 请求 500）。
+
+    用法：路由/取数完成后、发起上游调用（尤其流式）之前调用。session
+    之后仍可复用（下一条语句重新签出连接）；expire_on_commit=False 保证
+    已加载属性在 close 后仍可读（已实测）。幂等、永不抛异常。"""
+    try:
+        await db.close()
+    except Exception:
+        pass
+
 @router.post("/compress")
 async def compress_context(raw_request: Request):
     """Compress messages using AIGate token savers without routing to an upstream model."""
@@ -1149,6 +1166,9 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
                 if _rc.kind == "oauth" and getattr(_rc, "account", None):
                     candidate.account = getattr(_rc, "account", None)
         # 发起完整业务请求（非探测）——HTTP 在锁外
+        # 连接池治理：候选/凭证的 DB 操作已全部完成，先归还连接再打上游
+        # （上游可耗时分钟级；不归还则每请求独占一条池连接，高并发必打满）
+        await _release_db(db)
         upstream_request = _without_unsupported_reasoning(
             request.model_copy(update={"model": candidate.model.model_id}), candidate.model
         )
@@ -2156,6 +2176,9 @@ async def _chat_completions_impl(
                     finally:
                         await _finish_session()
 
+                # 连接池治理：外层 db 的取数已完成（生成器内用独立会话），
+                # 归还连接再返回流式响应——否则连接被握到整个流结束
+                await _release_db(db)
                 return StreamingResponse(_combo_cascade_stream(), media_type="text/event-stream")
             # ─── 非流式 combo：循环尝试（含冷却），不再走 is_auto 级联路径 ───
             combo_attempts = []
@@ -2225,6 +2248,8 @@ async def _chat_completions_impl(
                 _ns_ctx_by_idx[t_idx] = ctx
                 _decision_select(conversation_id, provider=provider.name, model=model.model_id,
                                  model_pk=model.id, reason="next combo target")
+                # 连接池治理：DB 取数完成，先归还连接再打上游（非流式上游也可长跑）
+                await _release_db(db)
                 try:
                     if _rc.kind == "free_tier":
                         result = await call_via(_rc, upstream_req, provider, model)
@@ -2527,11 +2552,15 @@ async def _chat_completions_impl(
                                                 ar.health_checker.mark_cooling(model.id, 300)
                                         except Exception:
                                             pass
+                        # 连接池治理：外层 db 取数完成（生成器用独立会话），先归还再返回流
+                        await _release_db(db)
                         return StreamingResponse(_free_stream(), media_type="text/event-stream")
                     else:
                         try:
                             _free_started = time.time()
                             _proxy_token = _FORCE_PROXY.set(bool(getattr(provider, "proxy_enabled", False)))
+                            # 连接池治理：DB 取数完成，先归还连接再打上游
+                            await _release_db(db)
                             data = await free_exec.execute_non_stream(free_req)
                             _free_latency = int((time.time() - _free_started) * 1000)
                             _decision_attempt(conversation_id, provider=provider.name, model=model.model_id, status="success", attempt=0, latency_ms=_free_latency)
@@ -2942,6 +2971,8 @@ async def _chat_completions_impl(
                         pass
                 await _finish_session()
 
+        # 连接池治理：外层 db 取数完成（生成器用独立会话），先归还再返回流
+        await _release_db(db)
         return StreamingResponse(cascade_stream(), media_type="text/event-stream")
 
     else:
@@ -3228,6 +3259,8 @@ async def _chat_completions_impl(
                         ))
                     except Exception:
                         pass
+            # 连接池治理：外层 db 取数完成（wrap_stream 不依赖 db），先归还再返回流
+            await _release_db(db)
             response = StreamingResponse(wrap_stream(), media_type="text/event-stream")
         else:
             try:
@@ -3254,6 +3287,8 @@ async def _chat_completions_impl(
                                 break  # 同模型 key 集合内已无可用 key
                             _cur_kid, _cur_key = _nk
                             _tried.add(_cur_kid)
+                    # 连接池治理：key 轮换取数完成，归还连接再打上游（非流式上游可长跑）
+                    await _release_db(db)
                     _diag(conversation_id, "upstream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False)
                     try:
                         result = await route_result.adapter.chat_completion(

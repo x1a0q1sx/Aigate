@@ -220,6 +220,29 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>推理并发闸（过载保护）</h2>
+          <p>所有生成类入口（chat/messages/responses/Gemini 生成）合计在途请求上限：超出后在入口短暂等待，仍拿不到名额则快速失败 503（带 Retry-After，客户端可直接重试）。防止突发洪峰打满数据库连接池导致整体变慢/崩溃（2026-10-15 事故配套）。</p>
+        </div>
+        <span class="status-pill" :class="conc.enabled ? 'ok' : 'muted'">{{ conc.enabled ? '已启用' : '未启用' }}</span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="conc.enabled" /> 启用并发闸</label>
+      </div>
+      <div class="notify-fields">
+        <label>在途上限<input v-model.number="conc.max_inflight" type="number" min="4" max="2048" /></label>
+        <label>等待秒数<input v-model.number="conc.acquire_timeout_seconds" type="number" min="1" max="120" step="0.5" /></label>
+      </div>
+      <p v-if="conc.stats" class="hint" style="font-size: 12px; color: var(--text-muted);">
+        当前在途 {{ conc.stats.inflight || 0 }} / 峰值 {{ conc.stats.max_seen || 0 }} · 累计放行 {{ conc.stats.admitted || 0 }} · 拒绝 {{ conc.stats.rejected || 0 }}
+      </p>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveConc" :disabled="concSaving">{{ concSaving ? '保存中...' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>模型刷新（并发与超时）</h2>
           <p>刷新模型列表时按并发数同时请求多个服务商，避免串行等待；单个服务商超过「整站超时」即判失败、不再继续等待（失败明细见刷新结果与「分析 · 模型刷新」）。</p>
         </div>
@@ -363,6 +386,8 @@ export default {
       droolSaving: false,
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
+      conc: { enabled: true, max_inflight: 128, acquire_timeout_seconds: 15, stats: null },
+      concSaving: false,
       mr: {
         timeout_seconds: 20, provider_timeout_seconds: 45, concurrency: 12,
         scheduled_enabled: false, interval_minutes: 720, remove_missing_models: true,
@@ -492,7 +517,7 @@ print(resp.choices[0].message.content)`,
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadModelRefresh(), this.loadOpenCode()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadConc(), this.loadModelRefresh(), this.loadOpenCode()])
         // 接入信息卡：密钥掩码（明文按需揭示，见 toggleKey）
         api.getAIGateKey(false).then((d) => { this.keyMeta = d || null }).catch(() => {})
       } finally {
@@ -618,6 +643,24 @@ print(resp.choices[0].message.content)`,
       } catch (e) {
         toast.error('保存失败: ' + e.message)
       } finally { this.raceSaving = false }
+    },
+    async loadConc() {
+      try { this.conc = { ...this.conc, ...(await api.getConcurrency()) } }
+      catch (e) { /* ignore */ }
+    },
+    async saveConc() {
+      this.concSaving = true
+      try {
+        const r = await api.updateConcurrency({
+          enabled: this.conc.enabled,
+          max_inflight: this.conc.max_inflight,
+          acquire_timeout_seconds: this.conc.acquire_timeout_seconds,
+        })
+        this.conc = { ...this.conc, ...r }
+        toast.success('并发闸配置已保存')
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.concSaving = false }
     },
     async loadModelRefresh() {
       try { this.mr = { ...this.mr, ...(await api.getModelRefresh()) } }

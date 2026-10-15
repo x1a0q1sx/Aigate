@@ -217,8 +217,24 @@ async def live_summary(db: AsyncSession = Depends(get_db)):
         } for r in recent],
         "log_queue": dict(lq_stats),
         "cache": cache_info,
+        "overload": _overload_stats(),
         "server_time": datetime.utcnow().isoformat(timespec="seconds"),
     }
+
+
+def _overload_stats() -> dict:
+    """过载保护实时状态：并发闸在途/拒绝 + 异常护栏计数。"""
+    try:
+        from server.core.inflight_gate import get_gate_stats
+        gate = get_gate_stats()
+    except Exception:
+        gate = {}
+    try:
+        from server.core.exception_guard import get_guard_stats
+        guard = get_guard_stats()
+    except Exception:
+        guard = {}
+    return {"gate": gate, "guard": guard}
 
 
 # ─────────────────────────── B5: 日志导出 ───────────────────────────
@@ -353,6 +369,42 @@ async def put_race_config(body: RaceModel):
     from server.config import get_config, save_config
     cfg = get_config().race
     for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(cfg, k, v)
+    save_config()
+    return cfg.model_dump()
+
+
+# ─────────────────────────── 推理并发闸（过载保护）───────────────────────────
+# 背景：2026-10-15 生产事故——同机客户端 81 条并发流式请求打满 DB 连接池
+# （QueuePool timeout 30s，94% 请求 500）。本闸给生成类入口设全局在途上限，
+# 超出即快速失败 503，让过载在入口泄压。统计实时暴露在 /live/summary。
+
+class ConcurrencyModel(BaseModel):
+    enabled: Optional[bool] = None
+    max_inflight: Optional[int] = None
+    acquire_timeout_seconds: Optional[float] = None
+
+
+@router.get("/concurrency")
+async def get_concurrency_config():
+    from server.config import get_config
+    from server.core.inflight_gate import get_gate_stats
+    cfg = get_config().concurrency
+    return {**cfg.model_dump(), "stats": get_gate_stats()}
+
+
+@router.put("/concurrency")
+async def put_concurrency_config(body: ConcurrencyModel):
+    from server.config import get_config, save_config
+    cfg = get_config().concurrency
+    for k, v in body.model_dump(exclude_unset=True).items():
+        if v is None:
+            continue
+        # 钳制到合理区间：上限过大等于没闸，过小会把正常负载也拒掉
+        if k == "max_inflight":
+            v = max(4, min(2048, int(v)))
+        elif k == "acquire_timeout_seconds":
+            v = max(1.0, min(120.0, float(v)))
         setattr(cfg, k, v)
     save_config()
     return cfg.model_dump()

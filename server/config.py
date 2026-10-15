@@ -171,6 +171,21 @@ class RaceConfig(BaseModel):
     enabled: bool = True
     no_content_seconds: int = 15
 
+class ConcurrencyConfig(BaseModel):
+    """推理入口全局并发闸（过载保护，2026-10-15）。
+
+    背景：同机客户端（artex）曾以 81 条并发流式请求打 /v1/chat/completions，
+    单条上游耗时 ~58s；旧实现无并发上限 → DB 连接池（20+10）被长请求占满、
+    请求排队 30s 后 500、内存涨到 2.4GB 触发内核 OOM。
+
+    max_inflight：全局在途上限（所有生成类入口合计）。超出后在入口等待
+    acquire_timeout_seconds，仍拿不到名额则快速失败 503 + Retry-After——
+    让过载在入口泄压而不是打穿连接池。纯内存信号量，默认 128 远大于正常
+    负载（生产正常并发 < 20），只在洪峰时生效。"""
+    enabled: bool = True
+    max_inflight: int = 128
+    acquire_timeout_seconds: float = 15.0
+
 class QoderConfig(BaseModel):
     """Qoder 签到/积分（/sash/ 端点）的请求身份。
 
@@ -279,6 +294,7 @@ class Config(BaseModel):
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
     drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
     race: RaceConfig = Field(default_factory=RaceConfig)
+    concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     checkin: CheckinConfig = Field(default_factory=CheckinConfig)
     growth: GrowthConfig = Field(default_factory=GrowthConfig)
     qoder: QoderConfig = Field(default_factory=QoderConfig)
