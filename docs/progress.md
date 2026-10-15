@@ -194,3 +194,14 @@
 - artex 属另一项目，**未动其进程**。若其调用不降频，aigate 在 1GB 内存闸下会周期性重启（实测当前负载下 RSS 约 30-35MB/分钟爬升）；建议与用户确认限流/重试退避
 - 网关侧硬化（**待确认后再做**，属代码改动）：①chat 热路径 `get_by_full_id` 改用进程内目录缓存，消除每请求 DB session ②`admin_gzip`/`combo_prefix` 为 `BaseHTTPMiddleware`，高压下缓存响应体，可改原生 ASGI 中间件或加并发背压 ③连接池 20+10 与 30s 等待在洪峰下无背压，考虑排队上限与快速失败
 - 风暴期证据保留在服务器 `~/.pm2/logs/aigate-error.log`（174MB），磁盘无压力，暂留查证
+
+## Session 14 - 2026-10-15
+### 完成（排查「aigate 巨卡」）
+- ✅ **结论：网关进程本身健康，卡在连接池排队**。服务器内部 `/health`、`/` 响应 2-3ms（200），aigate **无重启**（RSS 533M，远低于 1GB 闸），load 0.20、CPU 95% idle、swap 无换入换出、磁盘 57%——「巨卡」不是 CPU/内存/磁盘瓶颈
+- ✅ **根因链（实锤）**：同机 **artex**（pid 186780，systemd 服务，非本项目）以 **81 条并发连接 / 35 线程**持续打 `/v1/chat/completions` 流式请求（模型 `CodeBuddy CN (腾讯)/step-5-preview`）；上游单条**平均 58.2 秒**（观测 max 62.4s，疑上游超时或长生成）；而 `/v1/chat/completions` 用 `Depends(get_db)`（`server/api/v1_router.py:1517`）→ **DB 会话生命周期 = 整个请求生命周期**，每条流式请求在整个 58 秒内独占一条池连接 → 池 20+10 被 81 并发瞬间打满 → 后续请求 `QueuePool limit of size 20 overflow 10 reached ... timeout 30.00` 排队 30 秒后 500
+- ✅ **量化证据**：①`aigate-out.log` 最近 2MB：7,180 个 chat POST 中 **6,747 个 500（94%）**、仅 691 个 200；`响应已就绪` 耗时均值 58,246ms（n=659）②`aigate-error.log` 20 秒涨 590KB（≈2.5GB/天），最近 6MB 内 308 次 `sqlalchemy.exc.TimeoutError`（全为 QueuePool 超时）③`request_logs` 近 3h 共 4,738 行**全部 `user_ip=127.0.0.1`、`api_key_id=NULL`**（本地无 key 直连 → 按 key 的限流天然不生效），状态 error 3,967 / pending 765 / success 6；逐时均值延迟 18s→35s→50s 递增 ④落库严重滞后（3h 仅 4,738 行，而单个 2MB 日志段就有 7,180 个 POST）——**日志写入与业务共用同一个已耗尽的池**，写日志自己也在排队
+- ✅ **恢复手段**：压力源在 artex 而非网关，`sudo systemctl stop artex` 可立即解除（随时 start 恢复）。**本次未执行，待用户决定**
+- ⚠️ **旁路发现（非本次卡的直接原因）**：mihomo 通用 `PROXY` 组（Selector）`now=DIRECT`，其订阅源 **XFLTD 拉取 403、0 节点（已过期）** → api.openai.com / grok.com 等走 `Match` 规则的出站全部 `i/o timeout`；`opencode.ai` 走的 `OPENCODE-REGION`（日本中转，19 节点）不受影响仍正常；`iKuuu_V2`(7) / `sabusuku`(102) 订阅正常更新。**需翻墙的渠道（走 `PROXY`/`Match`）当前实际不可用**，需换订阅或把 `PROXY` 指向可用组
+### 未完成 / 建议
+- **结构性硬化（待确认，属代码改动）**：①`get_db` 不跨越上游流式调用（进入流式前取完数据、上游调用期间不持连接）+ 热路径结果落进程内缓存 ②连接池加排队上限/快速失败（当前 30s 排队完全无背压）③`admin_gzip`/`combo_prefix` 改原生 ASGI 中间件
+- artex 侧降频/重试退避（其 `empty body from model` 重试是放大回路），或网关侧对本地无 key 调用加并发闸
