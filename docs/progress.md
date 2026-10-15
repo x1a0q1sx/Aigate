@@ -205,3 +205,22 @@
 ### 未完成 / 建议
 - **结构性硬化（待确认，属代码改动）**：①`get_db` 不跨越上游流式调用（进入流式前取完数据、上游调用期间不持连接）+ 热路径结果落进程内缓存 ②连接池加排队上限/快速失败（当前 30s 排队完全无背压）③`admin_gzip`/`combo_prefix` 改原生 ASGI 中间件
 - artex 侧降频/重试退避（其 `empty body from model` 重试是放大回路），或网关侧对本地无 key 调用加并发闸
+
+## Session 15 - 2026-10-15/16
+### 完成（高并发适配 + 日志机制 + muse/gemini 调研）
+- ✅ **过载保护三件套（已部署生产，commit 56875f6）**：
+  - ① `server/core/inflight_gate.py` 推理入口全局并发闸（纯 ASGI）：只拦生成类入口（chat/messages/responses/Gemini generate/streamGenerateContent + `/combo:<ref>/` 前缀），在途超限先等 `acquire_timeout_seconds`、仍无名额 → **503 + Retry-After**（`gateway_overloaded`）。默认 128 在途/等 15s；`config.concurrency` 热改即时生效；设置页新增「推理并发闸」卡片（含实时统计：在途/峰值/放行/拒绝），`/admin/api/concurrency` + live summary `overload` 段
+  - ② `server/core/exception_guard.py` 最外层兜底护栏：QueuePool 超时/DB 不可用/超时 → **503 短 JSON**（内部细节不泄漏）；未处理异常日志按 `(异常类型,路径)` **10 秒窗口限流**（首条记类型/摘要/前 6 帧栈，其余计数、下窗口补记 +N suppressed）——根治每请求 ~180 行 traceback 洪泛
+  - ③ `_release_db()` DB 连接不横跨上游调用：路由/取数完成后、上游调用（尤其流式）之前提前归还连接，覆盖 **六条路径**（auto 级联 / combo 流式 / combo 非流式 / 直连流式 / 直连非流式 / free_tier）；fusion 保持不释放（并行任务全程需要 db）。机制实证：AsyncSession 读查询即开启事务独占连接直到 close；close 后连接归还、已加载属性仍可读、会话可继续复用（测试锁死）
+- ✅ **实测验证（生产）**：60 并发 + 40 并发流式压测（重放 artex 事故场景）——**全部 200、零 QueuePool 超时、零 ASGI 异常、错误日志增长 0 字节**；闸统计峰值在途 62、拒绝 0（128 上限未触）；对照=重启前旧代码时段同一场景 24 个 500 + 56 次 QueuePool。20 并发非流式也全 200
+- ✅ **服务器 pm2-logrotate**（此前单文件 439MB 无轮转）：`max_size 200M` + 每天 00:00 轮转 + `retain 3` + `compress`，装后已实际轮转两次（23:28 按大小、00:00 按 cron）；`pm2 save` 已持久化
+- ✅ **测试**：新增 `tests/test_overload_protection.py` 12 项（路径判定/过载 503/非生成路径放行/闸关/异常分类/防洪窗口/端到端 503/池独占-释放-复用/幂等/配置默认值），全量 **1040 全绿**
+- 📋 **调研结论（muse / 9router / gemini）**：
+  - **muse = Meta 的 Muse Spark 模型**（Muse Code 订阅，官方登录=auth.meta.com 设备码 RFC 8628 → `POST api.meta.ai/muse-code/key` 铸 key，API=`api.meta.ai/v1` 的 Chat Completions + Responses）；AIGate 接入的 `muse-spark-*-contributor-free` 是 **opencode Zen 免费层转售的 Meta contributor 档**
+  - **能登录 muse 的项目（实锤）**：`TheStreamCode/opencode-muse-auth`（opencode 插件，设备码）、`TheStreamCode/hermes-muse-code`、`BlockedPath/pi-meta-oauth`（每日重铸 key）、**`router-for-me/CLIProxyAPI`（5.5 万★，内置 Meta Muse provider：OAuth 登录 + Model API key）**、`JohnWangggg/magpie-muse-web`（muse.ai 网页 cookie + 无头 Chrome）；opencode 免费层纯 HTTP 侧车项目一批（`azrinaldi/opencode-free-bridge`、`TiaraBasori/OpenCode2API` 341★ 等）
+  - **9router 支持 muse（源码实锤）**：双通道——`open-sse/providers/registry/muse.js`（Meta Muse OAuth 设备码 + 别名 muse-code/meta-model-api）+ `opencode.js` 免费层伪造头（`Bearer public` + `x-opencode-client: desktop`）；CHANGELOG v0.5.59~v0.5.99 一路在修 muse 路由（chat→responses 改道、contributor 模型、OAuth 登录）。**注意**：9router 当前是纯 HTTP 指纹路线（非 CLI sidecar），且 10-14~15 上游收紧后正在高频打补丁（issue #4845 作者独立得出与 AIGate 一致结论：纯 HTTP 复刻仍 403，建议驱动本地 `opencode serve`）；**AIGate 的 CLI sidecar 路线仍是更稳的**
+  - **gemini 登录式接入（实锤）**：**Gemini CLI 免费层已被 Google 于 2026-06-18 关闭**（9router README 原文）；现役路线=**Antigravity**（Google IDE，附带 Gemini 3.x/Claude 5.x 额度）：`su-kaka/gcli2api`（5251★，10-15 活跃，GeminiCLI+Antigravity→OpenAI/Gemini/Claude API）、`liuw1535/antigravity2api-nodejs`（815★，多账号轮换+额度查看，但 6-19 后未更新）、`router-for-me/CLIProxyAPI`（Antigravity OAuth 完整支持）、9router `antigravity.js`（OAuth authorization_code + IDE UA + 429/500/503 重试）。**AIGate 现状**：`oauth_registry.py` 已有 antigravity 配置（authorization_code + PKCE + 5 分钟前置刷新 + 静态模型 12 个），但生产 oauth_tokens 表无 antigravity 连接；**历史否决记录**（09-26 jet-hub 调研）：①需网关主机跑 IDE 进程 ②公共 API 403 SUBSCRIPTION_REQUIRED ③违反其 9 条防封号约束——但 9router/gcli2api 的现役实现走的是 **OAuth + cloudcode-pa/v1internal** 通道，与此前否决的「读本机 IDE 状态」通道不同，**值得重新评估**（用户已表达接入意愿）
+### 未完成 / 建议
+- **combo 多模型负载分摊评估**（用户设想：建组合多放模型分摊）：combo 现支持 fallback/round_robin/weighted/fusion 四种策略，round_robin 与 weighted 都能跨请求分摊流量（实测 918 组合 18 候选）；但**分摊解决的是上游侧选择，不解决本地并发上限**——真正防崩的是本次的并发闸+连接释放（已验证 100 并发级压测零故障）。建议：①生产 combo 用 round_robin/weighted 分摊上游压力 ②若 artex 洪峰再来，128 上限 + 15s 等待会把超额请求快速 503（客户端可重试）而不是打穿池子 ③如需更高并发，先升 DB 池（20+10 是 SQLite 单写者场景的保守值）或迁 PG
+- **artex 侧未动**（属另一项目）：仍建议降频/重试退避；网关侧闸已能兜住其洪峰
+- **mihomo PROXY 组仍 DIRECT**（XFLTD 订阅 403 过期）：需翻墙的渠道受影响，待换订阅或改指可用组
