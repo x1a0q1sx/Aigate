@@ -530,3 +530,39 @@ def test_codex_adapter_regression_default_instructions_still_injected():
 def test_muse_capabilities_reports_reasoning_effort_support():
     from server.core.model_capabilities import infer_reasoning_effort_support
     assert infer_reasoning_effort_support("muse_responses", "muse-spark-1.3") is True
+
+
+# ── 自动登记服务商：必须带「走代理」开关 ──────────────────
+
+@pytest.mark.asyncio
+async def test_ensure_provider_registered_enables_proxy_for_muse(tmp_path):
+    """注册表 extra_params.force_proxy=True → 服务商行建好即 proxy_enabled=True。
+
+    这是 muse 能不能出网的分水岭：没有该开关就不会带 __proxy_force，
+    推理/刷新直接打 api.meta.ai（服务端直连不通 → 全盘失败且不报配置错。
+    """
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from server.models.base import Base
+    from server.models.provider import Provider
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/muse.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[Provider.__table__])
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    c = OAuthClient(crypto=FakeCrypto())
+    async with Session() as db:
+        await c._ensure_provider_registered(db, "muse")
+        row = (await db.execute(
+            select(Provider).where(Provider.oauth_code == "muse"))).scalar_one()
+        assert row.api_type == "muse_responses"
+        assert row.base_url == "https://api.meta.ai/v1"
+        assert row.credential_type == "oauth"
+        assert row.proxy_enabled is True
+        # 幂等：再登记一次不新增行
+        await c._ensure_provider_registered(db, "muse")
+        rows = (await db.execute(
+            select(Provider).where(Provider.oauth_code == "muse"))).scalars().all()
+        assert len(rows) == 1
+    await engine.dispose()
