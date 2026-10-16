@@ -59,6 +59,20 @@ def _now_utc() -> datetime:
     return datetime.utcnow()
 
 
+def _force_proxy_kwargs() -> dict:
+    """OAuth 流程里访问**按国别封锁**的上游（Meta 等）时的 httpx 代理参数。
+
+    服务端直连不通、必须经 mihomo；走代理池并 force=True（池 enabled=False 时
+    仅 force 生效，语义即「服务商/流程强制走代理」，与推理侧 __proxy_force 一致）。
+    池空/全冷却时返回 {} = 静默回落直连。
+    """
+    try:
+        from server.core.proxy_pool import get_proxy_pool
+        return get_proxy_pool().proxied_kwargs(force=True)
+    except Exception:
+        return {}
+
+
 # P1-15: 判定"凭证真的失效"（该永久下线）vs "上游抖动"（只记错误，保留 active）。
 # 此前任意 >=400 都 is_active=False，上游一次 429/502/超时就把连接判死刑，
 # 调度器只扫 active 连接 → 须人工重新登录才能恢复。
@@ -943,6 +957,9 @@ class OAuthClient:
         if _style == "codebuddy" or provider_code == "codebuddy_cn":
             # 腾讯系（CN/国际服同构）：X-Refresh-Token 头 + 空 JSON body
             return await self._refresh_codebuddy(db, provider, existing, refresh_plain)
+        if _style == "muse":
+            # Meta Muse：refresh_token 列存的是 OAuth access token，「刷新」= 重铸 LLM| key
+            return await self._refresh_muse(db, provider, existing, refresh_plain)
         if _style == "cline":
             # Cline：JSON body {refreshToken,grantType,clientType} → {data:{accessToken,expiresAt}}
             return await self._refresh_cline(db, provider, existing, refresh_plain)
@@ -1161,6 +1178,206 @@ class OAuthClient:
             return {"bearer": bearer, "priv": keys["priv"], "pub": keys.get("pub")}
         except Exception:
             return None
+
+    # ── Meta Muse Code 设备码流（RFC 8628 → 铸 LLM| key） ──
+    # 见 oauth_registry "muse" 条目的协议说明。此处实现三个动作：
+    #   start（要设备码）→ 轮询换 OAuth token → 铸 key → 落库。
+    # 前置/铸 key 端点按国别封锁（服务端须经代理），故统一走代理池 force。
+    async def start_muse_device(self, provider_code: str, db: AsyncSession,
+                                owner: str = "__default") -> dict:
+        """1) POST 设备授权端点（form client_id）拿 user_code/verification_uri
+        2) 返回 login_url（优先 verification_uri_complete，已内嵌 code）给前端
+        3) 后台轮询 OAuth token → 铸 LLM| key → 落库"""
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return {"error": f"unknown provider {provider_code}"}
+        ep = provider.extra_params or {}
+        if ep.get("auth_mode") != "muse_device":
+            return {"error": "provider not muse_device mode"}
+        device_url = ep.get("device_url") or provider.authorize_url
+        try:
+            async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
+                resp = await client.post(
+                    device_url,
+                    data={"client_id": provider.client_id},
+                    headers={"Accept": "application/json",
+                             "x-api-version": ep.get("api_version", "1.0.0")},
+                )
+            if resp.status_code >= 400:
+                return {"error": f"muse device start http {resp.status_code}: {resp.text[:200]}"}
+            data = resp.json()
+        except Exception as e:
+            return {"error": f"start_muse_device exception: {e}"}
+        device_code = str(data.get("device_code") or "")
+        user_code = str(data.get("user_code") or "")
+        verification_uri = str(data.get("verification_uri") or "")
+        complete = str(data.get("verification_uri_complete") or "")
+        if not device_code or not user_code or not verification_uri.startswith(("http://", "https://")):
+            return {"error": "muse device authorization response is missing fields"}
+        interval = int(data.get("interval") or 5)
+        expires_in = int(data.get("expires_in") or 600)
+        asyncio.create_task(self._poll_muse_device(
+            provider_code, device_code, owner, interval, expires_in))
+        return {"state": device_code, "login_url": complete or verification_uri,
+                "user_code": user_code,
+                "poll_interval_ms": max(1, interval) * 1000, "owner": owner}
+
+    async def _poll_muse_device(self, provider_code: str, device_code: str,
+                                owner: str, interval: int, expires_in: int):
+        """RFC 8628 轮询：authorization_pending=继续，slow_down=间隔 +5s，
+        其它错误=终止；拿到 access_token 后铸 key 落库。"""
+        provider = get_oauth_provider(provider_code)
+        if not provider:
+            return
+        ep = provider.extra_params or {}
+        token_url = ep.get("device_token_url") or provider.token_url
+        interval = max(1, int(interval or 5))
+        deadline = time.time() + max(60, expires_in + 30)
+        slow_downs = 0
+        while time.time() < deadline:
+            await asyncio.sleep(interval)
+            try:
+                async with httpx.AsyncClient(timeout=20, **_force_proxy_kwargs()) as client:
+                    resp = await client.post(
+                        token_url,
+                        data={"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                              "client_id": provider.client_id,
+                              "device_code": device_code},
+                        headers={"Accept": "application/json",
+                                 "x-api-version": ep.get("api_version", "1.0.0")},
+                    )
+                try:
+                    body = resp.json() if resp.status_code < 500 else None
+                except Exception:
+                    body = None
+                if body and not body.get("error"):
+                    access = str(body.get("access_token") or "")
+                    if not access:
+                        logger.warning("muse poll: token response has no access_token")
+                        return
+                    await self._finish_muse_login(provider_code, owner, access, ep, body)
+                    return
+                err = (body or {}).get("error")
+                if err == "slow_down":
+                    slow_downs += 1
+                    interval += 5
+                elif err not in (None, "authorization_pending"):
+                    logger.warning("muse device login failed: %s", err or resp.status_code)
+                    return
+            except Exception as e:
+                logger.debug("muse poll failed: %s", e)
+                continue
+        logger.info("muse device login timed out (%d slow_downs)", slow_downs)
+
+    async def _finish_muse_login(self, provider_code: str, owner: str, oauth_access: str,
+                                 ep: dict, token_body: dict = None):
+        """铸 LLM| key 并落库（access_token=key，refresh_token=OAuth token）。"""
+        try:
+            minted = await self._mint_muse_key(oauth_access, ep)
+        except Exception as e:
+            logger.warning("muse key mint failed for %s/%s: %s", provider_code, owner, e)
+            return
+        api_key = minted["api_key"]
+        account_id = minted.get("account_id") or ""
+        email = minted.get("email") or ""
+        # OAuth token 存 refresh_token 列，供重铸；其自身寿命未知（上游不保证），
+        # 只作为「重铸材料」，不作为推理凭证。
+        oauth_expires = int((token_body or {}).get("expires_in") or 0)
+        scope_meta = json.dumps({"account_id": account_id, "email": email}, ensure_ascii=False)
+        async with AsyncSessionLocal() as db:
+            target_owner = owner
+            # 新连接若还是自动名，改用账号邮箱（同 CodeBuddy 的做法，仅限自动名）
+            if email and _is_auto_allocated_owner(target_owner):
+                existing_here = await self._get_token_record(db, provider_code, target_owner)
+                if existing_here is None:
+                    clash = await self._get_token_record(db, provider_code, email)
+                    if clash is None:
+                        logger.info("muse: 新连接默认名「%s」→「%s」（账号标识）",
+                                    target_owner, email)
+                        target_owner = email
+            try:
+                await self._save_token(db, provider_code, target_owner, {
+                    "access_token": api_key,
+                    "refresh_token": oauth_access,
+                    "expires_in": 2 * 86400,          # 见 _refresh_muse：重铸节奏 = 2d - lead(1d)
+                    "refresh_token_expires_in": oauth_expires,
+                    "token_type": "Bearer",
+                    "scope": scope_meta,
+                })
+            except Exception as e:
+                logger.warning("muse save token failed: %s", e)
+                return
+        logger.info("muse key acquired for %s/%s (account=%s)", provider_code, target_owner, account_id or "?")
+
+    async def _mint_muse_key(self, oauth_access_token: str, ep: dict) -> dict:
+        """POST api.meta.ai/muse-code/key（JSON {"onboard":true}）→ 解析 LLM| key。
+
+        与官方插件同判据：is_subs_active=False → 订阅未激活；
+        无 api_key 且 require_payment/action_url → 需付费；否则视为响应异常。
+        """
+        key_url = ep.get("key_url") or "https://api.meta.ai/muse-code/key"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "x-api-version": ep.get("api_version", "1.0.0"),
+            "Authorization": f"Bearer {oauth_access_token}",
+        }
+        async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
+            resp = await client.post(key_url, json={"onboard": True}, headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"muse key exchange failed: HTTP {resp.status_code} {resp.text[:200]}")
+        data = resp.json()
+        if data.get("is_subs_active") is False:
+            raise RuntimeError("Muse Code subscription is inactive for this account")
+        api_key = str(data.get("api_key") or "").strip()
+        if not api_key:
+            action = str(data.get("action_url") or data.get("require_payment_action_url") or "").strip()
+            if data.get("require_payment") is True or action:
+                raise RuntimeError("Muse Code subscription required"
+                                   + (f": {action}" if action else ""))
+            raise RuntimeError("muse key response is missing api_key")
+        return {
+            "api_key": api_key,
+            "account_id": str(data.get("user_id") or "").strip(),
+            "email": str(data.get("user_email") or "").strip().lower(),
+        }
+
+    async def _refresh_muse(self, db: AsyncSession, provider: OAuthProviderConfig,
+                            existing: OAuthToken, oauth_token: str) -> Tuple[bool, str]:
+        """muse 的「刷新」= 用存下的 OAuth token 重铸 LLM| key。
+
+        ⚠️ 失败语义与别的上游不同：**推理凭证（现有 LLM| key）可能仍然有效**，
+        失去的只是「重铸能力」。因此永不因重铸失败下线连接，只记 last_error；
+        并把 expires_at 往后推（永久失败 30 天 / 瞬时失败 30 分钟）—— 否则刷新
+        调度器每 60s 会重试一次，而铸 key 端点激进限流（429）。
+        """
+        ep = provider.extra_params or {}
+        now = _now_utc()
+        try:
+            minted = await self._mint_muse_key(oauth_token, ep)
+        except Exception as e:
+            msg = str(e)[:300]
+            code = status_from_error_text(msg)
+            existing.last_error = (
+                "重铸 key 失败（当前推理 key 仍然有效）：" + msg
+                + ("" if code != 401 else " —— OAuth 授权已失效，需重新设备码登录"))
+            if code in (401, 403):
+                existing.expires_at = now + timedelta(days=30)      # 授权失效：停止自动重试
+            else:
+                existing.expires_at = now + timedelta(minutes=30)   # 瞬时（429/5xx）：半小时后再试
+            await db.commit()
+            return False, msg
+        email = minted.get("email") or ""
+        scope_meta = json.dumps({"account_id": minted.get("account_id") or "", "email": email},
+                                ensure_ascii=False)
+        await self._save_token(db, provider.code, existing.owner, {
+            "access_token": minted["api_key"],
+            "refresh_token": oauth_token,
+            "expires_in": 2 * 86400,
+            "token_type": "Bearer",
+            "scope": scope_meta,
+        }, update_existing=existing)
+        return True, "ok"
 
     # ── Qoder 设备流（本地 PKCE+nonce，轮询 deviceToken/poll 收 dt- token） ──
     async def start_qoder_device(self, provider_code: str, db: AsyncSession,
@@ -1842,14 +2059,23 @@ class OAuthClient:
         if not cfg:
             return
         name = (cfg.name or provider_code).strip() or provider_code
+        # 注册表声明的「必须走代理」（如 Meta Muse：出口按国别封锁）→ 建行即置
+        # proxy_enabled=True，推理/刷新才会带 __proxy_force 走代理池。
+        _force_proxy = bool((cfg.extra_params or {}).get("force_proxy"))
         dup = (await db.execute(
             select(Provider).where(Provider.name == name).limit(1)
         )).scalar_one_or_none()
         if dup:
             # 用户已手工建过同名服务商：只补 oauth 指向
+            _changed = False
             if not dup.oauth_code:
                 dup.oauth_code = provider_code
                 dup.credential_type = "oauth"
+                _changed = True
+            if _force_proxy and not dup.proxy_enabled:
+                dup.proxy_enabled = True
+                _changed = True
+            if _changed:
                 await db.commit()
             return
         db.add(Provider(
@@ -1858,6 +2084,7 @@ class OAuthClient:
             api_type=cfg.adapter_api_type or "openai_compat",
             credential_type="oauth",
             oauth_code=provider_code,
+            proxy_enabled=_force_proxy,
             enabled=True,
             description=f"由 OAuth 连接自动登记（{provider_code}）",
         ))

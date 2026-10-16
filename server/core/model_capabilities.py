@@ -7,7 +7,8 @@ def infer_reasoning_effort_support(api_type: str, model_id: str) -> bool | None:
     api = (api_type or "").lower()
     name = (model_id or "").lower()
 
-    if api == "codex_responses":
+    if api in ("codex_responses", "muse_responses"):
+        # 两者都是 Responses wire，均支持 reasoning.effort（muse 档位为 minimal…max）
         return True
 
     if api == "anthropic":

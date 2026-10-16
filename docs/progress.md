@@ -259,3 +259,59 @@
 ### 未完成 / 建议
 - 分流状态（`account_balancer.stats()`）暂未透出到设置页/分析页，需要时可以加一个只读卡片
 - 若希望「达到阈值立即均匀 50/50」而不是「落后者先追平再轮流」，把 `account_load_key` 的 count 比较换成 LRU-only 即可（现实现=负载均衡语义）
+
+## Session 18 - 2026-10-16
+### 完成（三项用户问询：账号冷却语义 / 测活请求来源 / CodeBuddy Intl 11128）
+- ✅ **Q1 账号冷却 + 跨账号重试（确认，未改码）**：机制存在且生效，但语义与「一失败当场换号」有三处差异——
+  - ① **冷却只在「值得冷却」的错误上触发**（`is_account_worthy_error`：401/403/429/5xx 或限流文案）→ 失败写 `oauth_tokens.cooldown_until/fail_count`（429=60s 起 / 401·403=300s 起 / 其余 120s 起，指数退避封顶 1h，落库跨重启存活）；**换号发生在「下一次取号」**（`_rank_auto_rows` 把冷却账号排最后），不是同一请求内
+  - ② **同一请求内不会换号**：候选身份是 (服务商, 模型)，`tried_ids` 按模型排重 → 同一 provider+model 不会被另一账号重试。直连路径 `resolve_credential_async` 每请求只解析一次（`v1_router.py:2432`）；「同模型换 key 重试」(`v1_router.py:3285` `next_key_for_model`) 只作用于标准 API key 集合，OAuth 账号不参与。auto/combo 会在同一请求内退到**其它模型/服务商**
+  - ③ **「全部账号都不好使」不是硬报错**：全冷却时仍回退使用（防 503 饿死，`test_pick_all_cooling_still_falls_back`）；点名 `provider.oauth_owner` 不受冷却影响
+- ✅ **Q2 「12:10:50 一大批测活请求」= 上一会话（Session 17）自己的 F41 生产验证**，非第三方探测：生产 `request_logs` 12:10:50–51 CST（=04:10:50Z）14 条 `CodeBuddy CN/deepseek-v4-flash` 全 200，`routed_account` 分布 **10 + 4**、`user_ip=127.0.0.1`、无网关 key —— 与 Session 17 记录「14 并发验证、分布 10+4」逐条吻合；时间落在 commit 13bab80（12:08）与 docs 2ebd54d（12:12）之间
+- ✅ **Q3 `CodeBuddy (International)/deepseek-v4.1-flash` 报 11128 = 上游对该账号的账号级拦截，与请求体/模型/链路无关**。生产 A/B 实测：
+  - 现象：`{"code":11128,"msg":"conversation id missing","displayMsg":"请求被拦截，请重新发送"}`（HTTP 400）。**全部命中同一账号 `1355386364@qq.com`**（今日 Intl 6 次请求：5 错 1 对）
+  - 排除项：同 payload 换另一账号（`x1a0q1sx@gmail.com`）**12/12 全 200**；被拦账号 **9/9 全败**（含直连与 127.0.0.1:7890 代理出口、静置 180s 后单发、5 个模型、CLI/IDE 两种头形态、`conversation_id`/`conversationId`/`X-Conversation-Id` 各承载位、70k token 大 prompt）→ **既非出口 IP、非 payload 形态、非 conversation id 字段缺失**（该提示是上游风控的通用文案）
+  - token 与账号均正常：两账号 access_token 有效期至 2027、`/v2/plugin/login/account` 200、billing 正常（被拦号 2 个 Bonus Pack 350 credit，有效期至 10-24）
+  - 时间线：被拦账号 10-13/14/15 分别 364/732/424 次成功，**2026-10-15 17:29 UTC（10-16 01:29 CST）起开始 11128**；此前 1 小时内以 ~15s 间隔连续跑 **126k token** 大 prompt（`deepseek-v4.1-flash` 是 0 倍率免费档）→ 符合上游风控对「免费档 + 高频超长上下文」的处置特征；期间偶有放行（04:21Z 一条成功）
+  - **网关侧放大因素**：400 不在 `is_account_worthy_error` 白名单 → 该账号**不会进冷却**，而它在额度排序里因最早到期（10-24）保持第一 → Intl 流量持续打向被拦账号、每条都失败
+### 未完成 / 建议（未实施，待用户决定）
+- 若要让网关自动绕开这类「上游账号级拦截」：把 CodeBuddy 系 `11128`（风控拦截）纳入账号冷却判据（需与「payload 形态导致的 11128」区分——本次实测排除法表明可从「同账号跨模型全失败」判定），或对 400+风控码做一次账号级探测后冷却
+- 短期可用：把 `CodeBuddy (International)` 服务商 `oauth_owner` 点名到可用账号（`x1a0q1sx@gmail.com`），或重连被拦账号换新 token（上游是否解除未验证）
+- 上游侧账号被风控的真实触发阈值未知（免费档 + 高频 + 超长上下文的组合），需继续观察该账号是否自行恢复
+
+## Session 19 - 2026-10-16
+### 完成（OpenCode 免费模型可用性实测 + muse 登录现状）
+- ✅ **OpenCode 免费模型生产实测（免费 executor → CLI sidecar → opencode.ai 全链路）**：
+  - zen 上游当前 **13 个免费模型**；**10 个实测 200**：big-pickle、cat-jam-free、mimo-v2.6-flash-free、muse-spark-1.2/1.3-contributor-free、nemotron-3.5-lightning-free、longcat-2.5-preview-free、deepseek-v4.1-flash-free、space-bunny-free + 复测后通的 **nemotron-3.5-super-vl-free**（34.6s）
+  - **3 个不可用：jev-1.13-free / ll-alpha-free / glm-5.3-flash-free** —— CLI 1.18.32 模型注册表（models.json）里**根本没有这几个 id** → `ModelUnavailableError`；最新 CLI v1.19.2（10-16 发布）或等注册表收录后才可用
+- ✅ **重大发现：CLI 内存模型表过期 → 免费模型「假超时」**。`opencode serve`（10-13 启动）内存里的模型表是启动时刻快照，上游新加的模型（nemotron-3.5-super-vl、deepseek-v4.1-flash-free）**一律 `ModelUnavailableError`**，而 sidecar 对该错误**不报错、空等到 300s 超时**（CLI 日志有 ERROR，网关侧只见 Timeout）→ **kill 旧 serve、120s 守护自动拉起（代理 env 注入正确）后立刻恢复**。以后「免费模型突然超时」先重启 sidecar 再排查
+- ✅ **网关模型目录已刷新**（provider 26，additive-only）：+5（nemotron-3.5-super-vl-free、deepseek-v4.1-flash-free、ll-alpha-free、glm-5.3-flash-free、gemini-4-argon），目录 94→99
+  - ⚠️ 目录里仍有 **11 个上游已下架的残留**（exo-free、fledge-alpha-free、ling-3.0/3.1、mimo-v2.5-free、step-5-preview-free、deepseek-v4-flash-free、nemotron-3-ultra-free、claude-sonnet-4、deepseek-v4-flash-vision-exp、test-novita-dsf4.1）——free_tier 刷新只增不删；选中会打上游 404/410（free_tier 失败冷却 300s 兜底，但用户侧会等一轮）
+  - nit：目录里有 `test` 条目（zen 列表里的占位模型）
+- ✅ **muse 登录现状（确认，未实施）**：AIGate **没有** muse 账号登录——oauth_registry 15 家里无 muse；muse-spark 目前只作为 **OpenCode 免费层模型**（免账号、匿名 Bearer public + CLI 会话）与 Freebuff 静态种子（provider 98 已禁用、账号被封）出现。要登 Meta 官方 Muse Code 账号需新增 OAuth provider（auth.meta.com 设备码 RFC 8628，clientId 1031625952748946 → `POST api.meta.ai/muse-code/key` 铸 `LLM|…` key）+ Responses wire 适配（device_poll 模式有 claude_code/codex 先例、Responses 适配有 codex_responses 可参考），且**当前服务器出口到 Meta 域名全不通**（直连超时；经 mihomo facebook/api.meta.ai/auth.meta.com 也全失败）→ 上线前必须先解决出口
+### 未完成 / 建议
+- 3 个 CLI 未收录的免费模型（jev-1.13-free 等）：升级 opencode CLI 到 v1.19.2 后复测（未执行，动生产 CLI 待用户确认）
+- sidecar 对 `ModelUnavailableError` 空等 300s：可在 sidecar 轮询里识别 CLI 日志的 ERROR 事件快速失败（未实施）
+- 11 个残留条目是否清理（free_tier 刷新不删，需手动 disable）待用户决定
+
+## Session 20 - 2026-10-16
+### 完成（opencode CLI 升级 + 目录清理 + Meta Muse Code 接入上线）
+- ✅ **生产 opencode CLI 升级 1.18.32 → 1.19.2**（`npm pack opencode-linux-x64@1.19.2` → 换 `~/opencode/bin/opencode`，旧版留 `opencode.1.18.32.bak`）；并**关键一步：刷新 models.json 注册表**——升级本身不够，CLI 的模型注册表是启动时抓 models.dev 的快照，缓存仍是旧的（124 条），直接换成当次抓到的 126 条
+  - **全量复测 13 个 zen 免费模型 → 12 个通**：新增 **ll-alpha-free**（曾因注册表缺条目被挡）、**glm-5.3-flash-free**（首测 "HTTP transport failed" 属瞬时，复测 30.3s 通）；**jev-1.13-free 仍不可用 —— models.dev 至今未收录该 id**（`api.json` 里确实没有），非网关问题，只能等上游发布
+  - 回归：big-pickle / cat-jam-free / mimo-v2.6-flash-free / muse-spark-1.2·1.3-contributor-free / nemotron-3.5-lightning·super-vl-free / longcat-2.5-preview-free / deepseek-v4.1-flash-free / space-bunny-free 全 200
+- ✅ **清理 provider 26 目录 11 个上游已下架残留**（`ModelCatalog.update_model(enabled=False)` 走应用层逻辑，非直改 SQL）：claude-sonnet-4、deepseek-v4-flash-free、deepseek-v4-flash-vision-exp、exo-free、fledge-alpha-free、ling-3.0-flash-fin-free、ling-3.1-flash-free、mimo-v2.5-free、nemotron-3-ultra-free、step-5-preview-free、test-novita-dsf4.1 → 启用数 99→**88**（与 zen 在线列表条数一致）。`test` 是 zen 在售占位条目，保留
+- ✅ **mihomo 出口：META-REGION 组 + Meta 域名规则**（`/opt/clash/clash_config.yaml`，改前备份 `.bak-1016`，`PUT /configs?force=true` 热重载）
+  - 新增 url-test 组 `META-REGION`（filter 日本|新加坡，与 OPENCODE-REGION 同池，健康检查 URL = `https://auth.meta.com/`）+ 规则 `meta.ai / meta.com / facebook.com / fbcdn.net / fb.com → META-REGION`（插在 `MATCH,PROXY` 前）
+  - 验证（默认路由，PROXY=DIRECT）：`api.meta.ai/v1/models` → **401**、`auth.meta.com/.well-known/openid-configuration` → **200**（此前直连/经代理均超时）
+- ✅ **Meta Muse Code 接入（新 OAuth provider `muse` + Responses wire 适配）**
+  - 协议取自 **TheStreamCode/opencode-muse-auth 源码逐行核对**（MIT）：`POST auth.meta.com/oidc/device/authorization/`（form client_id=1031625952748946）→ 浏览器输 user_code 批准 → 轮询 `POST auth.meta.com/oidc/device/token/`（`authorization_pending` 继续 / `slow_down` +5s / 否则终止）→ `POST api.meta.ai/muse-code/key`（`{"onboard":true}`，Bearer=OAuth token，头 `x-api-version:1.0.0`）铸 `LLM|…` key
+  - **实测确认真实可用**：对生产 auth.meta.com 发起真设备授权 → HTTP 200 + device_code/user_code（`https://auth.meta.com/oauth/device/`）
+  - 设计要点：**推理凭证 = 铸出的 `LLM|…` key**（存 `access_token` 列），OAuth token 另存 `refresh_token` 列仅作重铸材料（官方插件只在内存里保留它、从不落盘）；scope 列存 `{account_id,email}`；新连接自动名换成人账号邮箱
+  - **刷新语义特殊**：`refresh_style=muse` 的「刷新」= 重铸 key。**重铸失败绝不下线连接**（现有推理 key 可能仍有效），只记 `last_error`；并按错误分级推迟 `expires_at`（401/403 → +30 天，瞬时/429 → +30 分钟）——否则 60s 调度器会把「激进限流」的铸 key 端点打穿
+  - 适配器 `MuseResponsesAdapter` 继承 `CodexResponsesAdapter`（Responses wire 的 payload/SSE/chunk 全复用，含 `reasoning.encrypted_content` 回放），只覆盖三处指纹：①不注入 Codex 品牌 system prompt ②只用 `x-api-version`（不带 originator/X-Codex-Client/OpenAI-Beta）③effort 档位补 minimal/max（`models.dev` 声明 minimal…max）
+  - 出口：注册表 `extra_params.force_proxy=True` → 自动登记服务商时置 `proxy_enabled=True`，推理/刷新/刷新模型都带 `__proxy_force` 走代理池（mihomo 再按上面规则路由到 JP/SG）；OAuth 三段调用（设备码/换 token/铸 key）统一走 `_force_proxy_kwargs()`
+  - 目录/UI：`api_type=muse_responses` 进 adapter 工厂 + 健康检查工厂 + `infer_reasoning_effort_support`；Providers.vue 选项、OAuthConnections.vue 「设备流」徽标补 muse_device
+  - 测试：新增 `tests/test_muse.py`（25 项：注册表/设备码 start/轮询分类/铸 key 判据/刷新退避语义/适配器指纹与 payload/工厂/基类回归）；**全量 1084 项通过**
+### 未完成 / 建议
+- **muse 仅在代码层就绪，尚未建立连接**：需用户在「OAuth 连接」页点 Meta Muse Code → 浏览器登录 Meta 账号批准设备码，之后自动铸 key + 自动登记服务商
+- `jev-1.13-free` 只能等 models.dev 收录；sidecar 对 `ModelUnavailableError` 空等 300s 仍未做快速失败（本次靠重启 serve 绕过）
+- muse 的 `LLM|key` 是否真有日级有效期未实证（按官方插件「stable key、仅 401 时重登」的设计按长期凭证处理，`expires_in=2d` + lead 1d → 每天重铸一次做自愈）；首条真实连接建立后可观察 `last_error` 判断 OAuth token 寿命

@@ -514,6 +514,7 @@
           <select v-model="form.api_type">
             <option value="openai_compat">OpenAI 兼容</option>
             <option value="codex_responses">Codex / Responses API</option>
+            <option value="muse_responses">Meta Muse (Responses API)</option>
             <option value="anthropic">Anthropic Claude (API Key)</option>
             <option value="github">GitHub Models</option>
             <option value="atomcode">AtomCode (AtomGit 签名反代)</option>

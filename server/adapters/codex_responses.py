@@ -96,10 +96,11 @@ def _strip_stored_item_references(body):
                 it.pop("id", None)
 
 
-def _apply_request_quirks(body, request):
+def _apply_request_quirks(body, request, effort_levels=None):
+    levels = effort_levels or _EFFORT_LEVELS
     model = body.get("model") or (request.model if request else "")
     model_effort = None
-    for level in _EFFORT_LEVELS:
+    for level in levels:
         suffix = f"-{level}"
         if model.endswith(suffix):
             model_effort = level
@@ -112,7 +113,7 @@ def _apply_request_quirks(body, request):
         existing_effort = reasoning.get("effort")
     explicit = body.get("reasoning_effort")
     # ???????? reasoning_effort > ???? > ?? reasoning.effort > ?? low
-    if isinstance(explicit, str) and explicit in _EFFORT_LEVELS:
+    if isinstance(explicit, str) and explicit in levels:
         effort = explicit
     elif model_effort:
         effort = model_effort
@@ -137,18 +138,24 @@ def _apply_request_quirks(body, request):
             body.pop(k, None)
 
 
-def normalize_responses_body(body, request=None):
+def normalize_responses_body(body, request=None, effort_levels=None):
     if not isinstance(body, dict):
         return body
     _convert_system_to_developer(body)
     _strip_stored_item_references(body)
-    _apply_request_quirks(body, request)
+    _apply_request_quirks(body, request, effort_levels)
     return body
 
 
 
 class CodexResponsesAdapter(BaseAdapter):
     """Adapter for Codex-like providers that require OpenAI Responses format."""
+
+    # 子类可覆盖：默认系统提示词（空串 = 不注入，见 MuseResponsesAdapter）、
+    # 离线兜底模型清单、以及该上游接受的 reasoning effort 档位。
+    DEFAULT_INSTRUCTIONS = CODEX_DEFAULT_INSTRUCTIONS
+    BUILTIN_MODELS = CODEX_BUILTIN_MODELS
+    EFFORT_LEVELS = _EFFORT_LEVELS
 
     def __init__(self, timeout: int = 60):
         self.timeout = timeout
@@ -221,6 +228,23 @@ class CodexResponsesAdapter(BaseAdapter):
             headers["originator"] = "codex_cli_rs"
         if not headers.get("session_id"):
             headers["session_id"] = self._session_id(request)
+        return headers
+
+    def _list_headers(self, api_key: str, extra_headers: dict = None) -> dict:
+        """拉模型列表用的头。Codex 需要官方客户端指纹，其它 Responses 上游未必
+        （见 MuseResponsesAdapter 的覆盖）。"""
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "codex_cli_rs/0.136.0",
+            "originator": "codex_cli_rs",
+            # 模拟 Codex 官方客户端，部分上游按此头放行
+            "X-Codex-Client": "official",
+            "OpenAI-Beta": "responses=v1",
+        }
+        if api_key and str(api_key).strip():
+            headers["Authorization"] = f"Bearer {api_key}"
+        if extra_headers:
+            headers.update(outbound_headers(extra_headers))
         return headers
 
     def _content_blocks(self, role: str, content) -> list:
@@ -360,16 +384,20 @@ class CodexResponsesAdapter(BaseAdapter):
                 "content": [{"type": "input_text", "text": "..."}],
             })
 
+        instructions_text = "\n\n".join(instructions).strip() or self.DEFAULT_INSTRUCTIONS
         payload = {
             "model": request.model,
             "input": input_items,
-            "instructions": "\n\n".join(instructions).strip() or CODEX_DEFAULT_INSTRUCTIONS,
             "stream": True,
             "store": False,
             "reasoning": {"effort": "low", "summary": "auto"},
             "include": ["reasoning.encrypted_content"],
             "prompt_cache_key": self._session_id(request),
         }
+        # DEFAULT_INSTRUCTIONS 为空（Muse）时不发该字段——上游没有系统提示词要求，
+        # 注入别家品牌文案只会污染行为。
+        if instructions_text:
+            payload["instructions"] = instructions_text
         # ?????????? reasoning_effort / reasoning?? normalize ????????
         if getattr(request, "reasoning_effort", None):
             payload["reasoning_effort"] = request.reasoning_effort
@@ -378,7 +406,7 @@ class CodexResponsesAdapter(BaseAdapter):
 
         tools = self._convert_tools(request.tools)
         # Codex Responses 规范化：白名单 + 后缀解析 effort + 剥多余字段
-        normalize_responses_body(payload, request)
+        normalize_responses_body(payload, request, self.EFFORT_LEVELS)
 
         if tools:
             payload["tools"] = tools
@@ -749,23 +777,12 @@ class CodexResponsesAdapter(BaseAdapter):
     ) -> List[ModelInfo]:
         url = self._build_models_url(base_url)
         if not url:
-            return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in CODEX_BUILTIN_MODELS]
-        headers = {
-            "Accept": "application/json",
-            "User-Agent": "codex_cli_rs/0.136.0",
-            "originator": "codex_cli_rs",
-            # 模拟 Codex 官方客户端，部分上游按此头放行
-            "X-Codex-Client": "official",
-            "OpenAI-Beta": "responses=v1",
-        }
-        if api_key and str(api_key).strip():
-            headers["Authorization"] = f"Bearer {api_key}"
-        if extra_headers:
-            headers.update(outbound_headers(extra_headers))
+            return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in self.BUILTIN_MODELS]
+        headers = self._list_headers(api_key, extra_headers)
         async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400 and "backend-api/codex" in (base_url or ""):
-                return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in CODEX_BUILTIN_MODELS]
+                return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in self.BUILTIN_MODELS]
             resp.raise_for_status()
             data = resp.json()
         return [
@@ -793,7 +810,7 @@ class CodexResponsesAdapter(BaseAdapter):
         )
         start = time.time()
         try:
-            adapter = CodexResponsesAdapter(timeout=timeout)
+            adapter = type(self)(timeout=timeout)
             async for chunk in adapter.stream_chat_completion(req, api_key, base_url, extra_headers):
                 if "error" in chunk and "choices" not in chunk:
                     raise RuntimeError(str(chunk["error"])[:200])

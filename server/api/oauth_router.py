@@ -167,6 +167,25 @@ async def start_oauth_authorize(provider_code: str, request: Request,
             "poll_interval_ms": r["poll_interval_ms"],
             "message": "请在新窗口登录 u1s1 并批准本设备，批准后系统会自动收取 api_key",
         }
+    # ── Meta Muse Code 设备码（浏览器输入 user_code 批准 → 自动铸 LLM| key）────
+    if (provider.extra_params or {}).get("auth_mode") == "muse_device":
+        async with AsyncSessionLocal() as db:
+            r = await get_oauth_client().start_muse_device(provider_code, db, owner=owner)
+        if "error" in r:
+            raise HTTPException(status_code=400, detail=r["error"])
+        _code = r.get("user_code") or ""
+        return {
+            "device_poll": True,
+            "state": r["state"],
+            "login_url": r["login_url"],
+            "user_code": _code,
+            "poll_interval_ms": r["poll_interval_ms"],
+            "message": (f"请在新窗口打开链接，使用 Meta 账号登录并输入设备码 "
+                        f"{_code} 批准本设备；批准后系统会自动铸造推理 key"
+                        if _code else
+                        "请在新窗口打开链接，使用 Meta 账号登录并批准本设备，"
+                        "批准后系统会自动铸造推理 key"),
+        }
     # ── Qoder 设备流（本地 PKCE+nonce → 轮询收 dt- token + 签名元数据）────
     if (provider.extra_params or {}).get("auth_mode") == "qoder_device":
         async with AsyncSessionLocal() as db:

@@ -362,6 +362,9 @@ def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) ->
         return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
     elif api_type == "codex_responses":
         return CodexResponsesAdapter(timeout=timeout) if timeout else CodexResponsesAdapter()
+    elif api_type == "muse_responses":
+        from server.adapters.muse_responses import MuseResponsesAdapter
+        return MuseResponsesAdapter(timeout=timeout) if timeout else MuseResponsesAdapter()
     elif api_type == "atomcode":
         return AtomCodeAdapter(timeout=timeout) if timeout else AtomCodeAdapter()
     elif api_type == "qoder":

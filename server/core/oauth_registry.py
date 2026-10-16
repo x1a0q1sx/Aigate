@@ -726,6 +726,58 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         notes="Freebuff（Codebuff 免费层）— CLI 授权码轮询登录；Freebucks 按次扣费的每日钱包；"
               "⚠️ 免费层按出口国别分层（US=full，其余=limited，模型目录缩减）",
     ),
+    # ── Meta Muse Code（Meta 官方订阅，Muse Spark）──
+    # 协议来源：TheStreamCode/opencode-muse-auth 源码逐行核对（MIT；其 NOTICE 注明
+    # 兼容 oh-my-pi 公开行为）+ 2026-10-16 生产实测（auth.meta.com / api.meta.ai 经
+    # JP/SG 出口可达；见 mihomo META-REGION 组）。
+    # 流程（RFC 8628 设备码）：
+    #   1) POST {device_url} form client_id=… → {device_code, user_code,
+    #      verification_uri[_complete], interval, expires_in}
+    #   2) 浏览器打开 verification_uri 输入 user_code 批准
+    #   3) 轮询 POST {device_token_url} form grant_type=device_code&client_id&device_code
+    #      → authorization_pending（继续）/ slow_down（间隔 +5s）/ access_token
+    #   4) POST {key_url} JSON {"onboard":true}（Bearer=OAuth token，头 x-api-version）
+    #      → {api_key:"LLM|…", user_id, user_email, is_subs_active, require_payment…}
+    # **api_key 即推理凭证**（Bearer 调 https://api.meta.ai/v1/responses，Responses wire）。
+    # OAuth access token 另存 refresh_token 列，供「重铸 key」用（muse refresh_style）。
+    # ⚠️ 铸 key 端点激进限流（429）—— 只在 refresh_lead 到期时重铸一次，不做高频重试。
+    "muse": OAuthProviderConfig(
+        code="muse",
+        name="Meta Muse Code (Muse Spark)",
+        # 公开设备码 client id（内嵌于官方插件，非密钥）；环境变量可覆盖
+        client_id=_env_client_id("muse", "1031625952748946"),
+        client_secret="",
+        authorize_url="https://auth.meta.com/oidc/device/authorization/",
+        token_url="https://auth.meta.com/oidc/device/token/",
+        refresh_url="",
+        redirect_uri="",                     # 设备码流，无回调
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=86400,          # 提前 1 天重铸（铸 key 端点限流，别更频繁）
+        extra_params={
+            "auth_mode": "muse_device",
+            "refresh_style": "muse",
+            "device_url": "https://auth.meta.com/oidc/device/authorization/",
+            "device_token_url": "https://auth.meta.com/oidc/device/token/",
+            "key_url": "https://api.meta.ai/muse-code/key",
+            "api_version": "1.0.0",
+            # Meta 出口仅 JP/SG 可达 → 该服务商强制走代理池（mihomo 依规则路由到
+            # META-REGION）。自动登记服务商时据此置 proxy_enabled=True。
+            "force_proxy": True,
+        },
+        api_base_url="https://api.meta.ai/v1",
+        adapter_api_type="muse_responses",
+        static_models=_seed(
+            ("muse-spark-1.3", "Muse Spark 1.3"),
+            ("muse-spark-1.2", "Muse Spark 1.2"),
+            ("muse-spark-1.1", "Muse Spark 1.1"),
+            ("muse-wonder-1.0", "Muse Wonder 1.0"),
+            ("muse-spark-1.3-contributor", "Muse Spark 1.3 (Contributor)"),
+            ("muse-spark-1.2-contributor", "Muse Spark 1.2 (Contributor)"),
+        ),
+        notes="Meta Muse Code — OIDC 设备码登录后铸 LLM| key；推理走 Responses wire；"
+              "⚠️ 服务端出口须经 JP/SG 代理（强制走代理池）",
+    ),
 }
 
 

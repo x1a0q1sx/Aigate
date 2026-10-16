@@ -43,6 +43,9 @@ def create_adapter_for_provider(provider: Provider) -> BaseAdapter:
         return AnthropicAdapter()
     if provider.api_type == "codex_responses":
         return CodexResponsesAdapter()
+    if provider.api_type == "muse_responses":
+        from server.adapters.muse_responses import MuseResponsesAdapter
+        return MuseResponsesAdapter()
     if provider.api_type == "atomcode":
         return AtomCodeAdapter()
     return OpenAICompatAdapter()
