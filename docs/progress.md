@@ -315,3 +315,24 @@
 - **muse 仅在代码层就绪，尚未建立连接**：需用户在「OAuth 连接」页点 Meta Muse Code → 浏览器登录 Meta 账号批准设备码，之后自动铸 key + 自动登记服务商
 - `jev-1.13-free` 只能等 models.dev 收录；sidecar 对 `ModelUnavailableError` 空等 300s 仍未做快速失败（本次靠重启 serve 绕过）
 - muse 的 `LLM|key` 是否真有日级有效期未实证（按官方插件「stable key、仅 401 时重登」的设计按长期凭证处理，`expires_in=2d` + lead 1d → 每天重铸一次做自愈）；首条真实连接建立后可观察 `last_error` 判断 OAuth token 寿命
+
+## Session 21 - 2026-10-16
+### 完成（CodeBuddy Intl 渠道校验根因修复 + Playground 连续下发历史 + muse 登录失败定性）
+- ✅ **CodeBuddy Intl 11128「没通过渠道校验」根因修复（生产 A/B 实证）**
+  - 现场：Intl 全量 400/11128（`request illegal`），用户看到「这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。」（同码另一文案变体；displayMsg 还有「请求被拦截」等，**别按文案区分语义**）
+  - 实测定位：点名 `x1a0q1sx@gmail.com` 200 正常、`1355386364@qq.com` 恒 11128 → 上游**按账号灰度**强制「渠道校验」（社区实证约 22% 账号进强制桶）
+  - 根因（子代理交叉 9router PR #4944/#4949、workbuddy2api-hub #381、dsh-connect-workbuddy #66 二分、workbuddy-manager #193）：**官方客户端头族 `X-Conversation-ID / X-Conversation-Request-ID / X-Conversation-Message-ID` 三件套缺一即拦**（AIGate 一个都没发）；UA 不是判据；CN 无此校验。另注意 11128 还有 body 侧变体（`Illegal API invocation from an unapproved channel` = body 含 Claude Code 身份句，与缺头是同码两义，**诊断必须读 `msg`**）
+  - 修复：`provider_quirks.codebuddy_client_headers()`（会话 ID 按「账号×首条 user 消息」uuid5 稳定派生——多账号池必须落到账号维度，同一 ID 挂 N 号反成关联特征；Request/Message-ID 每请求随机 32hex；trace/agent/IDE 族对齐官方），`client_headers=True` 只挂 Intl；`openai_compat._get_headers` 仅对 `/chat/completions` 注入（models/billing 不带）
+  - **生产验证：被拦账号 1355386364@qq.com 补头后 200 正常回复**（此前 9/9 全败）→ 头族就是灰度强制桶的判据
+  - 兜底：11128/「渠道校验」文案进 `is_account_worthy_error` 资格闸（error_text.is_risk_block_text），账号冷却风控档 **30 分钟起步**（补头族后仍被拦才触发——那才是真账号级封禁）；agent A 调研认为 11128 不该冷却（补头即好），保留理由：万一再出现（新灰度/新判据）不至于每条请求都钉死在被拦号上
+- ✅ **Playground 连续下发 + 测试记录（前端自持）**（4d7cb4b）
+  - 每次发送/鹈鹕测试追加**独立流式记录**（互不阻塞、各自可取消/复制/下载/删除）；对话测试也改流式（与鹈鹕同一 SSE 消费器），实时显示接收字符数；usage 透传显示 tok
+  - 记录存 **sessionStorage**（键 `pg_runs`，内容绑定 admin session 尾号）：切路由/切浏览器标签不丢、重新登录自动清空；上限 30 条、单条 60k 截断、超配额自动丢最旧
+  - 切走路由**不 abort** 在跑的流：后台跑完写回 sessionStorage，切回来能看到完整结果（刷新页则标「已中断」）
+- ✅ **muse 登录「Sign-in failed / Token exchange failed」定性 + 加固**
+  - 取证：生产日志 3 次设备码流全部 `authorization_pending` 直到 `expired_token`（授权从未被 approved），无 minted key；另有 2 次 authorize 400 = mihomo 出口 SSL EOF 瞬断（重放实测确认，非 Meta 限流）
+  - 调研（CLIProxyAPI #6242 同错关单）：错误由 **Meta 自己的页面在用户浏览器侧**渲染——Muse 分区域开放，浏览器出口地区不支持/被标记、或用了托管/工作账号都会在页面交换环节失败；**与服务端出口和我们的请求形态无关**（与官方插件/oh-my-pi 逐字节比对：poll 带 client_id、form-urlencoded 全一致）
+  - 加固：`start_muse_device` 传输层失败重试 2 次；poll 收到非 JSON 错误体（WAF/403 拦截页，9router-go PR #302 实证 Meta 会这么干）按终止处理不再空转到过期；authorize 提示讲清 10 分钟时限/个人账号/支持区域干净出口
+  - **待用户重试**：个人 Meta 账号 + 支持区域（如美国）的干净浏览器出口（建议无痕窗口），10 分钟内完成批准；失败后回页面重点连接换新码
+- 顺带观察（未处理）：CN 12:57 曾有 step-5-preview 连续 429（copilot.tencent.com 限流），与本次 Intl 渠道校验无关
+- 测试：**1093 全过**（新增 muse start 重试/400 不重试×2、11128 资格闸+风控冷却档×3、头族×5）；前端 build 通过；部署 4d7cb4b 并生产 A/B 验证
