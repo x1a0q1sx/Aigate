@@ -271,6 +271,17 @@ class OpenCodeBridgeConfig(BaseModel):
     # 改动需重启 sidecar 生效（设置页有按钮）。
     proxy_url: str = ""
 
+class OAuthBalanceConfig(BaseModel):
+    """OAuth 多账号频率感知分流（见 core/account_balancer.py）。
+
+    请求频率低时保持 F40「锁定最优账号」模式；滑窗内请求数达到阈值后在
+    同档位（同额度状态）账号之间轮流分流。滞回：达到 enter 进入、低于 exit
+    退出，防止临界抖动。enabled=False 完全关闭（保持 F40 行为）。"""
+    enabled: bool = True
+    window_seconds: int = 60
+    enter_requests: int = 10   # 窗口内请求数 ≥ 此值 → 进入分流
+    exit_requests: int = 3     # 窗口内请求数 < 此值 → 退回粘住
+
 class Config(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -299,6 +310,7 @@ class Config(BaseModel):
     growth: GrowthConfig = Field(default_factory=GrowthConfig)
     qoder: QoderConfig = Field(default_factory=QoderConfig)
     opencode_bridge: OpenCodeBridgeConfig = Field(default_factory=OpenCodeBridgeConfig)
+    oauth_balance: OAuthBalanceConfig = Field(default_factory=OAuthBalanceConfig)
 def load_config(config_path: str = "config.yaml") -> Config:
     """加载配置文件，如果不存在则创建默认"""
     path = Path(config_path)

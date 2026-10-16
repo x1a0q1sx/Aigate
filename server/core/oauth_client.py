@@ -1520,13 +1520,19 @@ class OAuthClient:
         return min(base * (2 ** max(int(fail_count or 1) - 1, 0)), OAuthClient._ACCOUNT_COOLDOWN_CAP)
 
     def _rank_auto_rows(self, provider_code: str, rows: list) -> list:
-        """自动模式候选排序键（升序取第一）：(是否冷却, 额度排序键, __default 优先, id)。
+        """自动模式候选排序键（升序取第一）。
 
-        额度排序键来自 oauth_usage.quota_rank_key：有余额按最早到期升序 →
-        无数据 → 已耗尽。缓存冷启动时全部为「无数据」，退化为 __default
-        优先、其次 id 最早（完全保持旧语义）。"""
+        频率感知分流（2026-10-16，见 core/account_balancer.py）：
+          - 低频（默认）：(是否冷却, 额度档位, 恒定负载位, 最早到期, -剩余, __default, id)
+            —— load 位恒 (0, 0.0)，与 F40 的「额度排序键全量参与」完全等价；
+          - 分流模式（滑窗请求数达阈值自动进入）：load 位 = (窗口内请求数, 最近使用)
+            —— 同档位账号之间轮流用；冷却与已耗尽账号仍排最后。
+        额度键来自 oauth_usage.quota_rank_key：有余额按最早到期升序 → 无数据 →
+        已耗尽。缓存冷启动时全部为「无数据」，退化为 __default 优先、其次 id 最早。"""
         from server.core.oauth_usage import cached_usage_for_token, quota_rank_key
+        from server.core import account_balancer
         now = _now_utc()
+        balancing = account_balancer.is_balancing(provider_code)
         ranked = []
         for row in rows:
             cooling = 1 if (row.cooldown_until and row.cooldown_until > now) else 0
@@ -1537,8 +1543,11 @@ class OAuthClient:
                 token = None
             usage = cached_usage_for_token(provider_code, token) if token else None
             pref = 0 if row.owner == "__default" else 1
-            ranked.append((cooling, quota_rank_key(usage), pref, row.id, row))
-        ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+            tier, earliest, neg_rem = quota_rank_key(usage)
+            load = (account_balancer.account_load_key(provider_code, row.owner)
+                    if balancing else (0, 0.0))
+            ranked.append((cooling, tier, load, earliest, neg_rem, pref, row.id, row))
+        ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5], t[6]))
         return ranked
 
     async def _row_token_ready(self, db: AsyncSession, provider_code: str, row) -> Optional[str]:
@@ -1588,6 +1597,12 @@ class OAuthClient:
                     _ACCOUNT_DIRTY.add((provider_code, row.owner))
             except Exception:
                 pass
+            # 点名取号同样消耗该账号 → 也计入分流计数（分流排序只作用于自动模式）
+            try:
+                from server.core import account_balancer
+                account_balancer.note_selection(provider_code, owner)
+            except Exception:
+                pass
             return (owner, token)
         try:
             rows = (await db.execute(
@@ -1602,7 +1617,7 @@ class OAuthClient:
         if not rows:
             return None
         ranked = self._rank_auto_rows(provider_code, rows)
-        for _cool, _qk, _pref, _rid, row in ranked:
+        for _cool, _tier, _load, _earliest, _neg, _pref, _rid, row in ranked:
             token = await self._row_token_ready(db, provider_code, row)
             if token:
                 # 该行有 DB 残留状态（如重启前写入的冷却）→ 本次若成功应能清掉：
@@ -1610,6 +1625,13 @@ class OAuthClient:
                 try:
                     if (row.fail_count or 0) or row.cooldown_until:
                         _ACCOUNT_DIRTY.add((provider_code, row.owner))
+                except Exception:
+                    pass
+                # 计入频率感知分流（见 core/account_balancer.py）：高频自动多账号轮流，
+                # 低频保持粘住。记录失败绝不影响取号本身。
+                try:
+                    from server.core import account_balancer
+                    account_balancer.note_selection(provider_code, row.owner)
                 except Exception:
                     pass
                 return (row.owner, token)
