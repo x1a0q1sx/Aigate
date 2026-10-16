@@ -300,6 +300,7 @@ export default {
   // ── OAuth 接入 ──
   getOAuthProviders: () => apiGet('/admin/oauth/providers'),
   getOAuthConnections: () => apiGet('/admin/oauth/connections'),
+  getOAuthDeviceStatus: (code) => apiGet(`/admin/oauth/device-status/${code}`),
   startOAuthAuthorize: (code, opts = {}) => {
     const qs = new URLSearchParams()
     if (opts.owner) qs.append('owner', opts.owner)

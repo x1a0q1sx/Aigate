@@ -390,7 +390,7 @@ export default {
         this.renaming = false
       }
     },
-    // 设备流：后端在轮询上游，前端只需盯连接数变化
+    // 设备流：后端在轮询上游，前端盯连接数变化 + 设备流终态（失败立即报真实原因）
     watchDeviceFlow(code) {
       const before = this.connectionsOf(code).length
       if (this._deviceWatcher) clearInterval(this._deviceWatcher)
@@ -410,6 +410,14 @@ export default {
             this._deviceWatcher = null
             this.connections = rows || this.connections
             toast.success(code + ' 连接成功，token 已自动保存')
+            return
+          }
+          // 后端轮询已判终态失败（浏览器未批准/expired_token/铸 key 失败）→ 立即停轮询并展示原因
+          const st = await api.getOAuthDeviceStatus(code).catch(() => null)
+          if (st && st.status === 'failed') {
+            clearInterval(this._deviceWatcher)
+            this._deviceWatcher = null
+            toast.error('设备流失败：' + (st.error || '未知原因'))
           }
         } catch (e) { /* 轮询失败等下一轮 */ }
       }, 3000)

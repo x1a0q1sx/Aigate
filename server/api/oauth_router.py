@@ -66,6 +66,18 @@ async def list_connections(db: AsyncSession = Depends(get_db)):
     return await get_oauth_client().list_connections(db)
 
 
+@router.get("/device-status/{provider_code}")
+async def device_flow_status(provider_code: str):
+    """设备流最近一次终态（muse 等）：pending/ok/failed + 失败原因。
+
+    背景：muse 轮询在后台跑，浏览器侧被拒（expired_token）或铸 key 失败此前
+    只进服务端日志，前端要等 6 分钟超时才报「未检测到新连接」——看不到原因。
+    前端 watchDeviceFlow 每 3s 轮询本接口，failed 立即展示真实错误并停轮询。
+    """
+    from server.core.oauth_client import get_device_flow_status
+    return get_device_flow_status(provider_code)
+
+
 # ── 触发授权 ──────────────────────────────────────────
 
 async def _next_owner_for_provider(db: AsyncSession, provider_code: str) -> str:

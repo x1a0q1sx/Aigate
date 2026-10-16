@@ -357,3 +357,20 @@
   - OAuth 连接页：连接行「每日限额：模型（x时后重置）」（与账号冷却独立显示，蓝色区分）
 - 测试：新增 `tests/test_quota_limit.py` 18 项（识别/解析/记账/选号跳过/成功清记录/resolver quota_limited）；修复 1 项既有 spy 测试（新 kwarg）；`conftest.py` 重置新增进程全局态 `_ACCOUNT_DIRTY`；**全量 1111 全绿**；前端 build 通过
 - 部署：commit + push + 服务器 pull + `npm run build` + pm2 restart（后端改动，需重启）；生产验证：quota_limits 表随启动建表，首次真实限额触发时自动建行
+
+## Session 23 - 2026-10-17
+### 完成（muse 登录失败定性 + 设备流失败原因透出 + 刷新窗口内禁用服务商）
+- ✅ **muse「还是报错」排查定性（用户任务 1）**
+  - **生产取证**：5 次设备流全部轮询到 `expired_token`（授权从未被 approved）；`authorization_pending`/`slow_down` 语义均正确返回——**设备码申请与轮询端点全正常**；2 次 authorize 400 = mihomo 出口 SSL EOF 瞬断（重放确认）
+  - **多源交叉定性**：「Sign-in failed / Token exchange failed」是 **Meta 自己的认证门户（auth.meta.com）在用户浏览器侧渲染**的（CLIProxyAPI #6242 维护者同判，not-planned 关闭归因上游）；根因=① Muse 按 Meta Geographic Use Policy 分区域开放（韩/印尼/UAE/中国含港澳有实报；建议支持地区如美国干净出口）② 企业/托管账号（MMA）不支持设备码流必须个人号 ③ 代理/扩展/防火墙干扰、出口 IP 频繁跳变
+  - **服务器侧对照实验**：auth.meta.com **网页**从 JP/SG 多节点均 400（同域 API 端点全通、facebook.com/meta.com 200）——但服务器 curl 无浏览器会话，400 不能作为「机房 IP 被封」证据；真实批准发生在用户浏览器，**服务端出口不是变量**
+  - **AIGate 侧修复（体验缺口）**：设备流失败此前只进服务端日志 → 前端要等 6 分钟超时才报「未检测到新连接」，看不到原因。现在：
+    - `oauth_client.record_device_flow()`（进程内 `_DEVICE_FLOW_STATUS`）在 expired_token/非 JSON 拦截/铸 key 失败/超时各终态记录失败原因 + 排障指引（含「浏览器报 Sign-in failed 需支持地区干净网络+个人账号」）
+    - 新增 `GET /admin/oauth/device-status/{provider_code}`；前端 `watchDeviceFlow` 每 3s 轮询，failed **立即停轮询并弹真实原因**；授权弹窗文案同步补充指引
+    - 测试补 4 项（expired_token 记录/成功记录 ok/铸 key 失败记录/超时记录）；`conftest.py` 增加 `_DEVICE_FLOW_STATUS` 逐测试重置
+- ✅ **模型刷新结果窗口内直接禁用失败/超时服务商（用户任务 2）**
+  - `ModelRefreshModal` 失败清单每条渲染「禁用」按钮（已禁用标「已禁用」不发重复请求）+ 多条时「全部禁用（N）」
+  - 复用既有 `PUT /admin/api/providers/{id}`（不新增后端端点）；成功后发 `provider-disabled` 事件，Models/Providers 两页同步本地列表（筛选下拉/开关/排序即时更新）
+  - 后端 `failed_details` 补 `enabled` 字段（刷新前就已禁用者同样会失败，前端据此显示「已禁用」）
+  - 新增 `tests/test_frontend_refresh_disable.py` 6 项静态回归
+- 测试：**全量 1120 全绿**（1111 + muse 3 + 前端 6）；前端 build 通过

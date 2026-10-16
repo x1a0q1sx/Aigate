@@ -323,6 +323,74 @@ async def test_poll_muse_device_terminal_error_stops(monkeypatch):
     c._finish_muse_login = fake_finish
     await c._poll_muse_device("muse", "dc-1", "__default", 1, 30)
     assert not saved
+    # 终态失败必须记录到设备流状态（前端 device-status 接口消费），且带上排障提示
+    st = oc.get_device_flow_status("muse")
+    assert st["status"] == "failed"
+    assert "expired_token" in st["error"]
+    assert "Sign-in failed" in st["error"]   # 浏览器侧被拒的排障指引
+
+
+@pytest.mark.asyncio
+async def test_poll_muse_device_success_records_ok_status(monkeypatch):
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"access_token": "oauth-token-1"}),
+        (200, {"api_key": "LLM|abc", "user_id": "1", "user_email": "a@b.c"}),
+    ]))
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    async def fake_get_token_record(db, provider_code, owner):
+        return None
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        pass
+
+    c._get_token_record = fake_get_token_record
+    c._save_token = fake_save
+    await c._poll_muse_device("muse", "dc-1", "__default", 1, 30)
+    st = oc.get_device_flow_status("muse")
+    assert st["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_poll_muse_device_mint_failure_records_reason(monkeypatch):
+    """浏览器批准成功但铸 key 失败（如订阅未激活）→ 状态记录真实原因。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"access_token": "oauth-token-1"}),
+        (200, {"is_subs_active": False}),
+    ]))
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+    await c._poll_muse_device("muse", "dc-1", "__default", 1, 30)
+    st = oc.get_device_flow_status("muse")
+    assert st["status"] == "failed"
+    assert "铸造推理 key 失败" in st["error"]
+    assert "subscription is inactive" in st["error"]
+
+
+@pytest.mark.asyncio
+async def test_poll_muse_device_timeout_records_reason(monkeypatch):
+    """轮询到有效期结束仍未批准 → 状态记录超时（含浏览器侧排障指引）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, []))
+    # deadline = time.time() + max(60, expires_in+30) 有 60s 下限：让 fake time
+    # 每次调用推进 120s → 第 2 次（while 判定）即超期，无需真实 sleep。
+    _t = {"now": 1000.0}
+
+    def fake_time():
+        v = _t["now"]
+        _t["now"] += 120.0
+        return v
+
+    monkeypatch.setattr(oc.time, "time", fake_time)
+    await c._poll_muse_device("muse", "dc-1", "__default", 1, 10)
+    st = oc.get_device_flow_status("muse")
+    assert st["status"] == "failed"
+    assert "超时" in st["error"]
+    assert "Sign-in failed" in st["error"]
 
 
 @pytest.mark.asyncio
@@ -335,7 +403,7 @@ async def test_poll_muse_device_slow_down_extends_interval(monkeypatch):
     ]))
     fin = {}
 
-    async def fake_finish(provider_code, owner, access, ep, token_body=None):
+    async def fake_finish(provider_code, owner, access, ep, token_body=None, device_code=""):
         fin["access"] = access
 
     c._finish_muse_login = fake_finish

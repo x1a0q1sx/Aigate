@@ -1413,6 +1413,8 @@ async def refresh_models(
                 "provider_id": provider.id,
                 "provider_name": provider.name,
                 "error": _errors[provider.id],
+                # 供前端刷新结果窗口「就地禁用」判断：已禁用者标已禁用、不再发禁用请求
+                "enabled": bool(provider.enabled),
             })
         if "error" in result:
             continue

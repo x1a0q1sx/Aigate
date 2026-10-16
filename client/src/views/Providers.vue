@@ -29,7 +29,8 @@
       </template>
     </PageHeader>
 
-    <ModelRefreshModal :visible="showRefreshModal" :result="refreshResult || {}" @close="showRefreshModal = false" />
+    <ModelRefreshModal :visible="showRefreshModal" :result="refreshResult || {}"
+                       @close="showRefreshModal = false" @provider-disabled="onRefreshProviderDisabled" />
 
     <div v-if="loadError" class="alert alert-error text-sm">
       {{ loadError }}
@@ -1569,6 +1570,11 @@ export default {
       } finally {
         this.busy.refreshModels = false
       }
+    },
+    // 刷新结果窗口里直接禁用失败/超时的服务商 → 同步本地列表（开关/排序/状态即时更新）
+    onRefreshProviderDisabled(providerId) {
+      const p = (this.providers || []).find((x) => x.id === providerId)
+      if (p) p.enabled = false
     },
     async cleanOrphans() {
       if (!confirm('清理没有服务商归属的孤儿模型？')) return

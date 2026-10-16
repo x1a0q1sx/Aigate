@@ -41,6 +41,27 @@ logger = logging.getLogger(__name__)
 # 才查库写库 —— 让正常成功路径保持零 DB 开销（多账号冷却的常用情形）。
 _ACCOUNT_DIRTY: set = set()
 
+# 设备流终态记录（进程内）：muse 轮询在后台跑，失败原因（浏览器未批准/
+# expired_token/铸 key 失败/被 WAF 拦）此前只进服务端日志，前端 6 分钟
+# 超时前完全无感知。此处把终态暴露给 GET /admin/oauth/device-status。
+# key = provider_code，value = {"state": 设备码, "status": ok|failed|pending,
+#   "error": 文案, "at": epoch 秒}；仅保留最近一次设备流。
+_DEVICE_FLOW_STATUS: dict = {}
+
+
+def record_device_flow(provider_code: str, state: str, status: str, error: str = "") -> None:
+    """记录设备流终态（供前端实时展示失败原因）。"""
+    _DEVICE_FLOW_STATUS[provider_code] = {
+        "state": state,
+        "status": status,
+        "error": str(error or "")[:500],
+        "at": time.time(),
+    }
+
+
+def get_device_flow_status(provider_code: str) -> dict:
+    return dict(_DEVICE_FLOW_STATUS.get(provider_code) or {})
+
 _STATUS_CODE_RE = re.compile(r"(?<![\d.])([45]\d{2})(?![\d.])")
 
 
@@ -1233,6 +1254,7 @@ class OAuthClient:
             return {"error": "muse device authorization response is missing fields"}
         interval = int(data.get("interval") or 5)
         expires_in = int(data.get("expires_in") or 600)
+        record_device_flow(provider_code, device_code, "pending", "")
         asyncio.create_task(self._poll_muse_device(
             provider_code, device_code, owner, interval, expires_in))
         return {"state": device_code, "login_url": complete or verification_uri,
@@ -1273,13 +1295,18 @@ class OAuthClient:
                     if resp.status_code in (429,) or resp.status_code >= 500:
                         continue
                     logger.warning("muse poll terminal: HTTP %s non-JSON body", resp.status_code)
+                    record_device_flow(provider_code, device_code, "failed",
+                                       f"上游返回非 JSON 错误体（HTTP {resp.status_code}，疑似 WAF/网关拦截），已终止")
                     return
                 if body and not body.get("error"):
                     access = str(body.get("access_token") or "")
                     if not access:
                         logger.warning("muse poll: token response has no access_token")
+                        record_device_flow(provider_code, device_code, "failed",
+                                           "token 响应缺少 access_token（上游异常响应）")
                         return
-                    await self._finish_muse_login(provider_code, owner, access, ep, body)
+                    await self._finish_muse_login(provider_code, owner, access, ep, body,
+                                                  device_code=device_code)
                     return
                 err = (body or {}).get("error")
                 if err == "slow_down":
@@ -1287,19 +1314,33 @@ class OAuthClient:
                     interval += 5
                 elif err not in (None, "authorization_pending"):
                     logger.warning("muse device login failed: %s", err or resp.status_code)
+                    _hint = ""
+                    if err == "expired_token":
+                        _hint = ("——设备码 10 分钟内未被批准。若浏览器侧曾报 "
+                                 "「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧"
+                                 "拒绝了本次授权（地区/出口被标记或账号类型不支持），"
+                                 "需在支持地区（如美国）的干净网络 + 个人账号 + 无痕窗口下重新批准")
+                    record_device_flow(provider_code, device_code, "failed",
+                                       f"设备授权失败：{err or resp.status_code} {_hint}")
                     return
             except Exception as e:
                 logger.debug("muse poll failed: %s", e)
                 continue
         logger.info("muse device login timed out (%d slow_downs)", slow_downs)
+        record_device_flow(provider_code, device_code, "failed",
+                           f"设备流超时（{slow_downs} 次 slow_down）：浏览器侧未在有效期内完成批准。"
+                           "若浏览器报「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧"
+                           "拒绝（地区/出口/账号类型），需支持地区干净网络 + 个人账号重试")
 
     async def _finish_muse_login(self, provider_code: str, owner: str, oauth_access: str,
-                                 ep: dict, token_body: dict = None):
+                                 ep: dict, token_body: dict = None, device_code: str = ""):
         """铸 LLM| key 并落库（access_token=key，refresh_token=OAuth token）。"""
         try:
             minted = await self._mint_muse_key(oauth_access, ep)
         except Exception as e:
             logger.warning("muse key mint failed for %s/%s: %s", provider_code, owner, e)
+            record_device_flow(provider_code, device_code, "failed",
+                               f"浏览器批准成功，但铸造推理 key 失败：{str(e)[:300]}")
             return
         api_key = minted["api_key"]
         account_id = minted.get("account_id") or ""
@@ -1330,8 +1371,11 @@ class OAuthClient:
                 })
             except Exception as e:
                 logger.warning("muse save token failed: %s", e)
+                record_device_flow(provider_code, device_code, "failed",
+                                   f"key 已铸造但保存连接失败：{str(e)[:200]}")
                 return
         logger.info("muse key acquired for %s/%s (account=%s)", provider_code, target_owner, account_id or "?")
+        record_device_flow(provider_code, device_code, "ok", "")
 
     async def _mint_muse_key(self, oauth_access_token: str, ep: dict) -> dict:
         """POST api.meta.ai/muse-code/key（JSON {"onboard":true}）→ 解析 LLM| key。
