@@ -17,10 +17,11 @@
 <script>
 // 全局范围选择器：驱动分析页 ①-④ 区联动。
 // emit 载荷 { key, label, bucket, start, end, hours }，start/end 为 UTC ISO（后端 _parse_dt_param 兼容）。
-const pad = (n) => String(n).padStart(2, '0')
-const toLocalInput = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
-// datetime-local（本地时区）→ UTC ISO，避免与后端 UTC 口径错位
-const localToUtcIso = (v) => (v ? new Date(v).toISOString() : '')
+//
+// 时间窗口新鲜度（2026-10-16 修复）：预设窗口一律在「点击的当下」经 buildPresets(now) 重算，
+// 绝不缓存挂载时刻的旧窗口——此前 preset 列表放 computed 里，new Date() 无响应式依赖被
+// Vue 永久缓存，导致「今日」趋势永远停在打开页面那一刻（详见 rangePresets.js 头注）。
+import { buildPresets, defaultCustomWindow } from '../rangePresets.js'
 
 export default {
   name: 'RangePicker',
@@ -29,44 +30,35 @@ export default {
   },
   emits: ['change'],
   data() {
-    return { customOpen: false, customStart: '', customEnd: '' }
-  },
-  computed: {
-    presets() {
-      const now = new Date()
-      const daysAgo = (n) => new Date(now.getTime() - n * 86400000)
-      const mk = (key, label, start, end, bucket) => ({
-        key, label, bucket,
-        start: localToUtcIso(toLocalInput(start)),
-        end: localToUtcIso(toLocalInput(end)),
-        hours: Math.max(1, Math.ceil((end - start) / 3600000)),
-      })
-      return [
-        // spec §4② 默认粒度：今日→hour、7/30 天→day、90 天→week
-        mk('today', '今日', new Date(now.getFullYear(), now.getMonth(), now.getDate()), now, 'hour'),
-        mk('7d', '近7天', daysAgo(7), now, 'day'),
-        mk('30d', '近30天', daysAgo(30), now, 'day'),
-        mk('90d', '近90天', daysAgo(90), now, 'week'),
-      ]
-    },
+    return { customOpen: false, customStart: '', customEnd: '', presets: [] }
   },
   mounted() {
+    this.refreshPresets()
     if (!this.value) this.pick(this.presets[1])   // 默认近7天
   },
   methods: {
+    refreshPresets() {
+      this.presets = buildPresets(new Date())
+    },
     emitRange(r) {
       this.$emit('change', r)
     },
     pick(p) {
       this.customOpen = false
-      this.emitRange({ key: p.key, label: p.label, bucket: p.bucket, start: p.start, end: p.end, hours: p.hours })
+      // 关键：以「点击当下」重算窗口（p 是按钮渲染时刻的快照，可能已过时数小时）
+      this.refreshPresets()
+      const fresh = this.presets.find((x) => x.key === p.key) || p
+      this.emitRange({
+        key: fresh.key, label: fresh.label, bucket: fresh.bucket,
+        start: fresh.start, end: fresh.end, hours: fresh.hours,
+      })
     },
     toggleCustom() {
       this.customOpen = !this.customOpen
       if (this.customOpen && !this.customStart) {
-        const now = new Date()
-        this.customStart = toLocalInput(new Date(now.getTime() - 7 * 86400000))
-        this.customEnd = toLocalInput(now)
+        const w = defaultCustomWindow(new Date())
+        this.customStart = w.start
+        this.customEnd = w.end
       }
     },
     applyCustom() {

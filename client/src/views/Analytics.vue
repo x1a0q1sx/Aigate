@@ -16,8 +16,8 @@
 
     <!-- 全局范围选择器：驱动 ①-④ -->
     <div class="range-bar">
-      <RangePicker @change="onRangeChange" />
-      <span class="muted" v-if="range">{{ range.label }}（UTC）</span>
+      <RangePicker :value="range" @change="onRangeChange" />
+      <span class="muted" v-if="range">{{ range.label }}（本地时间）</span>
     </div>
 
     <!-- ① 统计卡行（跟随范围） -->
@@ -185,6 +185,7 @@ import api from '../api.js'
 import RangePicker from '../components/RangePicker.vue'
 import TrendChart from '../components/TrendChart.vue'
 import LogsPanel from '../components/LogsPanel.vue'
+import { freshRange } from '../rangePresets.js'
 
 // 编排层：全局范围状态（range）驱动 ①-④ 联动；
 // 日志区自管轮询/筛选（子组件内部状态）。实时区已删（2026-10-13 用户要求）。
@@ -231,7 +232,13 @@ export default {
     },
     setBucket(b) {
       this.trendBucket = b
+      this.syncRange()   // 切粒度同样按当前时刻推进窗口（自定义范围不动）
       this.loadTrend()
+    },
+    // 预设范围按当前时刻重算窗口（2026-10-16）：此前 range 是挂载时刻快照，
+    // 页面开久了点「刷新」/切粒度也只是重放旧窗口（趋势停在打开那一刻）。
+    syncRange() {
+      if (this.range) this.range = freshRange(this.range)
     },
     async loadToday() {
       if (!this.range) return
@@ -277,6 +284,7 @@ export default {
     },
     async refreshAll() {
       this.loadDiag()
+      this.syncRange()
       await Promise.all([
         this.loadToday(), this.loadTrend(), this.loadByProvider(), this.loadFailures(),
         this.$refs.logs ? this.$refs.logs.reload() : Promise.resolve(),

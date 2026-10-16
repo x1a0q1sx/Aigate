@@ -224,3 +224,20 @@
 - **combo 多模型负载分摊评估**（用户设想：建组合多放模型分摊）：combo 现支持 fallback/round_robin/weighted/fusion 四种策略，round_robin 与 weighted 都能跨请求分摊流量（实测 918 组合 18 候选）；但**分摊解决的是上游侧选择，不解决本地并发上限**——真正防崩的是本次的并发闸+连接释放（已验证 100 并发级压测零故障）。建议：①生产 combo 用 round_robin/weighted 分摊上游压力 ②若 artex 洪峰再来，128 上限 + 15s 等待会把超额请求快速 503（客户端可重试）而不是打穿池子 ③如需更高并发，先升 DB 池（20+10 是 SQLite 单写者场景的保守值）或迁 PG
 - **artex 侧未动**（属另一项目）：仍建议降频/重试退避；网关侧闸已能兜住其洪峰
 - **mihomo PROXY 组仍 DIRECT**（XFLTD 订阅 403 过期）：需翻墙的渠道受影响，待换订阅或改指可用组
+
+## Session 16 - 2026-10-15
+### 完成（修「用量趋势最多只显示到 10 点」）
+- ✅ **定性：后端无恙，纯前端「时间窗冻结」**。用户 22:00 看到趋势停在十点左右，两层叠加：
+  - ① **预设窗口冻结（主因）**：`RangePicker.presets` 是含 `new Date()` 的 `computed` 且**无响应式依赖** → Vue 首次求值后永久缓存；`Analytics.refreshAll`/`setBucket` 又复用冻结的 `this.range` → 「刷新」= 重放打开那一刻的窗口。现场复现：页面 01:20 挂载、01:24 点「今日」仍发 `end=2026-10-15T17:20:00.000Z`；生产访问日志同一 `end=` 反复出现（`11:20Z`×9、`10:19Z`×4、`10:59Z`×2、`15:54Z`×2）
+  - ② **小时轴裸显 UTC（放大因素）**：`TrendChart` 小时桶 `k.slice(11,16)` 直接显示 UTC 小时（后端 `_trend_slots` 按 UTC 分桶），北京用户看「今日」从 16:00 起轴，把「滞后几小时」视觉再放大
+- ✅ **修复（前端，后端零改动）**：
+  - 新增 `client/src/rangePresets.js`：`buildPresets(now)` / `freshRange(range, now)`（**只推进预设，`custom` 不动**）/ `defaultCustomWindow(now)` / `toLocalInput` / `localToUtcIso`，`now` 全部显式注入（组件不自行取时刻）
+  - `RangePicker.vue`：删掉 computed（根因）→ `data.presets` + `mounted` 初始化 + **`pick()` 先 `refreshPresets()` 再 emit**（按点击当下重算）
+  - `Analytics.vue`：`refreshAll`/`setBucket` 均先 `syncRange()`（内部走 `freshRange`）再拉数据；范围提示 `（UTC）`→`（本地时间）`
+  - `TrendChart.vue`：小时标签 `label()` 与悬浮 `tipDay()` 把 UTC 槽键 `new Date(k + 'Z')` 转浏览器本地时区
+- ✅ **测试**：新增 `tests/test_frontend_range_freshness.py` 5 项静态守卫（导出齐全 / custom 不变 / RangePicker 无 computed / pick 重算 / refresh 经 freshRange）；连同既有前端回归共 **16 项全绿**；`npm run build` 通过
+### 部署与验证记录
+- 纯前端改动 → 服务器 `git pull` + `cd client && npm run build`，**无需重启 pm2**（见下）
+- 修复后浏览器复核：见下方「验证」小节（隧道 18600 → 点「今日」/刷新，确认 `end` 随当前时刻前进）
+### 未完成 / 建议
+- 若还有别的页面用「挂载时刻快照」做时间窗（同类 computed 陷阱），应按同一模式排查；本次已把工具抽到 `rangePresets.js` 供复用

@@ -16,7 +16,7 @@
         <line v-if="hover >= 0" :x1="x(hover)" :y1="pad" :x2="x(hover)" :y2="H - pad" stroke="#64748b" stroke-width="1" stroke-dasharray="3 3"/>
       </svg>
       <div v-if="hover >= 0" class="trend-tip" :style="tipStyle">
-        <div class="trend-tip-day">{{ rows[hover].day }}</div>
+        <div class="trend-tip-day">{{ tipDay(rows[hover]) }}</div>
         <div>Token：{{ fmtTok(rows[hover].tokens) }}</div>
         <div>成本：${{ (rows[hover].cost_usd || 0).toFixed(4) }}</div>
         <div>请求：{{ rows[hover].requests }}</div>
@@ -88,9 +88,24 @@ export default {
     },
     label(d) {
       const k = String(d.day)
-      if (this.bucket === 'hour') return k.slice(11, 16)
+      if (this.bucket === 'hour') {
+        // 槽键是 UTC（"YYYY-MM-DDTHH:00:00"）→ 换成浏览器本地时区显示，
+        // 与页面其它地方（日志时间/用户时钟）一致，否则 +8 用户看「今日」图会以为从 16:00 开始
+        const dt = new Date(k + 'Z')
+        if (Number.isNaN(dt.getTime())) return k.slice(11, 16)
+        const p = (n) => String(n).padStart(2, '0')
+        return `${p(dt.getHours())}:${p(dt.getMinutes())}`
+      }
       if (this.bucket === 'month') return k.slice(0, 7)
       return k.slice(5)   // day / week（周一槽位）
+    },
+    tipDay(d) {
+      const k = String(d.day)
+      if (this.bucket !== 'hour') return k
+      const dt = new Date(k + 'Z')
+      if (Number.isNaN(dt.getTime())) return k
+      const p = (n) => String(n).padStart(2, '0')
+      return `${dt.getFullYear()}-${p(dt.getMonth() + 1)}-${p(dt.getDate())} ${p(dt.getHours())}:${p(dt.getMinutes())}`
     },
     onMove(e) {
       const rect = e.currentTarget.getBoundingClientRect()
