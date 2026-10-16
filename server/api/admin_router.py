@@ -1186,6 +1186,19 @@ async def list_models(
         m.provider = provider
         valid_models.append(m)
     models = valid_models
+    # 每日限额（(账号×模型) 粒度，2026-10-16）：按 (provider_name, model_id) 聚合
+    # 未过期记录 → 模型行标注「限额 x 个账号至 <时间>」
+    _ql_map = {}
+    try:
+        from server.models.quota_limit import QuotaLimit as _QL
+        from datetime import datetime as _dt
+        _ql_rows = (await db.execute(
+            select(_QL).where(_QL.reset_at > _dt.utcnow())
+        )).scalars().all()
+        for _q in _ql_rows:
+            _ql_map.setdefault((_q.provider_id, _q.model_id), []).append(_q)
+    except Exception as e:
+        logger.warning("quota limit aggregation failed: %s", e)
     result = []
     for m in models:
         item = ModelInfoResponse.from_orm(m)
@@ -1205,6 +1218,12 @@ async def list_models(
             cd = hc._cooling.get(m.id)
             if cd and datetime.now(timezone.utc).replace(tzinfo=None) < cd:
                 item.cooldown_until = cd.isoformat() + "Z"
+        # 每日限额（(账号×模型) 粒度）：最新重置时间 + 受限账号清单
+        _qls = _ql_map.get((m.provider_id, m.model_id)) or []
+        if _qls:
+            _latest = max(q.reset_at for q in _qls)
+            item.quota_limited_until = _latest.isoformat() + "Z"
+            item.quota_limited_accounts = sorted({q.owner for q in _qls})
         result.append(item)
     if limit and limit > 0:
         result = result[offset:offset + limit]
@@ -2157,7 +2176,8 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
         extra_headers = {**(extra_headers or {}), **route_result.extra_headers}
 
     async def _note_pg_account(ok, error: str = ""):
-        """OAuth 多账号：本次 playground 调用结果记到所选账号（成功清零/失败冷却）。"""
+        """OAuth 多账号：本次 playground 调用结果记到所选账号（成功清零/失败冷却）。
+        model_id 随行：每日限额文案改记 (账号×模型) 限额记录（2026-10-16）。"""
         acct = getattr(route_result, "account", None)
         if not acct:
             return
@@ -2167,7 +2187,8 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             await note_account_result(
                 route_result.provider, acct, ok=ok,
                 status_code=(None if ok else status_from_error_text(error)),
-                error=error)
+                error=error,
+                model_id=getattr(getattr(route_result, "model", None), "model_id", "") or "")
         except Exception:
             pass
 

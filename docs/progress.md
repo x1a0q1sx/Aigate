@@ -336,3 +336,24 @@
   - **待用户重试**：个人 Meta 账号 + 支持区域（如美国）的干净浏览器出口（建议无痕窗口），10 分钟内完成批准；失败后回页面重点连接换新码
 - 顺带观察（未处理）：CN 12:57 曾有 step-5-preview 连续 429（copilot.tencent.com 限流），与本次 Intl 渠道校验无关
 - 测试：**1093 全过**（新增 muse start 重试/400 不重试×2、11128 资格闸+风控冷却档×3、头族×5）；前端 build 通过；部署 4d7cb4b 并生产 A/B 验证
+
+## Session 22 - 2026-10-16
+### 完成（workbuddy/CodeBuddy CN+Intl 每日限额识别 → (账号×模型) 冷却到重置时间 + 双页面展示）
+- ✅ **需求**：用户要求「workbuddy 国内版和国外版超出每日限制都会在返回包里提示，读取识别到提示后自动进入冷却到它的那个时间点，并在模型里和 oauth 都显示」
+- ✅ **生产报文取证（决定设计粒度）**
+  - CN（copilot.tencent.com）：`{"code":6004,"msg":"您的使用量已超出频率限制，将在 2026-10-17 15:26:42 UTC+8 重置，您也可以切换其他模型继续使用。"}`
+  - Intl（www.codebuddy.ai）：同码 6004 英文 `usage exceeds frequency limit, ... your usage will reset at ... UTC+8, alternatively, you can switch to the other models ...`
+  - 关键判据：① 文案**自带精确重置时间**（UTC+8）；② 上游明说「可切换其他模型」→ **限额是 (账号×模型) 粒度，不是账号级**（若按整号冷却会误伤该账号其他模型）；③ `14003 too many requests` 是瞬时频率限流（无重置时间），**必须区分**，仍走原有短冷却
+  - 痛点实证：生产日志同一账号对已限额的 step-5-preview 在限额期内反复重试 **2293 次**（旧逻辑 429→60s 指数退避→到点再撞墙）
+- ✅ **后端实现**
+  - `server/core/quota_limit.py`：识别（code 6004 / 中英文案）+ 解析（`UTC+8` 时间戳 → naive UTC；已过期返回 None；无时间戳 1h 兜底）+ `is_quota_related_error`（供模型冷却/瞬态重试排除）
+  - `server/models/quota_limit.py`（`quota_limits` 表，唯一键 `(provider_code, owner, model_id)`，reset_at 过期自动失效无需清理）+ `server/core/quota_store.py`（选号跳过/列表聚合查询）
+  - `note_request_result(..., model_id, provider_id)`：命中限额文案 → **upsert 限额记录而非整号冷却**；该账号**同一模型**成功 → 清该记录（提前恢复）
+  - 自动选号（`pick_access_token_ex` 传 model_id）跳过该模型上限额的账号、其他账号顶上；全部账号都限额 → resolver 返回 `quota_limited: ... resets at ...`（自动路由换模型，不再误报「未连接」）
+  - 限额错误**不进模型冷却**（该模型其他账号仍可用）、**不进瞬态重试**（等 1 秒必然再撞）；全链路 9 处账号记账点带 model_id，且用「短形态+全量原文」合并文本判限额（重置时间可能落在 120/200/300 字符截断之外）
+  - 模型列表接口（`/admin/api/models`）按 `(provider_id, model_id)` 聚合输出 `quota_limited_until` + `quota_limited_accounts`
+- ✅ **前端展示**
+  - 模型页：模型行「限额 x时x分」徽标（悬浮 = 受限账号清单 + 重置时刻 + 说明「该账号其他模型/其他账号不受影响」）
+  - OAuth 连接页：连接行「每日限额：模型（x时后重置）」（与账号冷却独立显示，蓝色区分）
+- 测试：新增 `tests/test_quota_limit.py` 18 项（识别/解析/记账/选号跳过/成功清记录/resolver quota_limited）；修复 1 项既有 spy 测试（新 kwarg）；`conftest.py` 重置新增进程全局态 `_ACCOUNT_DIRTY`；**全量 1111 全绿**；前端 build 通过
+- 部署：commit + push + 服务器 pull + `npm run build` + pm2 restart（后端改动，需重启）；生产验证：quota_limits 表随启动建表，首次真实限额触发时自动建行

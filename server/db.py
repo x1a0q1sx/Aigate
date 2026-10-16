@@ -46,6 +46,7 @@ from .models.admin_session import AdminSession  # 登录会话持久化（重启
 from .models.model_refresh_log import ModelRefreshLog  # 模型刷新日志（分析页·日志类型）
 from .models.checkin_log import CheckinLog  # 每日签到日志（签到页·状态派生源）
 from .models.growth_log import GrowthLog  # 成长中心日志（Buddy 旅行 / 成长任务）
+from .models.quota_limit import QuotaLimit  # 上游每日限额 (账号×模型) 冷却记录（2026-10-16）
 from .config import get_config
 config = get_config()
 # P2-11: DATABASE_URL 环境变量优先（postgresql+asyncpg://...），未设置时用 SQLite 单机默认

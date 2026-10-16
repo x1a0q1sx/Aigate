@@ -51,6 +51,11 @@
             </span>
           </template>
           <div v-if="c.last_error" class="conn-error text-xs" :title="c.last_error">最后错误：{{ c.last_error.slice(0, 120) }}</div>
+          <div v-if="(c.quota_limits || []).length" class="conn-error text-xs" style="color:#2b8aef"
+               :title="quotaLimitsTitle(c)">
+            <AppIcon name="clock" :size="10" />
+            {{ quotaLimitsText(c) }}
+          </div>
           <div v-if="usage[c.id]" class="usage-panel">
             <div v-if="usage[c.id].loading" class="text-xs muted">额度查询中...</div>
             <template v-else>
@@ -242,6 +247,32 @@ export default {
       const m = Math.ceil(ms / 60000)
       const fail = c.fail_count ? `（连续失败 ${c.fail_count} 次）` : ''
       return `冷却 ${m} 分钟后恢复${fail}`
+    },
+    // 每日限额（(账号×模型) 粒度）：该账号在哪些模型上今日额度用完、何时重置。
+    // 与账号冷却独立——该账号的其他模型仍可用，自动路由只跳过限额模型。
+    _quotaLimitsActive(c) {
+      const now = Date.now()
+      return (c.quota_limits || []).filter((q) => new Date(q.reset_at).getTime() > now)
+    },
+    quotaLimitsText(c) {
+      const qs = this._quotaLimitsActive(c)
+      if (!qs.length) return ''
+      const models = qs.map((q) => q.model_id).join('、')
+      const latest = Math.max(...qs.map((q) => new Date(q.reset_at).getTime()))
+      const ms = latest - Date.now()
+      const h = Math.floor(ms / 3600000)
+      const m = Math.ceil((ms % 3600000) / 60000)
+      const left = h >= 24 ? `${Math.floor(h / 24)}天${h % 24}时` : (h > 0 ? `${h}时${m}分` : `${m}分`)
+      return `每日限额：${models}（${left}后重置）`
+    },
+    quotaLimitsTitle(c) {
+      const qs = this._quotaLimitsActive(c)
+      if (!qs.length) return ''
+      const lines = qs.map((q) => {
+        const at = new Date(q.reset_at).toLocaleString('zh-CN', { hour12: false })
+        return `${q.model_id} → ${at} 重置`
+      })
+      return '上游每日限额（(账号×模型) 粒度，该账号的其他模型不受影响）：\n' + lines.join('\n')
     },
     expireText(c) {
       if (!c.expires_at) return '长效'

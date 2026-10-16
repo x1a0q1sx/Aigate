@@ -335,7 +335,8 @@ class AutoRouter:
                         _cand_extra = _rc_c.extra_headers
                         _cand_account = getattr(_rc_c, "account", None) or None
                     if not api_key:
-                        # OAuth 未连接，跳过此候选
+                        # OAuth 未连接 / 该模型所有账号额度用完 → 跳过此候选
+                        # （resolver 的 error 已带准确原因，如 quota_limited: ...）
                         if conversation_id:
                             from .route_decision import mark_candidate_skipped
                             mark_candidate_skipped(
@@ -343,7 +344,7 @@ class AutoRouter:
                                 model_pk=candidate.id,
                                 provider=provider.name,
                                 model=candidate.model_id,
-                                reason="OAuth connection unavailable",
+                                reason=(getattr(_rc_c, "error", None) or "OAuth connection unavailable"),
                             )
                         continue
                 else:

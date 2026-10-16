@@ -86,6 +86,22 @@ def is_risk_block_text(error) -> bool:
         '"code":11128', "request illegal", "没通过渠道校验", "渠道校验"))
 
 
+def combine_err_text(short, full) -> str:
+    """合并「短形态 + 全量文本」：短形态保证 HTTP 状态码可提取（如 '429'），
+    全量保证上游原文特征不被截断吃掉（如每日限额文案里的重置时间）。
+
+    两者互相包含时返回其一；都有时用 ' || ' 连接（受 4000 字符防御上限）。
+    用于账号记账：网关内错误以字符串流转，而各路径的短形态截断点（120/200/300）
+    不一致——限额识别必须看到完整原文才不会退化成短冷却。"""
+    s = str(short or "").strip()
+    f = str(full or "").strip()
+    if not f or f in s:
+        return s
+    if not s or s in f:
+        return f[:4000]
+    return (s + " || " + f)[:4000]
+
+
 def err_text(e: BaseException) -> str:
     """异常 → '类型: 消息'；消息为空时沿异常链兜底生成可读描述。
 

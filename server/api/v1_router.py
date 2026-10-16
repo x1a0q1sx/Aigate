@@ -43,7 +43,17 @@ from server.core.context_guard import (
     record_context_overflow,
 )
 from server.config import get_config, save_config
-from server.core.error_text import err_text
+from server.core.error_text import err_text, combine_err_text
+from server.core.quota_limit import is_quota_related_error
+
+
+def _combine_err(short, full) -> str:
+    """短形态 + 全量文本合并（见 error_text.combine_err_text）。供账号记账判
+    「每日限额」用：重置时间可能落在短形态截断之外（2026-10-16）。"""
+    try:
+        return combine_err_text(short, full)
+    except Exception:
+        return str(short or full or "")
 
 
 def _openai_completion_is_empty(result) -> bool:
@@ -294,8 +304,13 @@ _TRANSIENT_UPSTREAM_RE = re.compile(
 
 
 def _is_transient_upstream_error(text) -> bool:
-    """识别可自动重试的瞬态上游故障（区别于 4xx 参数错误 / 鉴权失败等不可重试故障）。"""
+    """识别可自动重试的瞬态上游故障（区别于 4xx 参数错误 / 鉴权失败等不可重试故障）。
+
+    每日限额（429 + 重置时间文案）不是瞬态——等 1 秒重试必然再撞，
+    排除在重试判据外（2026-10-16）。"""
     if not text:
+        return False
+    if is_quota_related_error(text):
         return False
     return bool(_TRANSIENT_UPSTREAM_RE.search(str(text)))
 
@@ -1053,26 +1068,36 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         )
         if is_context_error(err_short) and candidate.model:
             await record_context_overflow(candidate.model.id, est_tokens)
-        elif cooling and ar.health_checker and candidate.model:
+        elif (cooling and ar.health_checker and candidate.model
+              and not is_quota_related_error(full_error or err_short)):
+            # 每日限额不是模型故障 → 不罚模型冷却（否则该模型被整体封锁，
+            # 其他账号本可顶上；(账号×模型) 限额记录已精确管控，2026-10-16）
             ar.health_checker.mark_failure(candidate.model.id)
             ar.health_checker.mark_cooling(
                 candidate.model.id,
                 ar.config.cooling_period_seconds,
             )
         # OAuth 多账号：失败 → 对应账号冷却（与模型冷却独立；上下文超限不是账号问题）
+        # model_id 随行：错误若为「每日限额」文案（自带重置时间），改记 (账号×模型)
+        # 限额记录而非整号冷却（该账号其他模型仍可用，2026-10-16）。
+        # 用 full_error 判限额：重置时间可能落在短形态 120/300 字符截断之外。
         if cooling and not is_context_error(err_short) and getattr(candidate, "account", None):
             try:
                 from server.core.credential_resolver import note_account_result as _nar
                 from server.core.oauth_client import status_from_error_text as _sfe
+                _err_full_acct = full_error or err_short or ""
                 await _nar(candidate.provider, candidate.account, ok=False,
-                           status_code=_sfe(err_short), error=err_short or "")
+                           status_code=_sfe(_err_full_acct), error=_err_full_acct[:2000],
+                           model_id=(getattr(candidate.model, "model_id", "") or "") if candidate.model else "")
             except Exception:
                 pass
         # 写一条失败日志，方便在分析页看到每次尝试（含冷却信息）
         cd_seconds = ar.config.cooling_period_seconds
         fc = (ar.health_checker._fail_count.get(candidate.model.id, 0) if ar.health_checker else 0)
         cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
-        cooldown_note = f" | cooldown={cd_actual}s fail#{fc}"
+        cooldown_note = (" | daily_quota_exhausted"
+                         if is_quota_related_error(full_error or err_short)
+                         else f" | cooldown={cd_actual}s fail#{fc}")
         try:
             import json as _j
             from server.db import AsyncSessionLocal as _LS
@@ -1274,11 +1299,12 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         fallback_count=attempt,
         account=getattr(candidate, "account", None),   # OAuth 多账号：本次实际使用的账号（日志用）
     )
-    # OAuth 多账号：成功 → 清该账号冷却/失败计数
+    # OAuth 多账号：成功 → 清该账号冷却/失败计数（同模型限额记录也清，提前恢复）
     if getattr(candidate, "account", None):
         try:
             from server.core.credential_resolver import note_account_result as _nar
-            await _nar(candidate.provider, candidate.account, ok=True)
+            await _nar(candidate.provider, candidate.account, ok=True,
+                       model_id=getattr(candidate.model, "model_id", "") or "")
         except Exception:
             pass
     # 确保返回结果中的 model 字段已设为完整标识
@@ -2017,11 +2043,17 @@ async def _chat_completions_impl(
                                           attempt=st_attempt,
                                           latency_ms=int((time.time() - ctx["start"]) * 1000),
                                           ttft_ms=ctx["attempt_ttft_ms"], error=et)
+                        # raw_err（全量原文）优先：限额文案的重置时间可能落在 et 的
+                        # 200 字符截断之外，识别不到就会退化成短冷却（2026-10-16）
+                        raw_err = getattr(exc, "raw_err", None) or getattr(exc, "stream_body", None) or et
+                        _et_full = _combine_err(et, raw_err)
                         # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避）
-                        # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却
+                        # 上下文超限 / 上游内容校验失败 均不是模型自身故障，不进冷却；
+                        # 每日限额也不是（该模型其他账号仍可用），不罚模型冷却
                         if is_context_error(et):
                             await record_context_overflow(ctx["mdl"].id, est_req_tokens)
-                        elif ar.health_checker and not _is_stream_content_validation_error(et):
+                        elif (ar.health_checker and not _is_stream_content_validation_error(et)
+                              and not is_quota_related_error(_et_full)):
                             ar.health_checker.mark_failure(ctx["mdl"].id)
                             ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
                         # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
@@ -2030,10 +2062,10 @@ async def _chat_completions_impl(
                                 from server.core.credential_resolver import note_account_result as _nar
                                 from server.core.oauth_client import status_from_error_text as _sfe
                                 await _nar(ctx["prov"], ctx["account"], ok=False,
-                                           status_code=_sfe(et), error=et or "")
+                                           status_code=_sfe(_et_full), error=_et_full,
+                                           model_id=getattr(ctx["mdl"], "model_id", "") or "")
                             except Exception:
                                 pass
-                        raw_err = getattr(exc, "raw_err", None) or getattr(exc, "stream_body", None) or et
                         await _write_stream_log(conversation_id, request, raw_request, "error",
                             ctx["prov"].name, ctx["mdl"].model_id, et[:500], st_attempt, None,
                             stream_body=raw_err, diag_start_ts=_diag_start,
@@ -2145,11 +2177,12 @@ async def _chat_completions_impl(
                             routed_account=ctx.get("account"))
                         if ar.health_checker:
                             ar.health_checker.mark_success(_mdl.id)
-                        # OAuth 多账号：成功 → 清该账号冷却/失败计数
+                        # OAuth 多账号：成功 → 清该账号冷却/失败计数（同模型限额记录也清）
                         if ctx.get("account"):
                             try:
                                 from server.core.credential_resolver import note_account_result as _nar
-                                await _nar(_prov, ctx["account"], ok=True)
+                                await _nar(_prov, ctx["account"], ok=True,
+                                           model_id=getattr(_mdl, "model_id", "") or "")
                             except Exception:
                                 pass
                         yield b"data: [DONE]\n\n"
@@ -2163,7 +2196,8 @@ async def _chat_completions_impl(
                                           ttft_ms=_cb_attempt_ttft_ms, error=err_s)
                         if is_context_error(err_s):
                             await record_context_overflow(_mdl.id, est_req_tokens)
-                        elif ar.health_checker and not _is_stream_content_validation_error(err_s):
+                        elif (ar.health_checker and not _is_stream_content_validation_error(err_s)
+                              and not is_quota_related_error(err_s)):
                             ar.health_checker.mark_failure(_mdl.id)
                             ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
                         raw_err = _extract_error_body(se) or err_s
@@ -2196,9 +2230,10 @@ async def _chat_completions_impl(
                     self.info = {"pk": pk, "prov": prov, "model": model}
 
             class _NFail(Exception):
-                def __init__(self, msg, ctx):
+                def __init__(self, msg, ctx, raw=None):
                     super().__init__(msg)
                     self.ctx = ctx
+                    self.raw = raw
 
             _ns_ctx_by_idx = {}
 
@@ -2261,7 +2296,7 @@ async def _chat_completions_impl(
                     ctx["cancelled"] = True
                     raise
                 except Exception as e:
-                    raise _NFail(err_text(e)[:300], ctx) from e
+                    raise _NFail(err_text(e)[:300], ctx, raw=_extract_error_body(e)) from e
                 ctx["send_end"] = time.time()
                 if isinstance(result, dict):
                     result["model"] = f"{provider.name}/{model.model_id}"
@@ -2291,10 +2326,10 @@ async def _chat_completions_impl(
                                   model=ctx["model"].model_id, status="failed", attempt=t_idx,
                                   latency_ms=int((time.time() - ctx["start"]) * 1000), error=et)
                 # 失败惩罚：与 auto 路由一致 —— 计入失败并进入冷却（指数退避 30×2^n 秒）
-                # 上下文超限不是模型自身故障，不进冷却
+                # 上下文超限 / 每日限额不是模型自身故障，不进冷却（限额该模型其他账号仍可用）
                 if is_context_error(et):
                     await record_context_overflow(ctx["model"].id, est_req_tokens)
-                elif ar.health_checker:
+                elif ar.health_checker and not is_quota_related_error(et):
                     ar.health_checker.mark_failure(ctx["model"].id)
                     ar.health_checker.mark_cooling(ctx["model"].id, ar.config.cooling_period_seconds)
                 # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
@@ -2302,8 +2337,10 @@ async def _chat_completions_impl(
                     try:
                         from server.core.credential_resolver import note_account_result as _nar
                         from server.core.oauth_client import status_from_error_text as _sfe
+                        _et_ns = _combine_err(et, getattr(exc, "raw", None))
                         await _nar(ctx["provider"], ctx["account"], ok=False,
-                                   status_code=_sfe(et), error=et or "")
+                                   status_code=_sfe(_et_ns), error=_et_ns,
+                                   model_id=getattr(ctx["model"], "model_id", "") or "")
                     except Exception:
                         pass
                 print(f"[组合路由] 目标 {ctx['full_id']} 失败：{et[:120]}，正在尝试下一个候选", flush=True)
@@ -2432,9 +2469,12 @@ async def _chat_completions_impl(
                     _rc_d = await resolve_credential_async(provider, model, db)
                     oauth_code = getattr(provider, "oauth_code", None) or provider.name
                     if not _rc_d.ok or not _rc_d.api_key:
-                        await _decision_finish(conversation_id, status="error", failure_reason=f"OAuth provider '{oauth_code}' not connected")
-                        await _early_error_log(conversation_id, request, raw_request, f"OAuth provider '{oauth_code}' not connected")
-                        return JSONResponse(status_code=503, content=_api_error(f"OAuth provider '{oauth_code}' not connected (set provider.oauth_code or import token)", status=503))
+                        # 全部账号该模型额度用完（quota_limited）→ 如实报限额（含重置时间），
+                        # 不误报「未连接」（(账号×模型) 每日限额，2026-10-16）
+                        _rc_err = _rc_d.error or f"OAuth provider '{oauth_code}' not connected"
+                        await _decision_finish(conversation_id, status="error", failure_reason=_rc_err)
+                        await _early_error_log(conversation_id, request, raw_request, _rc_err)
+                        return JSONResponse(status_code=503, content=_api_error(_rc_err, status=503))
                     api_key = _rc_d.api_key
                     _direct_extra = _rc_d.extra_headers
                     _direct_account = getattr(_rc_d, "account", None) or None
@@ -2831,23 +2871,32 @@ async def _chat_completions_impl(
                 cd_seconds = ar.config.cooling_period_seconds
                 fc = (ar.health_checker._fail_count.get(ctx["mdl"].id, 0) if (ar.health_checker and ctx["mdl"].id) else 0)
                 cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
-                # 落库的 error_msg 用全量（上游原文常远超 120 字符），冷却注记追加在末尾
-                err_annotated = f"{full_error or et} | cooldown={cd_actual}s fail#{fc}"
+                # 落库的 error_msg 用全量（上游原文常远超 120 字符），冷却注记追加在末尾；
+                # 每日限额不是模型故障，注记区分（该模型其他账号仍可用，2026-10-16）
+                _et_quota = (full_error or et or "")
+                _cd_note = ("daily_quota_exhausted" if is_quota_related_error(_et_quota)
+                            else f"cooldown={cd_actual}s fail#{fc}")
+                err_annotated = f"{full_error or et} | {_cd_note}"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
                     ctx["prov"].name, ctx["mdl"].model_id, err_annotated, st_attempt, None,
                     stream_body=raw_body or et, diag_start_ts=_diag_start,
                     routed_provider_id=getattr(ctx["prov"], "id", None),
                     routed_account=ctx.get("account"))
-                if cooling and ar.health_checker and not _is_stream_content_validation_error(et) and ctx["mdl"].id:
+                if (cooling and ar.health_checker and not _is_stream_content_validation_error(et)
+                        and ctx["mdl"].id and not is_quota_related_error(_et_quota)):
                     ar.health_checker.mark_failure(ctx["mdl"].id)
                     ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
                 # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题/超限不算账号故障）
+                # 全量原文优先：限额文案的重置时间可能被 et 截断吃掉（2026-10-16）
                 if cooling and not is_context_error(et) and ctx.get("account"):
                     try:
                         from server.core.credential_resolver import note_account_result as _nar
                         from server.core.oauth_client import status_from_error_text as _sfe
+                        from server.core.error_text import combine_err_text as _combine
+                        _et_acct = _combine(et, full_error)
                         await _nar(ctx["prov"], ctx["account"], ok=False,
-                                   status_code=_sfe(et), error=et or "")
+                                   status_code=_sfe(_et_acct), error=_et_acct,
+                                   model_id=getattr(ctx["mdl"], "model_id", "") or "")
                     except Exception:
                         pass
                 print(f"[CASCADE] attempt {st_attempt} failed ({et[:60]}), trying next (tried={tried_sids})", flush=True)
@@ -3062,10 +3111,11 @@ async def _chat_completions_impl(
             )
             _stream_usage = {}
             _stream_err = None
+            _stream_err_full = None   # 全量错误原文（账号记账判每日限额用，见下）
             _stream_ttft_ms = None
             _stream_chunks_log = []  # 收集所有 chunk 用于日志
             async def wrap_stream():
-                nonlocal _stream_usage, _stream_err, _stream_ttft_ms
+                nonlocal _stream_usage, _stream_err, _stream_err_full, _stream_ttft_ms
                 _diag(conversation_id, "direct_stream_generator_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
                 # 直连流对“正文出现前断流”（内容校验失败 / 空闲超时等）自动重试：
                 # 只有尚未向客户端吐出任何实质 chunk 时才重试，避免重复输出对客户端可见。
@@ -3135,6 +3185,13 @@ async def _chat_completions_impl(
                                     await asyncio.sleep(1.0)  # 429/503 类瞬态故障稍候再试
                                 continue
                             _stream_err = _err_text
+                            # 全量原文（含上游 body）：账号记账判「每日限额」用——
+                            # 限额文案的重置时间可能落在 300 字符截断之外（2026-10-16）
+                            try:
+                                from server.core.error_text import combine_err_text as _combine
+                                _stream_err_full = _combine(_err_text, _extract_error_body(e))
+                            except Exception:
+                                _stream_err_full = _err_text
                             yield _format_sse_chunk(
                                 _api_error(f"upstream_stream_failed: {_stream_err}"), model_id_full)
                             yield b"data: [DONE]\n\n"
@@ -3197,10 +3254,12 @@ async def _chat_completions_impl(
                         try:
                             from server.core.credential_resolver import note_account_result as _nar
                             from server.core.oauth_client import status_from_error_text as _sfe
+                            _acct_err = (_stream_err_full if _stream_err else "") or ""
                             await _nar(route_result.provider, _direct_account,
                                        ok=not _stream_err,
-                                       status_code=_sfe(_stream_err) if _stream_err else None,
-                                       error=_stream_err or "")
+                                       status_code=_sfe(_acct_err) if _stream_err else None,
+                                       error=_acct_err,
+                                       model_id=_mdl_name or "")
                         except Exception:
                             pass
                     # 决策收尾已移到独立的 shielded 调用（原来混在本 try 里，决策一挂日志就丢）
@@ -3333,10 +3392,14 @@ async def _chat_completions_impl(
                             _e_status = getattr(getattr(e, "response", None), "status_code", None)
                         _rot.mark_failure(_cur_kid, _e_status)
                         # OAuth 多账号：失败 → 该账号进入冷却（多账号路由自动换号）
+                        # 全量原文优先：每日限额的重置时间可能被 300 字符截断吃掉（2026-10-16）
                         if getattr(route_result, "account", None):
                             from server.core.credential_resolver import note_account_result as _nar, error_status_code as _esc
+                            from server.core.error_text import combine_err_text as _combine
+                            _err_acct = _combine(_err_now, _extract_error_body(e))
                             await _nar(route_result.provider, route_result.account, ok=False,
-                                       status_code=_e_status or _esc(e), error=_err_now)
+                                       status_code=_e_status or _esc(e), error=_err_acct,
+                                       model_id=getattr(route_result.model, "model_id", "") or "")
                         _diag(conversation_id, "upstream_error", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id, stream=False, error=type(e).__name__)
                         # 瞬态故障同 key 原样重试（连接阶段预算 2：重建 httpx 客户端与连接，
                         # 瞬断多为偶发，多一次机会——2026-10-10 两次都撞抖动线路的实证）

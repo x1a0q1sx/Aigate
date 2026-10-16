@@ -148,6 +148,10 @@ class ModelInfoResponse(BaseModel):
     # 冷却信息
     cooldown_until: Optional[str] = None  # ISO 时间字符串，非空表示正在冷却
     fail_count: int = 0
+    # 每日限额（(账号×模型) 粒度，2026-10-16）：上游 429 文案自带重置时间；
+    # 非空表示该模型在部分/全部账号上今日额度已用完（到期自动失效）
+    quota_limited_until: Optional[str] = None
+    quota_limited_accounts: Optional[list] = None
     # 所属分组（combo 名称列表，由列表接口附带；不在 ORM 上，from_orm 不填）
     combos: Optional[list] = None
     class Config:

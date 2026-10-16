@@ -165,6 +165,9 @@
                 <span v-if="m.cooldown_until" class="badge badge-warning text-xs" style="margin-left: 4px" :title="'冷却至 ' + m.cooldown_until">
                   <AppIcon name="clock" :size="10" /> {{ cooldownRemaining(m) }}
                 </span>
+                <span v-if="m.quota_limited_until" class="badge badge-info text-xs" style="margin-left: 4px" :title="quotaLimitTitle(m)">
+                  <AppIcon name="clock" :size="10" /> 限额 {{ quotaLimitRemaining(m) }}
+                </span>
                 <span v-else-if="m.fail_count > 0" class="text-xs text-muted" style="margin-left: 4px">
                   ×{{ m.fail_count }}
                 </span>
@@ -702,6 +705,23 @@ export default {
       if (s < 60) return s + 's'
       if (s < 3600) return Math.ceil(s / 60) + 'm'
       return Math.ceil(s / 3600) + 'h'
+    },
+    // 每日限额（(账号×模型) 粒度）：剩余时间 + 提示（含账号清单与重置时刻）
+    quotaLimitRemaining(m) {
+      if (!m.quota_limited_until) return ''
+      const diff = new Date(m.quota_limited_until) - Date.now()
+      if (diff <= 0) return ''
+      const h = Math.floor(diff / 3600000)
+      const min = Math.ceil((diff % 3600000) / 60000)
+      if (h >= 24) return Math.floor(h / 24) + '天' + (h % 24) + '时'
+      if (h > 0) return h + '时' + min + '分'
+      return min + '分'
+    },
+    quotaLimitTitle(m) {
+      const accs = (m.quota_limited_accounts || []).join('、') || '未知账号'
+      const at = new Date(m.quota_limited_until).toLocaleString('zh-CN', { hour12: false })
+      return `上游每日限额：账号「${accs}」在 ${m.model_id} 上今日额度已用完，${at} 重置。` +
+        '该账号的其他模型、以及其他账号不受影响；期间自动路由会跳过这些账号。'
     },
     // 分组复选：comboName 为 null 表示 Auto；一个模型可同时属多个分组
     async toggleGroup(model, comboName, checked) {

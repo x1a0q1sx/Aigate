@@ -63,7 +63,8 @@ async def default_call(db, provider, model, request, timeout: float):
         if account:
             try:
                 await note_account_result(provider, account, ok=False,
-                                          status_code=error_status_code(e), error=str(e)[:300])
+                                          status_code=error_status_code(e), error=str(e)[:300],
+                                          model_id=getattr(model, "model_id", "") or "")
             except Exception:
                 pass
         raise

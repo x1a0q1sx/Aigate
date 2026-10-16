@@ -177,13 +177,15 @@ async def test_resolver_passes_oauth_owner(tmp_path, monkeypatch):
     """credential_resolver 必须把 provider.oauth_owner 透传给取号入口（多账号选号）
 
     2026-10-13 起解析器走 pick_access_token_ex（额外返回实际选中的 owner），
-    spy 两个入口都要提供（pick_access_token 为兼容封装）。"""
+    spy 两个入口都要提供（pick_access_token 为兼容封装）。
+    2026-10-16 起解析器还传 model_id（选号跳过该模型上已限额的账号）。"""
     import server.core.oauth_client as oc_mod
     captured = {}
 
     class _Spy:
-        async def pick_access_token_ex(self, code, db, owner="__default"):
+        async def pick_access_token_ex(self, code, db, owner="__default", model_id=""):
             captured["owner"] = owner
+            captured["model_id"] = model_id
             return (owner if owner != "__default" else "acct-chosen", "tok")
 
         async def pick_access_token(self, code, db, owner="__default"):
@@ -202,6 +204,7 @@ async def test_resolver_passes_oauth_owner(tmp_path, monkeypatch):
     rc = await resolve_credential_async(provider, SimpleNamespace(model_id="m"), None)
     assert rc.ok and captured["owner"] == "13800000000"
     assert rc.account == "13800000000"   # 实际选中的账号随解析结果出行
+    assert captured["model_id"] == "m"   # 模型随行（每日限额跳过该模型上的受限账号）
     # 未点名 → 自动 __default（多账号自动选号；account 为实际选中者）
     provider.oauth_owner = None
     rc2 = await resolve_credential_async(provider, SimpleNamespace(model_id="m"), None)

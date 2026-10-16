@@ -26,11 +26,13 @@ import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 from sqlalchemy import select
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from server.db import AsyncSessionLocal
 from server.models.oauth_token import OAuthToken
 from server.core.crypto_service import get_crypto_service, CryptoService
 from server.core.error_text import is_risk_block_text
+from server.core.quota_limit import is_daily_limit_text
 from server.core.oauth_registry import OAuthProviderConfig, get_oauth_provider
 
 logger = logging.getLogger(__name__)
@@ -1823,12 +1825,15 @@ class OAuthClient:
         provider_code: str,
         db: AsyncSession,
         owner: str = "__default",
+        model_id: str = "",
     ) -> Optional[Tuple[str, str]]:
         """同 pick_access_token，但返回 (实际选中的 owner, access_token)。
 
         显式 owner：精确取号（不受冷却影响）。
         自动模式（__default）：加载全部 active 连接 → 账号级冷却/额度到期排序 →
-        依序尝试取 token（某行解密失败自动落到下一行）。"""
+        依序尝试取 token（某行解密失败自动落到下一行）。
+        model_id：给了就同时跳过「该模型今日额度已用完」的账号（(账号×模型)
+        粒度的每日限额，见 core/quota_limit.py）——该账号的其他模型不受影响。"""
         if owner and owner != "__default":
             row = await self._get_token_record(db, provider_code, owner)
             if not row or not row.is_active:
@@ -1862,6 +1867,21 @@ class OAuthClient:
         if not rows:
             return None
         ranked = self._rank_auto_rows(provider_code, rows)
+        # 每日限额（(账号×模型) 粒度，2026-10-16）：该模型今日已限额的账号跳过，
+        # 让其他账号顶上（上游明说「可切换其他模型」= 账号对别的模型仍可用）；
+        # 全部账号都限额 → 返回 None（调用方给出明确报错，自动路由据此换模型）。
+        if model_id:
+            try:
+                from server.core.quota_store import active_limit_owners
+                limited = await active_limit_owners(db, provider_code, model_id)
+            except Exception:
+                limited = {}
+            if limited:
+                ranked = [t for t in ranked if t[7].owner not in limited]
+                if not ranked:
+                    logger.info("oauth %s: all accounts quota-limited for %s until %s",
+                                provider_code, model_id, min(limited.values()))
+                    return None
         for _cool, _tier, _load, _earliest, _neg, _pref, _rid, row in ranked:
             token = await self._row_token_ready(db, provider_code, row)
             if token:
@@ -1889,12 +1909,17 @@ class OAuthClient:
         ok: bool,
         status_code: Optional[int] = None,
         error: str = "",
+        model_id: str = "",
+        provider_id: Optional[int] = None,
     ) -> None:
         """账号级健康记录（多账号路由用；永不抛异常）。
 
         ok=False → fail_count+1 并按错误类型设置 cooldown_until（指数退避）；
         ok=True  → 仅当该账号曾失败过（脏标记）才查库清零——成功路径零成本。
-        """
+
+        model_id：本次请求的模型（裸 id）。带它且错误文案命中「每日限额」时
+        （见 core/quota_limit.py）**不走账号冷却**，而是记 (账号×模型) 限额记录
+        ——该账号的其他模型不受影响，避免整号冷却误伤。"""
         if not provider_code or not owner:
             return
         mark = (provider_code, owner)
@@ -1903,6 +1928,14 @@ class OAuthClient:
                 return
             _ACCOUNT_DIRTY.discard(mark)
         else:
+            # 每日限额（CodeBuddy CN/Intl 等，报文自带重置时间）：(账号×模型) 粒度，
+            # 只记限额记录 + 到点自动失效；账号本身不冷却（其他模型仍可用）。
+            # 也置脏标记：该账号下次在**同一模型**上成功时把限额记录清掉
+            # （上游提前恢复额度时无需等 reset_at）。
+            if model_id and is_daily_limit_text(error):
+                _ACCOUNT_DIRTY.add(mark)
+                await self._record_quota_limit(provider_code, owner, model_id, error, provider_id)
+                return
             _ACCOUNT_DIRTY.add(mark)
             if status_code is None:
                 status_code = status_from_error_text(error)
@@ -1920,6 +1953,19 @@ class OAuthClient:
                 if ok:
                     row.fail_count = 0
                     row.cooldown_until = None
+                    # 该账号在 model_id 上成功 → 清掉同模型限额记录（上游提前恢复
+                    # 额度时无需等 reset_at 自动过期；其他模型的限额记录保留）
+                    if model_id:
+                        try:
+                            from server.models.quota_limit import QuotaLimit
+                            await db.execute(
+                                sa_delete(QuotaLimit).where(
+                                    QuotaLimit.provider_code == provider_code,
+                                    QuotaLimit.owner == owner,
+                                    QuotaLimit.model_id == model_id,
+                                ))
+                        except Exception:
+                            pass
                     await db.commit()
                     return
                 fc = int(row.fail_count or 0) + 1
@@ -1933,6 +1979,51 @@ class OAuthClient:
                     provider_code, owner, secs, fc, status_code, risk)
         except Exception as e:
             logger.debug("note_request_result failed: %s", e)
+
+    async def _record_quota_limit(self, provider_code: str, owner: str, model_id: str,
+                                  error: str, provider_id: Optional[int] = None) -> None:
+        """upsert 一条 (账号×模型) 每日限额记录（reset_at 取上游文案里的时间点）。
+
+        并发安全：按唯一键先查后写；撞唯一约束（并发同键插入）退化为 UPDATE 重试一次。
+        解析不到时间点 → 1 小时后兜底（仍远好于 60s 指数退避打墙）。"""
+        try:
+            from server.core.quota_limit import daily_limit_reset_or_default
+            from server.models.quota_limit import QuotaLimit
+            reset_at = daily_limit_reset_or_default(error, default_seconds=3600)
+            note = (str(error or "").strip()[:500]) or ""
+            from server.db import AsyncSessionLocal
+            for _try in range(2):
+                try:
+                    async with AsyncSessionLocal() as db:
+                        row = (await db.execute(
+                            select(QuotaLimit).where(
+                                QuotaLimit.provider_code == provider_code,
+                                QuotaLimit.owner == owner,
+                                QuotaLimit.model_id == model_id,
+                            ).limit(1)
+                        )).scalar_one_or_none()
+                        if row is None:
+                            db.add(QuotaLimit(
+                                provider_code=provider_code, provider_id=provider_id,
+                                owner=owner, model_id=model_id, reset_at=reset_at, note=note))
+                        else:
+                            # 取更晚的重置时间（上游可能续报；绝不让新记录提前解锁）
+                            if reset_at > (row.reset_at or datetime.min):
+                                row.reset_at = reset_at
+                            row.note = note
+                            if provider_id is not None:
+                                row.provider_id = provider_id
+                        await db.commit()
+                    break
+                except Exception:
+                    if _try == 1:
+                        raise
+                    continue  # 并发撞唯一约束 → 重试一次走 UPDATE 分支
+            logger.info(
+                "oauth quota limit: %s/%s model=%s until %s UTC",
+                provider_code, owner, model_id, reset_at.isoformat())
+        except Exception as e:
+            logger.debug("_record_quota_limit failed: %s", e)
 
     # ── 持久化辅助 ──
     async def _get_token_record(self, db: AsyncSession, provider_code: str, owner: str) -> Optional[OAuthToken]:
@@ -2136,6 +2227,17 @@ class OAuthClient:
     async def list_connections(self, db: AsyncSession) -> list:
         r = await db.execute(select(OAuthToken).order_by(OAuthToken.id))
         rows = r.scalars().all()
+        # 每日限额记录（(账号×模型) 粒度）：按 (provider_code, owner) 分组附到连接行
+        _qmap: dict = {}
+        try:
+            from server.core.quota_store import list_active
+            for ql in await list_active(db):
+                _qmap.setdefault((ql.provider_code, ql.owner), []).append({
+                    "model_id": ql.model_id,
+                    "reset_at": ql.reset_at.isoformat() + "Z",
+                })
+        except Exception:
+            pass
         out = []
         for row in rows:
             out.append({
@@ -2151,6 +2253,7 @@ class OAuthClient:
                 "last_error": row.last_error,
                 "cooldown_until": row.cooldown_until.isoformat() + "Z" if getattr(row, "cooldown_until", None) else None,
                 "fail_count": int(getattr(row, "fail_count", 0) or 0),
+                "quota_limits": _qmap.get((row.provider_code, row.owner), []),
             })
         return out
 

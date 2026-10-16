@@ -98,16 +98,24 @@ def is_account_worthy_error(error, status_code: Optional[int] = None) -> bool:
 
 
 async def note_account_result(provider, account: str, ok: bool,
-                              status_code: Optional[int] = None, error: str = "") -> None:
+                              status_code: Optional[int] = None, error: str = "",
+                              model_id: str = "") -> None:
     """把一次上游调用的结果记到 OAuth 账号（失败→账号级冷却；成功→清零）。
 
     仅对 OAuth 多账号路由有意义；account 为空（标准 key/free_tier/未选号）直接跳过。
     失败时先过 `is_account_worthy_error` 闸：空输出/内容校验类失败不冷却账号。
+    model_id：本次请求的模型（裸 id）——错误命中「每日限额」文案时改记
+    (账号×模型) 限额记录而非账号冷却（见 oauth_client.note_request_result）。
     永不抛异常、永不阻塞主流程（内部吞掉一切错误）。"""
     if not account:
         return
-    if not ok and not is_account_worthy_error(error, status_code):
-        return
+    if not ok:
+        # 每日限额（带重置时间的文案）必须记录，不受常规资格闸约束；
+        # 其余失败仍先过 is_account_worthy_error 闸：空输出/内容校验类不冷却账号。
+        from server.core.quota_limit import is_daily_limit_text
+        if not (model_id and is_daily_limit_text(error)) \
+                and not is_account_worthy_error(error, status_code):
+            return
     try:
         from server.core.oauth_client import get_oauth_client
         code = getattr(provider, "oauth_code", None) if provider is not None else None
@@ -116,7 +124,9 @@ async def note_account_result(provider, account: str, ok: bool,
         if not code:
             return
         await get_oauth_client().note_request_result(
-            code, account, ok=ok, status_code=status_code, error=error or "")
+            code, account, ok=ok, status_code=status_code, error=error or "",
+            model_id=model_id or "",
+            provider_id=getattr(provider, "id", None) if provider is not None else None)
     except Exception as e:
         logger.debug("note_account_result failed: %s", e)
 
@@ -144,12 +154,36 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
             # v4.2: 多账号连接时按 provider.oauth_owner 点名取号；
             # 空=自动（多账号时按「余额最近到期 + 账号冷却」排序选号，见 pick_access_token_ex）
             owner = (getattr(provider, "oauth_owner", None) or "").strip() or "__default"
-            got = (await get_oauth_client().pick_access_token_ex(oauth_code, db, owner=owner)
+            # model_id 供选号时跳过「该模型今日额度已用完」的账号（(账号×模型) 限额，
+            # 2026-10-16）；该账号的其他模型不受影响
+            got = (await get_oauth_client().pick_access_token_ex(
+                       oauth_code, db, owner=owner,
+                       model_id=getattr(model, "model_id", "") or "")
                    if oauth_p else None)
             if not got:
-                rc.error = (f"OAuth provider '{oauth_code}' not connected"
-                            if owner == "__default"
-                            else f"OAuth provider '{oauth_code}' account '{owner}' not connected")
+                _err = (f"OAuth provider '{oauth_code}' not connected"
+                        if owner == "__default"
+                        else f"OAuth provider '{oauth_code}' account '{owner}' not connected")
+                # 区分「全部账号该模型今日额度已用完」：自动路由应换模型，而非误报未连接
+                # （(账号×模型) 每日限额，2026-10-16）
+                _mid = getattr(model, "model_id", "") or ""
+                if owner == "__default" and _mid:
+                    try:
+                        from server.core.quota_store import active_limit_owners
+                        _lim = await active_limit_owners(db, oauth_code, _mid)
+                        if _lim:
+                            from sqlalchemy import select as _sel
+                            from server.models.oauth_token import OAuthToken as _OT
+                            _rows = (await db.execute(_sel(_OT).where(
+                                _OT.provider_code == oauth_code,
+                                _OT.is_active == True))).scalars().all()  # noqa: E712
+                            if _rows and all(r.owner in _lim for r in _rows):
+                                _latest = max(_lim.values())
+                                _err = (f"quota_limited: model '{_mid}' daily quota exhausted on "
+                                        f"all accounts; resets at {_latest.isoformat()}Z")
+                    except Exception:
+                        pass
+                rc.error = _err
                 return rc
             rc.account, token = got[0], got[1]
             rc.oauth_code = oauth_code
