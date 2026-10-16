@@ -241,3 +241,21 @@
 - 修复后浏览器复核：见下方「验证」小节（隧道 18600 → 点「今日」/刷新，确认 `end` 随当前时刻前进）
 ### 未完成 / 建议
 - 若还有别的页面用「挂载时刻快照」做时间窗（同类 computed 陷阱），应按同一模式排查；本次已把工具抽到 `rangePresets.js` 供复用
+
+## Session 17 - 2026-10-15
+### 完成（OAuth 多账号频率感知分流：高频自动负载、低频粘住）
+- ✅ **需求**：用户观察到 workbuddy（CodeBuddy）国际服与 CN 自动选号一直打同一个账号。生产实锤：近 24h CN 4620 次里 **91.6%** 集中在 159 账号（386 次给 135 账号=冷却回退期）；Intl 594 次里 **68.7%** 集中在 1355386364@qq.com。要求：高频自动多账号负载、低频保持 F40 粘住
+- ✅ **实现**（commit 13bab80，后端，已部署重启）：
+  - 新增 `server/core/account_balancer.py`：纯进程内滑窗计数（默认 60s）+ 滞回阈值（`enter_requests`=10 进入分流 / `exit_requests`=3 退回粘住）；`note_selection`（自动+点名取号成功都记账）、`is_balancing`、`account_load_key`、`stats`、`reset`
+  - 接线：`oauth_client._rank_auto_rows` 分流模式在「额度档位」后插 `(窗口请求数, 最近使用)`；低频路径恒定负载位 `(0,0.0)` 与 F40 完全等价；`pick_access_token_ex` 两条成功路径记账（永不影响取号）
+  - **闸门不变**：冷却账号、已耗尽账号（档位 2）照旧排最后，分流绝不动它们；点名不受影响；单账号无操作
+  - 配置 `config.oauth_balance`（enabled 默认开），每调用读配置热改即时生效（照 inflight_gate 模式）
+- ✅ **测试**：新增 `tests/test_oauth_balance.py` 14 项 + `tests/conftest.py` autouse 重置夹具（**新教训：进程全局态会跨测试累积**——19 次 pick/60s 就会误开分流，必须逐测试 reset）；既有 23 项多账号测试不改一字全绿；全量 **1059 全绿**
+- ✅ **生产验证**：pm2 restart 后 14 并发请求 `CodeBuddy CN/deepseek-v4-flash` 全 200，routed_account 分布 **10 + 4** —— 前 10 次粘住（阈值内）、第 11 次起自动分流给计数 0 的第二账号。与设计逐步吻合
+### 行为说明（给用户）
+- 低频（60s 内 <10 次）：保持原样——优先「有余额且积分最近到期」的账号，失败才冷却切换
+- 高频（60s 内 ≥10 次）：同额度档位的账号自动轮流（计数落后者先接管）；掉回低频 30s 内回到粘住
+- 阈值可调：服务器 config.yaml 加 `oauth_balance: {enter_requests, exit_requests, window_seconds, enabled}`，改完即时生效（此配置段默认不在文件里，走代码默认值）
+### 未完成 / 建议
+- 分流状态（`account_balancer.stats()`）暂未透出到设置页/分析页，需要时可以加一个只读卡片
+- 若希望「达到阈值立即均匀 50/50」而不是「落后者先追平再轮流」，把 `account_load_key` 的 count 比较换成 LRU-only 即可（现实现=负载均衡语义）
