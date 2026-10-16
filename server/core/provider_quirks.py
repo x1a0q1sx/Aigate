@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -106,6 +107,7 @@ class ProviderQuirks:
     unwrap_envelope: bool = False       # 非流式响应 {success,data} 解包
     neutralize_competitor_tokens: bool = False  # 出站前等价改写竞品客户端名（u1s1 指纹黑名单）
     blocked_tool_names: dict = field(default_factory=dict)  # 上游按工具名拦截：原名→出站别名
+    client_headers: bool = False        # chat 请求补官方客户端头族（CodeBuddy Intl 渠道校验）
     default_headers: dict = field(default_factory=dict)
 
 
@@ -127,6 +129,10 @@ _CODEBUDDY_INTL = ProviderQuirks(
     name="codebuddy_intl",
     force_stream=True,
     ide_message_shape=True,
+    # 2026-10-16：Intl 上游按账号灰度强制「渠道校验」——要求官方客户端头族
+    # X-Conversation-*（三件套缺一即 400/11128「没通过渠道校验 / request illegal」；
+    # 同 payload 换账号通过=灰度桶内才强制）。CN 无此校验（多源交叉 A/B），保持干净。
+    client_headers=True,
     default_headers={
         "User-Agent": "IDE/2.108.1 CodeBuddy/2.108.1",
         "X-Product": "SaaS",
@@ -205,6 +211,61 @@ def quirks_for(base_url: str) -> Optional[ProviderQuirks]:
         if domain in url:
             return q
     return None
+
+
+def _first_user_text(payload: dict) -> str:
+    """首条 user 消息的文本（会话 id 派生种子；取不到返回空串）。"""
+    try:
+        for m in (payload or {}).get("messages") or []:
+            if (m or {}).get("role") == "user":
+                return _flatten_content(m.get("content"))
+    except Exception:
+        pass
+    return ""
+
+
+def codebuddy_client_headers(api_key: str, payload: dict = None, url: str = "") -> dict:
+    """CodeBuddy 国际版「渠道校验」官方客户端头族（2026-10-16 社区多源交叉实证）。
+
+    硬判据 = X-Conversation-ID / X-Conversation-Request-ID / X-Conversation-Message-ID
+    三件套缺一即 400/11128（单发一个仍拦，三件齐即 200）；其余头非判据但与官方一致
+    （官方 CLI isSkippableInternalHeader 白名单里的这族就是「客户端指纹」，
+    未来收紧的候选对象，带上免费）。UA 不是判据（CLI/2.63.2、WorkBuddy/5.5.2 均不
+    影响该闸）。会话族取值：
+      - Conversation-ID 按（账号 × 首条用户消息）uuid5 稳定派生——多账号池必须把
+        「官方每设备一个」的值落到账号维度，否则同一 id 挂 N 个账号反而是账号关联特征；
+      - Request/Message-ID 每请求随机（官方形态：32 位 hex，与 dashed UUID 均被接受）。
+    """
+    seed = _first_user_text(payload)
+    if seed:
+        conv = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                              f"aigate-cbai:{api_key or ''}:{seed[:512]}"))
+    else:
+        conv = str(uuid.uuid4())
+    req_id = uuid.uuid4().hex
+    msg_id = uuid.uuid4().hex
+    trace = uuid.uuid4().hex
+    span = uuid.uuid4().hex[:16]
+    host = (url or "").split("//", 1)[-1].split("/", 1)[0] or "www.codebuddy.ai"
+    return {
+        "X-Conversation-ID": conv,
+        "X-Conversation-Request-ID": req_id,
+        "X-Conversation-Message-ID": msg_id,
+        "X-Request-ID": msg_id,               # 官方：与 Message-ID 同值
+        "X-Root-Request-ID": req_id,          # 官方：与 Conversation-Request-ID 同值
+        "X-Trace-ID": trace,
+        "traceparent": f"00-{trace}-{span}-01",
+        "b3": f"{trace}-{span}-1",
+        "X-B3-TraceId": trace,
+        "X-B3-SpanId": span,
+        "X-B3-Sampled": "1",
+        "X-Agent-Intent": "craft",
+        "X-Agent-Purpose": "conversation",
+        "X-Agent-Type": "main",
+        "X-Agent-Runtime": "local-agent",
+        "X-Private-Data": "true",
+        "X-Domain": host,
+    }
 
 
 # Cline OAuth access token 是 WorkOS JWT（base64url eyJ… 开头）。

@@ -207,6 +207,65 @@ async def test_start_muse_device_requires_all_fields(monkeypatch):
     assert "error" in r and "missing fields" in r["error"]
 
 
+@pytest.mark.asyncio
+async def test_start_muse_device_retries_transport_failure(monkeypatch):
+    """出口抖动（SSL EOF）重试一次即成功——生产实测用户点 5 次连接有 2 次撞上抖动。"""
+    import asyncio as _real_asyncio
+    import httpx as _httpx
+
+    attempts = {"n": 0}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, data=None, **k):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _httpx.ConnectError(
+                    "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+            return _Resp(200, {"device_code": "dc-2", "user_code": "AAAA-1111",
+                               "verification_uri": "https://auth.meta.com/oauth/device/",
+                               "interval": 5, "expires_in": 600})
+
+    class _FastAsyncio:
+        @staticmethod
+        async def sleep(*a, **k):
+            return None
+
+        create_task = staticmethod(_real_asyncio.create_task)
+
+    monkeypatch.setattr(oc.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(oc, "asyncio", _FastAsyncio)
+    c = OAuthClient(crypto=FakeCrypto())
+
+    async def fake_poll(*a, **k):
+        pass
+
+    c._poll_muse_device = fake_poll
+    r = await c.start_muse_device("muse", None)
+    assert r["state"] == "dc-2" and attempts["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_start_muse_device_http_400_not_retried(monkeypatch):
+    """HTTP 4xx 是上游判定（设备码申请限流等），重试没意义 → 只发一次。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (429, {"error": "slow_down"}),
+    ]))
+    r = await c.start_muse_device("muse", None)
+    assert "error" in r and "429" in r["error"]
+    assert len([x for x in calls if x.get("method") == "post"]) == 1
+
+
 # ── 轮询 → 铸 key → 落库 ──────────────────────────────────
 
 @pytest.mark.asyncio

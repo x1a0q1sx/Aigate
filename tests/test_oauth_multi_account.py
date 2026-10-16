@@ -240,9 +240,54 @@ def test_account_worthy_error_classification():
     assert is_account_worthy_error("usage exceeds frequency limit")
     assert is_account_worthy_error("x", status_code=401)
     assert is_account_worthy_error("x", status_code=503)
+    # 上游账号级风控拦截（CodeBuddy 国际版 11128）：HTTP 400 也是「这个账号打不通」
+    # —— 2026-10-16 实测：同 payload 换账号 12/12 通过、被拦账号 9/9 全败
+    assert is_account_worthy_error(
+        "upstream_call_failed: HTTPStatusError: Client error '400 Bad Request' for url "
+        "'https://www.codebuddy.ai/v2/chat/completions'\nResponse: {\"code\":11128,"
+        "\"msg\":\"request illegal\",\"displayMsg\":{\"zh\":\"请求被拦截，请重新发送\"}}")
+    assert is_account_worthy_error("这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。")
     # 内容类问题不该冷却账号
     assert not is_account_worthy_error("empty_output: upstream 返回 200 但无内容")
     assert not is_account_worthy_error("race_overtaken: 15s 内无返回")
+    # 普通 400（请求体不合法）与风控无关，仍不冷却
+    assert not is_account_worthy_error("HTTP 400: invalid request body", status_code=400)
+
+
+def test_account_cooldown_seconds_risk_block_tier():
+    """风控拦截不是瞬时故障 → 30 分钟基础档（否则 120s 一过又要牺牲请求去试探）。"""
+    from server.core.oauth_client import OAuthClient
+    assert OAuthClient._account_cooldown_seconds(400, 1) == 120
+    assert OAuthClient._account_cooldown_seconds(400, 1, True) == 1800
+    assert OAuthClient._account_cooldown_seconds(400, 2, True) == 3600   # 指数退避仍生效
+    assert OAuthClient._account_cooldown_seconds(429, 1, True) == 1800   # 风控档优先于 429 档
+
+
+@pytest.mark.asyncio
+async def test_note_request_result_risk_block_sets_long_cooldown(tmp_path, monkeypatch):
+    """11128 走到 note_request_result 时要真的进冷却，且直接用 30 分钟档。"""
+    from server.core.oauth_client import get_oauth_client
+    import server.core.oauth_client as oc
+    engine, Session = await _oauth_setup(tmp_path)
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    monkeypatch.setattr("server.db.AsyncSessionLocal", Session)
+    err = ("upstream_call_failed: HTTPStatusError: Client error '400 Bad Request' for url "
+           "'https://www.codebuddy.ai/v2/chat/completions'\nResponse: "
+           "{\"code\":11128,\"msg\":\"request illegal\"}")
+    try:
+        await client.note_request_result("codebuddy_intl", "acct-a", ok=False,
+                                         status_code=400, error=err)
+        async with Session() as db:
+            row = (await db.execute(
+                __import__("sqlalchemy").select(OAuthToken).where(OAuthToken.owner == "acct-a")
+            )).scalar_one()
+        assert row.fail_count == 1 and row.cooldown_until is not None
+        delta = (row.cooldown_until - datetime.utcnow()).total_seconds()
+        assert 1700 < delta <= 1800, f"风控档应为 1800s，实际 {delta}"
+    finally:
+        oc._ACCOUNT_DIRTY.discard(("codebuddy_intl", "acct-a"))
+        await engine.dispose()
 
 
 def test_status_from_error_text_extraction():

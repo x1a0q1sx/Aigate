@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from server.db import AsyncSessionLocal
 from server.models.oauth_token import OAuthToken
 from server.core.crypto_service import get_crypto_service, CryptoService
+from server.core.error_text import is_risk_block_text
 from server.core.oauth_registry import OAuthProviderConfig, get_oauth_provider
 
 logger = logging.getLogger(__name__)
@@ -1195,19 +1196,33 @@ class OAuthClient:
         if ep.get("auth_mode") != "muse_device":
             return {"error": "provider not muse_device mode"}
         device_url = ep.get("device_url") or provider.authorize_url
+        # 传输层失败重试 2 次：Meta 走 mihomo 出口，SSL EOF 抖动实测常见
+        # （2026-10-16 生产：用户点 5 次连接，3 次成功 2 次撞上出口抖动被记成 400）。
+        # HTTP 4xx 是上游判定（如设备码申请限流），不重试。
+        resp = None
+        last_exc = ""
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
+                    resp = await client.post(
+                        device_url,
+                        data={"client_id": provider.client_id},
+                        headers={"Accept": "application/json",
+                                 "x-api-version": ep.get("api_version", "1.0.0")},
+                    )
+                break
+            except Exception as e:
+                last_exc = f"start_muse_device exception: {e}"
+                if attempt < 2:
+                    await asyncio.sleep(2 * (attempt + 1))
+        if resp is None:
+            return {"error": last_exc or "start_muse_device failed"}
+        if resp.status_code >= 400:
+            return {"error": f"muse device start http {resp.status_code}: {resp.text[:200]}"}
         try:
-            async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
-                resp = await client.post(
-                    device_url,
-                    data={"client_id": provider.client_id},
-                    headers={"Accept": "application/json",
-                             "x-api-version": ep.get("api_version", "1.0.0")},
-                )
-            if resp.status_code >= 400:
-                return {"error": f"muse device start http {resp.status_code}: {resp.text[:200]}"}
             data = resp.json()
         except Exception as e:
-            return {"error": f"start_muse_device exception: {e}"}
+            return {"error": f"muse device start json: {e}"}
         device_code = str(data.get("device_code") or "")
         user_code = str(data.get("user_code") or "")
         verification_uri = str(data.get("verification_uri") or "")
@@ -1250,6 +1265,13 @@ class OAuthClient:
                     body = resp.json() if resp.status_code < 500 else None
                 except Exception:
                     body = None
+                if body is None and resp.status_code >= 400:
+                    # 非 JSON 错误体（WAF/网关拦截页，9router-go PR #302 实证 Meta 会这么干）：
+                    # 当成终止，别按 pending 空转到过期；429/5xx 属瞬时，继续轮询
+                    if resp.status_code in (429,) or resp.status_code >= 500:
+                        continue
+                    logger.warning("muse poll terminal: HTTP %s non-JSON body", resp.status_code)
+                    return
                 if body and not body.get("error"):
                     access = str(body.get("access_token") or "")
                     if not access:
@@ -1726,9 +1748,15 @@ class OAuthClient:
     _ACCOUNT_COOLDOWN_CAP = 3600
 
     @staticmethod
-    def _account_cooldown_seconds(status_code: Optional[int], fail_count: int) -> int:
-        """失败 → 冷却秒数：429=60s 起、401/403=300s 起、其余=120s 起，指数退避封顶 1h。"""
-        if status_code == 429:
+    def _account_cooldown_seconds(status_code: Optional[int], fail_count: int,
+                                  risk_block: bool = False) -> int:
+        """失败 → 冷却秒数：429=60s 起、401/403=300s 起、其余=120s 起，指数退避封顶 1h。
+
+        账号级风控拦截（CodeBuddy 11128 等，见 error_text.is_risk_block_text）不是瞬时
+        故障，用 120s 基础档只会反复牺牲请求去试探 → 直接 30 分钟起步（仍受 1h 封顶）。"""
+        if risk_block:
+            base = 1800
+        elif status_code == 429:
             base = 60
         elif status_code in (401, 403):
             base = 300
@@ -1896,13 +1924,13 @@ class OAuthClient:
                     return
                 fc = int(row.fail_count or 0) + 1
                 row.fail_count = fc
-                row.cooldown_until = _now_utc() + timedelta(
-                    seconds=self._account_cooldown_seconds(status_code, fc))
+                risk = is_risk_block_text(error)
+                secs = self._account_cooldown_seconds(status_code, fc, risk)
+                row.cooldown_until = _now_utc() + timedelta(seconds=secs)
                 await db.commit()
                 logger.info(
-                    "oauth account %s/%s entering cooldown %ss (fail#%d status=%s)",
-                    provider_code, owner,
-                    self._account_cooldown_seconds(status_code, fc), fc, status_code)
+                    "oauth account %s/%s entering cooldown %ss (fail#%d status=%s risk_block=%s)",
+                    provider_code, owner, secs, fc, status_code, risk)
         except Exception as e:
             logger.debug("note_request_result failed: %s", e)
 

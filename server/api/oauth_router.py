@@ -180,11 +180,14 @@ async def start_oauth_authorize(provider_code: str, request: Request,
             "login_url": r["login_url"],
             "user_code": _code,
             "poll_interval_ms": r["poll_interval_ms"],
-            "message": (f"请在新窗口打开链接，使用 Meta 账号登录并输入设备码 "
-                        f"{_code} 批准本设备；批准后系统会自动铸造推理 key"
-                        if _code else
-                        "请在新窗口打开链接，使用 Meta 账号登录并批准本设备，"
-                        "批准后系统会自动铸造推理 key"),
+            "message": (
+                "请在新窗口用 Meta 账号登录并批准本设备"
+                + (f"（设备码 {_code} 已内嵌在链接里，无需手输）" if _code else "")
+                + "。设备码 10 分钟内有效。Muse 按区域开放：若页面报"
+                "「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧拒绝"
+                "（地区/代理出口被标记，或用了托管/工作账号）——需个人账号 + 支持区域的"
+                "干净网络，建议无痕窗口重试；回本页重新点连接即可换新码。"
+                "批准成功后系统会自动铸造推理 key。"),
         }
     # ── Qoder 设备流（本地 PKCE+nonce → 轮询收 dt- token + 签名元数据）────
     if (provider.extra_params or {}).get("auth_mode") == "qoder_device":

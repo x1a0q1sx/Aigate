@@ -74,6 +74,18 @@ def _proxy_suffix() -> str:
         return ""
 
 
+def is_risk_block_text(error) -> bool:
+    """错误文本是否为上游「账号级风控拦截」。
+
+    CodeBuddy 国际版 11128 是同一风控的多个文案变体（request illegal / 请求被拦截 /
+    没通过渠道校验）；2026-10-16 实测：同 payload 换账号 12/12 通过、被拦账号 9/9 全败
+    ——与请求内容无关，语义=「这个账号被上游拉黑」，冷却换号才有用。
+    供 is_account_worthy_error 资格闸与账号冷却时长分档共用。"""
+    text = str(error or "").lower()
+    return any(m in text for m in (
+        '"code":11128', "request illegal", "没通过渠道校验", "渠道校验"))
+
+
 def err_text(e: BaseException) -> str:
     """异常 → '类型: 消息'；消息为空时沿异常链兜底生成可读描述。
 

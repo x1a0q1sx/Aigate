@@ -20,6 +20,7 @@ from typing import AsyncIterator, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from server.core.model_catalog import create_adapter_for_provider
+from server.core.error_text import is_risk_block_text
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,8 @@ def is_account_worthy_error(error, status_code: Optional[int] = None) -> bool:
     """该失败是否值得记到「账号级冷却」（账号故障 vs 内容/请求问题）。
 
     真：401/403/429、5xx、含限流语义的错误文案（rate limit / too many requests /
-    quota / usage limit / FreeUsageLimitError）——说明这个账号现在打不通，换号有用。
+    quota / usage limit / FreeUsageLimitError）、上游账号级风控拦截（CodeBuddy 11128
+    等，is_risk_block_text）——说明这个账号现在打不通，换号有用。
     假：空输出、race 取消、上下文超限（调用方已排除）等——模型/内容侧问题，
     把账号冷却了反而白白减少可用账号。"""
     try:
@@ -88,6 +90,8 @@ def is_account_worthy_error(error, status_code: Optional[int] = None) -> bool:
     except (TypeError, ValueError):
         pass
     text = str(error or "").lower()
+    if is_risk_block_text(text):
+        return True
     return any(k in text for k in (
         "rate limit", "too many requests", "quota", "usage limit",
         "freeusagelimiterror", "usage exceeds frequency"))

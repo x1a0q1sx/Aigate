@@ -14,7 +14,7 @@ from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.core.provider_quirks import (
     quirks_for, transform_payload, unwrap_response, auth_token_for,
-    restore_tool_names_in_response,
+    restore_tool_names_in_response, codebuddy_client_headers,
 )
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
@@ -149,7 +149,7 @@ class OpenAICompatAdapter(BaseAdapter):
             base += '/v1'
         return f"{base}/models"
     def _get_headers(self, api_key: str, extra_headers: dict = None, base_url: str = None,
-                     url: str = None, method: str = "POST") -> dict:
+                     url: str = None, method: str = "POST", payload: dict = None) -> dict:
         q = quirks_for(base_url) if base_url else None
         token = auth_token_for(q, api_key) if q else str(api_key or "").strip()
         # v3.1：free_tier / OAuth 路径可能给空字符串 — 不带 Authorization 头
@@ -166,6 +166,10 @@ class OpenAICompatAdapter(BaseAdapter):
         # provider 级自定义头优先覆盖
         if q and q.default_headers:
             headers.update(q.default_headers)
+        # CodeBuddy Intl 渠道校验：chat 请求必须带官方客户端头族（X-Conversation-* 三件套
+        # 缺一即 11128）；会话 id 由 payload 派生，故只对 chat/completions 且拿到 payload 时补
+        if q and q.client_headers and payload is not None and url and "/chat/completions" in url:
+            headers.update(codebuddy_client_headers(api_key, payload, url))
         # 网关内部路由标记（__proxy_* / __oauth / __dpop / __fg）不是上游协议的一部分，绝不出站；
         # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支。
         # 统一走 outbound_headers：剥离 __ 前缀内部键 + 值强制 str（httpx 硬要求）。
@@ -192,13 +196,15 @@ class OpenAICompatAdapter(BaseAdapter):
         tg_on = (extra_headers or {}).get("__fg", "1") != "0"
         aliases = (q.blocked_tool_names if q and tg_on else None)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         # reasoning dict 是网关内部思考控制提示（anthropic 出站方言）；OpenAI 兼容上游
         # 只认 reasoning_effort，透传非标字段有被严格上游 400 的风险
         payload.pop("reasoning", None)
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
+        # 头族要在 transform 之前从原始 payload 派生（会话 id 取首条 user 消息）
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST",
+                                    payload=payload)
         payload = transform_payload(payload, q, tool_guard_enabled=tg_on)
         if q and q.force_stream:
             # 流式专属上游（CodeBuddy 拒绝非流式，11101）：走 SSE 聚合成 JSON 回包
@@ -318,11 +324,13 @@ class OpenAICompatAdapter(BaseAdapter):
         tg_on = (extra_headers or {}).get("__fg", "1") != "0"
         aliases = (q.blocked_tool_names if q and tg_on else None)
         url = self._build_url(base_url)
-        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
         payload = request.model_dump(exclude_none=True)
         payload.pop("reasoning", None)  # 内部思考控制提示，非 OpenAI 标准字段
         payload["messages"] = _ensure_tool_call_ids(payload.get("messages") or [])
+        # 头族要在 transform 之前从原始 payload 派生（会话 id 取首条 user 消息）
+        headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST",
+                                    payload=payload)
         payload = transform_payload(payload, q, tool_guard_enabled=tg_on)  # 流式专属/请求体形态方言
         timeout_error = None
         try:

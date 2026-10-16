@@ -598,6 +598,90 @@ async def test_stream_chat_completion_applies_intl_shape(monkeypatch):
     assert calls[0]["headers"]["X-IDE-Type"] == "IDE"
 
 
+# ── CodeBuddy Intl「渠道校验」官方客户端头族（2026-10-16）────────────
+# 现场：Intl 上游按账号灰度强制渠道校验，缺 X-Conversation-* 三件套即
+# 400/11128（「没通过渠道校验，可能不是官方客户端发出的」/「request illegal」）。
+# 社区多源交叉（9router / workbuddy2api-hub / dsh-connect-workbuddy #66 二分）：
+# 硬判据 = 三件套缺一即拦，三件齐即通；UA 不是判据；CN 无此校验。
+
+def test_intl_quirks_declares_client_headers_cn_does_not():
+    from server.core.provider_quirks import quirks_for
+    assert quirks_for("https://www.codebuddy.ai/v2/chat/completions").client_headers is True
+    assert quirks_for("https://copilot.tencent.com/v2/chat/completions").client_headers is False
+
+
+def test_client_header_family_rules():
+    from server.core.provider_quirks import codebuddy_client_headers
+    payload = {"messages": [{"role": "system", "content": "x"},
+                            {"role": "user", "content": "写一个冒泡排序"}]}
+    u = "https://www.codebuddy.ai/v2/chat/completions"
+    h1 = codebuddy_client_headers("tok-A", payload, u)
+    h2 = codebuddy_client_headers("tok-A", payload, u)
+    # 三件套齐全（硬判据）
+    for k in ("X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"):
+        assert h1.get(k), k
+    # 官方形态：Conversation-ID 是 36 字符 dashed UUID；Request/Message-ID 是 32 位 hex
+    assert len(h1["X-Conversation-ID"]) == 36 and h1["X-Conversation-ID"].count("-") == 4
+    assert len(h1["X-Conversation-Message-ID"]) == 32
+    assert h1["X-Request-ID"] == h1["X-Conversation-Message-ID"]
+    assert h1["X-Root-Request-ID"] == h1["X-Conversation-Request-ID"]
+    assert h1["X-Domain"] == "www.codebuddy.ai"
+    assert h1["traceparent"].startswith("00-") and len(h1["X-Trace-ID"]) == 32
+    assert h1["X-Agent-Intent"] == "craft" and h1["X-Private-Data"] == "true"
+    # 同账号同首条消息 → 会话 id 稳定；请求/消息 id 每请求换新
+    assert h2["X-Conversation-ID"] == h1["X-Conversation-ID"]
+    assert h2["X-Conversation-Request-ID"] != h1["X-Conversation-Request-ID"]
+    assert h2["X-Conversation-Message-ID"] != h1["X-Conversation-Message-ID"]
+    # 换账号 → 换会话 id（多账号池不能共用「官方每设备一个」的值，否则反成关联特征）
+    h3 = codebuddy_client_headers("tok-B", payload, u)
+    assert h3["X-Conversation-ID"] != h1["X-Conversation-ID"]
+    # 取不到首条 user 消息时退回随机 id（不报错、不共用）
+    h4 = codebuddy_client_headers("tok-A", {"messages": []}, u)
+    h5 = codebuddy_client_headers("tok-A", None, u)
+    assert h4["X-Conversation-ID"] and h4["X-Conversation-ID"] != h5["X-Conversation-ID"]
+
+
+@pytest.mark.asyncio
+async def test_intl_stream_carries_client_header_family(monkeypatch):
+    from server.adapters.openai_compat import OpenAICompatAdapter
+    import server.adapters.openai_compat as oa
+    a = OpenAICompatAdapter()
+    u = "https://www.codebuddy.ai/v2/chat/completions"
+    from server.schemas.chat import ChatCompletionRequest
+    req = ChatCompletionRequest.model_validate(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True})
+
+    async def _headers_for(token):
+        calls = []
+        monkeypatch.setattr(oa.httpx, "AsyncClient", make_fake_stream_client(calls, ["data: [DONE]"]))
+        [c async for c in a.stream_chat_completion(req, token, u)]
+        return calls[0]["headers"]
+
+    h1 = await _headers_for("tok-A")
+    h2 = await _headers_for("tok-A")
+    for k in ("X-Conversation-ID", "X-Conversation-Request-ID", "X-Conversation-Message-ID"):
+        assert h1.get(k), k
+    assert h2["X-Conversation-ID"] == h1["X-Conversation-ID"]
+    assert h2["X-Conversation-Message-ID"] != h1["X-Conversation-Message-ID"]
+    assert (await _headers_for("tok-B"))["X-Conversation-ID"] != h1["X-Conversation-ID"]
+
+
+@pytest.mark.asyncio
+async def test_cn_chat_does_not_carry_client_header_family(monkeypatch):
+    from server.adapters.openai_compat import OpenAICompatAdapter
+    import server.adapters.openai_compat as oa
+    a = OpenAICompatAdapter()
+    calls = []
+    monkeypatch.setattr(oa.httpx, "AsyncClient", make_fake_stream_client(
+        calls, ['data: {"id":"c1","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}',
+                "data: [DONE]"]))
+    from server.schemas.chat import ChatCompletionRequest
+    req = ChatCompletionRequest.model_validate(
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": False})
+    await a.chat_completion(req, "tok", "https://copilot.tencent.com/v2/chat/completions")
+    assert "X-Conversation-ID" not in calls[0]["headers"]
+
+
 # ── 凭证身份守卫（2026-09-22 事故回归锁）──────────────────────
 # 事故：`一键连接` 的 owner 在**轮询开始前**就已分配好，而用户可能在另一个账号上
 # 完成登录 → 第二次登录把第一个账号的连接覆盖成新账号的 token。实测后果：
