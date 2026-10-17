@@ -141,9 +141,9 @@ def test_build_payload_context_tier_auto_upgrade():
 
 def test_build_payload_max_tokens_min_rule():
     a = QoderAdapter()
-    body = {"model": "lite", "messages": [{"role": "user", "content": "hi"}],
+    body = {"model": "qfmodel", "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 1000}
-    p = a._build_payload(body, "lite", _cfg(max_output_tokens=8000), {"user_id": "u"})
+    p = a._build_payload(body, "qfmodel", _cfg(max_output_tokens=8000), {"user_id": "u"})
     assert p["parameters"]["max_tokens"] == 1000
 
 
@@ -267,8 +267,8 @@ def test_stream_billing_first_frame_raises(monkeypatch):
     _patch_stream(monkeypatch, lines)
 
     async def run():
-        req = SimpleNamespace(model="lite",
-                              model_dump=lambda: {"model": "lite",
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
                                                   "messages": [{"role": "user", "content": "hi"}]})
         async for _ in a.stream_chat_completion(req, "dt-1", ""):
             pass
@@ -290,8 +290,8 @@ def test_non_stream_collects_tools_and_usage(monkeypatch):
     _patch_stream(monkeypatch, lines)
 
     async def run():
-        req = SimpleNamespace(model="lite",
-                              model_dump=lambda: {"model": "lite",
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
                                                   "messages": [{"role": "user", "content": "time?"}]})
         return await a.chat_completion(req, "dt-1", "")
 
@@ -627,3 +627,58 @@ def test_stream_queue_counts_down_and_respects_budget(monkeypatch):
     # 等待总量不得超过总预算；且每次等的是上游给的值（60 封顶后）
     assert sum(slept) <= qa_mod.QODER_QUEUE_TOTAL_BUDGET_SECONDS
     assert all(w == 60 for w in slept), "必须尊重上游倒计时值（封顶 60）"
+
+
+# ── 目录版本闸（2026-10-17）：Cosy-Version 决定上游下发哪套模型 ──
+def test_cosy_version_is_current_cli_not_ancient():
+    """⚠️ 回归锁：1.0.0 时上游只下发 15 个旧模型（无 fast/Sonus/Cantus，
+    且含已下架的 performance）——版本钉死会让「刷新模型」永远看不到新模型。
+    当前 npm @qoder-ai/qodercli latest = 1.1.73。"""
+    assert qs.QODER_IDE_VERSION >= "1.1.73", \
+        f"Cosy-Version 过旧（{qs.QODER_IDE_VERSION}），上游会下发旧模型目录"
+    h = build_cosy_headers(b"", "https://api3.qoder.sh/algo/api/v2/model/list",
+                           {"user_id": "u", "auth_token": "dt-x"})
+    assert h["Cosy-Version"] == qs.QODER_IDE_VERSION
+
+
+def test_qoder_static_seed_has_new_models_and_no_delisted():
+    p = get_oauth_provider("qoder")
+    ids = {m["model_id"] for m in p.static_models}
+    # 1.1.73 目录新增
+    assert {"fast", "smodel", "cmodel"} <= ids
+    # 已从上游目录消失的旧键不得留在种子里
+    assert "performance" not in ids and "lite" not in ids
+
+
+def test_queue_resource_limit_reports_actionable_reason(monkeypatch):
+    """RESOURCE_LIMIT（免费模型高峰限流）报错必须带可操作提示，
+    而不是笼统「上游繁忙」——生产实测 qfmodel/dfmodel 全天排队。"""
+    a = _ready_adapter(monkeypatch)
+
+    def frame():
+        inner = json.dumps({"code": "403", "message": json.dumps({
+            "code": "10605", "message": json.dumps({
+                "isQueued": True, "modelKey": "qfmodel", "retryAfterSeconds": 5,
+                "subCode": "RESOURCE_LIMIT"})})})
+        return "data: " + json.dumps({"statusCodeValue": 403, "body": inner})
+
+    n = qa_mod.QODER_QUEUE_MAX_RETRIES + 1
+    _patch_stream_seq(monkeypatch, [[frame()] for _ in range(n)])
+
+    async def fake_sleep(sec):
+        pass
+
+    monkeypatch.setattr(qa_mod.asyncio, "sleep", fake_sleep)
+
+    async def run():
+        req = SimpleNamespace(model="qfmodel",
+                              model_dump=lambda: {"model": "qfmodel",
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        async for _ in a.stream_chat_completion(req, "dt-1", ""):
+            pass
+
+    with pytest.raises(RuntimeError) as ei:
+        asyncio.run(run())
+    msg = str(ei.value)
+    assert "RESOURCE_LIMIT" in msg
+    assert "错峰" in msg, "免费模型限流必须提示错峰，不能只说繁忙"

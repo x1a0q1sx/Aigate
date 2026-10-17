@@ -56,7 +56,8 @@ _INFLIGHT: Dict[str, asyncio.Task] = {}
 _PAT_JOBS: Dict[str, dict] = {}       # pt-xxx -> {token, uid, exp}
 
 _QODER_STATIC_HINT = {
-    "auto", "ultimate", "performance", "efficient", "lite",
+    "auto", "ultimate", "fast", "efficient",
+    "smodel", "cmodel",
     "qmodel", "qfmodel", "qmodel_latest", "qmodel_38max",
     "kmodel", "kmodel_latest", "gmodel", "gfmodel",
     "dmodel", "dfmodel", "mmodel",
@@ -662,9 +663,13 @@ class QoderAdapter(BaseAdapter):
                             qsig = _parse_queue_signal(inner) if first_frame else None
                             if qsig is not None:
                                 if queue_tries >= QODER_QUEUE_MAX_RETRIES:
+                                    _sub = str(qsig.get("subCode") or "")
+                                    _hint = ("；免费模型高峰期限流，建议错峰（Qoder 错峰时段 22:00-08:00 UTC+8）或换模型"
+                                             if _sub == "RESOURCE_LIMIT" else "")
                                     raise RuntimeError(
-                                        f"qoder 上游繁忙（排队重试 {queue_tries} 次仍未放行）：模型 "
-                                        f"{qsig.get('modelKey') or qoder_key}")
+                                        f"qoder 上游繁忙（排队/资源受限，模型 {qsig.get('modelKey') or qoder_key}"
+                                        f"{'，subCode=' + _sub if _sub else ''}，"
+                                        f"已重试 {queue_tries} 次仍未放行{_hint}）")
                                 # ⚠️ 尊重上游倒计时：retryAfterSeconds 是「还要等多久」，
                                 # 抢跑会在窗口中途耗尽重试次数（实测倒计时 30→11）
                                 wait_s = max(1, min(

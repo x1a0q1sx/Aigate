@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import time
 import uuid
 from typing import Optional
@@ -44,7 +45,12 @@ QODER_CHAT_URL_ENCODED = (
 )
 
 # ── 指纹常量（上游签名校验依赖，勿改） ─────────────────
-QODER_IDE_VERSION = "1.0.0"
+# ⚠️ 模型目录**按客户端版本下发**（2026-10-17 实测）：
+#   1.0.0 → 15 个（含已下架的 performance，无 fast/Sonus/Cantus）
+#   1.1.73（当前 npm @qoder-ai/qodercli latest）→ 17 个（fast/smodel/cmodel 上新）
+# 版本钉死会让「刷新模型」永远看不到上游新增模型，升级 CLI 后需同步改这里。
+# 可用环境变量 QODER_CLI_VERSION 覆盖（排查新目录/灰度时无需改代码）。
+QODER_IDE_VERSION = os.environ.get("QODER_CLI_VERSION") or "1.1.73"
 QODER_CLIENT_TYPE = "5"
 QODER_DATA_POLICY = "disagree"
 QODER_LOGIN_VERSION = "v2"

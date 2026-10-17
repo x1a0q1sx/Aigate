@@ -312,8 +312,12 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             "quota_usage_url": "https://openapi.qoder.sh/api/v2/quota/usage",
         },
         static_models=_seed(
-            ("auto", "Auto"), ("ultimate", "Ultimate"), ("performance", "Performance"),
-            ("efficient", "Efficient"), ("lite", "Lite"),
+            # ⚠️ 种子只在「在线目录拉取失败」时兜底；在线目录按客户端版本下发，
+            # 旧种子里的 performance/lite 已从上游目录消失（2026-10-17 1.1.73 实测
+            # 15→17：performance 下架、fast/smodel/cmodel 上新），这里同步校准，
+            # 避免断网时把已下架模型当可用（刷新会按上游清掉，但种子不该反向误导）。
+            ("auto", "Auto"), ("ultimate", "Ultimate"), ("fast", "Fast"),
+            ("efficient", "Efficient"), ("smodel", "Sonus"), ("cmodel", "Cantus"),
             ("qmodel_38max", "Qwen3.8-Max"), ("qmodel_latest", "Qwen3.7-Max"),
             ("qmodel", "Qwen3.7-Plus"), ("qfmodel", "Qwen3.8-Flash"),
             ("kmodel_latest", "Kimi-K3"), ("kmodel", "Kimi-K2.7-Code"),
