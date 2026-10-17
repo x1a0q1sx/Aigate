@@ -398,3 +398,17 @@
   - 切换服务商自动落到第一家模型；重选同一服务商保留当前模型
   - 新增 `tests/test_frontend_playground_search.py` 6 项静态回归；全量 **1151 全绿**；前端 build 通过
   - 纯前端改动：部署只需 `git pull + cd client && npm run build`，无需重启 pm2
+
+## Session 25 - 2026-10-18
+### 完成（Playground 智商测试图标行 + muse OAuth 对照上游加固）
+- ✅ **用户任务 1：Playground 加智商测试（只留图标 + 悬停文字提示）**
+  - 调研 GitHub/公开 benchmark，收录 10 道经典题（糖果保底 21 / strawberry 数 r / 蝙蝠球 / 9.11 vs 9.9 / 兄弟姐妹 / 蜗牛爬井 / 时钟 7.5° / 千瓶药水 / 日期推理 / Sally-Anne），每题带考察点与「常见错误答案」
+  - UI：只渲染 emoji 按钮（title/aria-label 给名称），悬停/聚焦在下方展开题目+答案，点击把题干填入输入框（不直接发送）
+  - 新增 `tests/test_frontend_playground_iq.py` 3 项
+- ✅ **用户任务 2：muse OAuth 照搬成熟项目**
+  - 逐字段核对 CLIProxyAPI(55.5k★)/opencode-muse-auth/9router/oh-my-pi/pi-meta-oauth/hermes：**请求形状完全一致**，无 scope/PKCE/redirect；CLIProxyAPI #6242 维护者定性「Sign-in failed」= Meta 门户浏览器侧拒绝（地区/托管账号/代理干扰），非代码问题
+  - 实修：统一官方 UA `muse-code/1.0.2`；整条设备流固定单代理出口（原 round-robin 会 JP→SG→US 跳变）；铸 key 429/5xx 重试 3 次 + 解析 Meta 错误信封；key 寿命 30 天 + lead 7 天（每 23 天重铸，原每 24h）；导入 LLM| key 自动 30 天
+  - 新增 `scripts/muse_login.py`（纯标准库）：本机同出口登录 → 打印 LLM| key → 「导入 Token」，绕开服务器/浏览器出口不一致
+  - 测试：test_muse 33 项（新增 UA/单出口/静态 TTL）
+- 全量 **1156 全绿**；前端 build 通过；已部署生产（pull + client build + pm2 restart，HEAD 3475740）
+- ⚠️ 仍待用户侧验证：浏览器端批准是否成功取决于 Meta 对**用户网络出口/账号类型**的判定；若仍报 Sign-in failed，用 `python scripts/muse_login.py --proxy <本机代理>` 铸 key 后导入
