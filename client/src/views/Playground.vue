@@ -5,18 +5,26 @@
       <div class="model-picker">
         <div class="form-group">
           <label>服务商</label>
-          <select v-model="selectedProviderId" @change="onProviderChange">
-            <option value="auto">Auto（智能选举）</option>
-            <option v-for="p in providersWithModels" :key="p.id" :value="String(p.id)">{{ p.name }}（{{ modelCount(p.id) }}）</option>
-          </select>
+          <!-- 可搜索：服务商名或旗下任一模型名命中都会出现在结果里（如搜 free → OpenCode） -->
+          <SearchSelect
+            :model-value="selectedProviderId"
+            :options="providerOptions"
+            placeholder="搜索服务商 / 模型名..."
+            empty-text="无匹配服务商"
+            :filter-fn="providerFilter"
+            :hint-fn="providerHint"
+            @update:model-value="onProviderPick"
+          />
         </div>
         <div class="form-group" v-if="selectedProviderId !== 'auto'">
           <label>模型</label>
-          <select v-model="selectedModelId" @change="syncModel" :disabled="modelsLoading">
-            <option v-if="modelsLoading" value="">模型加载中...</option>
-            <option v-else-if="filteredModels.length === 0" value="">（该服务商暂无可用模型）</option>
-            <option v-for="m in filteredModels" :key="m.id" :value="String(m.id)">{{ m.display_name || m.model_id }}</option>
-          </select>
+          <SearchSelect
+            :model-value="selectedModelId"
+            :options="modelOptions"
+            :placeholder="modelOptions.length ? '搜索模型...' : '（该服务商暂无可用模型）'"
+            empty-text="（该服务商暂无可用模型）"
+            @update:model-value="onModelPick"
+          />
         </div>
       </div>
       <div v-if="form.model !== 'auto'" class="selected-model"><code>{{ form.model }}</code></div>
@@ -77,6 +85,7 @@
 <script>
 import api, { apiStream } from '../api.js'
 import toast from '../toast.js'
+import SearchSelect from '../components/SearchSelect.vue'
 
 const PELICAN_PROMPT = '创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试'
 // 只取回复中的 HTML 代码：优先 ``` 围栏（含 html/xml 等语言标记），
@@ -120,9 +129,10 @@ const MAX_STORED_TEXT = 60000   // 单条记录的正文/HTML 上限，防会话
 
 export default {
   name: 'PlaygroundView',
+  components: { SearchSelect },
   data() {
     return {
-      providers: [], modelStats: {}, models: [], loadedPid: null, modelsLoading: false,
+      providers: [], modelStats: {}, lightModels: [],
       selectedProviderId: 'auto', selectedModelId: '',
       form: { model: 'auto', message: '' },
       loadError: '',
@@ -132,10 +142,44 @@ export default {
     }
   },
   computed: {
-    // 懒加载：服务商下拉只依赖轻量的 model-stats（每家模型数），不再等全量模型列表。
     // 已关闭服务商隐藏（2026-10-13 用户要求）：路由层跳过它们，选了也必失败。
-    providersWithModels() { return this.providers.filter(p => p.enabled !== false && (this.modelStats[p.id] || 0) > 0) },
-    filteredModels() { return this.models.filter(m => String(m.provider_id) === String(this.selectedProviderId)) }
+    providersWithModels() { return this.providers.filter(p => p.enabled !== false && this.modelCount(p.id) > 0) },
+    // 轻量全量目录（9 字段）：模型下拉与「按模型名搜服务商」共用同一份数据
+    providerModelCount() {
+      const map = {}
+      for (const m of this.lightModels) {
+        if (m.enabled === false) continue
+        map[m.provider_id] = (map[m.provider_id] || 0) + 1
+      }
+      return map
+    },
+    providerModelNames() {
+      const map = {}
+      for (const m of this.lightModels) {
+        if (m.enabled === false) continue
+        const arr = map[m.provider_id] || (map[m.provider_id] = [])
+        if (m.model_id) arr.push(m.model_id)
+        if (m.display_name && m.display_name !== m.model_id) arr.push(m.display_name)
+      }
+      return map
+    },
+    providerOptions() {
+      const opts = [{ value: 'auto', label: 'Auto（智能选举）', modelNames: [] }]
+      for (const p of this.providersWithModels) {
+        opts.push({ value: String(p.id), label: `${p.name}（${this.modelCount(p.id)}）`, modelNames: this.providerModelNames[p.id] || [] })
+      }
+      return opts
+    },
+    filteredModels() {
+      return this.lightModels.filter(m => String(m.provider_id) === String(this.selectedProviderId) && m.enabled !== false)
+    },
+    modelOptions() {
+      return this.filteredModels.map(m => ({
+        value: String(m.id),
+        label: m.display_name || m.model_id,
+        keywords: `${m.model_id || ''} ${m.display_name || ''}`,
+      }))
+    },
   },
   mounted() {
     this.runs = this.loadHistory()
@@ -148,38 +192,47 @@ export default {
     this.persist()
   },
   methods: {
-    modelCount(pid) { return this.modelStats[pid] || 0 },
+    modelCount(pid) { return this.modelStats[pid] || this.providerModelCount[pid] || 0 },
     fullId(m) { return m.full_id || ((m.provider_name || this.providers.find(p => p.id === m.provider_id)?.name || '') + '/' + m.model_id) },
-    async onProviderChange() {
-      if (this.selectedProviderId === 'auto') { this.form.model = 'auto'; this.selectedModelId = ''; return }
-      await this.loadModelsFor(this.selectedProviderId)
+    /** 服务商搜索：命中服务商名，或旗下任一模型名/显示名命中（如搜 free → OpenCode）。 */
+    providerFilter(opt, q) {
+      if (opt.value === 'auto') return 'auto'.includes(q) || '智能选举'.includes(q)
+      if ((opt.label || '').toLowerCase().includes(q)) return true
+      return (opt.modelNames || []).some(n => String(n).toLowerCase().includes(q))
     },
-    async loadModelsFor(pid) {
-      if (this.loadedPid === String(pid) && this.models.length) return
-      this.modelsLoading = true
-      this.models = []
-      this.selectedModelId = ''
-      try {
-        const list = await api.getModels({ provider_id: pid })
-        this.models = list || []
-        this.loadedPid = String(pid)
-        const first = this.models[0]
+    /** 服务商行右侧提示：输入命中模型时列出命中的模型，让「为什么这家会出现」一目了然。 */
+    providerHint(opt, query) {
+      const q = (query || '').trim().toLowerCase()
+      if (!q || opt.value === 'auto') return ''
+      const hits = (opt.modelNames || []).filter(n => String(n).toLowerCase().includes(q))
+      if (!hits.length || (opt.label || '').toLowerCase().includes(q)) return ''
+      const uniq = [...new Set(hits)]
+      return '含模型：' + uniq.slice(0, 3).join('、') + (uniq.length > 3 ? ` 等 ${uniq.length} 个` : '')
+    },
+    onProviderPick(val) {
+      const same = String(val) === String(this.selectedProviderId)
+      this.selectedProviderId = val
+      if (val === 'auto') { this.form.model = 'auto'; this.selectedModelId = ''; return }
+      // 重选同一服务商时保留当前模型，只切服务商才落到第一家
+      if (!same) {
+        const first = this.filteredModels[0]
         this.selectedModelId = first ? String(first.id) : ''
-        this.syncModel()
-      } catch (e) {
-        console.error('加载模型失败:', e)
-        this.loadError = '模型加载失败: ' + (e.message || e)
-      } finally {
-        this.modelsLoading = false
       }
+      this.syncModel()
     },
-    syncModel() { const m = this.models.find(x => String(x.id) === String(this.selectedModelId)); this.form.model = m ? this.fullId(m) : 'auto' },
+    onModelPick(val) {
+      this.selectedModelId = val
+      this.syncModel()
+    },
+    syncModel() { const m = this.filteredModels.find(x => String(x.id) === String(this.selectedModelId)); this.form.model = m ? this.fullId(m) : 'auto' },
 
     async loadInitial() {
-      // 服务商 + 每家模型数都是轻量接口，首屏秒开；模型列表等选中服务商后再按需拉取
-      const [providers, stats] = await Promise.all([
+      // 服务商 + 每家模型数 + 轻量全量模型目录并行拉取：
+      // 后两者让「服务商/模型」两个下拉都能本地即时搜索（含按模型名命中服务商），不再逐服务商懒加载。
+      const [providers, stats, light] = await Promise.all([
         api.getProviders().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
         api.getProviderModelStats().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
+        api.getModelsLight().then(d => ({ ok: true, d })).catch(e => ({ ok: false, e })),
       ])
       if (providers.ok) this.providers = providers.d || []
       if (stats.ok) {
@@ -187,9 +240,10 @@ export default {
         for (const s of (stats.d || [])) map[s.provider_id] = s.model_count
         this.modelStats = map
       }
-      const failed = [providers, stats].filter(x => !x.ok)
-      if (failed.length === 2) this.loadError = (failed[0].e?.message || String(failed[0].e)) + '（请检查网络后刷新）'
-      else if (failed.length === 1) console.error('Playground 部分加载失败:', failed[0].e)
+      if (light.ok) this.lightModels = light.d || []
+      const failed = [providers, stats, light].filter(x => !x.ok)
+      if (failed.length === 3) this.loadError = (failed[0].e?.message || String(failed[0].e)) + '（请检查网络后刷新）'
+      else if (failed.length) console.error('Playground 部分加载失败:', failed.map(x => x.e))
     },
 
     fmtNum(n) { return Number(n || 0).toLocaleString('zh-CN') },

@@ -391,3 +391,10 @@
   - DB：`models.active_schedule` + `models.promotion` 两条迁移；`ModelUpdate` 增 `active_schedule` / `clear_active_schedule`（null 与「未修改」歧义沿用 price_ratio 的显式清空开关）
 - 测试：新增 `tests/test_model_schedule.py` 22 项（窗口语义/归属日/时区/安全默认/next_open/路由与前端契约）；全量 **1145 全绿**；前端 build 通过
 - 部署：commit + push + 服务器 pull + 前端 build + pm2 restart（后端改动）
+- ✅ **补充（同日）：Playground 服务商/模型下拉可搜索**（用户要求：两个下拉都能搜索；服务商搜索按「旗下任一模型名命中」也算命中，如搜 free → OpenCode 出现）
+  - 新增通用组件 `client/src/components/SearchSelect.vue`：输入即过滤、↑/↓/Enter/Esc 键盘操作、点击外部关闭、`filterFn` 自定义匹配、`hintFn` 动态副标题
+  - Playground 首屏并行拉 `providers + model-stats + /admin/api/models/light`，两个下拉本地即时过滤；移除逐服务商懒加载 `loadModelsFor`（轻量目录 9 字段 ≈42KB gzip，不回到 2.4MB 整包）
+  - 服务商匹配：`providerFilter` = 服务商名命中 OR `modelNames` 任一命中；命中模型时行右侧 `providerHint` 显示「含模型：xxx-free、…」
+  - 切换服务商自动落到第一家模型；重选同一服务商保留当前模型
+  - 新增 `tests/test_frontend_playground_search.py` 6 项静态回归；全量 **1151 全绿**；前端 build 通过
+  - 纯前端改动：部署只需 `git pull + cd client && npm run build`，无需重启 pm2
