@@ -757,7 +757,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         redirect_uri="",                     # 设备码流，无回调
         scope="",
         use_pkce=False,
-        refresh_lead_seconds=86400,          # 提前 1 天重铸（铸 key 端点限流，别更频繁）
+        refresh_lead_seconds=7 * 86400,      # 铸出的 key 是静态凭证：30 天寿命 - 7 天 lead = 每 23 天重铸一次
         extra_params={
             "auth_mode": "muse_device",
             "refresh_style": "muse",

@@ -97,6 +97,11 @@ def _force_proxy_kwargs() -> dict:
         return {}
 
 
+# Meta Muse 设备流统一 UA（照搬 CLIProxyAPI 55.5k★ 的取值）：
+# auth.meta.com 对无 UA / 非官方 UA 的容忍度不稳定，官方 CLI 指纹最稳。
+MUSE_USER_AGENT = "muse-code/1.0.2"
+
+
 # P1-15: 判定"凭证真的失效"（该永久下线）vs "上游抖动"（只记错误，保留 active）。
 # 此前任意 >=400 都 is_active=False，上游一次 429/502/超时就把连接判死刑，
 # 调度器只扫 active 连接 → 须人工重新登录才能恢复。
@@ -1219,6 +1224,10 @@ class OAuthClient:
         if ep.get("auth_mode") != "muse_device":
             return {"error": "provider not muse_device mode"}
         device_url = ep.get("device_url") or provider.authorize_url
+        # 整条设备流固定同一个代理出口（2026-10-18）：设备码由服务器经代理申请、
+        # 由用户浏览器批准；中途换出口会让 Meta 侧看到不同来源（CLIProxyAPI #6242
+        # 的地区类拒绝）。这里只取一次 proxy_kwargs，轮询与铸 key 全部复用。
+        proxy_kwargs = _force_proxy_kwargs()
         # 传输层失败重试 2 次：Meta 走 mihomo 出口，SSL EOF 抖动实测常见
         # （2026-10-16 生产：用户点 5 次连接，3 次成功 2 次撞上出口抖动被记成 400）。
         # HTTP 4xx 是上游判定（如设备码申请限流），不重试。
@@ -1226,11 +1235,12 @@ class OAuthClient:
         last_exc = ""
         for attempt in range(3):
             try:
-                async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
+                async with httpx.AsyncClient(timeout=25, **proxy_kwargs) as client:
                     resp = await client.post(
                         device_url,
                         data={"client_id": provider.client_id},
                         headers={"Accept": "application/json",
+                                 "User-Agent": MUSE_USER_AGENT,
                                  "x-api-version": ep.get("api_version", "1.0.0")},
                     )
                 break
@@ -1256,19 +1266,25 @@ class OAuthClient:
         expires_in = int(data.get("expires_in") or 600)
         record_device_flow(provider_code, device_code, "pending", "")
         asyncio.create_task(self._poll_muse_device(
-            provider_code, device_code, owner, interval, expires_in))
+            provider_code, device_code, owner, interval, expires_in,
+            proxy_kwargs=proxy_kwargs))
         return {"state": device_code, "login_url": complete or verification_uri,
                 "user_code": user_code,
+                "code_embedded": bool(complete),
                 "poll_interval_ms": max(1, interval) * 1000, "owner": owner}
 
     async def _poll_muse_device(self, provider_code: str, device_code: str,
-                                owner: str, interval: int, expires_in: int):
+                                owner: str, interval: int, expires_in: int,
+                                proxy_kwargs: dict = None):
         """RFC 8628 轮询：authorization_pending=继续，slow_down=间隔 +5s，
-        其它错误=终止；拿到 access_token 后铸 key 落库。"""
+        其它错误=终止；拿到 access_token 后铸 key 落库。
+        proxy_kwargs 由 start_muse_device 传入 → 整条流固定同一出口。"""
         provider = get_oauth_provider(provider_code)
         if not provider:
             return
         ep = provider.extra_params or {}
+        if proxy_kwargs is None:
+            proxy_kwargs = _force_proxy_kwargs()
         token_url = ep.get("device_token_url") or provider.token_url
         interval = max(1, int(interval or 5))
         deadline = time.time() + max(60, expires_in + 30)
@@ -1276,13 +1292,14 @@ class OAuthClient:
         while time.time() < deadline:
             await asyncio.sleep(interval)
             try:
-                async with httpx.AsyncClient(timeout=20, **_force_proxy_kwargs()) as client:
+                async with httpx.AsyncClient(timeout=20, **proxy_kwargs) as client:
                     resp = await client.post(
                         token_url,
                         data={"grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                               "client_id": provider.client_id,
                               "device_code": device_code},
                         headers={"Accept": "application/json",
+                                 "User-Agent": MUSE_USER_AGENT,
                                  "x-api-version": ep.get("api_version", "1.0.0")},
                     )
                 try:
@@ -1306,7 +1323,8 @@ class OAuthClient:
                                            "token 响应缺少 access_token（上游异常响应）")
                         return
                     await self._finish_muse_login(provider_code, owner, access, ep, body,
-                                                  device_code=device_code)
+                                                  device_code=device_code,
+                                                  proxy_kwargs=proxy_kwargs)
                     return
                 err = (body or {}).get("error")
                 if err == "slow_down":
@@ -1317,9 +1335,11 @@ class OAuthClient:
                     _hint = ""
                     if err == "expired_token":
                         _hint = ("——设备码 10 分钟内未被批准。若浏览器侧曾报 "
-                                 "「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧"
-                                 "拒绝了本次授权（地区/出口被标记或账号类型不支持），"
-                                 "需在支持地区（如美国）的干净网络 + 个人账号 + 无痕窗口下重新批准")
+                                 "「Sign-in failed / Token exchange failed」，是 Meta 门户在浏览器侧"
+                                 "拒绝了本次授权（CLIProxyAPI #6242 同判：地区限制 / 企业托管账号 / "
+                                 "代理扩展干扰；设备码由服务器经代理申请、浏览器在另一网络也会触发）。"
+                                 "可改用本机同出口登录：python scripts/muse_login.py --proxy <代理> "
+                                 "铸出 LLM| key 后在「导入 Token」粘贴")
                     record_device_flow(provider_code, device_code, "failed",
                                        f"设备授权失败：{err or resp.status_code} {_hint}")
                     return
@@ -1329,14 +1349,16 @@ class OAuthClient:
         logger.info("muse device login timed out (%d slow_downs)", slow_downs)
         record_device_flow(provider_code, device_code, "failed",
                            f"设备流超时（{slow_downs} 次 slow_down）：浏览器侧未在有效期内完成批准。"
-                           "若浏览器报「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧"
-                           "拒绝（地区/出口/账号类型），需支持地区干净网络 + 个人账号重试")
+                           "若浏览器报「Sign-in failed / Token exchange failed」，是 Meta 门户在浏览器侧"
+                           "拒绝（地区/出口/账号类型）。备选：本机跑 python scripts/muse_login.py "
+                           "--proxy <代理>，把铸出的 LLM| key 用「导入 Token」录入")
 
     async def _finish_muse_login(self, provider_code: str, owner: str, oauth_access: str,
-                                 ep: dict, token_body: dict = None, device_code: str = ""):
+                                 ep: dict, token_body: dict = None, device_code: str = "",
+                                 proxy_kwargs: dict = None):
         """铸 LLM| key 并落库（access_token=key，refresh_token=OAuth token）。"""
         try:
-            minted = await self._mint_muse_key(oauth_access, ep)
+            minted = await self._mint_muse_key(oauth_access, ep, proxy_kwargs=proxy_kwargs)
         except Exception as e:
             logger.warning("muse key mint failed for %s/%s: %s", provider_code, owner, e)
             record_device_flow(provider_code, device_code, "failed",
@@ -1364,7 +1386,10 @@ class OAuthClient:
                 await self._save_token(db, provider_code, target_owner, {
                     "access_token": api_key,
                     "refresh_token": oauth_access,
-                    "expires_in": 2 * 86400,          # 见 _refresh_muse：重铸节奏 = 2d - lead(1d)
+                    # 铸出的 LLM| key 是账号绑定的静态凭证（9router/opencode 都不自动重铸）。
+                    # 设 30 天寿命 + registry 的 7 天 lead → 每 23 天才重铸一次，
+                    # 避免把激进限流的 mint 端点打成 429。
+                    "expires_in": 30 * 86400,
                     "refresh_token_expires_in": oauth_expires,
                     "token_type": "Bearer",
                     "scope": scope_meta,
@@ -1377,23 +1402,47 @@ class OAuthClient:
         logger.info("muse key acquired for %s/%s (account=%s)", provider_code, target_owner, account_id or "?")
         record_device_flow(provider_code, device_code, "ok", "")
 
-    async def _mint_muse_key(self, oauth_access_token: str, ep: dict) -> dict:
+    async def _mint_muse_key(self, oauth_access_token: str, ep: dict,
+                             proxy_kwargs: dict = None) -> dict:
         """POST api.meta.ai/muse-code/key（JSON {"onboard":true}）→ 解析 LLM| key。
 
         与官方插件同判据：is_subs_active=False → 订阅未激活；
         无 api_key 且 require_payment/action_url → 需付费；否则视为响应异常。
-        """
+
+        429/5xx 重试（照搬 9router：铸 key 端点激进限流，设备码是一次性的，
+        mint 失败若直接丢弃 OAuth token，用户必须重新走浏览器批准）。"""
         key_url = ep.get("key_url") or "https://api.meta.ai/muse-code/key"
         headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "User-Agent": MUSE_USER_AGENT,
             "x-api-version": ep.get("api_version", "1.0.0"),
             "Authorization": f"Bearer {oauth_access_token}",
         }
-        async with httpx.AsyncClient(timeout=25, **_force_proxy_kwargs()) as client:
-            resp = await client.post(key_url, json={"onboard": True}, headers=headers)
+        if proxy_kwargs is None:
+            proxy_kwargs = _force_proxy_kwargs()
+        resp = None
+        for attempt in range(3):
+            async with httpx.AsyncClient(timeout=25, **proxy_kwargs) as client:
+                resp = await client.post(key_url, json={"onboard": True}, headers=headers)
+            if resp.status_code != 429 and resp.status_code < 500:
+                break
+            if attempt < 2:
+                await asyncio.sleep(5 * (attempt + 1))
         if resp.status_code >= 400:
-            raise RuntimeError(f"muse key exchange failed: HTTP {resp.status_code} {resp.text[:200]}")
+            # Meta 错误信封（如 403 code 4705002）带 title/detail/action_url：
+            # 解析出来给用户可执行的修复入口，别只丢原始 JSON。
+            msg = f"HTTP {resp.status_code} {resp.text[:200]}"
+            try:
+                err = resp.json()
+                if err.get("title") or err.get("detail"):
+                    msg = f"HTTP {resp.status_code} " + ": ".join(
+                        str(x) for x in (err.get("title"), err.get("detail")) if x)
+                    if err.get("action_url"):
+                        msg += f" — {err['action_url']}"
+            except Exception:
+                pass
+            raise RuntimeError(f"muse key exchange failed: {msg}")
         data = resp.json()
         if data.get("is_subs_active") is False:
             raise RuntimeError("Muse Code subscription is inactive for this account")
@@ -1441,7 +1490,7 @@ class OAuthClient:
         await self._save_token(db, provider.code, existing.owner, {
             "access_token": minted["api_key"],
             "refresh_token": oauth_token,
-            "expires_in": 2 * 86400,
+            "expires_in": 30 * 86400,
             "token_type": "Bearer",
             "scope": scope_meta,
         }, update_existing=existing)

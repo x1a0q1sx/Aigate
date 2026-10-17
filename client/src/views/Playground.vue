@@ -30,7 +30,27 @@
       <div v-if="form.model !== 'auto'" class="selected-model"><code>{{ form.model }}</code></div>
       <div class="form-group">
         <label>消息</label>
-        <textarea v-model="form.message" rows="4" placeholder="输入你的消息..."></textarea>
+        <textarea ref="msgInput" v-model="form.message" rows="4" placeholder="输入你的消息..."></textarea>
+      </div>
+      <!-- 智商测试题库：只显示图标，悬停展示题目/考察点/标准答案，点击填入输入框 -->
+      <div class="iq-row">
+        <span class="iq-title">🧠 智商测试</span>
+        <div class="iq-icons">
+          <button v-for="t in iqTests" :key="t.id" type="button" class="iq-icon"
+                  :class="{ active: iqActive === t.id }" :aria-label="t.name" :title="t.name"
+                  @mouseenter="iqActive = t.id" @mouseleave="iqActive = ''"
+                  @focus="iqActive = t.id" @blur="iqActive = ''"
+                  @click="fillIqTest(t)">{{ t.emoji }}</button>
+        </div>
+        <span class="iq-caption dim">悬停看题与答案 · 点击填入输入框</span>
+      </div>
+      <div v-if="iqCurrent" class="iq-detail">
+        <div class="iq-detail-head">
+          <strong>{{ iqCurrent.emoji }} {{ iqCurrent.name }}</strong>
+          <span class="iq-tag">{{ iqCurrent.note }}</span>
+          <span class="dim">标准答案：{{ iqCurrent.answer }}</span>
+        </div>
+        <div class="iq-question">{{ iqCurrent.prompt }}</div>
       </div>
       <div class="btn-row">
         <button class="btn btn-primary" @click="send" :disabled="!form.message.trim()">发送 🚀</button>
@@ -88,6 +108,62 @@ import toast from '../toast.js'
 import SearchSelect from '../components/SearchSelect.vue'
 
 const PELICAN_PROMPT = '创建一个HTML，内容是SVG绘制一个鹈鹕骑自行车的2D动画，你不需要任何测试'
+
+// 智商测试题库（GitHub 上大模型推理测试的经典题目）：
+// 只渲染图标，悬停/聚焦显示题目与标准答案，点击把题干填入输入框。
+// 每题都带「常见错误答案」，用来判断模型是推理对了还是踩了直觉陷阱。
+const IQ_TESTS = [
+  {
+    id: 'candy', emoji: '🍬', name: '糖果保底', note: '最坏情况推理',
+    answer: '21 颗（9 颗圆形 + 12 颗五角星形）；常见错误答案 29',
+    prompt: '一个黑袋子里有三种口味的糖果：苹果味、桃子味、西瓜味。每种口味都有圆形和五角星形两种形状，形状可以靠手感摸出来，但口味摸不出来。袋子中各种糖果的数量如下：苹果味圆形 7 颗、苹果味五角星形 7 颗；桃子味圆形 9 颗、桃子味五角星形 6 颗；西瓜味圆形 8 颗、西瓜味五角星形 4 颗。你可以在不看的情况下，按形状挑选糖果。请问：最少要取出多少颗糖果，才能保证手中一定同时拥有「不同形状的苹果味和桃子味」——即要么有圆形苹果味 + 五角星形桃子味，要么有圆形桃子味 + 五角星形苹果味？请给出最少数量，并简要说明理由。最后一行只写答案。',
+  },
+  {
+    id: 'strawberry', emoji: '🍓', name: '草莓数 r', note: '字符级计数',
+    answer: '3 个；常见错误答案 2',
+    prompt: '单词 strawberry 里有几个字母 r？请只回答数字。',
+  },
+  {
+    id: 'batball', emoji: '⚾', name: '蝙蝠球', note: '认知反射 CRT',
+    answer: '0.05 美元；常见错误答案 0.10',
+    prompt: '一根球棒和一个球一共 1.10 美元。球棒比球贵 1.00 美元。球多少钱？请给出金额。',
+  },
+  {
+    id: 'decimal', emoji: '🔢', name: '小数比大小', note: '数值位值',
+    answer: '9.9 更大（9.90 > 9.11）',
+    prompt: '按数值比较，9.11 和 9.9 哪个更大？请直接回答。',
+  },
+  {
+    id: 'siblings', emoji: '👧', name: '兄弟姐妹', note: '视角转换',
+    answer: '1 个；常见错误答案 2 或 3',
+    prompt: 'Sally 有 3 个兄弟。她的每个兄弟都有 2 个姐妹。Sally 有几个姐妹？',
+  },
+  {
+    id: 'snail', emoji: '🐌', name: '蜗牛爬井', note: '边界条件',
+    answer: '第 8 天；常见错误答案 10 天',
+    prompt: '一只蜗牛在一口 10 米深的井底。它白天向上爬 3 米，晚上滑下去 2 米。请问它第几天能爬出井口？',
+  },
+  {
+    id: 'clock', emoji: '🕒', name: '时钟角度', note: '角速度/相对运动',
+    answer: '7.5°；常见错误答案 0°',
+    prompt: '钟表显示 3 点 15 分时，时针和分针之间的夹角是多少度？',
+  },
+  {
+    id: 'potion', emoji: '🧪', name: '千瓶药水', note: '二进制编码',
+    answer: '10 只，按二进制编号喂药；常见错误答案 1000/500/32',
+    prompt: '有 1000 瓶药水，其中恰好 1 瓶有毒。喝下毒药后 24 小时内会死亡。你只有 10 只小白鼠和 24 小时，如何一次找出有毒的那瓶？请说明方法。',
+  },
+  {
+    id: 'date', emoji: '📅', name: '日期推理', note: '月末进位',
+    answer: '05/01/2021',
+    prompt: '昨天是 2021 年 4 月 30 日。今天是几月几日？请用 MM/DD/YYYY 格式回答。',
+  },
+  {
+    id: 'sallyanne', emoji: '🧠', name: '莎莉安妮', note: '心智理论',
+    answer: '篮子（Sally 没看到 Anne 移动弹珠）',
+    prompt: 'Sally 把一个弹珠放进篮子里，然后离开了房间。Sally 不在时，Anne 把弹珠从篮子里拿出来，放进了盒子里。Sally 回来后，她会先去哪里找她的弹珠？',
+  },
+]
 // 只取回复中的 HTML 代码：优先 ``` 围栏（含 html/xml 等语言标记），
 // 其次从首个 <!DOCTYPE/<html 截到最后一个 </html>，再退 <svg…</svg>；都找不到则原样返回
 function extractHtml(text) {
@@ -139,9 +215,13 @@ export default {
       runs: [],
       seq: 0,
       maxRuns: MAX_RUNS,
+      iqTests: IQ_TESTS,
+      iqActive: '',
     }
   },
   computed: {
+    iqCurrent() { return this.iqTests.find((t) => t.id === this.iqActive) || null },
+
     // 已关闭服务商隐藏（2026-10-13 用户要求）：路由层跳过它们，选了也必失败。
     providersWithModels() { return this.providers.filter(p => p.enabled !== false && this.modelCount(p.id) > 0) },
     // 轻量全量目录（9 字段）：模型下拉与「按模型名搜服务商」共用同一份数据
@@ -268,6 +348,17 @@ export default {
     },
     runPelican() {
       this.newRun('pelican', this.form.model || 'auto', PELICAN_PROMPT, [{ role: 'user', content: PELICAN_PROMPT }])
+    },
+    /** 点击智商测试图标：题干填入输入框（不直接发送，用户可先改模型/追加要求）。 */
+    fillIqTest(t) {
+      this.form.message = t.prompt
+      this.$nextTick(() => {
+        const el = this.$refs.msgInput
+        if (el && el.focus) {
+          el.focus()
+          el.setSelectionRange(el.value.length, el.value.length)
+        }
+      })
     },
     newRun(kind, reqModel, promptText, messages) {
       const run = {
@@ -451,6 +542,18 @@ export default {
 .playground-card { max-width: 920px; }
 .model-picker { display: grid; grid-template-columns: minmax(220px, 320px) minmax(280px, 1fr); gap: 12px; align-items: end; }
 .selected-model { margin: -4px 0 12px; color: var(--text-muted); font-size: 12px; }
+/* 智商测试题库：图标行 + 悬停展开的题目详情 */
+.iq-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: -4px 0 10px; }
+.iq-title { font-size: 12px; color: var(--text-muted); }
+.iq-icons { display: flex; gap: 4px; flex-wrap: wrap; }
+.iq-icon { width: 32px; height: 32px; padding: 0; font-size: 17px; line-height: 1; cursor: pointer; background: var(--surface-1, #0f1622); border: 1px solid var(--border-soft); border-radius: 8px; transition: border-color .15s, transform .15s; }
+.iq-icon:hover, .iq-icon.active, .iq-icon:focus-visible { border-color: var(--accent, #6366f1); transform: translateY(-1px); outline: none; }
+.iq-caption { font-size: 12px; }
+.iq-detail { margin: 0 0 12px; padding: 10px 12px; background: var(--surface-1, #0f1622); border: 1px solid var(--border-soft); border-radius: 8px; }
+.iq-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.iq-detail-head .dim { font-size: 12px; }
+.iq-tag { font-size: 11px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-soft); color: var(--text-muted); }
+.iq-question { margin-top: 6px; font-size: 12px; color: var(--text-primary); line-height: 1.6; white-space: pre-wrap; }
 .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
 .error-box { margin-top: 20px; padding: 16px; background: var(--alert-error-bg); border: 1px solid var(--alert-error-border); border-radius: 8px; color: var(--alert-error-fg); }
 .pelican-frame { width: 100%; height: 420px; border: 1px solid var(--border-soft); border-radius: 8px; background: #fff; }

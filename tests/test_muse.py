@@ -157,8 +157,9 @@ async def test_start_muse_device_returns_login_url_and_code(monkeypatch):
 
     started = {}
 
-    async def fake_poll(provider_code, device_code, owner, interval, expires_in):
+    async def fake_poll(provider_code, device_code, owner, interval, expires_in, **kw):
         started["args"] = (provider_code, device_code, owner, interval, expires_in)
+        started["proxy_kwargs"] = kw.get("proxy_kwargs")
 
     c._poll_muse_device = fake_poll
     r = await c.start_muse_device("muse", None)
@@ -179,7 +180,56 @@ async def test_start_muse_device_returns_login_url_and_code(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_muse_device_rejects_wrong_auth_mode(monkeypatch):
+async def test_muse_device_flow_uses_official_ua_and_one_proxy_exit(monkeypatch):
+    """2026-10-18 对照 CLIProxyAPI（55.5k★）：
+    1) 三个请求都带官方 CLI UA `muse-code/1.0.2`；
+    2) 整条设备流只取一次代理，authorization / poll / mint 复用同一出口
+       （中途换出口会被 Meta 判成不同来源，是浏览器侧拒绝的已知诱因之一）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"device_code": "dc-1", "user_code": "ABCD-1234",
+               "verification_uri": "https://auth.meta.com/oauth/device/",
+               "interval": 1, "expires_in": 30}),
+        (200, {"access_token": "oauth-1"}),
+        (200, {"api_key": "LLM|abc", "user_id": "1", "user_email": "a@b.c"}),
+    ]))
+    pool = FakePool()
+    import server.core.proxy_pool as pp
+    monkeypatch.setattr(pp, "get_proxy_pool", lambda: pool)
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    async def fake_get_token_record(db, provider_code, owner):
+        return None
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        pass
+
+    c._get_token_record = fake_get_token_record
+    c._save_token = fake_save
+
+    real_poll = c._poll_muse_device
+
+    async def fake_poll(provider_code, device_code, owner, interval, expires_in, **kw):
+        await real_poll(provider_code, device_code, owner, interval, expires_in,
+                        proxy_kwargs=kw.get("proxy_kwargs"))
+
+    c._poll_muse_device = fake_poll
+    await c.start_muse_device("muse", None)
+    await asyncio.sleep(1.5)
+
+    posts = [x for x in calls if x.get("method") == "post"]
+    assert len(posts) == 3
+    for p in posts:
+        assert p["headers"].get("User-Agent") == "muse-code/1.0.2"
+    # 代理只取一次：start 里取的那次；poll/mint 复用同一份 kwargs
+    assert len(pool.calls) == 1
+    inits = [x["_client_init"] for x in calls if "_client_init" in x]
+    assert inits and all(i.get("proxy") == "http://127.0.0.1:7890" for i in inits)
+
+
+@pytest.mark.asyncio
+async def test_start_muse_device_reports_code_embedded(monkeypatch):
     c = OAuthClient(crypto=FakeCrypto())
     r = await c.start_muse_device("u1s1", None)
     assert "error" in r
@@ -403,7 +453,7 @@ async def test_poll_muse_device_slow_down_extends_interval(monkeypatch):
     ]))
     fin = {}
 
-    async def fake_finish(provider_code, owner, access, ep, token_body=None, device_code=""):
+    async def fake_finish(provider_code, owner, access, ep, token_body=None, device_code="", **kw):
         fin["access"] = access
 
     c._finish_muse_login = fake_finish
@@ -468,10 +518,14 @@ async def test_mint_muse_key_http_error_carries_status(monkeypatch):
     calls = []
     monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
         (429, {"error": "rate limited"}),
+        (429, {"error": "rate limited"}),
+        (429, {"error": "rate limited"}),
     ]))
     with pytest.raises(RuntimeError) as e:
         await c._mint_muse_key("oauth-1", {})
     assert "429" in str(e.value)
+    # 铸 key 端点激进限流 → 429 必须重试（3 次）而不是一次就丢 OAuth token
+    assert len([x for x in calls if x.get("method") == "post"]) == 3
 
 
 # ── 刷新语义（重铸失败绝不下线 + 退避防打穿限流端点）──────
@@ -567,6 +621,38 @@ async def test_do_refresh_dispatches_muse_style(monkeypatch):
     ok, msg = await c._do_refresh(db, "muse", "dev@meta.example")
     assert (ok, msg) == (True, "reminted")
     assert hit["token"] == "oauth-1"
+
+
+@pytest.mark.asyncio
+async def test_muse_key_saved_with_static_credential_ttl(monkeypatch):
+    """铸出的 LLM| key 是账号绑定的静态凭证（9router/opencode 都不自动重铸）。
+
+    落库寿命给 30 天、registry lead 7 天 → 每 23 天才重铸一次；此前是 2 天寿命
+    + 1 天 lead（每 24h 重铸），会持续撞上铸 key 端点的激进限流。
+    """
+    from server.core.oauth_registry import get_oauth_provider as _get
+    p = _get("muse")
+    assert p.refresh_lead_seconds == 7 * 86400
+
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"api_key": "LLM|x", "user_id": "1", "user_email": "a@b.c"}),
+    ]))
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+    saved = {}
+
+    async def fake_get_token_record(db, provider_code, owner):
+        return None
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        saved.update(tok=tok)
+
+    c._get_token_record = fake_get_token_record
+    c._save_token = fake_save
+    await c._finish_muse_login("muse", "__default", "oauth-1",
+                               get_oauth_provider("muse").extra_params)
+    assert saved["tok"]["expires_in"] == 30 * 86400
 
 
 # ── 适配器：Responses wire + Muse 指纹 ────────────────────

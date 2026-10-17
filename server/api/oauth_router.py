@@ -186,20 +186,24 @@ async def start_oauth_authorize(provider_code: str, request: Request,
         if "error" in r:
             raise HTTPException(status_code=400, detail=r["error"])
         _code = r.get("user_code") or ""
+        _embedded = bool(r.get("code_embedded"))
         return {
             "device_poll": True,
             "state": r["state"],
             "login_url": r["login_url"],
             "user_code": _code,
+            "code_embedded": _embedded,
             "poll_interval_ms": r["poll_interval_ms"],
             "message": (
                 "请在新窗口用 Meta 账号登录并批准本设备"
-                + (f"（设备码 {_code} 已内嵌在链接里，无需手输）" if _code else "")
-                + "。设备码 10 分钟内有效。Muse 按区域开放：若页面报"
-                "「Sign-in failed / Token exchange failed」，是 Meta 在浏览器侧拒绝"
-                "（地区/代理出口被标记，或用了托管/工作账号）——需个人账号 + 支持区域的"
-                "干净网络，建议无痕窗口重试；回本页重新点连接即可换新码。"
-                "批准成功后系统会自动铸造推理 key。"),
+                + (f"（设备码 {_code} 已内嵌在链接里，无需手输）"
+                   if (_code and _embedded) else
+                   (f"（打开后请手动输入设备码 {_code}）" if _code else ""))
+                + "。设备码 10 分钟内有效。若页面报「Sign-in failed / Token exchange failed」，"
+                "是 Meta 在浏览器侧拒绝了本次授权（CLIProxyAPI #6242 同判：地区限制 / "
+                "企业托管账号 / 代理扩展干扰）——请用支持地区的干净网络（推荐美国出口）"
+                "+ 个人 Meta 账号 + 无痕窗口；浏览器与服务器出口地区不一致也会触发，"
+                "可先在本机用同一代理地区打开该链接。批准成功后系统会自动铸造推理 key。"),
         }
     # ── Qoder 设备流（本地 PKCE+nonce → 轮询收 dt- token + 签名元数据）────
     if (provider.extra_params or {}).get("auth_mode") == "qoder_device":
@@ -310,6 +314,12 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
         "token_type": "Bearer",
         "scope": data.scope or "",
     }
+    # muse 导入的是铸好的静态 LLM| key（本机 scripts/muse_login.py 产出）。
+    # 前端导入框默认 3600 秒会让它在 1 小时后触发「重铸」——但没有 OAuth token，
+    # 重铸必失败。按上游语义直接给 30 天（与设备流落库一致）。
+    if (data.provider_code == "muse" and data.access_token.startswith("LLM|")
+            and not data.refresh_token):
+        tok["expires_in"] = max(tok["expires_in"], 30 * 86400)
     client = get_oauth_client()
     try:
         saved = await client._save_token(db, data.provider_code, data.owner, tok)
