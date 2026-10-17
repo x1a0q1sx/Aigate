@@ -169,6 +169,16 @@
                 <span v-if="m.quota_limited_until" class="badge badge-info text-xs" style="margin-left: 4px" :title="quotaLimitTitle(m)">
                   <AppIcon name="clock" :size="10" /> 限额 {{ quotaLimitRemaining(m) }}
                 </span>
+                <span v-if="m.schedule_state && m.schedule_state.configured"
+                      class="badge text-xs" style="margin-left: 4px"
+                      :class="m.schedule_state.blocked ? 'badge-neutral' : 'badge-success'"
+                      :title="scheduleTip(m)">
+                  <AppIcon name="clock" :size="10" />
+                  {{ m.schedule_state.blocked ? '时段外' : (m.schedule_state.label || '时段内') }}
+                </span>
+                <span v-if="m.promotion && m.promotion.active" class="badge badge-warning text-xs" style="margin-left: 4px" :title="promotionText(m.promotion)">
+                  {{ (m.promotion.badge && (m.promotion.badge.zh || m.promotion.badge.en)) || '促销' }}
+                </span>
                 <span v-else-if="m.fail_count > 0" class="text-xs text-muted" style="margin-left: 4px">
                   ×{{ m.fail_count }}
                 </span>
@@ -327,6 +337,74 @@
         </div>
       </div>
 
+      <div class="form-divider">生效时段（定时免费 / 限时模型）</div>
+      <div class="form-group">
+        <label class="checkbox-label">
+          <input type="checkbox" v-model="schedEnabled" /> 启用生效时段
+        </label>
+        <div class="text-xs text-muted" style="margin-top: 4px;">
+          上游按时段免费/打折的模型（如 CodeBuddy Hy4 preview 每晚 23:00-08:00 免费、
+          Qoder 错峰 22:00-08:00 打折）可在此限定生效时间。对组合 / Auto / 直连统一生效。
+        </div>
+      </div>
+      <template v-if="schedEnabled">
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">时段外行为</label>
+            <select v-model="schedForm.mode">
+              <option value="only">仅时段内可用（时段外跳过 / 直连 409）</option>
+              <option value="boost">时段内优先（时段外仍可用，仅降权）</option>
+            </select>
+          </div>
+          <div class="form-group" v-if="schedForm.mode === 'boost'">
+            <label class="form-label">时段内加分</label>
+            <input v-model.number="schedForm.boost" type="number" min="0" max="100" step="5" />
+          </div>
+          <div class="form-group">
+            <label class="form-label">时区</label>
+            <input v-model.trim="schedForm.timezone" placeholder="Asia/Shanghai" />
+          </div>
+        </div>
+        <div class="form-group" v-for="(r, i) in schedForm.rules" :key="'sr'+i">
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">开始</label>
+              <input v-model.trim="r.start" placeholder="23:00" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">结束</label>
+              <input v-model.trim="r.end" placeholder="08:00" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">标签</label>
+              <input v-model.trim="r.label" placeholder="夜间免费" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">生效日期（可选，含端点）</label>
+              <input v-model.trim="r.date_from" placeholder="2026-09-11" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">&nbsp;</label>
+              <input v-model.trim="r.date_to" placeholder="2026-10-31" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">星期（空=每天）</label>
+              <select v-model="r.days" multiple size="3">
+                <option v-for="d in [1,2,3,4,5,6,7]" :key="d" :value="d">{{ ['一','二','三','四','五','六','日'][d-1] }}</option>
+              </select>
+            </div>
+          </div>
+          <button v-if="schedForm.rules.length > 1" class="btn btn-outline btn-xs" @click="removeScheduleRule(i)">删除该时段</button>
+        </div>
+        <button class="btn btn-outline btn-sm" @click="addScheduleRule">+ 添加时段</button>
+        <div v-if="editForm.promotion" class="text-xs" style="margin-top: 8px; color: var(--accent, #2b8aef);">
+          上游促销：{{ promotionText(editForm.promotion) }}
+          <button class="btn btn-outline btn-xs" style="margin-left: 6px" @click="applyPromotionToSchedule">套用为时段规则</button>
+        </div>
+      </template>
+
       <div class="form-divider">高级：请求覆盖</div>
       <div class="form-group">
         <label class="form-label">模型别名</label>
@@ -449,6 +527,9 @@ export default {
       showEditModal: false,
       saving: false,
       editForm: {},
+      // v4.6 生效时段编辑器（定时免费/限时模型）
+      schedEnabled: false,
+      schedForm: { mode: 'only', boost: 30, timezone: 'Asia/Shanghai', rules: [] },
       overrideHeadersText: '',
       overrideBodyPatchText: '',
       showAddModel: false,
@@ -834,7 +915,23 @@ export default {
         price_ratio: (m.price_ratio === null || m.price_ratio === undefined) ? null : m.price_ratio,
         price_ratio_source: m.price_ratio_source || '',
         model_alias: overrides.model_alias || '',
+        promotion: m.promotion || null,
       }
+      const sch = m.active_schedule
+      this.schedEnabled = !!(sch && Array.isArray(sch.rules) && sch.rules.length)
+      this.schedForm = {
+        mode: (sch && sch.mode) || 'only',
+        boost: (sch && sch.boost) || 30,
+        timezone: (sch && sch.timezone) || 'Asia/Shanghai',
+        rules: this.schedEnabled
+          ? sch.rules.map((r) => ({
+              start: r.start || '', end: r.end || '', label: r.label || '',
+              date_from: r.date_from || '', date_to: r.date_to || '',
+              days: Array.isArray(r.days) ? [...r.days] : [],
+            }))
+          : [],
+      }
+      if (this.schedEnabled && !this.schedForm.rules.length) this.addScheduleRule()
       this.overrideHeadersText = overrides.headers ? JSON.stringify(overrides.headers, null, 2) : ''
       this.overrideBodyPatchText = overrides.body_patch ? JSON.stringify(overrides.body_patch, null, 2) : ''
       this.showEditModal = true
@@ -855,6 +952,16 @@ export default {
           // 原值非空、本次清空 → 显式请求清空（回到"未知"）
           clear_price_ratio: !hasRatio && !!(this.editForm.price_ratio_source),
           request_overrides: requestOverrides,
+          // v4.6 生效时段：启用则提交配置，否则显式清空（null 无法与「未修改」区分）
+          active_schedule: this.schedEnabled
+            ? {
+                mode: this.schedForm.mode,
+                boost: Number(this.schedForm.boost) || 0,
+                timezone: this.schedForm.timezone || 'Asia/Shanghai',
+                rules: this.schedForm.rules.filter((r) => r.start && r.end),
+              }
+            : null,
+          clear_active_schedule: !this.schedEnabled,
         }
         delete payload.model_alias
         delete payload.capability_source
@@ -868,6 +975,51 @@ export default {
       } finally {
         this.saving = false
       }
+    },
+    // ── v4.6 生效时段编辑器（定时免费/限时模型）──
+    addScheduleRule() {
+      this.schedForm.rules.push({ start: '23:00', end: '08:00', label: '',
+                                  date_from: '', date_to: '', days: [] })
+    },
+    removeScheduleRule(i) {
+      this.schedForm.rules.splice(i, 1)
+    },
+    // 生效时段徽标 tooltip：窗口状态 + 下次开放时间
+    scheduleTip(m) {
+      const st = m.schedule_state || {}
+      const mode = st.mode === 'boost' ? '时段内优先' : '仅时段内可用'
+      const label = st.label ? `（${st.label}）` : ''
+      if (st.blocked) return `${mode}${label}：当前时段外，下次开放 ${st.next_open || '未知'}`
+      return `${mode}${label}：当前在生效时段内${st.boost ? '（+ ' + st.boost + ' 分）' : ''}`
+    },
+    // 上游促销元数据（Qoder 目录 promotion）→ 人话摘要
+    promotionText(p) {
+      if (!p || typeof p !== 'object') return ''
+      const zh = (p.description && (p.description.zh || p.description.en)) || ''
+      const badge = (p.badge && (p.badge.zh || p.badge.en)) || ''
+      const win = (p.window_start && p.window_end) ? ` ${p.window_start}-${p.window_end}` : ''
+      return [badge, zh || win].filter(Boolean).join('｜')
+    },
+    // 一键把上游促销套用为时段规则（错峰折扣类 → boost 模式：时段内优先）
+    applyPromotionToSchedule() {
+      const p = this.editForm.promotion
+      if (!p || !p.window_start || !p.window_end) {
+        toast.error('该促销未提供时段窗口，无法自动套用')
+        return
+      }
+      this.schedEnabled = true
+      this.schedForm = {
+        mode: 'boost',
+        boost: 30,
+        timezone: p.timezone || 'Asia/Shanghai',
+        rules: [{
+          start: p.window_start,
+          end: p.window_end,
+          label: (p.badge && (p.badge.zh || p.badge.en)) || '错峰折扣',
+          date_from: '', date_to: '', days: [],
+        }],
+      }
+      toast.success('已套用促销时段（时段内优先 +30）')
     },
     async addModel() {
       if (!this.addModelForm.provider_id || !this.addModelForm.model_id.trim()) {

@@ -56,6 +56,12 @@ class Model(Base):
     is_manual = Column(Boolean, nullable=False, default=False)      # 是否手动添加（刷新清理失效模型时保留，不被自动删除）
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     request_overrides = Column(JSON, nullable=True, default=dict)  # v3.4 per-model request customization
+    # v4.6 生效时段（定时免费/限时模型，2026-10-17）：JSON {mode, boost, timezone, rules[]}。
+    # NULL=无限制（默认）。语义与结构见 core/model_schedule.py 模块注释。
+    active_schedule = Column(JSON, nullable=True, default=None)
+    # v4.6 上游促销元数据快照（Qoder 目录 promotion 字段：错峰折扣等）。
+    # 仅展示 + 一键套用为 active_schedule，不参与计费。
+    promotion = Column(JSON, nullable=True, default=None)
     @property
     def full_id(self) -> str:
         """返回 provider_id/model_id 格式"""

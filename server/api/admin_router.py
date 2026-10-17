@@ -1200,9 +1200,14 @@ async def list_models(
     except Exception as e:
         logger.warning("quota limit aggregation failed: %s", e)
     result = []
+    # v4.6 生效时段：批量评估当前窗口状态（纯内存计算，零额外查询）
+    from server.core.model_schedule import evaluate_model as _eval_sched
+    _now_sched = datetime.now(timezone.utc)
     for m in models:
         item = ModelInfoResponse.from_orm(m)
         item.combos = _combo_map.get((item.provider_name, m.model_id), [])
+        if item.active_schedule:
+            item.schedule_state = _eval_sched(m, now=_now_sched)
         _real_tps = _tps_map.get((item.provider_name, m.model_id))
         if _real_tps:
             # 本网关真实流量观测优先于刷新带的远端元数据（Model.avg_tps）
@@ -1270,7 +1275,9 @@ async def update_model(model_id: int, data: ModelUpdate, db: AsyncSession = Depe
         input_modalities=data.input_modalities,
         max_output_tokens=data.max_output_tokens,
         price_ratio=data.price_ratio,
-        clear_price_ratio=data.clear_price_ratio
+        clear_price_ratio=data.clear_price_ratio,
+        active_schedule=data.active_schedule,
+        clear_active_schedule=data.clear_active_schedule,
     )
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -2044,6 +2051,12 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             model = next((m for m in models if m.model_id == request.model), None)
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
+        # v4.6 生效时段：playground 与 /v1 直连同语义（仅时段内可用 → 409）
+        from server.core.model_schedule import evaluate_model as _eval_model_sched
+        _sch = _eval_model_sched(model)
+        if _sch["blocked"]:
+            raise HTTPException(status_code=409,
+                                detail=f"Model {request.model} is outside its active window: {_sch['reason']}")
         provider = await db.get(Provider, model.provider_id)
         # v4.0: 服务商被禁用 → playground 直连同样不可用
         if provider is None or not getattr(provider, "enabled", True):

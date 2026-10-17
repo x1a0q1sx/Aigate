@@ -234,6 +234,9 @@ async def init_db():
         "ALTER TABLE oauth_tokens ADD COLUMN cooldown_until TIMESTAMP DEFAULT NULL",
         "ALTER TABLE oauth_tokens ADD COLUMN fail_count INTEGER DEFAULT 0",
         "ALTER TABLE request_logs ADD COLUMN routed_account VARCHAR(100) DEFAULT NULL",
+        # v4.6: 模型生效时段（定时免费/限时模型）+ 上游促销元数据快照
+        "ALTER TABLE models ADD COLUMN active_schedule JSON DEFAULT NULL",
+        "ALTER TABLE models ADD COLUMN promotion JSON DEFAULT NULL",
     ]
     for sql in _migrations:
         try:

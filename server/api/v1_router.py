@@ -2446,6 +2446,15 @@ async def _chat_completions_impl(
                 await _decision_finish(conversation_id, status="error", failure_reason=f"Model {request.model} not found")
                 await _early_error_log(conversation_id, request, raw_request, f"Model {request.model} not found")
                 return JSONResponse(status_code=404, content=_api_error(f"Model {request.model} not found", status=404))
+            # v4.6 生效时段：直连命中「仅时段内可用」模型但当前不在窗口 → 409 明确告知
+            from server.core.model_schedule import evaluate_model as _eval_model_sched
+            _sch = _eval_model_sched(model)
+            if _sch["blocked"]:
+                _msg = (f"Model {request.model} is outside its active window: {_sch['reason']}")
+                await _decision_finish(conversation_id, status="error", failure_reason=_msg)
+                await _early_error_log(conversation_id, request, raw_request, _msg)
+                return JSONResponse(status_code=409, content=_api_error(_msg, status=409,
+                                                                       next_open=_sch.get("next_open")))
             _diag(conversation_id, "direct_model_done", _diag_start, routed_model=model.model_id)
             provider = await db.get(Provider, model.provider_id)
             # v4.0: 服务商被禁用 → 直连同样不可用

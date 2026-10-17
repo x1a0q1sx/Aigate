@@ -126,6 +126,13 @@ async def resolve_combo_targets(
             if not model.enabled:
                 # 临时禁用：请求时跳过，保留组合顺序不删除
                 continue
+            # v4.6 生效时段：仅时段内可用的模型，时段外跳过（保留组合顺序不删除，
+            # 与「临时禁用」同一语义——到点自动恢复，无需人工干预）
+            from server.core.model_schedule import evaluate_model
+            _st = evaluate_model(model)
+            if _st["blocked"]:
+                logger.info("[组合路由] %s/%s 时段外跳过（%s）", prov_name, mod_id, _st["reason"])
+                continue
             targets.append({
                 "provider": provider,
                 "model": model,

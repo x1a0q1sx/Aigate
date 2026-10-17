@@ -785,6 +785,9 @@ class QoderAdapter(BaseAdapter):
                 input_modalities=(["text", "image"] if _vl else None),
                 context_length=int(entry.get("max_input_tokens") or 131072),
                 price_ratio=_ratio,
+                # 错峰折扣等促销元数据（ultimate/Qwen3.8-Max/Qwen3.7-Plus 22:00-08:00）：
+                # 原样透传落库，模型页展示 + 一键套用为生效时段
+                promotion=(entry.get("promotion") if isinstance(entry.get("promotion"), dict) else None),
             ))
         return out
 

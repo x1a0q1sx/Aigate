@@ -133,15 +133,27 @@ class AutoRouter:
         )
         # v4.3 能力偏好：多模态请求 +分给支持该模态的候选；长上下文请求 +分给大窗口候选。
         # 上限 ~24 分（context_guard.capability_preference），不压过智力/稳定性量级差。
+        by_id = {m.id: m for m in candidates}
         if profile is not None and (profile.has_image or profile.has_audio or profile.is_long):
             from .context_guard import capability_preference
-            by_id = {m.id: m for m in candidates}
             for s in scores:
                 if s.excluded_reason:
                     continue
                 m = by_id.get(s.model_id)
                 if m is not None:
                     s.final_score = round(s.final_score + capability_preference(m, profile), 2)
+        # v4.6 生效时段（boost 模式）：窗口内加分，让「错峰折扣」类模型在时段内优先命中；
+        # 时段外不加分（不排除，急用时仍可命中）。
+        from .model_schedule import evaluate_model
+        for s in scores:
+            if s.excluded_reason:
+                continue
+            m = by_id.get(s.model_id)
+            if m is None:
+                continue
+            st = evaluate_model(m)
+            if st["boost"]:
+                s.final_score = round(s.final_score + st["boost"], 2)
         # 把 ModelScore 按 model_id 映射回 Model 对象
         score_map = {s.model_id: s for s in scores}
         def sort_key(m: Model):
@@ -194,6 +206,11 @@ class AutoRouter:
         cached = self.health_checker.get_cached_status(model.id) if self.health_checker else None
         if cached and cached.status in ["unhealthy", "rate_limited"]:
             return f"health status: {cached.status}"
+        # v4.6 生效时段：仅时段内可用的模型，时段外跳过（决策面板可见原因）
+        from .model_schedule import evaluate_model
+        st = evaluate_model(model)
+        if st["blocked"]:
+            return st["reason"] or "outside active window"
         return None
     def _filter_candidates(
         self,
@@ -466,6 +483,10 @@ class AutoRouter:
         if not sticky_model or sticky_model.id in exclude_model_ids:
             return None
         if not (sticky_model.enabled and sticky_model.auto_enabled and not sticky_model.auto_excluded):
+            return None
+        # v4.6 生效时段：sticky 模型已出窗口 → 放走，走正常选举
+        from .model_schedule import evaluate_model
+        if evaluate_model(sticky_model)["blocked"]:
             return None
         # v4.3: 请求含图片/音频而 sticky 模型模态已知不支持 → 放走 sticky
         from .context_guard import media_mismatch_reason

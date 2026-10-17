@@ -374,3 +374,20 @@
   - 后端 `failed_details` 补 `enabled` 字段（刷新前就已禁用者同样会失败，前端据此显示「已禁用」）
   - 新增 `tests/test_frontend_refresh_disable.py` 6 项静态回归
 - 测试：**全量 1120 全绿**（1111 + muse 3 + 前端 6）；前端 build 通过
+
+## Session 24 - 2026-10-17
+### 完成（Qoder 模型目录版本闸修复 + 模型级「生效时段」定时免费模型）
+- ✅ **用户任务 1：Qoder「qwen3.8flash 不好使 / 新模型刷不出来」排查**
+  - **根因 1（新模型刷不出来）**：`qoder_sign.QODER_IDE_VERSION` 钉死在 `1.0.0`，而 **Qoder 模型目录按 Cosy-Version 下发**——1.0.0 只给 15 个旧模型（无 fast/Sonus/Cantus，且仍含已下架的 performance）。A/B 扫描版本：`>=1.1.0` 起 17 个（1.1.0 有 performance 无 fast；1.1.73 起 fast+Sonus+Cantus、performance 消失）。修复：版本升到 **1.1.73**（npm `@qoder-ai/qodercli` latest，支持 `QODER_CLI_VERSION` 环境变量覆盖），静态种子同步校准，新增版本回归锁测试
+  - **根因 2（qfmodel 不好使）**：上游 **RESOURCE_LIMIT 排队**（`10605 + isQueued + subCode:RESOURCE_LIMIT`，qfmodel/dfmodel 全天排队、fast 也常排队）。不是模型下架、不是签名失效——同一账号 `smodel/cmodel` 全通。修复：排队报错区分 subCode，附「免费模型高峰限流，建议错峰（22:00-08:00 UTC+8）或换模型」
+  - **「deepseek-v4.1-flash-1017」**：DeepSeek 官方 2026-10-17 发布该版本，但 **Qoder 侧无任何公开证据**（官方论坛 1017 搜索 0 条；目录里 dfmodel=DeepSeek-Flash 0.1x、dmodel=DeepSeek-V4-Pro 0.5x）；Qoder 官方文档明确「模型/倍率随客户端版本与账号开放范围变化」——本次已把版本闸打开，若上游灰度到该账号，下次刷新会自动入库
+  - 生产验证：refresh `added=3(fast/Sonus/Cantus) removed=1(performance) total=17`；qfmodel/fast 实测推理 200
+- ✅ **用户任务 2：定时免费模型的通用能力（用户确认：模型级 + 两种模式 + 接入 Qoder 促销元数据）**
+  - 调研结论：CodeBuddy Hy4 preview 夜间 23:00-08:00 不计积分（9/11 起，9/30 宣布延至 10/31；时段外正常扣积分；官方公告为 WorkBuddy 侧经媒体转载，CodeBuddy 文档未提；「北京时间」无官方明文，按 UTC+8 惯例）；Hy3 是全天限免（非时段制）；Qoder 目录自带 `promotion`（ultimate 错峰2折 / Qwen3.8-Max、Qwen3.7-Plus 错峰4折，22:00-08:00 UTC+8）
+  - 新模块 `server/core/model_schedule.py`：纯函数（零 DB）求值。跨零点窗口**归属日=开窗那天**（周二 02:00 算周一窗口）、星期过滤、日期区间含端点、IANA 时区（无 tzdata 时 Asia/Shanghai 固定 +8 兜底）、`only`=时段外跳过 / `boost`=时段内加分、`next_open` 供报错文案、脏配置安全默认（不拦截）
+  - 接入点：`get_auto_candidates`（时段外不进候选池）、`_candidate_skip_reason`（决策面板可见原因）、`_rank_candidates`（boost 加分）、sticky 候选（出窗口放走）、`resolve_combo_targets`（跳过但**保留顺序**，与「临时禁用」同语义）、v1 直连流式/非流式（409 + `next_open`）、playground（同语义 409）
+  - Qoder `promotion` 原样落库（`models.promotion`），模型页显示错峰徽标 + 「套用为时段规则」一键生成 boost 配置
+  - 前端：模型编辑弹窗新增「生效时段」编辑器（启用开关 / 时段外行为 / 加分 / 时区 / 多规则 / 星期多选 / 日期区间）；列表行新增「时段内|时段外」徽标（tooltip 含下次开放时间）与促销徽标
+  - DB：`models.active_schedule` + `models.promotion` 两条迁移；`ModelUpdate` 增 `active_schedule` / `clear_active_schedule`（null 与「未修改」歧义沿用 price_ratio 的显式清空开关）
+- 测试：新增 `tests/test_model_schedule.py` 22 项（窗口语义/归属日/时区/安全默认/next_open/路由与前端契约）；全量 **1145 全绿**；前端 build 通过
+- 部署：commit + push + 服务器 pull + 前端 build + pm2 restart（后端改动）

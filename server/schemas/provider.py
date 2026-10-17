@@ -154,6 +154,11 @@ class ModelInfoResponse(BaseModel):
     quota_limited_accounts: Optional[list] = None
     # 所属分组（combo 名称列表，由列表接口附带；不在 ORM 上，from_orm 不填）
     combos: Optional[list] = None
+    # v4.6 生效时段（定时免费/限时模型）：配置 + 当前是否在窗口内（派生，非 ORM 列）
+    active_schedule: Optional[Dict[str, Any]] = None
+    schedule_state: Optional[Dict[str, Any]] = None
+    # v4.6 上游促销元数据（Qoder 错峰折扣，仅展示/一键套用）
+    promotion: Optional[Dict[str, Any]] = None
     class Config:
         from_attributes = True
     @classmethod
@@ -193,6 +198,8 @@ class ModelInfoResponse(BaseModel):
             priority_boost=getattr(model, 'priority_boost', 0),
             auto_excluded=getattr(model, 'auto_excluded', False),
             request_overrides=getattr(model, 'request_overrides', None),
+            active_schedule=getattr(model, 'active_schedule', None),
+            promotion=getattr(model, 'promotion', None),
         )
 class ModelUpdate(BaseModel):
     display_name: Optional[str] = None
@@ -217,6 +224,10 @@ class ModelUpdate(BaseModel):
     price_ratio: Optional[float] = None
     # 清空倍率（回到"未知"）：price_ratio 传 null 时无法与"未修改"区分，故单列一个开关
     clear_price_ratio: bool = False
+    # v4.6: 生效时段（定时免费/限时模型）。传 dict 即覆盖（后端 normalize），
+    # clear_active_schedule=True 显式清空（同 price_ratio 的 null/未修改歧义处理）
+    active_schedule: Optional[Dict[str, Any]] = None
+    clear_active_schedule: bool = False
     # v3.4: per-model request overrides (headers/body_patch/model_alias)
     request_overrides: Optional[Dict[str, Any]] = None
 class ModelsRefreshResponse(BaseModel):

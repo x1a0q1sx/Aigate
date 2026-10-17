@@ -24,6 +24,9 @@ class ModelInfo:
     max_output_tokens: Optional[int] = None
     # v4.4 订阅制上游倍率（credit multiplier，如 Qoder price_factor=0.5 / CodeBuddy x0.16）
     price_ratio: Optional[float] = None
+    # v4.6 上游促销元数据（Qoder 目录 promotion：错峰折扣窗口等）。仅展示/一键套用，
+    # 不参与计费与路由；结构由上游原样透传。
+    promotion: Optional[dict] = None
 @dataclass
 class HealthResult:
     status: str  # healthy / degraded / rate_limited / unhealthy

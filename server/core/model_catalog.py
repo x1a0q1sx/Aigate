@@ -448,7 +448,12 @@ class ModelCatalog:
             ).all()
         }
         valid = []
+        # v4.6 生效时段：仅时段内可用的模型，时段外不参与 auto 选举
+        # （evaluate_model 对未配置模型是纯字典判空，零额外查询）
+        from server.core.model_schedule import evaluate_model
         for model, provider in rows:
+            if evaluate_model(model)["blocked"]:
+                continue
             cred = getattr(provider, "credential_type", "api_key")
             if cred in ("free_tier", "oauth"):
                 # 免费层 / OAuth 供应商无需 ApiKey 表中的密钥
@@ -501,7 +506,9 @@ class ModelCatalog:
         input_modalities: Optional[list] = None,
         max_output_tokens: Optional[int] = None,
         price_ratio: Optional[float] = None,
-        clear_price_ratio: bool = False
+        clear_price_ratio: bool = False,
+        active_schedule: Optional[dict] = None,
+        clear_active_schedule: bool = False,
     ) -> Optional[Model]:
         """更新模型配置"""
         model = await self.get_by_id(session, model_id)
@@ -574,6 +581,13 @@ class ModelCatalog:
             model.price_ratio_source = ""
         if request_overrides is not None:
             model.request_overrides = request_overrides
+        # v4.6 生效时段：normalize 后再落库（脏配置一律收敛为 None=无限制）。
+        # 传 dict 即覆盖；clear_active_schedule 显式清空。
+        if active_schedule is not None:
+            from server.core.model_schedule import normalize_schedule
+            model.active_schedule = normalize_schedule(active_schedule)
+        elif clear_active_schedule:
+            model.active_schedule = None
         await session.commit()
         await session.refresh(model)
         return model
@@ -961,6 +975,12 @@ class ModelCatalog:
                     existing_model.price_ratio_source = _new_src
                     if model_info.price_ratio == 0.0:
                         existing_model.is_free = True
+                # v4.6 促销元数据快照：上游有则更新；上游无则保留既有（促销下线由
+                # 上游目录移除字段体现，本地保留最后一次快照不至于静默消失——展示层
+                # 会按 active 判断是否还在进行）。
+                _promo = getattr(model_info, "promotion", None)
+                if _promo:
+                    existing_model.promotion = _promo
                 if remote_metadata:
                     # P1-17: 远程缺字段时不要把本地已有值抹成 None
                     _sr = remote_metadata.get("success_rate")
@@ -1038,6 +1058,8 @@ class ModelCatalog:
                          "codebuddy" if str(getattr(provider, "oauth_code", "") or "").startswith("codebuddy")
                          else "provider")
                         if model_info.price_ratio is not None else ""),
+                    # v4.6 上游促销元数据（Qoder 错峰折扣）：仅展示/一键套用
+                    promotion=getattr(model_info, "promotion", None),
                     priority_boost=0,
                     auto_excluded=False
                 )
