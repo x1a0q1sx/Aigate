@@ -7,7 +7,7 @@
         type="text"
         autocomplete="off"
         :value="open ? query : displayLabel"
-        :placeholder="open ? '输入关键字过滤...' : placeholder"
+        :placeholder="open ? (displayLabel || placeholder) : placeholder"
         :disabled="disabled"
         @input="onInput"
         @focus="openMenu"
@@ -93,7 +93,8 @@ export default {
     },
     openMenu() {
       if (this.disabled) return
-      if (!this.open) {
+      const wasOpen = this.open
+      if (!wasOpen) {
         this.open = true
         this.query = ''
         const idx = this.filtered.findIndex((o) => String(o.value) === String(this.modelValue))
