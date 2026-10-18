@@ -534,3 +534,75 @@
   `plan.id` 的 ULID 时间戳是套餐模板创建时间（2026-05-26），不是用户订阅时间，别混用。
 - 用量接口可用：`GET /api/v1/users/{uid}/usages?limit=N`（`/users/me/usages` 400）；
   返回 `aiModelName`、`costUsd`（1e-8 USD）、tokens。200 条覆盖 08-23~10-18，按天计数正常。
+
+## Session 30 - 2026-10-18（续）
+### 完成（限额本地拒绝 + Cline 402/产品面头 + 组合页时段入口）
+
+**1. 「组合内定时启用模型」找不到（用户任务 1）**
+- 结论：功能**已完成**（Session 24 v4.6），但入口在**模型级**：模型页 → 编辑模型 →
+  「生效时段（定时免费 / 限时模型）」。组合页此前完全没有提示，也没有任何徽标。
+- 补充（本次）：
+  - `/admin/api/models/light` 增 `schedule_blocked`（派生布尔，保持轻量）——
+    组合页需要知道「该候选当前时段外」。
+  - 组合页头部加说明（指向模型页 + 说明对组合/Auto/直连统一生效）。
+  - 组合页候选池与已选栏都显示「时段外」徽标（tooltip：请求会被跳过、到点自动恢复）。
+- 测试：`test_admin_models_light.py` 扩到 4 项（含 schedule_blocked 断言）+
+  新增 `test_frontend_schedule_and_quota.py` 5 项静态回归。
+
+**2. 限额/余额不足的请求不再发上游（用户任务 2）**
+- 既有行为缺口：
+  - 每日限额（CodeBuddy 6004）已有本地跳过，但**点名账号（oauth_owner）分支不过闸**
+    → 点名时照样发上游。
+  - Cline 402 `insufficient_credits` 完全没识别 → 每次请求先烧一次 402 往返。
+  - playground 把解析器原因硬编码成「not connected」。
+  - `/v1` 直连把限额报成 503（语义错，客户端不会按限流退避）。
+- 修复：
+  - `quota_limit.is_credit_exhausted_text`（402 / insufficient_credits / insufficient balance）
+    并入 `is_quota_related_error`（不罚模型冷却）。
+  - `oauth_client.note_request_result`：余额耗尽记 (账号×模型) 限额记录，
+    **30 分钟固定冷却**（无重置时间；与 cline2api 同策略，充值后自动恢复）。
+  - **同身份连接扩散**：限额是上游账号级的，`_record_quota_limit` 用 `token_identity`
+    解析同 JWT sub 的全部连接一并记录 —— 否则自动选号会换连接名继续打同一个破产账号
+    （生产实证：Cline `__default` 与 `account-2` 同邮箱）。
+  - 点名账号分支同样过限额闸（`pick_access_token_ex`）；resolver 点名也返回
+    `quota_limited` 而非 "not connected"。
+  - `/v1` 直连：`quota_limited` → **429 + Retry-After**（从错误文案解析重置秒数）。
+  - playground：透出解析器真实原因。
+- 生产验证：第一次 402 写入限额；第二次 resolve 0.00s 返回 `quota_limited ... resets at`；
+  同账号 `cline-pass/kimi-k3` 不受影响；两条连接都写入记录（验证后已清理测试记录）。
+- 测试：新增 6 项（识别/30 分钟兜底/点名本地拒绝/点名 resolver/同身份扩散/提示文案）。
+
+**3. Cline 402 与 cline2api 调研（用户任务 3）**
+- 用户报错 `Cline (cline.bot)/deepseek/deepseek-v4.1-flash-1017` 402
+  `insufficient_credits` / balance $0.00。
+- 根因：**Cline Pass 订阅只覆盖 `cline-pass/*` 订阅模型**；`deepseek/*`、`anthropic/*` 等
+  公共目录模型走 **Cline Credits 按量计费**，余额 0 就 402。不是配置错误。
+- 对照 cline2api（luawei1/cline2api，Go）：
+  - 402 处理：`setModelCooldown(acc, model, 30min)` + 换账号（不整号冷却，因为同账号免费模型仍可用）
+    —— 与本项目 (账号×模型) 限额记录 + 30 分钟兜底完全同构。
+  - 模型源：`GET /api/v1/ai/cline/recommended-models`（**无需认证**）返回
+    `recommended` / `free` / `clinePass` / `clineCloud` 四组 —— 这是唯一能拿到
+    `cline-free/*` 与 `cline-pass/*` 的在线源（`/api/v1/models` 471 条只有按量计费）。
+  - 客户端头族：`X-CLIENT-TYPE: cline-sdk` + `X-CLIENT-VERSION` / `X-PLATFORM` /
+    `X-CORE-VERSION` / `X-Task-ID`（sess_<ts>）。
+- 生产 A/B（本机实测）：
+  - `cline-free/solar-mini4` / `nemotron-3.5-super-vl`：**缺 `X-CLIENT-TYPE` → 403**
+    「only available via Cline product surfaces」；**只加这一个头 → 200**。
+    其余头均非判据（但一起带上免费）。
+  - `cline-cloud/deepseek-v4.1-flash`：带全头仍 403「This request is not supported」（当前不可用）。
+  - `cline-pass/mimo-v2.6-*`：500 `empty response content`（推理模型先吐 reasoning 吃满
+    max_tokens=16；与既有「小 max_tokens 假 500」结论一致，**不是不可用**）。
+- 修复：
+  - `provider_quirks`：`cline_client_headers`（X-Task-ID 按 账号×首条消息 派生）+
+    `_CLINE.cline_client_headers=True` + UA `Cline/3.0.47`。
+  - `openai_compat._get_headers`：出站注入。
+  - 种子补 `cline-free/*`（4 个）与 `cline-pass/mimo-v2.6-{flash,pro}`。
+  - `model_catalog.fetch_cline_catalog`：刷新时并集官方 recommended-models（free/clinePass/
+    recommended）∪ `/api/v1/models` ∪ 种子。
+  - `error_text.credit_exhausted_hint`：402 文案末尾追加「Pass 只覆盖 cline-pass/*」提示。
+- 生产验证：Cline 刷新 `added=6`（4 个 cline-free + 2 个 mimo-v2.6）；
+  `cline-free/solar-mini4` / `cline-pass/kimi-k3` / `cline-pass/deepseek-v4.1-flash` 全部推理 200。
+- 测试：`test_cline_pass.py` 新增 3 项（头族/适配器接线/目录解析），全量 **1185 全绿**。
+
+**部署**：后端 + 前端都有改动 → 服务器 pull + `npm run build`（`index-CNW2D1d2.js`）+
+`pm2 restart aigate`；health 200；`/admin` 已引用新 bundle。
