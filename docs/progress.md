@@ -511,3 +511,26 @@
 
 **顺带发现**：生产还有 provider 102「Cline Pass」（api_key，base `.../api/v1`，key 前缀 `sk_`）——
 非 OAuth 连接，额度面板不覆盖 api_key 服务商；若要用订阅额度请以 provider 85 的 OAuth 连接为准。
+
+## Session 29（2026-10-18）Playground 测试记录不实时刷新 + Cline 账号核对
+
+**1. Playground 记录必须切模型才刷新（c47bb52，纯前端已部署）**
+- 根因：`newRun` 里 `this.runs.unshift(run)` 传的是**裸对象**；Vue3 的响应式在
+  「通过数组读」时才包代理，而 `streamRun` 持有的是原始 `run` 引用 → `run.chars/text/status`
+  的写入不经过代理，不触发重渲染。切换模型会触发一次重渲染，于是表现为「切了才看到」。
+- 修复：创建时 `reactive({...})` 包一层，后续写入全走代理；`run.abortCtl` 用 `markRaw(abort)`
+  （AbortController 被代理后 `.abort()` 会 Illegal invocation）。
+- 部署：`git pull` + `cd client && npm run build`（纯前端，未重启 pm2）；新 bundle
+  `index-COlSZUlY.js` 已由 /admin 引用，health 200；`test_frontend_pelican_and_analytics.py` 11 passed。
+
+**2. Cline 账号核对（用户问 default 是哪个账号）**
+- 两条 cline 连接（id 4 `__default`、id 12 `account-2`）解 JWT 均为
+  **x1a0q1sx@gmail.com**（displayName「1a0q1 x」，sub `user_01KYRQGJ4JBBNB2HQ3AWJEF7MB`）——同一账号。
+- provider 102「Cline Pass」的 api_key（`sk_`，label=claw）实测 `/users/me` 返回同一 user id
+  （key 原样 Bearer；加 `workos:` 401）→ 三条凭证指向同一个账号。
+- 套餐实况：`Cline Pass (Monthly)[Internal]`，$9.99/月；`currentPeriodStart=2026-10-18T13:57:08Z`
+  （=北京时间 10-18 21:57，**今天刚开通**），`currentPeriodEnd=cancelAt=2026-11-18T13:57:08Z`，
+  `canceledAt=2026-10-18T13:58:55Z`（开通约 2 分钟后已设置期末取消 → 不会自动续费）。
+  `plan.id` 的 ULID 时间戳是套餐模板创建时间（2026-05-26），不是用户订阅时间，别混用。
+- 用量接口可用：`GET /api/v1/users/{uid}/usages?limit=N`（`/users/me/usages` 400）；
+  返回 `aiModelName`、`costUsd`（1e-8 USD）、tokens。200 条覆盖 08-23~10-18，按天计数正常。
