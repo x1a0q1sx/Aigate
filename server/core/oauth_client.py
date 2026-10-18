@@ -49,12 +49,18 @@ _ACCOUNT_DIRTY: set = set()
 _DEVICE_FLOW_STATUS: dict = {}
 
 
-def record_device_flow(provider_code: str, state: str, status: str, error: str = "") -> None:
-    """记录设备流终态（供前端实时展示失败原因）。"""
+def record_device_flow(provider_code: str, state: str, status: str,
+                       error: str = "", detail: str = "") -> None:
+    """记录设备流终态（供前端实时展示失败原因）。
+
+    detail 用于成功态补充说明（如 CodeBuddy 同账号重登：token 写回已有连接，
+    连接数不增加 —— 前端据此提示「已更新原连接」而不是空等 6 分钟）。
+    """
     _DEVICE_FLOW_STATUS[provider_code] = {
         "state": state,
         "status": status,
         "error": str(error or "")[:500],
+        "detail": str(detail or "")[:300],
         "at": time.time(),
     }
 
@@ -1705,6 +1711,9 @@ class OAuthClient:
                         (state_url + ("?state=" + state if state else ""))
             # 启动后台轮询任务（不 awaited，独立协程）
             poll_interval_ms = ep.get("poll_interval_ms", 5000)
+            # 设备流状态置 pending：否则前端会读到上一次流程的 failed 终态，
+            # 把本次刚开始的登录误报成失败（CodeBuddy 是唯一走本函数的 device_poll）。
+            record_device_flow(provider_code, state, "pending", "")
             asyncio.create_task(self._poll_codebuddy_token(
                 provider_code, state, owner, poll_interval_ms,
             ))
@@ -1808,12 +1817,31 @@ class OAuthClient:
                     await self._save_token(db, provider_code, target_owner, tok)
                     logger.info("codebuddy %s token acquired after %d polls (owner=%s)",
                                   provider_code, attempt + 1, target_owner)
+                    # 终态回写（与 muse 对齐）：同账号重登只换 token、连接数不增，
+                    # 前端 watchDeviceFlow 靠「连接数变多」判定成功 → 会一直空等
+                    # 到 6 分钟超时并误报「未检测到新连接」。这里把结果写进
+                    # _DEVICE_FLOW_STATUS，前端立即提示「已更新原连接」。
+                    if target_owner == owner:
+                        _msg = (f"登录成功：该账号已有连接「{target_owner}」，"
+                                f"token 已更新（连接数不变，属正常）")
+                    else:
+                        _msg = f"登录成功：已新增/写回连接「{target_owner}」"
+                    record_device_flow(provider_code, state, "ok", "", detail=_msg)
                     return
             except Exception as e:
                 logger.warning("codebuddy poll attempt %d failed: %s", attempt + 1, e)
                 continue
         logger.warning("codebuddy poll for state %s reached max_attempts without token",
                         state)
+        # 超时也回写终态：前端 6 分钟到点前就能看到「浏览器未完成登录」，
+        # 而不是笼统的「未检测到新连接」。CodeBuddy 的 state 有效期约 10 分钟，
+        # 与轮询窗口（120 × 5s）基本同长。
+        record_device_flow(
+            provider_code, state, "failed",
+            "设备流超时：浏览器侧未在有效期内完成登录（state 未被批准）。"
+            "请确认登录窗口已打开并完成账号登录/授权；若已有连接且是同一账号，"
+            "重登只会更新 token 不会新增连接——如需再加一个账号，请用「强制新增」"
+            "并在新窗口登录另一个账号。")
 
     async def pick_access_token(
         self,

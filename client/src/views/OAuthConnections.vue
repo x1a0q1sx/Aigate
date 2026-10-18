@@ -405,15 +405,17 @@ export default {
         try {
           const rows = await api.getOAuthConnections()
           const now = (rows || []).filter((c) => c.provider_code === code).length
-          if (now > before) {
+          // 后端终态优先：同账号重登只换 token、连接数不变（CodeBuddy 常见），
+          // 只靠「连接数变多」会空等到超时并误报失败。
+          const st = await api.getOAuthDeviceStatus(code).catch(() => null)
+          if (now > before || (st && st.status === 'ok')) {
             clearInterval(this._deviceWatcher)
             this._deviceWatcher = null
             this.connections = rows || this.connections
-            toast.success(code + ' 连接成功，token 已自动保存')
+            toast.success((st && st.detail) || (code + ' 连接成功，token 已自动保存'))
             return
           }
           // 后端轮询已判终态失败（浏览器未批准/expired_token/铸 key 失败）→ 立即停轮询并展示原因
-          const st = await api.getOAuthDeviceStatus(code).catch(() => null)
           if (st && st.status === 'failed') {
             clearInterval(this._deviceWatcher)
             this._deviceWatcher = null

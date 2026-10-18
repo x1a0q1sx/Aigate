@@ -1070,6 +1070,106 @@ async def test_poll_codebuddy_same_account_reuses_renamed_owner(monkeypatch):
     assert saved["args"][1] == "我的主号"
 
 
+# ── 设备流终态回写（2026-10-18：同账号重登连接数不增，前端空等 6 分钟）──
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_records_ok_status_for_same_account(monkeypatch):
+    """同账号重登：token 写回原连接（连接数不变）也必须记 ok 终态。
+
+    前端 watchDeviceFlow 只盯「连接数变多」，同账号重登时永远等不到 →
+    6 分钟超时误报「未检测到新连接」。终态里带 detail 说明「已更新原连接」。
+    """
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": _TOK_135, "refreshToken": "RT-new",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        pass
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return None
+    c._get_token_record = fake_get
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-OK", "13500818840", 1)
+    st = oc.get_device_flow_status("codebuddy_cn")
+    assert st["status"] == "ok"
+    assert "13500818840" in st["detail"]
+    assert "连接数不变" in st["detail"]
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_records_ok_status_for_new_connection(monkeypatch):
+    """新账号登录：终态 detail 说明新增了哪条连接（owner 用账号标识）。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 0, "data": {"accessToken": _TOK_135, "refreshToken": "RT-new",
+                                   "tokenType": "Bearer", "expiresIn": 7200}}),
+    ]))
+
+    async def fake_save(db, code, owner, tok, update_existing=None, allow_identity_change=False):
+        pass
+    c._save_token = fake_save
+
+    async def fake_get(db, code, owner):
+        return None
+    c._get_token_record = fake_get
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-NEW", "__default", 1)
+    st = oc.get_device_flow_status("codebuddy_cn")
+    assert st["status"] == "ok"
+    assert "13500818840" in st["detail"]
+
+
+@pytest.mark.asyncio
+async def test_poll_codebuddy_timeout_records_failed_status(monkeypatch):
+    """轮询耗尽（浏览器侧未完成登录）必须落 failed 终态，带可操作提示。"""
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(calls, [
+        (200, {"code": 11217, "msg": "11217:login ing..."}),
+    ] * 3))
+    monkeypatch.setattr(oc, "AsyncSessionLocal", _fake_sessionmaker())
+
+    await c._poll_codebuddy_token("codebuddy_cn", "S-TMO", "__default", 1, max_attempts=3)
+    st = oc.get_device_flow_status("codebuddy_cn")
+    assert st["status"] == "failed"
+    assert "超时" in st["error"]
+    assert "强制新增" in st["error"]   # 同账号重登不增连接的排障指引
+
+
+@pytest.mark.asyncio
+async def test_start_device_poll_resets_status_to_pending(monkeypatch):
+    """发起新一次设备流必须先把终态置 pending。
+
+    否则前端轮询 device-status 会读到上一次流程的 failed（CodeBuddy 的
+    _DEVICE_FLOW_STATUS 键只有 provider_code，不区分 state），新登录刚开始就
+    被误报失败。
+    """
+    c = OAuthClient(crypto=FakeCrypto())
+    calls = []
+    monkeypatch.setattr(oc.httpx, "AsyncClient", make_fake_httpx(
+        calls, [(200, {"code": 0, "data": {"state": "S-P",
+                                           "authUrl": "https://copilot.tencent.com/login?state=S-P"}})]))
+    oc.record_device_flow("codebuddy_cn", "OLD", "failed", "上一次的失败")
+
+    async def fake_poll(*a, **k):
+        pass
+    c._poll_codebuddy_token = fake_poll
+    r = await c.start_device_poll("codebuddy_cn", None)
+    assert r["state"] == "S-P"
+    st = oc.get_device_flow_status("codebuddy_cn")
+    assert st["status"] == "pending"
+    assert st["state"] == "S-P"
+    assert st["error"] == ""
+
+
 def test_registry_has_sso_logout_url_for_codebuddy():
     """新增账号强制选号依赖 registry 的 sso_logout_url 配置（CN/Intl 都要有）。"""
     for code in ("codebuddy_cn", "codebuddy_intl"):
