@@ -554,6 +554,126 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
             }}
 
 
+# ── Cline / ClinePass ────────────────────────────────────────
+# ClinePass 订阅额度 = 三个滚动窗口的**百分比**，不是积分包：
+#   GET https://api.cline.bot/api/v1/users/me/plan/usage-limits
+#     → {data:{limits:[{type:"five_hour"|"weekly"|"monthly", percentUsed, resetsAt?}]}}
+#   绝对上限在 GET /users/me/plan → plan.entitlements.cline_pass.inferenceCapThreshold
+#     （last5HoursUsageCostUSDPerUser 等，单位 1e-8 USD，除以 1e8 得美元）
+# 鉴权：OAuth 是 WorkOS JWT，必须 `Bearer workos:<jwt>`；clp_ API key 原样发送。
+# 两个端点都要求 workos 前缀（实测裸 Bearer 401 "Please make sure you're using
+# the latest version of Cline"）——直接复用 provider_quirks.auth_token_for 的规则，
+# 避免第二份前缀逻辑漂移。
+_CLINE_WINDOW_LABELS = {
+    "five_hour": "5 小时窗口",
+    "weekly": "周窗口",
+    "monthly": "月窗口",
+}
+# inferenceCapThreshold 的字段名 → (窗口名, 单位换算)
+_CLINE_CAP_FIELDS = {
+    "last5HoursUsageCostUSDPerUser": ("5 小时窗口", 1e8),
+    "last7daysUsageCostUSDPerUser": ("周窗口", 1e8),
+    "last30daysUsageCostUSDPerUser": ("月窗口", 1e8),
+}
+
+
+def _cline_auth_header(token: str) -> str:
+    """Cline 出站 Authorization：JWT 补 workos:，clp_ key 原样（同 provider_quirks）。"""
+    from server.core.provider_quirks import auth_token_for, quirks_for
+    return f"Bearer {auth_token_for(quirks_for('https://api.cline.bot'), token)}"
+
+
+def _cline_parse_usage_limits(body: dict) -> dict:
+    """解析 /users/me/plan/usage-limits。percentUsed 可能 >100（上游测试 fixture 有 101.5），
+    不 clamp —— 超额要能看出来；resetsAt 可能缺失，缺失就不显示重置时间。"""
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    limits = data.get("limits") if isinstance(data, dict) else None
+    quotas: dict = {}
+    extra: dict = {}
+    for item in (limits or []):
+        if not isinstance(item, dict):
+            continue
+        wtype = str(item.get("type") or "").strip()
+        pct = item.get("percentUsed")
+        if not wtype or not isinstance(pct, (int, float)):
+            continue
+        label = _CLINE_WINDOW_LABELS.get(wtype, wtype)
+        quotas[label] = {
+            "used": float(pct), "total": 100.0,
+            "remaining": max(0.0, 100.0 - float(pct)),
+            "reset_at": _parse_reset(item.get("resetsAt")),
+            "unlimited": False, "recurring": True,
+        }
+        extra[f"{wtype}_pct"] = float(pct)
+    return {"quotas": quotas, "extra": extra}
+
+
+def _cline_parse_plan(body: dict) -> dict:
+    """解析 /users/me/plan：套餐名、订阅周期、三个窗口的 USD 成本上限。"""
+    data = body.get("data") if isinstance(body.get("data"), dict) else body
+    if not isinstance(data, dict):
+        return {}
+    plan = data.get("plan") if isinstance(data.get("plan"), dict) else {}
+    extra: dict = {}
+    if plan.get("displayName"):
+        extra["plan_name"] = plan["displayName"]
+    if data.get("currentPeriodEnd"):
+        extra["current_period_end"] = _parse_reset(data.get("currentPeriodEnd"))
+    if data.get("cancelAt"):
+        extra["cancel_at"] = _parse_reset(data.get("cancelAt"))
+    caps = ((plan.get("entitlements") or {}).get("cline_pass") or {}).get(
+        "inferenceCapThreshold") or {}
+    for field, (label, divisor) in _CLINE_CAP_FIELDS.items():
+        val = caps.get(field)
+        if isinstance(val, (int, float)) and val > 0:
+            extra[f"cap_usd_{label}"] = round(float(val) / divisor, 2)
+    return extra
+
+
+async def _cline_usage(token: str) -> dict:
+    """ClinePass 订阅额度：窗口百分比（主）+ 成本上限（补充）。
+
+    返回的是**百分比**额度（used/total=100），不是积分——ClinePass 没有
+    「每月 N credits」这种口径（订阅文档也只给三层 cap）。查不到百分比时
+    如实报 message，不要伪造 0。
+    """
+    headers = {
+        "Authorization": _cline_auth_header(token),
+        "Accept": "application/json",
+        "User-Agent": "Cline/3.0.0",
+        "HTTP-Referer": "https://cline.bot",
+        "X-Title": "Cline",
+    }
+    r = await _get_json("https://api.cline.bot/api/v1/users/me/plan/usage-limits", headers)
+    if r.status_code in (401, 403):
+        return {"quotas": {}, "message": "Cline 凭证无效或已过期（请重新连接）"}
+    if not r.is_success:
+        return {"quotas": {}, "message": f"Cline 额度接口返回 {r.status_code}"}
+    try:
+        parsed = _cline_parse_usage_limits(r.json() if r.content else {})
+    except ValueError:
+        return {"quotas": {}, "message": "Cline 额度响应不是 JSON"}
+    extra = dict(parsed["extra"])
+    # 套餐/上限是补充信息：失败不影响窗口百分比展示
+    try:
+        rp = await _get_json("https://api.cline.bot/api/v1/users/me/plan", headers)
+        if rp.is_success and rp.content:
+            extra.update(_cline_parse_plan(rp.json()))
+    except Exception:
+        pass
+    plan_name = extra.get("plan_name") or "Cline"
+    if not parsed["quotas"]:
+        return {"plan": plan_name, "quotas": {}, "extra": extra,
+                "message": "Cline 已连接，但额度接口未返回任何窗口数据"}
+    # 成本上限做成补充说明（QuotaPanel 的 note 行），不混进百分比额度
+    caps = [f"{label} ${extra[f'cap_usd_{label}']:g}"
+            for label in ("5 小时窗口", "周窗口", "月窗口")
+            if f"cap_usd_{label}" in extra]
+    if caps:
+        extra["note"] = "成本上限：" + " · ".join(caps)
+    return {"plan": plan_name, "quotas": parsed["quotas"], "extra": extra}
+
+
 def _qoder_sane_reset(iso: Optional[str]) -> Optional[str]:
     """吞掉「无到期」哨兵值（9999-12-31）：原样透出会让前端渲染「到期 287 万天后」。"""
     if not iso:
@@ -1093,6 +1213,8 @@ async def _dispatch(provider_code: str, token: str) -> dict:
         return await _codearts_usage(token)
     if provider_code == "trae":
         return await _trae_usage(token)
+    if provider_code == "cline":
+        return await _cline_usage(token)
     if provider_code == "freebuff":
         return await _freebuff_usage(token)
     return {"plan": None, "quotas": {},

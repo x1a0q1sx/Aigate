@@ -477,6 +477,25 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         },
         api_base_url="https://api.cline.bot/api/v1/chat/completions",
         static_models=_seed(
+            # ClinePass 订阅模型（2026-10-18 生产实测）：`/api/v1/models` 的 471 条
+            # 公共目录**不含** cline-pass/*，但订阅账号用 `cline-pass/<name>` 可推理
+            # （实测 kimi-k3 / qwen3.7-plus / qwen3.7-max / minimax-m3 / deepseek-v4.1-flash
+            #  / glm-5.3 / glm-5.3-flash / qwen3.8-max / deepseek-v4-pro / mimo-v2.5(-pro)
+            #  全部 200；muse-spark-1.3-contributor 按出口国别 403）。
+            # 这些是**订阅专有 ID**，公共目录拉不到 → 只能靠种子 ∪ 在线（见 model_catalog）。
+            ("cline-pass/kimi-k3", "Kimi K3 (Pass)"),
+            ("cline-pass/qwen3.8-max", "Qwen3.8 Max (Pass)"),
+            ("cline-pass/qwen3.7-max", "Qwen3.7 Max (Pass)"),
+            ("cline-pass/qwen3.7-plus", "Qwen3.7 Plus (Pass)"),
+            ("cline-pass/glm-5.3", "GLM-5.3 (Pass)"),
+            ("cline-pass/glm-5.3-flash", "GLM-5.3 Flash (Pass)"),
+            ("cline-pass/deepseek-v4-pro", "DeepSeek V4 Pro (Pass)"),
+            ("cline-pass/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (Pass)"),
+            ("cline-pass/minimax-m3", "MiniMax M3 (Pass)"),
+            ("cline-pass/mimo-v2.5-pro", "MiMo V2.5 Pro (Pass)"),
+            ("cline-pass/mimo-v2.5", "MiMo V2.5 (Pass)"),
+            ("cline-pass/muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor (Pass)"),
+            # 按量计费（Cline Credits）公共目录模型
             ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
             ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),
             ("anthropic/claude-opus-4.6", "Claude Opus 4.6"),
@@ -486,7 +505,8 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             ("google/gemini-3.1-flash-lite-preview", "Gemini 3.1 Flash Lite"),
             ("kwaipilot/kat-coder-pro", "KAT Coder Pro"),
         ),
-        notes="Cline 订阅 — code 即 base64 token（自解码）+ JSON 刷新 + workos: 前缀",
+        notes=("Cline 订阅 — code 即 base64 token（自解码）+ JSON 刷新 + workos: 前缀；"
+               "ClinePass 额度=5h/周/月三窗口百分比（/users/me/plan/usage-limits）"),
     ),
     # ── u1s1（有一说一）额度平台 ──
     # 设备登录流（复刻官方 CLI login.js，免客户端）：

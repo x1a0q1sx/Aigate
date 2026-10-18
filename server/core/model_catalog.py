@@ -805,6 +805,25 @@ class ModelCatalog:
                             any_success = True
                             for mi in _m:
                                 all_model_infos.setdefault(mi.model_id, mi)
+                            # Cline：在线 /api/v1/models 是 471 条**按量计费公共目录**，
+                            # 不含订阅专有的 `cline-pass/*`（2026-10-18 实测：公共目录
+                            # 0 条，但订阅账号用 cline-pass/<name> 推理 200）→ 种子只补不删，
+                            # 否则每次刷新都会把订阅模型从列表里「洗掉」。
+                            if oauth_code == "cline" and oauth_p and oauth_p.static_models:
+                                _seeded = 0
+                                for sm in oauth_p.static_models:
+                                    if sm["model_id"] in all_model_infos:
+                                        continue
+                                    all_model_infos[sm["model_id"]] = ModelInfo(
+                                        model_id=sm["model_id"],
+                                        display_name=sm.get("display_name") or sm["model_id"],
+                                        is_free=False, input_price=0.0, output_price=0.0,
+                                        supports_streaming=True, context_length=4096,
+                                    )
+                                    _seeded += 1
+                                list_note = f"在线目录 {len(_m)} 个"
+                                if _seeded:
+                                    list_note += f" + 种子补充 {_seeded} 个（订阅专有）"
                     except Exception as e:
                         logger.warning(f"oauth list_models failed for {provider.name}: {e}")
             if not any_success and oauth_p and oauth_p.static_models:

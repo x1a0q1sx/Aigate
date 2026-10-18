@@ -7,7 +7,7 @@ import pytest
 import server.core.oauth_usage as ou
 from server.core.oauth_usage import (
     _parse_reset, get_connection_usage, _claude_code_usage, _codex_usage,
-    _github_usage, _codebuddy_usage, _qoder_usage, _u1s1_usage,
+    _github_usage, _codebuddy_usage, _qoder_usage, _u1s1_usage, _cline_usage,
 )
 
 
@@ -399,6 +399,97 @@ def test_codebuddy_credits_summary_aggregates(monkeypatch):
 def test_dispatch_unknown_provider_message():
     r = asyncio.run(get_connection_usage("kimchi", "tok"))
     assert "额度接口" in r["message"] or "没有" in r["message"]
+
+
+# ── cline / ClinePass ───────────────────────────────
+def test_cline_usage_windows_and_caps(monkeypatch):
+    """ClinePass：三个窗口百分比 + 套餐成本上限（1e-8 USD）。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        (200, {"success": True, "data": {"limits": [
+            {"type": "five_hour", "percentUsed": 12.5, "resetsAt": "2026-10-18T18:00:00Z"},
+            {"type": "weekly", "percentUsed": 34},
+            {"type": "monthly", "percentUsed": 5},
+        ]}}),
+        (200, {"success": True, "data": {
+            "plan": {"displayName": "Cline Pass (Monthly)",
+                     "entitlements": {"cline_pass": {"inferenceCapThreshold": {
+                         "last5HoursUsageCostUSDPerUser": 1000000000,
+                         "last7daysUsageCostUSDPerUser": 2500000000,
+                         "last30daysUsageCostUSDPerUser": 5000000000}}}},
+            "currentPeriodEnd": "2026-11-18T13:57:08Z",
+        }}),
+    ])
+    r = asyncio.run(_cline_usage("eyJhbGciOiJSUzI1NiJ9.payload.sig"))
+    assert r["plan"] == "Cline Pass (Monthly)"
+    q = r["quotas"]
+    assert q["5 小时窗口"]["used"] == pytest.approx(12.5)
+    assert q["5 小时窗口"]["total"] == 100
+    assert q["5 小时窗口"]["remaining"] == pytest.approx(87.5)
+    assert q["5 小时窗口"]["reset_at"].startswith("2026-10-18T18:00")
+    assert q["周窗口"]["used"] == pytest.approx(34)
+    assert q["月窗口"]["used"] == pytest.approx(5)
+    # 成本上限换算成美元，进 note
+    ex = r["extra"]
+    assert ex["cap_usd_5 小时窗口"] == pytest.approx(10.0)
+    assert ex["cap_usd_周窗口"] == pytest.approx(25.0)
+    assert ex["cap_usd_月窗口"] == pytest.approx(50.0)
+    assert "成本上限" in ex["note"]
+    # 鉴权必须带 workos: 前缀（裸 Bearer 实测 401）
+    assert calls[0]["headers"]["Authorization"].startswith("Bearer workos:")
+    assert calls[0]["url"] == "https://api.cline.bot/api/v1/users/me/plan/usage-limits"
+    assert calls[1]["url"] == "https://api.cline.bot/api/v1/users/me/plan"
+
+
+def test_cline_api_key_not_prefixed(monkeypatch):
+    """clp_ API key 原样发送（加 workos: 会 401）。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"success": True, "data": {"limits": []}})])
+    asyncio.run(_cline_usage("clp_abc123"))
+    assert calls[0]["headers"]["Authorization"] == "Bearer clp_abc123"
+
+
+def test_cline_percent_over_100_not_clamped(monkeypatch):
+    """percentUsed 可能 >100（超额），不能 clamp，否则「已超限」看不出来。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"success": True, "data": {"limits": [
+        {"type": "five_hour", "percentUsed": 101.5},
+    ]}})])
+    r = asyncio.run(_cline_usage("tok"))
+    assert r["quotas"]["5 小时窗口"]["used"] == pytest.approx(101.5)
+    assert r["quotas"]["5 小时窗口"]["remaining"] == 0.0
+
+
+def test_cline_unauthorized_message(monkeypatch):
+    calls = []
+    _patch(monkeypatch, calls, [(401, {"error": "Unauthorized"})])
+    r = asyncio.run(_cline_usage("tok"))
+    assert r["quotas"] == {}
+    assert "重新连接" in r["message"]
+
+
+def test_cline_unknown_window_type_kept(monkeypatch):
+    """未知窗口类型不丢（上游可能加新窗口），按原名展示。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {"success": True, "data": {"limits": [
+        {"type": "future_window", "percentUsed": 3},
+    ]}})])
+    r = asyncio.run(_cline_usage("tok"))
+    assert r["quotas"]["future_window"]["used"] == pytest.approx(3)
+
+
+def test_cline_plan_failure_does_not_break_windows(monkeypatch):
+    """套餐端点失败（5xx）不应吞掉已拿到的窗口百分比。"""
+    calls = []
+    _patch(monkeypatch, calls, [
+        (200, {"success": True, "data": {"limits": [
+            {"type": "weekly", "percentUsed": 10},
+        ]}}),
+        (500, {"error": "boom"}),
+    ])
+    r = asyncio.run(_cline_usage("tok"))
+    assert r["quotas"]["周窗口"]["used"] == pytest.approx(10)
+    assert r["plan"] == "Cline"
 
 
 # ── 额度按到期顺序排序（用户需求 2026-09-22） ─────────────────────
