@@ -110,10 +110,11 @@ async def note_account_result(provider, account: str, ok: bool,
     if not account:
         return
     if not ok:
-        # 每日限额（带重置时间的文案）必须记录，不受常规资格闸约束；
-        # 其余失败仍先过 is_account_worthy_error 闸：空输出/内容校验类不冷却账号。
-        from server.core.quota_limit import is_daily_limit_text
-        if not (model_id and is_daily_limit_text(error)) \
+        # 每日限额（带重置时间的文案）/ 余额耗尽（402 insufficient_credits）必须记录，
+        # 不受常规资格闸约束；其余失败仍先过 is_account_worthy_error 闸：
+        # 空输出/内容校验类不冷却账号。
+        from server.core.quota_limit import is_daily_limit_text, is_credit_exhausted_text
+        if not (model_id and (is_daily_limit_text(error) or is_credit_exhausted_text(error))) \
                 and not is_account_worthy_error(error, status_code):
             return
     try:
@@ -164,23 +165,29 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
                 _err = (f"OAuth provider '{oauth_code}' not connected"
                         if owner == "__default"
                         else f"OAuth provider '{oauth_code}' account '{owner}' not connected")
-                # 区分「全部账号该模型今日额度已用完」：自动路由应换模型，而非误报未连接
-                # （(账号×模型) 每日限额，2026-10-16）
+                # 区分「该模型额度已用完」：自动路由应换模型，而非误报未连接
+                # （(账号×模型) 限额，2026-10-16 每日限额 / 2026-10-18 余额耗尽）。
+                # 点名账号同样命中：pick_access_token_ex 已在点名分支做本地拒绝，
+                # 这里给出与自动模式一致的 quota_limited 报错（含恢复时间）。
                 _mid = getattr(model, "model_id", "") or ""
-                if owner == "__default" and _mid:
+                if _mid:
                     try:
                         from server.core.quota_store import active_limit_owners
                         _lim = await active_limit_owners(db, oauth_code, _mid)
                         if _lim:
-                            from sqlalchemy import select as _sel
-                            from server.models.oauth_token import OAuthToken as _OT
-                            _rows = (await db.execute(_sel(_OT).where(
-                                _OT.provider_code == oauth_code,
-                                _OT.is_active == True))).scalars().all()  # noqa: E712
-                            if _rows and all(r.owner in _lim for r in _rows):
+                            if owner != "__default":
+                                _hit = owner if owner in _lim else None
+                            else:
+                                from sqlalchemy import select as _sel
+                                from server.models.oauth_token import OAuthToken as _OT
+                                _rows = (await db.execute(_sel(_OT).where(
+                                    _OT.provider_code == oauth_code,
+                                    _OT.is_active == True))).scalars().all()  # noqa: E712
+                                _hit = owner if (_rows and all(r.owner in _lim for r in _rows)) else None
+                            if _hit:
                                 _latest = max(_lim.values())
-                                _err = (f"quota_limited: model '{_mid}' daily quota exhausted on "
-                                        f"all accounts; resets at {_latest.isoformat()}Z")
+                                _err = (f"quota_limited: model '{_mid}' quota exhausted on "
+                                        f"account(s); resets at {_latest.isoformat()}Z")
                     except Exception:
                         pass
                 rc.error = _err

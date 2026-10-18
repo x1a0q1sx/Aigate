@@ -6,6 +6,12 @@
         <p style="color: var(--text-muted); font-size: 14px; margin-top: 4px;">
           自定义模型组合名，按策略在候选模型间 fallback / 轮询。请求时用 <code>combo:组合名</code> 调用。
         </p>
+        <p class="text-xs" style="color: var(--text-muted); margin-top: 6px;">
+          💡 「定时启用模型」是**模型级**设置：在
+          <router-link to="/models" style="color: var(--accent, #2b8aef);">模型页</router-link>
+          → 编辑某个模型 → 「生效时段」（可设仅时段内可用 / 时段内优先）。
+          配置后组合 / Auto / 直连统一生效；时段外的候选在组合里会显示「时段外」徽标并被请求跳过。
+        </p>
       </div>
       <button class="btn btn-primary" @click="openAddModal">+ 新建组合</button>
     </div>
@@ -138,6 +144,9 @@
                          @dragend="onDragEnd">
                       <span class="drag-grip" title="拖到右侧已选栏">⠿</span>
                       <span class="transfer-model-name">{{ m.display_name || m.model_id }}</span>
+                      <!-- 生效时段（v4.6 定时免费/限时模型）：时段外的候选请求时会被跳过 -->
+                      <span v-if="m.schedule_blocked" class="badge badge-neutral text-xs"
+                            title="该模型配置了「仅时段内可用」，当前时段外 → 组合请求会跳过它（到点自动恢复）。在「模型」页编辑该模型的生效时段。">时段外</span>
                       <span class="transfer-model-meta" v-if="m.is_free || m.input_price || m.avg_latency_ms">
                         {{ m.is_free ? '免费' : '¥' + fmtPrice(m.input_price) }}<template v-if="m.avg_latency_ms"> · {{ Math.round(m.avg_latency_ms) }}ms</template>
                       </span>
@@ -177,6 +186,8 @@
                      :class="{ 'dragging': dragIndex === i, 'drag-over': dragOverIndex === i }">
                   <span class="sel-idx">{{ i + 1 }}</span>
                   <span class="sel-name">{{ m.provider }}/{{ m.model_id }}</span>
+                  <span v-if="selScheduleBlocked(m)" class="badge badge-neutral text-xs"
+                        title="该模型配置了「仅时段内可用」，当前时段外 → 组合请求会跳过它（到点自动恢复）。在「模型」页编辑该模型的生效时段。">时段外</span>
                   <span class="sel-meta" v-if="selMeta(m)">{{ selMeta(m) }}</span>
                   <span class="sel-spacer"></span>
                   <input v-if="form.strategy === 'weighted'"
@@ -467,6 +478,11 @@ export default {
       else if (mo.input_price != null) parts.push('¥' + this.fmtPrice(mo.input_price))
       if (mo.avg_latency_ms != null) parts.push(Math.round(mo.avg_latency_ms) + 'ms')
       return parts.join(' · ')
+    },
+    /** 已选候选是否「时段外」（v4.6 生效时段：请求时会被跳过，到点自动恢复） */
+    selScheduleBlocked(m) {
+      const mo = this.selLookup[`${m.provider}::${m.model_id}`]
+      return !!(mo && mo.schedule_blocked)
     },
     fmtPrice(p) {
       const n = Number(p || 0)

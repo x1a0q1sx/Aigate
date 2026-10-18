@@ -108,6 +108,7 @@ class ProviderQuirks:
     neutralize_competitor_tokens: bool = False  # 出站前等价改写竞品客户端名（u1s1 指纹黑名单）
     blocked_tool_names: dict = field(default_factory=dict)  # 上游按工具名拦截：原名→出站别名
     client_headers: bool = False        # chat 请求补官方客户端头族（CodeBuddy Intl 渠道校验）
+    cline_client_headers: bool = False  # Cline 产品面头族（cline-free/cline-cloud 需要 X-CLIENT-TYPE）
     default_headers: dict = field(default_factory=dict)
 
 
@@ -147,9 +148,17 @@ _CLINE = ProviderQuirks(
     name="cline",
     workos_token=True,
     unwrap_envelope=True,
+    # 2026-10-18 生产 A/B 实证（Session 30）：`cline-free/*` 与 `cline-cloud/*` 有
+    # **产品面闸**——不带 `X-CLIENT-TYPE: cline-sdk` 一律 403
+    # 「xxx is only available via Cline product surfaces」；只加这一个头即 200
+    # （X-CLIENT-VERSION / X-PLATFORM / X-CORE-VERSION / X-Task-ID 均非判据，
+    #   但 cline2api 与官方 CLI 都带全，一起带上免费）。
+    # `cline-pass/*` 与按量计费模型无此闸；缺这些头不影响，但统一带上避免分裂。
+    cline_client_headers=True,
     default_headers={
         "HTTP-Referer": "https://cline.bot",
         "X-Title": "Cline",
+        "User-Agent": "Cline/3.0.47",
     },
 )
 
@@ -271,6 +280,32 @@ def codebuddy_client_headers(api_key: str, payload: dict = None, url: str = "") 
 # Cline OAuth access token 是 WorkOS JWT（base64url eyJ… 开头）。
 # 非 JWT 形态（ClinePass 的 clp_ API key 等）必须原样发送，加前缀会被 401 拒绝。
 _WORKOS_JWT = re.compile(r"^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+def cline_client_headers(api_key: str, payload: dict = None) -> dict:
+    """Cline 官方客户端头族（2026-10-18 A/B 实测：X-CLIENT-TYPE 是产品面闸判据）。
+
+    `cline-free/*` / `cline-cloud/*` 不带 `X-CLIENT-TYPE: cline-sdk` 一律 403
+    「only available via Cline product surfaces」；只加这一个头即 200。
+    其余头（VERSION/PLATFORM/CORE/Task-ID）非判据，但官方 CLI 与 cline2api 都带全，
+    一起带上避免未来收紧（与 CodeBuddy Intl 的 X-Conversation-* 同一防御姿态）。
+    X-Task-ID 按会话（账号 × 首条用户消息）派生，多账号池不会共用同一会话 id。
+    """
+    seed = _first_user_text(payload)
+    if seed:
+        task = "sess_" + uuid.uuid5(uuid.NAMESPACE_URL,
+                                    f"aigate-cline:{api_key or ''}:{seed[:512]}").hex
+    else:
+        task = "sess_" + uuid.uuid4().hex
+    return {
+        "X-IS-MULTIROOT": "false",
+        "X-CLIENT-TYPE": "cline-sdk",
+        "X-CLIENT-VERSION": "3.0.47",
+        "X-PLATFORM": "terminal",
+        "X-PLATFORM-VERSION": "3.0.47",
+        "X-CORE-VERSION": "0.0.66",
+        "X-Task-ID": task,
+    }
 
 
 def auth_token_for(q: Optional[ProviderQuirks], api_key: str) -> str:

@@ -802,8 +802,9 @@ export default {
     quotaLimitTitle(m) {
       const accs = (m.quota_limited_accounts || []).join('、') || '未知账号'
       const at = new Date(m.quota_limited_until).toLocaleString('zh-CN', { hour12: false })
-      return `上游每日限额：账号「${accs}」在 ${m.model_id} 上今日额度已用完，${at} 重置。` +
-        '该账号的其他模型、以及其他账号不受影响；期间自动路由会跳过这些账号。'
+      return `额度已用完：账号「${accs}」在 ${m.model_id} 上被上游限额/余额不足，${at} 自动恢复。` +
+        '期间网关**直接本地拒绝**该账号该模型的请求（不再发上游白烧一次必败往返）；' +
+        '该账号的其他模型、以及其他账号不受影响。'
     },
     // 分组复选：comboName 为 null 表示 Auto；一个模型可同时属多个分组
     async toggleGroup(model, comboName, checked) {

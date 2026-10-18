@@ -57,6 +57,65 @@ def test_cline_seed_keeps_payg_models():
         assert mid in ids
 
 
+# ── 客户端头族（2026-10-18 A/B：X-CLIENT-TYPE 是产品面闸判据）─────────
+
+def test_cline_quirks_require_client_type_header():
+    """cline-free/*、cline-cloud/* 必须带 X-CLIENT-TYPE: cline-sdk（缺则 403）。"""
+    from server.core.provider_quirks import quirks_for, cline_client_headers
+    q = quirks_for("https://api.cline.bot/api/v1/chat/completions")
+    assert q is not None and q.cline_client_headers is True
+    h = cline_client_headers("tok", {"messages": [{"role": "user", "content": "hi"}]})
+    assert h["X-CLIENT-TYPE"] == "cline-sdk"
+    assert h["X-CLIENT-VERSION"] == "3.0.47"
+    assert h["X-PLATFORM"] == "terminal"
+    # 会话 id 按（账号 × 首条用户消息）稳定派生：同账号同消息 → 同 id
+    h2 = cline_client_headers("tok", {"messages": [{"role": "user", "content": "hi"}]})
+    assert h["X-Task-ID"] == h2["X-Task-ID"]
+    # 换账号 / 换消息 → 不同 id（多账号池不共用会话 id）
+    h3 = cline_client_headers("tok2", {"messages": [{"role": "user", "content": "hi"}]})
+    assert h3["X-Task-ID"] != h["X-Task-ID"]
+
+
+def test_cline_headers_injected_into_outbound_request():
+    """适配器出站头必须包含 Cline 产品面头（静态回归）。"""
+    from pathlib import Path
+    src = Path("server/adapters/openai_compat.py").read_text(encoding="utf-8")
+    assert "cline_client_headers" in src
+    assert "q.cline_client_headers" in src
+
+
+# ── 在线推荐目录（free/clinePass 分组）────────────────────────────
+
+def test_cline_recommended_catalog_parses_groups(monkeypatch):
+    """fetch_cline_catalog 解析 free/clinePass/recommended 三组并保留前缀。"""
+    import asyncio
+    import httpx
+    from server.core import model_catalog as mc
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {
+                "recommended": [{"id": "anthropic/claude-sonnet-5.5", "name": "claude-sonnet-5.5"}],
+                "free": [{"id": "cline-free/solar-mini4", "name": "Solar Mini 4"}],
+                "clinePass": [{"id": "cline-pass/kimi-k3", "name": "Kimi K3"}],
+            }
+
+    class _Client:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, headers=None): return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *a, **kw: _Client())
+    out = asyncio.run(mc.fetch_cline_catalog("tok", "https://api.cline.bot/api/v1"))
+    by_id = {m.model_id: m for m in out}
+    assert "cline-free/solar-mini4" in by_id
+    assert by_id["cline-free/solar-mini4"].is_free is True
+    assert "cline-pass/kimi-k3" in by_id
+    assert " (Pass)" in by_id["cline-pass/kimi-k3"].display_name
+    assert "anthropic/claude-sonnet-5.5" in by_id
+
+
 # ── 刷新链路：在线目录 ∪ 种子 ─────────────────────────
 
 async def _setup(tmp_path):

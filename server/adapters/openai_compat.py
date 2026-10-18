@@ -14,7 +14,7 @@ from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
 from server.core.provider_quirks import (
     quirks_for, transform_payload, unwrap_response, auth_token_for,
-    restore_tool_names_in_response, codebuddy_client_headers,
+    restore_tool_names_in_response, codebuddy_client_headers, cline_client_headers,
 )
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
@@ -170,6 +170,10 @@ class OpenAICompatAdapter(BaseAdapter):
         # 缺一即 11128）；会话 id 由 payload 派生，故只对 chat/completions 且拿到 payload 时补
         if q and q.client_headers and payload is not None and url and "/chat/completions" in url:
             headers.update(codebuddy_client_headers(api_key, payload, url))
+        # Cline 产品面闸：cline-free/*、cline-cloud/* 必须带 X-CLIENT-TYPE: cline-sdk
+        # （2026-10-18 A/B：缺则 403 only available via Cline product surfaces）
+        if q and q.cline_client_headers and payload is not None and url and "/chat/completions" in url:
+            headers.update(cline_client_headers(api_key, payload))
         # 网关内部路由标记（__proxy_* / __oauth / __dpop / __fg）不是上游协议的一部分，绝不出站；
         # openai_compat 的 OAuth 密钥就是 api_key（Bearer），无需 __oauth 分支。
         # 统一走 outbound_headers：剥离 __ 前缀内部键 + 值强制 str（httpx 硬要求）。

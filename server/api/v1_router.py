@@ -2478,11 +2478,28 @@ async def _chat_completions_impl(
                     _rc_d = await resolve_credential_async(provider, model, db)
                     oauth_code = getattr(provider, "oauth_code", None) or provider.name
                     if not _rc_d.ok or not _rc_d.api_key:
-                        # 全部账号该模型额度用完（quota_limited）→ 如实报限额（含重置时间），
-                        # 不误报「未连接」（(账号×模型) 每日限额，2026-10-16）
+                        # 全部账号该模型额度用完（quota_limited）→ 如实报限额（含恢复时间），
+                        # 不误报「未连接」（(账号×模型) 限额，2026-10-16 每日限额 / 10-18 余额耗尽）。
+                        # 语义上用 429（与上游限额一致，客户端重试策略正确）+ Retry-After。
                         _rc_err = _rc_d.error or f"OAuth provider '{oauth_code}' not connected"
                         await _decision_finish(conversation_id, status="error", failure_reason=_rc_err)
                         await _early_error_log(conversation_id, request, raw_request, _rc_err)
+                        from server.core.quota_limit import is_quota_limited_error as _is_ql
+                        if _is_ql(_rc_err):
+                            _hdr = {}
+                            try:
+                                import re as _re
+                                _m = _re.search(r"resets at ([0-9T:\-\.]+Z?)", _rc_err)
+                                if _m:
+                                    from datetime import datetime as _dt, timezone as _tz
+                                    _when = _dt.fromisoformat(_m.group(1).rstrip("Z")).replace(tzinfo=_tz.utc)
+                                    _secs = max(1, int((_when - _dt.now(_tz.utc)).total_seconds()))
+                                    _hdr["Retry-After"] = str(_secs)
+                            except Exception:
+                                pass
+                            return JSONResponse(status_code=429,
+                                                content=_api_error(_rc_err, status=429, type_="quota_limited"),
+                                                headers=_hdr)
                         return JSONResponse(status_code=503, content=_api_error(_rc_err, status=503))
                     api_key = _rc_d.api_key
                     _direct_extra = _rc_d.extra_headers
@@ -3428,7 +3445,11 @@ async def _chat_completions_impl(
                 http_status_code = 503
                 _err_full = err_text(e)
                 raw_err = _extract_error_body(e) or _err_full
-                response = _api_error(f"upstream_call_failed: {_err_full[:300]}", status=503)
+                # 余额/积分耗尽（Cline 402 等）：补一句可操作提示（Pass 只覆盖 cline-pass/*）
+                from server.core.error_text import credit_exhausted_hint as _credit_hint
+                _hint = _credit_hint(str(e))
+                _msg = f"upstream_call_failed: {_err_full[:300]}" + (f"\n{_hint}" if _hint else "")
+                response = _api_error(_msg, status=503)
                 response["_raw_response"] = raw_err
     else:
         # 级联回退已完成实际调用，用返回的 model 信息构建标识

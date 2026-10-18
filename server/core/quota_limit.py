@@ -101,7 +101,9 @@ def parse_daily_limit_reset(error) -> Optional[datetime]:
 def daily_limit_reset_or_default(error, default_seconds: int = 3600) -> datetime:
     """解析重置时间；解析不出时给「现在 + default_seconds」兜底（默认 1 小时）。
 
-    兜底上限也受调用方（note_request_result）的封顶约束。"""
+    兜底上限也受调用方（note_request_result）的封顶约束。
+    余额耗尽（402，无重置时间）由调用方传 default_seconds=1800（30 分钟，
+    与 cline2api 的 402 冷却策略一致）——充值后最多半小时自动重试。"""
     got = parse_daily_limit_reset(error)
     if got is not None:
         return got
@@ -111,6 +113,35 @@ def daily_limit_reset_or_default(error, default_seconds: int = 3600) -> datetime
 # 网关内部生成的「全部账号该模型额度用完」错误前缀（credential_resolver）
 QUOTA_LIMITED_PREFIX = "quota_limited"
 
+# ── 余额/积分耗尽（无重置时间，按固定短冷却）────────────────────────────
+# Cline（cline.bot）按量计费模型在余额不足时返回：
+#   HTTP 402 {"error":{"code":"insufficient_credits",
+#            "message":"Insufficient balance. Your Cline Credits balance is $0.00",
+#            "current_balance":0.00393,...}}
+# 这是**账号余额**问题（Cline Pass 订阅模型不受影响，它们走 cline-pass/* 不计 credits），
+# 上游不会给出恢复时间 → 按固定冷却（默认 30 分钟，与 cline2api 同策略）记录，
+# 避免每个请求都先烧一次 402 往返。
+_CREDIT_EXHAUSTED_MARKERS = (
+    "insufficient_credits",
+    "insufficient balance",
+    "insufficient credits",
+    "payment required",
+)
+
+
+def is_credit_exhausted_text(error) -> bool:
+    """错误文本是否为「余额/积分耗尽」（402 insufficient_credits 等）。
+
+    与每日限额区分：这类错误**没有**重置时间，恢复靠用户充值/换账号；
+    记录时用固定冷却（见 oauth_client.note_request_result）。"""
+    text = str(error or "")
+    if not text:
+        return False
+    low = text.lower()
+    if "402" in low and ("payment required" in low or "insufficient" in low):
+        return True
+    return any(m in low for m in _CREDIT_EXHAUSTED_MARKERS)
+
 
 def is_quota_limited_error(error) -> bool:
     """是否为网关生成的 quota_limited 错误（选号全被限额拦截时）。"""
@@ -118,8 +149,9 @@ def is_quota_limited_error(error) -> bool:
 
 
 def is_quota_related_error(error) -> bool:
-    """限额相关错误（上游每日限额文案 / 网关 quota_limited 错误）。
+    """限额相关错误（上游每日限额文案 / 余额耗尽 / 网关 quota_limited 错误）。
 
     这类错误不是模型故障 → 调用方不应把它计入模型冷却（指数退避罚时）：
     限额记录本身已精确管控到重置时间点，账号切换与到期恢复自动生效。"""
-    return is_daily_limit_text(error) or is_quota_limited_error(error)
+    return (is_daily_limit_text(error) or is_credit_exhausted_text(error)
+            or is_quota_limited_error(error))

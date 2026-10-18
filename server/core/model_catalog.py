@@ -249,6 +249,71 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
     )
 
 
+# Cline 官方「推荐/免费/订阅」模型接口（**无需认证**，2026-10-18 实测）：
+#   GET https://api.cline.bot/api/v1/ai/cline/recommended-models
+#   → {"recommended":[...], "free":[...], "clinePass":[...], "clineCloud":[...]}
+# 这是**唯一**能拿到 cline-free/* 与 cline-pass/* 的在线源：
+#   - /api/v1/models 的 471 条公共目录只有按量计费模型（无 cline-free/cline-pass）
+#   - free 数组 = 官方免费模型（需 X-CLIENT-TYPE: cline-sdk 头才能调，见 provider_quirks）
+#   - clinePass 数组 = 订阅专有模型
+# 来源：cline2api（luawei1/cline2api models_sync.go）同款端点，实测生产 200。
+_CLINE_RECOMMENDED_URL = "https://api.cline.bot/api/v1/ai/cline/recommended-models"
+
+
+async def fetch_cline_catalog(token: str, base_url: str) -> List[ModelInfo]:
+    """拉取 Cline 推荐/免费/订阅模型清单（免费接口，不需要 token）。
+
+    失败（非 200 / 网络异常 / 解析不出）返回 []，由调用方回退静态种子。
+    返回的 model_id 保留原始前缀（cline-free/… / cline-pass/…），与推理 ID 一致。
+    """
+    import httpx
+    headers = {
+        "User-Agent": "Cline/3.0.47",
+        "HTTP-Referer": "https://cline.bot",
+        "X-Title": "Cline",
+        # 产品面头：虽然本接口实测无需鉴权，但带上与推理一致的客户端指纹更稳
+        "X-CLIENT-TYPE": "cline-sdk",
+        "X-CLIENT-VERSION": "3.0.47",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as c:
+            r = await c.get(_CLINE_RECOMMENDED_URL, headers=headers)
+    except Exception as e:
+        logger.info("cline recommended-models 拉取失败：%s", err_text(e))
+        return []
+    if r.status_code != 200:
+        logger.info("cline recommended-models HTTP %s", r.status_code)
+        return []
+    try:
+        data = r.json() or {}
+    except Exception:
+        return []
+    out: List[ModelInfo] = []
+    seen = set()
+    # free 数组是官方免费模型；clinePass 是订阅专有；recommended 是通用推荐（按量计费）
+    for group, suffix in (("free", " (Free)"), ("clinePass", " (Pass)"), ("recommended", "")):
+        for m in (data.get(group) or []):
+            if not isinstance(m, dict):
+                continue
+            mid = (m.get("id") or "").strip()
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            name = (m.get("name") or "").strip() or mid
+            if suffix and not name.endswith(suffix.strip()):
+                name = f"{name}{suffix}"
+            out.append(ModelInfo(
+                model_id=mid,
+                display_name=name,
+                is_free=(group == "free"),
+                input_price=0.0,
+                output_price=0.0,
+                supports_streaming=True,
+                context_length=4096,
+            ))
+    return out
+
+
 async def fetch_codebuddy_catalog(token: str, base_url: str) -> List[ModelInfo]:
     """从 CodeBuddy 两个在线目录端点拉取模型清单（详情信息以两端点并集为准）。
 
@@ -801,6 +866,13 @@ class ModelCatalog:
                             _m = await _fetch_lobsterai_models(_goc(), session, _owner)
                         else:
                             _m = await adapter.list_models(token, provider.base_url, eh)
+                        # Cline：公共目录（/api/v1/models）只有 471 条按量计费模型，
+                        # **不含** cline-free/* 与 cline-pass/*。官方另一个免费接口
+                        # /api/v1/ai/cline/recommended-models 才有 free/clinePass 分组
+                        # （2026-10-18 实测，cline2api 同款）→ 两源并集后再并种子。
+                        if oauth_code == "cline":
+                            _rec = await fetch_cline_catalog(token, provider.base_url)
+                            _m = list(_m or []) + list(_rec or [])
                         if _m:
                             any_success = True
                             for mi in _m:
@@ -817,7 +889,8 @@ class ModelCatalog:
                                     all_model_infos[sm["model_id"]] = ModelInfo(
                                         model_id=sm["model_id"],
                                         display_name=sm.get("display_name") or sm["model_id"],
-                                        is_free=False, input_price=0.0, output_price=0.0,
+                                        is_free=str(sm["model_id"]).startswith("cline-free/"),
+                                        input_price=0.0, output_price=0.0,
                                         supports_streaming=True, context_length=4096,
                                     )
                                     _seeded += 1
@@ -837,7 +910,9 @@ class ModelCatalog:
                     _r = _ratio_map.get(sm["model_id"])
                     all_model_infos.setdefault(sm["model_id"], ModelInfo(
                         model_id=sm["model_id"], display_name=sm.get("display_name") or sm["model_id"],
-                        is_free=(_r == 0.0), input_price=0.0, output_price=0.0,
+                        # cline-free/* 是官方免费模型（种子兜底时同样标免费）
+                        is_free=(_r == 0.0 or str(sm["model_id"]).startswith("cline-free/")),
+                        input_price=0.0, output_price=0.0,
                         supports_streaming=True, context_length=4096,
                         price_ratio=_r,
                     ))

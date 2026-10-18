@@ -494,7 +494,15 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             ("cline-pass/minimax-m3", "MiniMax M3 (Pass)"),
             ("cline-pass/mimo-v2.5-pro", "MiMo V2.5 Pro (Pass)"),
             ("cline-pass/mimo-v2.5", "MiMo V2.5 (Pass)"),
+            ("cline-pass/mimo-v2.6-flash", "MiMo V2.6 Flash (Pass)"),
+            ("cline-pass/mimo-v2.6-pro", "MiMo V2.6 Pro (Pass)"),
             ("cline-pass/muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor (Pass)"),
+            # cline-free/*：官方 /ai/cline/recommended-models 的 free 数组（2026-10-18）。
+            # ⚠️ 产品面闸：必须带 X-CLIENT-TYPE: cline-sdk（quirks 已统一附加），否则 403。
+            ("cline-free/nemotron-3.5-super-vl", "Nemotron 3.5 Super VL (Free)"),
+            ("cline-free/mimo-v2.6-flash", "MiMo V2.6 Flash (Free)"),
+            ("cline-free/muse-spark-1.3-contributor", "Muse Spark 1.3 Contributor (Free)"),
+            ("cline-free/solar-mini4", "Solar Mini 4 (Free)"),
             # 按量计费（Cline Credits）公共目录模型
             ("anthropic/claude-opus-4.7", "Claude Opus 4.7"),
             ("anthropic/claude-sonnet-4.6", "Claude Sonnet 4.6"),

@@ -32,7 +32,7 @@ from server.db import AsyncSessionLocal
 from server.models.oauth_token import OAuthToken
 from server.core.crypto_service import get_crypto_service, CryptoService
 from server.core.error_text import is_risk_block_text
-from server.core.quota_limit import is_daily_limit_text
+from server.core.quota_limit import is_daily_limit_text, is_credit_exhausted_text
 from server.core.oauth_registry import OAuthProviderConfig, get_oauth_provider
 
 logger = logging.getLogger(__name__)
@@ -1956,6 +1956,19 @@ class OAuthClient:
         model_id：给了就同时跳过「该模型今日额度已用完」的账号（(账号×模型)
         粒度的每日限额，见 core/quota_limit.py）——该账号的其他模型不受影响。"""
         if owner and owner != "__default":
+            # 点名账号同样要过「(账号×模型) 限额」闸（2026-10-18 用户要求）：
+            # 上游已明确给出恢复时间点，再发就是白烧一次必败的 402/429 往返；
+            # 网关直接返回限额错误（含重置时间），到点自动恢复。
+            if model_id:
+                try:
+                    from server.core.quota_store import active_limit_owners
+                    _lim = await active_limit_owners(db, provider_code, model_id)
+                except Exception:
+                    _lim = {}
+                if owner in _lim:
+                    logger.info("oauth %s/%s: model %s quota-limited until %s (explicit owner, local reject)",
+                                provider_code, owner, model_id, _lim[owner])
+                    return None
             row = await self._get_token_record(db, provider_code, owner)
             if not row or not row.is_active:
                 return None
@@ -2057,6 +2070,16 @@ class OAuthClient:
                 _ACCOUNT_DIRTY.add(mark)
                 await self._record_quota_limit(provider_code, owner, model_id, error, provider_id)
                 return
+            # 余额/积分耗尽（Cline 402 insufficient_credits 等）：同样记 (账号×模型)
+            # 限额记录（无重置时间 → 30 分钟固定冷却，与 cline2api 一致）。
+            # 这是账号余额问题：该账号的其他**计费模型**同样不可用，但同一账号上的
+            # 订阅/免费模型（cline-pass/*、cline-free/*）不受影响 —— 记成
+            # (账号×模型) 粒度最精确：只拦真正失败的那个模型，不误伤订阅模型。
+            if model_id and is_credit_exhausted_text(error):
+                _ACCOUNT_DIRTY.add(mark)
+                await self._record_quota_limit(provider_code, owner, model_id, error,
+                                               provider_id, default_seconds=1800)
+                return
             _ACCOUNT_DIRTY.add(mark)
             if status_code is None:
                 status_code = status_from_error_text(error)
@@ -2102,15 +2125,17 @@ class OAuthClient:
             logger.debug("note_request_result failed: %s", e)
 
     async def _record_quota_limit(self, provider_code: str, owner: str, model_id: str,
-                                  error: str, provider_id: Optional[int] = None) -> None:
-        """upsert 一条 (账号×模型) 每日限额记录（reset_at 取上游文案里的时间点）。
+                                  error: str, provider_id: Optional[int] = None,
+                                  default_seconds: int = 3600) -> None:
+        """upsert 一条 (账号×模型) 限额记录（reset_at 优先取上游文案里的时间点）。
 
         并发安全：按唯一键先查后写；撞唯一约束（并发同键插入）退化为 UPDATE 重试一次。
-        解析不到时间点 → 1 小时后兜底（仍远好于 60s 指数退避打墙）。"""
+        解析不到时间点 → default_seconds 兜底（每日限额默认 1 小时；余额耗尽传
+        1800 = 30 分钟，与 cline2api 的 402 冷却策略一致，充值后自动恢复）。"""
         try:
             from server.core.quota_limit import daily_limit_reset_or_default
             from server.models.quota_limit import QuotaLimit
-            reset_at = daily_limit_reset_or_default(error, default_seconds=3600)
+            reset_at = daily_limit_reset_or_default(error, default_seconds=default_seconds)
             note = (str(error or "").strip()[:500]) or ""
             from server.db import AsyncSessionLocal
             for _try in range(2):

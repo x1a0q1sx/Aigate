@@ -417,3 +417,140 @@ async def test_resolver_reports_quota_limited_when_all_accounts_limited(tmp_path
             assert "resets at" in (rc.error or "")
     finally:
         await engine.dispose()
+
+
+# ── 8) 余额耗尽（Cline 402 insufficient_credits）──────────────────
+
+_CLINE_402 = ('HTTPStatusError: Client error \'402 Payment Required\' for url '
+              '\'https://api.cline.bot/api/v1/chat/completions\'\nResponse: '
+              '{"error":{"code":"insufficient_credits","message":"Insufficient balance. '
+              'Your Cline Credits balance is $0.00","current_balance":0.00393,'
+              '"total_spent":0,"total_promotions":0}}')
+
+
+def test_is_credit_exhausted_text_identifies_cline_402():
+    """402 insufficient_credits 识别；普通 429 / 空输出不误判。"""
+    from server.core.quota_limit import is_credit_exhausted_text, is_quota_related_error
+    assert is_credit_exhausted_text(_CLINE_402)
+    assert is_credit_exhausted_text('HTTP 402 Payment Required: insufficient balance')
+    assert is_credit_exhausted_text('{"error":{"code":"insufficient_credits"}}')
+    # 非余额类错误不命中
+    assert not is_credit_exhausted_text(
+        'HTTPStatusError: Client error \'429 Too Many Requests\'')
+    assert not is_credit_exhausted_text("empty_output: upstream 返回 200 但无内容")
+    # 限额相关错误（不进模型冷却）
+    assert is_quota_related_error(_CLINE_402)
+
+
+@pytest.mark.asyncio
+async def test_note_credit_exhausted_records_quota_limit_with_30min_default(tmp_path, monkeypatch):
+    """Cline 402 → 写 quota_limits（固定 30 分钟兜底），账号本身不冷却。"""
+    import server.core.oauth_client as oc
+    from server.core.oauth_client import get_oauth_client
+    engine, Session = await _setup(tmp_path)
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    monkeypatch.setattr("server.db.AsyncSessionLocal", Session)
+    before = datetime.utcnow()
+    try:
+        await client.note_request_result("cline", "acct-a", ok=False,
+                                         status_code=402, error=_CLINE_402,
+                                         model_id="deepseek/deepseek-v4.1-flash-1017",
+                                         provider_id=85)
+        async with Session() as db:
+            tok = (await db.execute(
+                select(OAuthToken).where(OAuthToken.owner == "acct-a"))).scalar_one()
+            # 账号本身不冷却（cline-pass/* 订阅模型仍可用）
+            assert tok.fail_count == 0 and tok.cooldown_until is None
+            q = (await db.execute(select(QuotaLimit))).scalar_one()
+            assert q.provider_code == "cline"
+            assert q.model_id == "deepseek/deepseek-v4.1-flash-1017"
+            # 30 分钟固定冷却（无重置时间 → default_seconds=1800）
+            delta = (q.reset_at - before).total_seconds()
+            assert 1700 <= delta <= 1900, delta
+    finally:
+        oc._ACCOUNT_DIRTY.discard(("cline", "acct-a"))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_pick_explicit_owner_local_rejects_quota_limited_model(tmp_path, monkeypatch):
+    """点名账号（oauth_owner）在该模型上限额 → 本地直接拒绝（不再发上游白烧 402）。
+
+    用户要求（2026-10-18）：上游已明确限额/余额不足且给了恢复时间点，
+    再来请求不该再发上游 —— 网关直接返回限额错误。
+    """
+    from server.core.oauth_client import get_oauth_client
+    engine, Session = await _setup(tmp_path)
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    try:
+        async with Session() as db:
+            db.add(QuotaLimit(provider_code="codebuddy_cn", owner="acct-a",
+                              model_id="m1", reset_at=datetime.utcnow() + timedelta(hours=5)))
+            await db.commit()
+        async with Session() as db:
+            # 点名 acct-a + 已限额模型 → None（调用方转 quota_limited 错误）
+            assert await client.pick_access_token_ex(
+                "codebuddy_cn", db, owner="acct-a", model_id="m1") is None
+            # 点名 acct-a 的其他模型 → 正常取到（不误伤）
+            got = await client.pick_access_token_ex(
+                "codebuddy_cn", db, owner="acct-a", model_id="m2")
+            assert got == ("acct-a", "tok-a")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolver_reports_quota_limited_for_named_owner(tmp_path, monkeypatch):
+    """点名账号 + 该模型限额 → resolver 返回 quota_limited（而不是 'not connected'）。"""
+    from server.core.credential_resolver import resolve_credential_async
+    from server.core.oauth_client import get_oauth_client
+    from server.models.provider import Provider
+    from server.models.model import Model
+    engine, Session = await _db(
+        tmp_path, [OAuthToken.__table__, QuotaLimit.__table__,
+                   Provider.__table__, Model.__table__])
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    try:
+        async with Session() as db:
+            db.add_all([
+                OAuthToken(provider_code="codebuddy_cn", owner="acct-a",
+                           access_token_enc="enc-tok-a", is_active=True),
+                OAuthToken(provider_code="codebuddy_cn", owner="acct-b",
+                           access_token_enc="enc-tok-b", is_active=True),
+                QuotaLimit(provider_code="codebuddy_cn", owner="acct-a",
+                           model_id="m1", reset_at=datetime.utcnow() + timedelta(hours=5)),
+            ])
+            await db.commit()
+            prov = Provider(name="CodeBuddy CN", base_url="https://copilot.tencent.com/v2",
+                            api_type="openai_compat", credential_type="oauth",
+                            oauth_code="codebuddy_cn", oauth_owner="acct-a", enabled=True)
+            db.add(prov)
+            await db.commit()
+            mdl = Model(provider_id=prov.id, model_id="m1", display_name="m1",
+                        input_price=0, output_price=0, is_free=False, auto_enabled=True,
+                        enabled=True, supports_streaming=True, context_length=128000)
+            db.add(mdl)
+            await db.commit()
+            rc = await resolve_credential_async(prov, mdl, db)
+            assert not rc.ok
+            assert "quota_limited" in (rc.error or ""), rc.error
+            assert "not connected" not in (rc.error or ""), rc.error
+    finally:
+        await engine.dispose()
+
+
+# ── 9) 错误文案：余额耗尽的可操作提示 ─────────────────────────────
+
+def test_credit_exhausted_hint_mentions_cline_pass_scope():
+    """Cline 402 → 提示「Pass 只覆盖 cline-pass/*，公共目录走 credits」。"""
+    from server.core.error_text import credit_exhausted_hint
+    hint = credit_exhausted_hint(_CLINE_402)
+    assert "cline-pass" in hint
+    assert "Cline Credits" in hint
+    # 非余额错误 → 空串（不污染正常错误文案）
+    assert credit_exhausted_hint("429 Too Many Requests") == ""
+    # 通用余额不足（非 Cline）→ 通用提示
+    assert "充值" in credit_exhausted_hint("insufficient balance")

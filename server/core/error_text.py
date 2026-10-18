@@ -86,6 +86,24 @@ def is_risk_block_text(error) -> bool:
         '"code":11128', "request illegal", "没通过渠道校验", "渠道校验"))
 
 
+def credit_exhausted_hint(error) -> str:
+    """余额/积分耗尽错误 → 给用户可操作的中文提示（空串=不是这类错误）。
+
+    Cline 按量计费模型余额不足（402 insufficient_credits）时上游原文只说
+    "Insufficient balance. Your Cline Credits balance is $0.00" —— 用户看不出
+    「为什么订阅了 Cline Pass 还报余额不足」。实际上 Cline Pass 只覆盖
+    `cline-pass/*` 订阅模型；公共目录模型（`deepseek/...`、`anthropic/...`）走
+    Cline Credits 按量计费，余额为 0 就会 402。此提示用于错误文案末尾。"""
+    text = str(error or "").lower()
+    if "insufficient_credits" not in text and "insufficient balance" not in text:
+        return ""
+    if "cline" in text or "cline.bot" in text:
+        return ("提示：Cline Pass 订阅只覆盖 `cline-pass/*` 订阅模型（不计 credits）；"
+                "`deepseek/*`、`anthropic/*` 等公共目录模型走 Cline Credits 按量计费，"
+                "余额为 0 即 402。请改用 cline-pass/* 模型，或到 cline.bot 充值。")
+    return "提示：上游账户余额/积分不足，请充值或改用其他模型/账号。"
+
+
 def combine_err_text(short, full) -> str:
     """合并「短形态 + 全量文本」：短形态保证 HTTP 状态码可提取（如 '429'），
     全量保证上游原文特征不被截断吃掉（如每日限额文案里的重置时间）。

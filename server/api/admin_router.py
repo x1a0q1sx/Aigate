@@ -1237,20 +1237,38 @@ async def list_models(
 
 @router.get("/models/light")
 async def list_models_light(db: AsyncSession = Depends(get_db)):
-    """组合路由等选择器专用轻量模型列表：只回候选选择所需的 9 个字段。
+    """组合路由等选择器专用轻量模型列表：只回候选选择所需的字段。
 
     全量 /admin/api/models 附带 40+ 字段与 TPS 聚合（生产实测 ~2.4MB/476ms），
-    组合页只用 9 个字段，整包拉取是该页秒开慢的主因之一。
+    组合页只用少量字段，整包拉取是该页秒开慢的主因之一。
+
+    2026-10-18 增补 `schedule_blocked`：组合页需要提示「该模型当前时段外，
+    请求会被跳过」——否则用户不知道为什么 fallback 跳过了它（v4.6 生效时段）。
+    只回派生布尔，不回整份规则（保持轻量）。
     """
     rows = (await db.execute(
         select(Model.id, Model.provider_id, Model.model_id, Model.display_name,
                Model.is_free, Model.input_price, Model.output_price,
-               Model.avg_latency_ms, Model.enabled)
+               Model.avg_latency_ms, Model.enabled, Model.active_schedule)
         .order_by(Model.provider_id, Model.model_id)
     )).all()
-    keys = ("id", "provider_id", "model_id", "display_name", "is_free",
-            "input_price", "output_price", "avg_latency_ms", "enabled")
-    return [dict(zip(keys, r)) for r in rows]
+    from server.core.model_schedule import evaluate as _eval_sched
+    out = []
+    for r in rows:
+        _blocked = False
+        if r.active_schedule:
+            try:
+                _blocked = bool(_eval_sched(r.active_schedule).get("blocked"))
+            except Exception:
+                _blocked = False
+        out.append({
+            "id": r.id, "provider_id": r.provider_id, "model_id": r.model_id,
+            "display_name": r.display_name, "is_free": r.is_free,
+            "input_price": r.input_price, "output_price": r.output_price,
+            "avg_latency_ms": r.avg_latency_ms, "enabled": r.enabled,
+            "schedule_blocked": _blocked,
+        })
+    return out
 
 
 @router.put("/models/{model_id}")
@@ -2114,7 +2132,10 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             oauth_code = getattr(provider, "oauth_code", None) or provider.name
             _rc_p = await resolve_credential_async(provider, model, db)
             if not _rc_p.ok or not _rc_p.api_key:
-                raise HTTPException(status_code=503, detail=f"OAuth provider '{oauth_code}' not connected")
+                # 如实透出解析器原因：quota_limited（该模型额度已用完，含恢复时间）
+                # 不能被误报成「未连接」（(账号×模型) 限额，2026-10-16/10-18）
+                _rc_err = _rc_p.error or f"OAuth provider '{oauth_code}' not connected"
+                raise HTTPException(status_code=503, detail=_rc_err)
             from server.core.model_catalog import create_adapter_for_provider
             from server.core.auto_router import RouteResult
             adapter = create_adapter_for_provider(provider.api_type)
@@ -2218,18 +2239,24 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 await _note_pg_account(True)   # OAuth 多账号：流正常走完 → 清账号冷却
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 from server.api.v1_router import _api_error as _api_error_fn
+                from server.core.error_text import credit_exhausted_hint as _credit_hint
                 _pg_err = err_text(e)[:300]
                 await _note_pg_account(False, _pg_err)
-                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
+                _hint = _credit_hint(str(e))
+                _msg = f"upstream_stream_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
+                yield _format_sse_chunk(_api_error_fn(_msg), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             except Exception as e:
                 # 适配器自抛的业务错误（SessionError / RuntimeError 等）也必须变成
                 # SSE error 事件：否则异常穿透生成器 → 前端只看到流中断，原因丢失。
                 # 对齐 /v1 的宽捕获口径（那边 except Exception → _api_error）。
                 from server.api.v1_router import _api_error as _api_error_fn
+                from server.core.error_text import credit_exhausted_hint as _credit_hint
                 _pg_err = err_text(e)[:300]
                 await _note_pg_account(False, _pg_err)
-                yield _format_sse_chunk(_api_error_fn(f"upstream_stream_failed: {_pg_err}"), model_id_full)
+                _hint = _credit_hint(str(e))
+                _msg = f"upstream_stream_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
+                yield _format_sse_chunk(_api_error_fn(_msg), model_id_full)
                 await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
             yield b"data: [DONE]\n\n"
         return StreamingResponse(wrap_stream(), media_type="text/event-stream")
@@ -2244,21 +2271,26 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             )
             await _note_pg_account(True)   # OAuth 多账号：成功 → 清账号冷却
         except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
+            from server.core.error_text import credit_exhausted_hint as _credit_hint
             _pg_err = err_text(e)[:300]
             await _note_pg_account(False, _pg_err)
             await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
-            return JSONResponse(status_code=503, content={"error": f"upstream_call_failed: {_pg_err}"})
+            _hint = _credit_hint(str(e))
+            _msg = f"upstream_call_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
+            return JSONResponse(status_code=503, content={"error": _msg})
         except Exception as e:
             # ⚠️ 此前只捕获 httpx 三类异常，适配器自抛的业务错误（如 freebuff 的
             # SessionError「Freebucks 额度已用尽」/「模型不在此档」）会穿透成
             # **HTTP 500 Internal Server Error** —— 用户只看到 500，看不到真正原因
             # （生产实测：glm-5.3-flash 因额度用尽报 500，日志里才有可读文案）。
             # 对齐 /v1 的宽捕获：一律转成 503 + 可读 error 文案。
+            from server.core.error_text import credit_exhausted_hint as _credit_hint
             _pg_err = err_text(e)[:300]
             await _note_pg_account(False, _pg_err)
             await _write_log("error", None, int((time.time() - _send_time)*1000), _pg_err[:500])
-            return JSONResponse(status_code=503,
-                                content={"error": f"upstream_call_failed: {_pg_err}"})
+            _hint = _credit_hint(str(e))
+            _msg = f"upstream_call_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
+            return JSONResponse(status_code=503, content={"error": _msg})
 
 
     if isinstance(result, dict) and "model" in result:
