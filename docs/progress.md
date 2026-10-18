@@ -467,3 +467,47 @@
 **给用户的操作结论**：这次登录**确实成功了**（token 已换新、推理 200），只是登进了已有账号 13500818840。要真正**新增**一个账号：点「强制新增」（会先走 SSO 登出链）并在新窗口登录**另一个手机号/账号**；若浏览器仍复用旧会话，先手动打开一次登出链再登录。
 
 **遗留**：`docs/manga-*`、`scripts/manga_*`、`tests/test_manga_*`、`AGENTS.md` 为工作区未跟踪文件（非本会话产物，未提交）。
+
+### Session 28（2026-10-18）：ClinePass 订阅额度接入 + 订阅专有模型入库（fbe81ff）
+
+**用户诉求**：「cline 我订阅了 pass，看看有没有项目可以看到额度啥的，帮我增量更新一波」。
+
+**调研结论（子代理 + 生产实测交叉）**：
+1. Cline 账户额度有两个端点（官方 API 文档未公开，社区 3 个开源项目在用）：
+   - `GET https://api.cline.bot/api/v1/users/me/plan/usage-limits` → `data.limits[]`：
+     `type` = `five_hour` / `weekly` / `monthly`，`percentUsed`（0–100，可 >100），`resetsAt`（可能缺）。
+   - `GET https://api.cline.bot/api/v1/users/me/plan` → 套餐名、`currentPeriodEnd`、
+     `plan.entitlements.cline_pass.inferenceCapThreshold.*`（单位 **1e-8 USD**，除以 1e8）。
+2. **鉴权是最大坑**：OAuth token 是 WorkOS JWT，账户/额度端点**必须 `Bearer workos:<jwt>`**；
+   裸 Bearer 一律 401 `"Please make sure you're using the latest version of Cline..."`（生产两条连接全部复现）。
+   `clp_` API key 相反——原样发送，加 `workos:` 会 401（9router #2333 同结论）。
+3. ClinePass 没有「每月 N credits」口径，只有三个窗口的**百分比 + USD 成本上限**，不要伪造积分余额。
+4. **模型目录分裂**：`/api/v1/models` 471 条公共目录**不含任何 `cline-pass/*`**，
+   但订阅账号用 `cline-pass/<name>` 推理 200（`moonshotai/kimi-k3` 反而 404 "model not found"）。
+   实测可用：`cline-pass/{kimi-k3, qwen3.8-max, qwen3.7-max, qwen3.7-plus, glm-5.3,
+   glm-5.3-flash, deepseek-v4-pro, deepseek-v4.1-flash, minimax-m3, mimo-v2.5(-pro)}`；
+   `muse-spark-1.3-contributor` 按出口国别 403。
+   ⚠️ 小 `max_tokens`（8）时多数模型报 500 "empty response content"（推理模型先吐 reasoning），
+   放到 200 全部 200 —— 不是模型不可用。
+
+**实现（fbe81ff）**：
+- `server/core/oauth_usage.py`：新增 `_cline_usage` + `_cline_parse_usage_limits` / `_cline_parse_plan`；
+  `_cline_auth_header` 复用 `provider_quirks.auth_token_for`（JWT 补 `workos:`、`clp_` 原样，避免第二份前缀逻辑）。
+  窗口百分比归一化为 `used/total=100` 的 `_pct` 形态，`recurring=True`；成本上限进 `extra.cap_usd_*` + `note`；
+  未知窗口类型按原名保留；`/plan` 失败不影响窗口展示。
+- `server/core/oauth_registry.py`：cline 种子补 12 个 `cline-pass/*`（订阅专有）+ 保留按量计费公共模型。
+- `server/core/model_catalog.py`：cline 刷新改为「在线目录 ∪ 种子」（只补不删）——否则每次刷新
+  都会把订阅专有模型洗掉（与 CodeBuddy F31/F37 同规矩）。`list_note` 记「在线目录 N 个 + 种子补充 M 个（订阅专有）」。
+- 测试：`tests/test_oauth_usage.py` +6（窗口/成本上限/workos 前缀/clp_ 原样/>100 不 clamp/401 文案/plan 失败容错），
+  新增 `tests/test_cline_pass.py` +4（种子含订阅模型、种子保留按量模型、刷新并集、在线优先）。
+
+**验证**：全量 **1170 passed**；生产 pull + `pm2 restart aigate`（health 200，restarts 11）。
+- 两条 cline 连接额度实测：`Cline Pass (Monthly)` + 三窗口 0%（含真实 resetsAt：5h/周/月）。
+- 模型刷新实测：`在线目录 471 个 + 种子补充 13 个（订阅专有）`，`cline-pass/*` 12 条全部 enabled 落库。
+- 端到端：临时 gateway key 调 `POST /v1/chat/completions`，model=`Cline (cline.bot)/cline-pass/kimi-k3`
+  → 200 + `hello`（临时 key 已删）。
+- ⚠️ 裸模型名 `cline-pass/kimi-k3` 不会命中：v1 路由把第一个 `/` 前当服务商名（既有语义，
+  所有带 `/` 的模型都一样），调用需写 `服务商名/模型ID`。
+
+**顺带发现**：生产还有 provider 102「Cline Pass」（api_key，base `.../api/v1`，key 前缀 `sk_`）——
+非 OAuth 连接，额度面板不覆盖 api_key 服务商；若要用订阅额度请以 provider 85 的 OAuth 连接为准。
