@@ -103,6 +103,7 @@
   </div>
 </template>
 <script>
+import { reactive, markRaw } from 'vue'
 import api, { apiStream } from '../api.js'
 import toast from '../toast.js'
 import SearchSelect from '../components/SearchSelect.vue'
@@ -361,7 +362,10 @@ export default {
       })
     },
     newRun(kind, reqModel, promptText, messages) {
-      const run = {
+      // 用 reactive 包一层：流式回调（reader.read 的 await 之后）改 run.chars/text 时
+      // 才能触发重渲染。直接 push 裸对象进 this.runs，Vue3 只对数组本身做响应式，
+      // 不会代理元素 → 只有切换模型/重渲染才会「忽然」看到结果。
+      const run = reactive({
         id: `r${Date.now()}-${++this.seq}`,
         ts: Date.now(),
         kind, reqModel, served: '',
@@ -372,7 +376,7 @@ export default {
         prompt: promptText.length > 120 ? promptText.slice(0, 120) + '…' : promptText,
         expanded: false,
         abortCtl: null, url: '',
-      }
+      })
       this.runs.unshift(run)
       if (this.runs.length > MAX_RUNS) this.runs.splice(MAX_RUNS)
       this.persist()
@@ -382,7 +386,7 @@ export default {
     async streamRun(run, payload) {
       const startedAt = Date.now()
       const abort = new AbortController()
-      run.abortCtl = abort
+      run.abortCtl = markRaw(abort)   // 原生对象不能被 reactive 代理（abort() 会 Illegal invocation）
       let buf = '', served = '', reasoning = '', streamError = ''
       try {
         const stream = await apiStream('/admin/api/playground', payload, abort.signal)
