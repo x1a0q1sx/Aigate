@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -109,6 +111,14 @@ def main() -> int:
     print(f"   设备码：{user_code}（链接已内嵌时无需手输；{expires_in} 秒内有效）")
     print("   请用【个人 Meta 账号】登录并批准；企业/托管账号不支持设备码流。")
     print("   浏览器必须和本脚本走同一个出口地区（同一台机器直接跑最稳）。", flush=True)
+    # device_code 落盘：脚本中断后可手动接管轮询（device_code 一次性，丢了就要重来）
+    try:
+        with open(os.path.join(tempfile.gettempdir(), "muse_device_code.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"device_code": device_code, "user_code": user_code,
+                       "url": url, "expires_at": time.time() + expires_in}, f)
+    except Exception:
+        pass
     if not args.no_browser:
         try:
             webbrowser.open(url)
@@ -118,8 +128,13 @@ def main() -> int:
     print("③ 等待批准…", flush=True)
     deadline = time.time() + expires_in
     access = ""
+    polls = 0
     while time.time() < deadline:
         time.sleep(interval)
+        polls += 1
+        if polls % 6 == 1:
+            print(f"   …第 {polls} 次轮询（{int(deadline - time.time())}s 后设备码过期）",
+                  flush=True)
         try:
             _, tok = _post_form(opener, TOKEN_URL, {
                 "grant_type": GRANT,
@@ -129,7 +144,9 @@ def main() -> int:
         except SystemExit:
             raise
         except Exception as e:                       # 网络抖动：继续等
-            print(f"   轮询失败（{type(e).__name__}），重试…", flush=True)
+            reason = getattr(e, "reason", None) or getattr(e, "__cause__", None) or e
+            print(f"   轮询失败（{type(e).__name__}: {str(reason)[:80]}），重试…",
+                  flush=True)
             continue
         if not tok.get("error"):
             access = str(tok.get("access_token") or "")
