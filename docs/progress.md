@@ -412,3 +412,28 @@
   - 测试：test_muse 33 项（新增 UA/单出口/静态 TTL）
 - 全量 **1156 全绿**；前端 build 通过；已部署生产（pull + client build + pm2 restart，HEAD 3475740）
 - ⚠️ 仍待用户侧验证：浏览器端批准是否成功取决于 Meta 对**用户网络出口/账号类型**的判定；若仍报 Sign-in failed，用 `python scripts/muse_login.py --proxy <本机代理>` 铸 key 后导入
+
+## Session 26 - 2026-10-18
+### 完成（muse 登录实战排查 7 轮：网络变量全排除，卡点收窄到 Meta 账号侧）
+
+**背景**：Session 25 加固后用户仍报「Sign-in failed / Token exchange failed」。本 session 换「本机同出口」架构实战排查。
+
+**架构实验矩阵（7 轮设备码）**：
+| 轮次 | 脚本出口 | 浏览器出口 | 结果 |
+|---|---|---|---|
+| 1 | 本机 7897（日本机房 Catixs） | 默认浏览器 | 未完成批准 |
+| 2-3 | 本机 7897 | Chrome 同出口（独立 profile） | 未完成批准 |
+| 4-7 | **美国家宽住宅 IP**（服务器 mihomo META-LOGIN 临时组 + SSH 隧道 10890） | Chrome 同出口 | 未完成批准 |
+
+**临时基建（已全部还原）**：服务器 `/opt/clash/clash_config.yaml` 加 `META-LOGIN` select 组（filter 美国）+ meta 域名规则临时改指它，固定「美国-家宽 01 5倍消耗」节点，验证 auth.meta.com 可达（783ms）；登录实验后从备份还原 + SIGHUP。⚠️ 备份名 `clash_config.yaml.bak-muselogin` 还在服务器上，确认无需后可删。
+
+**关键定性**：
+1. **请求形态无罪**——7 轮横跨两种出口类型（日/新机房 vs 美国家宽）、脚本与浏览器同/异出口、默认/独立浏览器，轮询端始终 `authorization_pending` 到过期，无一次 invalid_grant/授权错误 → Meta 浏览器侧从未走到「批准后交换」那一步。
+2. **CLIProxyAPI #6242 同判成立**：剩下的拒绝原因只有账号侧——①托管/工作账号（MMA）不支持设备码流 ②账号所在区域未被 Muse 灰度。**换 IP 无效**，需用户用「个人 Meta 账号」（个人邮箱注册的 FB/IG）重试；若仍拒=账号区域未开放，只能换账号或等开放。
+3. **生产入口健康**：`start_muse_device` 生产路径验证 OK（产出码+code_embedded=True）。裸脚本直调会挂起——**必须先 init_proxy_pool**（lifespan 才做，独立进程调 OAuth 前要手动初始化），否则 `_force_proxy_kwargs()` 返回 {} 静默直连 auth.meta.com 超时。诊断脚本要带 `init_proxy_pool(get_config().proxy_pool.model_dump())`。
+4. 本机 9090 是 **SSH 隧道转发的服务器 mihomo API**（本地 Verge 控制器禁用、9097 也关）；本地 META 域名走本地 Verge 的同形规则（META-REGION url-test）。改服务器 mihomo 节点用隧道 9090 API 即可，无需 ssh 改配置。
+5. mihomo url-test 组 PUT 切换返回 204 后 url-test 仍可能按测速自动换节点（`fixed` 字段只是显示）；要真正钉死节点需改配置 filter 或用 select 组。`/proxies/{name}` 单节点查询在 providers 模式下 404，全组测速 `/group/{name}/delay` 的返回 key 才是节点全集。
+
+**muse_login.py 增强（01d81af 已推送）**：device_code 落盘 `%TEMP%/muse_device_code.json`（可手动接管轮询）+ URLError 带底层异常原因 + 6 次一轮心跳输出。
+
+**未完成**：用户侧账号定性未完成（7 轮都没到登录后的批准步）。下次会话直接问：登录用的什么账号？页面报错在登录时还是批准时？
