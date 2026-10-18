@@ -542,6 +542,55 @@ async def test_resolver_reports_quota_limited_for_named_owner(tmp_path, monkeypa
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_note_credit_exhausted_records_all_same_identity_connections(tmp_path, monkeypatch):
+    """同一上游账号挂多条连接（__default + account-2 同 JWT sub）→ 限额记录要给全部连接。
+
+    2026-10-18 生产实证：Cline 两连接是同一邮箱，自动选号会换连接名继续打同一个
+    破产账号（第二次请求仍发上游）。限额是**上游账号级**的，必须按 token 身份扩散。
+    """
+    import base64, json as _json
+    import server.core.oauth_client as oc
+    from server.core.oauth_client import get_oauth_client
+    engine, Session = await _setup(tmp_path)
+
+    def _jwt(sub: str) -> str:
+        payload = base64.urlsafe_b64encode(_json.dumps({"sub": sub}).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJIUzI1NiJ9.{payload}.sig"
+
+    tok_a = _jwt("user_01SAME")
+    tok_b = _jwt("user_01SAME")   # 同一上游账号（不同连接名）
+    tok_c = _jwt("user_01OTHER")  # 另一个账号
+    async with Session() as db:
+        db.add_all([
+            OAuthToken(provider_code="cline", owner="__default",
+                       access_token_enc="enc-" + tok_a, is_active=True),
+            OAuthToken(provider_code="cline", owner="account-2",
+                       access_token_enc="enc-" + tok_b, is_active=True),
+            OAuthToken(provider_code="cline", owner="account-3",
+                       access_token_enc="enc-" + tok_c, is_active=True),
+        ])
+        await db.commit()
+
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    monkeypatch.setattr("server.db.AsyncSessionLocal", Session)
+    try:
+        await client.note_request_result("cline", "__default", ok=False,
+                                         status_code=402, error=_CLINE_402,
+                                         model_id="deepseek/deepseek-v4.1-flash-1017",
+                                         provider_id=85)
+        async with Session() as db:
+            rows = (await db.execute(select(QuotaLimit))).scalars().all()
+            owners = sorted(r.owner for r in rows)
+            # 同身份的 __default 与 account-2 都要记；不同账号的 account-3 不记
+            assert owners == ["__default", "account-2"], owners
+    finally:
+        for o in ("__default", "account-2", "account-3"):
+            oc._ACCOUNT_DIRTY.discard(("cline", o))
+        await engine.dispose()
+
+
 # ── 9) 错误文案：余额耗尽的可操作提示 ─────────────────────────────
 
 def test_credit_exhausted_hint_mentions_cline_pass_scope():

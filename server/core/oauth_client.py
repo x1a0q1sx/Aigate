@@ -2131,34 +2131,60 @@ class OAuthClient:
 
         并发安全：按唯一键先查后写；撞唯一约束（并发同键插入）退化为 UPDATE 重试一次。
         解析不到时间点 → default_seconds 兜底（每日限额默认 1 小时；余额耗尽传
-        1800 = 30 分钟，与 cline2api 的 402 冷却策略一致，充值后自动恢复）。"""
+        1800 = 30 分钟，与 cline2api 的 402 冷却策略一致，充值后自动恢复）。
+
+        同一上游账号可能挂了多条连接（历史重复登录 = `__default` + `account-2`
+        同一邮箱）：限额是**上游账号级**的，必须给同身份的所有连接都记上，
+        否则自动选号会换个连接名继续打同一个破产账号（2026-10-18 生产实证）。"""
         try:
             from server.core.quota_limit import daily_limit_reset_or_default
             from server.models.quota_limit import QuotaLimit
             reset_at = daily_limit_reset_or_default(error, default_seconds=default_seconds)
             note = (str(error or "").strip()[:500]) or ""
             from server.db import AsyncSessionLocal
+            # 解析同身份的其他连接（token_identity 只读 JWT payload，不验签）
+            _owners = [owner]
+            try:
+                async with AsyncSessionLocal() as _idb:
+                    _rows = (await _idb.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.provider_code == provider_code,
+                            OAuthToken.is_active == True,  # noqa: E712
+                        ))).scalars().all()
+                _ids = {}
+                for _r in _rows:
+                    try:
+                        _tok = self._crypto.decrypt(_r.access_token_enc) if _r.access_token_enc else ""
+                    except Exception:
+                        _tok = ""
+                    _ids[_r.owner] = token_identity(_tok) if _tok else None
+                _me = _ids.get(owner)
+                if _me:
+                    _owners = [o for o, ident in _ids.items() if ident == _me] or [owner]
+            except Exception:
+                _owners = [owner]
             for _try in range(2):
                 try:
                     async with AsyncSessionLocal() as db:
-                        row = (await db.execute(
-                            select(QuotaLimit).where(
-                                QuotaLimit.provider_code == provider_code,
-                                QuotaLimit.owner == owner,
-                                QuotaLimit.model_id == model_id,
-                            ).limit(1)
-                        )).scalar_one_or_none()
-                        if row is None:
-                            db.add(QuotaLimit(
-                                provider_code=provider_code, provider_id=provider_id,
-                                owner=owner, model_id=model_id, reset_at=reset_at, note=note))
-                        else:
-                            # 取更晚的重置时间（上游可能续报；绝不让新记录提前解锁）
-                            if reset_at > (row.reset_at or datetime.min):
-                                row.reset_at = reset_at
-                            row.note = note
-                            if provider_id is not None:
-                                row.provider_id = provider_id
+                        for _own in _owners:
+                            row = (await db.execute(
+                                select(QuotaLimit).where(
+                                    QuotaLimit.provider_code == provider_code,
+                                    QuotaLimit.owner == _own,
+                                    QuotaLimit.model_id == model_id,
+                                ).limit(1)
+                            )).scalar_one_or_none()
+                            if row is None:
+                                db.add(QuotaLimit(
+                                    provider_code=provider_code, provider_id=provider_id,
+                                    owner=_own, model_id=model_id, reset_at=reset_at, note=note))
+                            else:
+                                # 取更晚的重置时间（上游可能续报；绝不让新记录提前解锁）
+                                if reset_at > (row.reset_at or datetime.min):
+                                    row.reset_at = reset_at
+                                row.note = note
+                                if provider_id is not None:
+                                    row.provider_id = provider_id
                         await db.commit()
                     break
                 except Exception:
