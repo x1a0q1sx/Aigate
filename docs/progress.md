@@ -444,3 +444,26 @@
 - 尝试矩阵追加：第 8 轮（已登录默认浏览器+本地抖动链路）、9-10 轮（10890 隧道 Chrome 独立 profile——**无用户登录态**，窗口显示 instagram 会话）、11-12 轮（**系统代理临时切 10890 + 用户默认浏览器**，链路稳定但用户侧仍未完成批准动作）
 - **遗留方法**（下次直接用）：①发码前先 `curl -x 10890 auth.meta.com/robots.txt` 预检 5 次 ②抖动就 ssh 触发组测速 ③`reg add ...ProxyEnable 1 / ProxyServer 127.0.0.1:10890` 让用户默认浏览器走稳定隧道（用后还原 ProxyEnable=0）④**必须让用户自己反馈页面显示什么**——12 轮盲烧码的教训
 - 系统代理已还原、临时 Chrome profile 已清理、服务器配置已还原（bak-muselogin 备份可删）
+
+### Session 27（2026-10-18）：CodeBuddy CN「新增账号网页成功但没连上」定性 + 修复（7732a68）
+
+**现象**：用户点「新增账号」完成 CodeBuddy CN 登录，网页显示成功，但连接列表没变化，前端最终报「设备流超时：未检测到新连接」。
+
+**生产取证（DB + 解密 + JWT claims + 上游实测）**：
+1. `oauth_tokens` 只有两条 codebuddy_cn（id 1 = 15944101987，id 6 = 13500818840）。**id 6 的 token 在 12:27:18 被换新**（access/refresh 双变、jti 变化），但 `sub`/`preferred_username` 与 10-17 备份完全一致 → 浏览器实际登录的仍是**已有账号 13500818840**（SSO 会话被登录页静默复用）。
+2. 新 token 实测有效：`GET /v3/config` 200、`POST /v2/chat/completions`（glm-5.3-flash 流式）200 —— **登录本身是成功的，凭据已落库**。
+3. 连接数不变是**正确行为**：身份守卫按 `preferred_username` 匹配到已有连接并写回（防重复连接的设计），不是 bug。
+4. 真 bug 在**观测层**：`_poll_codebuddy_token` 全程不回写 `_DEVICE_FLOW_STATUS`（只有 muse 有），前端 `watchDeviceFlow` 只能靠「连接数变多」判成功 → 同账号重登永远等不到 → 6 分钟超时误报「未检测到新连接」。
+5. 附带发现：`start_device_poll` 不重置终态，前端可能读到上一次流程的 `failed` 把新登录误报失败（CodeBuddy 的 `_DEVICE_FLOW_STATUS` 键只有 provider_code）。
+
+**修复（7732a68）**：
+- `_poll_codebuddy_token` 成功记 `ok` 终态，`detail` 区分「新增/写回连接 X」与「该账号已有连接，token 已更新（连接数不变，属正常）」
+- 轮询耗尽记 `failed` 终态，提示「浏览器未完成登录；同账号重登只更新 token；要加号请用强制新增登录另一个账号」
+- `start_device_poll` 先 `record_device_flow(..., "pending")` 清掉旧终态
+- 前端 `watchDeviceFlow` 以 `status==='ok'` 为成功信号（连接数只是兼容旧后端），toast 用 `detail` 文案
+
+**部署**：7732a68 已 push + 服务器 pull + `npm run build` + `pm2 restart aigate`（health 200，restarts 10）。生产探针验证：新发起设备流后 `device-status` = `pending` 且 state 匹配。全量 1160 passed。
+
+**给用户的操作结论**：这次登录**确实成功了**（token 已换新、推理 200），只是登进了已有账号 13500818840。要真正**新增**一个账号：点「强制新增」（会先走 SSO 登出链）并在新窗口登录**另一个手机号/账号**；若浏览器仍复用旧会话，先手动打开一次登出链再登录。
+
+**遗留**：`docs/manga-*`、`scripts/manga_*`、`tests/test_manga_*`、`AGENTS.md` 为工作区未跟踪文件（非本会话产物，未提交）。
