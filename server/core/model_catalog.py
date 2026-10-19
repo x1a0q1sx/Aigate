@@ -259,6 +259,31 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
 # 来源：cline2api（luawei1/cline2api models_sync.go）同款端点，实测生产 200。
 _CLINE_RECOMMENDED_URL = "https://api.cline.bot/api/v1/ai/cline/recommended-models"
 
+# Cline 渠道只同步「订阅专有 + 官方免费」模型（2026-10-19 用户要求「pass 分组不能用的都删掉」）：
+#   - 公共目录 /api/v1/models 的 471 条是按量计费（Cline Credits）；本账号余额 $0.00，
+#     实测 openai/qwen/z-ai/mistral/x-ai/cohere/anthropic/deepseek 全族一律 402
+#     insufficient_credits（见 docs/progress.md Session 31）。
+#   - 可用集合 = cline-pass/*（Pass 订阅）+ cline-free/* + 公共目录里带 :free 后缀的免费模型。
+#   - 区域封锁条目实测 403「not available in your region」（服务端出口国别），不入库。
+# 若将来账号充值 / 出口放开，改这里即可恢复（刷新幂等，删除的模型会被重新加回）。
+_CLINE_REGION_BLOCKED = frozenset({
+    "cline-pass/muse-spark-1.3-contributor",
+    "cline-free/muse-spark-1.3-contributor",
+})
+
+
+def is_cline_provider(provider) -> bool:
+    """是否 Cline 渠道（OAuth 与 ClinePass api_key 共用 api.cline.bot）。"""
+    return "api.cline.bot" in str(getattr(provider, "base_url", "") or "").lower()
+
+
+def cline_model_usable(model_id: str) -> bool:
+    """Cline 渠道可用模型判据：订阅专有 / 官方免费 / 公共免费后缀；排除区域封锁。"""
+    mid = (model_id or "").strip()
+    if not mid or mid in _CLINE_REGION_BLOCKED:
+        return False
+    return mid.startswith(("cline-pass/", "cline-free/")) or mid.endswith(":free")
+
 
 async def fetch_cline_catalog(token: str, base_url: str) -> List[ModelInfo]:
     """拉取 Cline 推荐/免费/订阅模型清单（免费接口，不需要 token）。
@@ -870,9 +895,13 @@ class ModelCatalog:
                         # **不含** cline-free/* 与 cline-pass/*。官方另一个免费接口
                         # /api/v1/ai/cline/recommended-models 才有 free/clinePass 分组
                         # （2026-10-18 实测，cline2api 同款）→ 两源并集后再并种子。
+                        # 2026-10-19：本账号 Cline Credits 余额 $0，公共目录全族 402
+                        # → 只保留订阅/免费/`:free` 且排除区域封锁（cline_model_usable）。
+                        # 推荐目录失败也不怕：下面的静态种子仍会补回 cline-pass/cline-free。
                         if oauth_code == "cline":
                             _rec = await fetch_cline_catalog(token, provider.base_url)
-                            _m = list(_m or []) + list(_rec or [])
+                            _m = [mi for mi in list(_m or []) + list(_rec or [])
+                                  if cline_model_usable(mi.model_id)]
                         if _m:
                             any_success = True
                             for mi in _m:
@@ -885,6 +914,8 @@ class ModelCatalog:
                                 _seeded = 0
                                 for sm in oauth_p.static_models:
                                     if sm["model_id"] in all_model_infos:
+                                        continue
+                                    if not cline_model_usable(sm["model_id"]):
                                         continue
                                     all_model_infos[sm["model_id"]] = ModelInfo(
                                         model_id=sm["model_id"],
@@ -907,6 +938,8 @@ class ModelCatalog:
                 from server.core.oauth_registry import STATIC_PRICE_RATIOS as _SPR
                 _ratio_map = _SPR.get(oauth_code) or {}
                 for sm in oauth_p.static_models:
+                    if str(oauth_code) == "cline" and not cline_model_usable(sm["model_id"]):
+                        continue
                     _r = _ratio_map.get(sm["model_id"])
                     all_model_infos.setdefault(sm["model_id"], ModelInfo(
                         model_id=sm["model_id"], display_name=sm.get("display_name") or sm["model_id"],
@@ -957,7 +990,19 @@ class ModelCatalog:
             async def _fetch_one(k):
                 ak = key_manager._crypto.decrypt(k.key_encrypted)
                 try:
-                    return k.id, await adapter.list_models(ak, provider.base_url, extra_headers)
+                    _list = await adapter.list_models(ak, provider.base_url, extra_headers)
+                    # Cline 渠道（含 ClinePass api_key）：公共目录全是按量计费模型，
+                    # 余额为 0 时全族 402 → 只保留订阅/免费/`:free` 可用集合。
+                    # ⚠️ 该渠道没有静态种子兜底：推荐目录拉不到时直接判本次刷新失败
+                    # （返回空列表 → 不增不删），绝不用 471 条按量计费死模型顶替。
+                    if is_cline_provider(provider):
+                        _rec = await fetch_cline_catalog(ak, provider.base_url)
+                        if not _rec:
+                            raise RuntimeError(
+                                "cline recommended-models unavailable; skip refresh to keep pass models")
+                        _list = [mi for mi in list(_list or []) + list(_rec or [])
+                                 if cline_model_usable(mi.model_id)]
+                    return k.id, _list
                 except Exception as e:
                     # err_text 兜底：代理抖动时 httpx 异常消息可能为空（'ConnectError: '）
                     logger.warning(f"list_models failed for key {k.id} of {provider.name}: {err_text(e)}")

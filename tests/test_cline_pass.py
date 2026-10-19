@@ -136,7 +136,7 @@ async def _setup(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cline_refresh_unions_online_with_pass_seed(tmp_path, monkeypatch):
-    """在线 471 条公共目录不含 cline-pass/*；刷新后订阅模型仍要在库里。"""
+    """在线公共目录（按量计费）不得入库；订阅/免费模型由种子补齐。"""
     engine, Session, pid = await _setup(tmp_path)
     async with Session() as db:
         p = await db.get(Provider, pid)
@@ -154,14 +154,23 @@ async def test_cline_refresh_unions_online_with_pass_seed(tmp_path, monkeypatch)
     monkeypatch.setattr(oc_mod, "get_oauth_client", lambda: _TokClient())
 
     async def _list_models(self, api_key, base_url, extra_headers=None):
-        # 公共目录：只有按量计费模型，没有 cline-pass/*
+        # 公共目录：按量计费模型（余额 $0 → 402）+ 一条 :free 免费模型
         return [
             ModelInfo(model_id="anthropic/claude-opus-4.7", display_name="Opus 4.7"),
             ModelInfo(model_id="moonshotai/kimi-k3", display_name="kimi-k3 (PAYG)"),
+            ModelInfo(model_id="cohere/north-mini-code:free", display_name="North Mini (Free)"),
         ]
 
     from server.adapters.openai_compat import OpenAICompatAdapter
     monkeypatch.setattr(OpenAICompatAdapter, "list_models", _list_models)
+
+    async def _rec_catalog(token, base_url):
+        return [ModelInfo(model_id="cline-free/solar-mini4", display_name="Solar Mini 4 (Free)"),
+                ModelInfo(model_id="cline-pass/kimi-k3", display_name="Kimi K3 (Pass)"),
+                ModelInfo(model_id="cline-pass/muse-spark-1.3-contributor",
+                          display_name="Muse Spark (Pass)")]
+
+    monkeypatch.setattr(mc, "fetch_cline_catalog", _rec_catalog)
 
     async def _no_pricing(base_url, timeout=None):
         class _R:
@@ -183,12 +192,17 @@ async def test_cline_refresh_unions_online_with_pass_seed(tmp_path, monkeypatch)
     async with Session() as db:
         rows = {m.model_id for m in (await db.execute(
             select(Model).where(Model.provider_id == pid))).scalars().all()}
-    # 在线目录模型入库
-    assert "anthropic/claude-opus-4.7" in rows
-    assert "moonshotai/kimi-k3" in rows
-    # 订阅专有模型由种子补齐（在线目录没有）
+    # 按量计费公共目录模型**不入库**（余额 $0 全族 402）
+    assert "anthropic/claude-opus-4.7" not in rows
+    assert "moonshotai/kimi-k3" not in rows
+    # 免费后缀 / 订阅 / 官方 free 入库
+    assert "cohere/north-mini-code:free" in rows
     assert "cline-pass/kimi-k3" in rows
+    assert "cline-free/solar-mini4" in rows
     assert "cline-pass/glm-5.3-flash" in rows
+    # 区域封锁条目（403 not available in your region）不入库
+    assert "cline-pass/muse-spark-1.3-contributor" not in rows
+    assert "cline-free/muse-spark-1.3-contributor" not in rows
     await engine.dispose()
 
 
@@ -212,12 +226,17 @@ async def test_cline_refresh_online_model_wins_over_seed(tmp_path, monkeypatch):
     monkeypatch.setattr(oc_mod, "get_oauth_client", lambda: _TokClient())
 
     async def _list_models(self, api_key, base_url, extra_headers=None):
-        return [ModelInfo(model_id="anthropic/claude-opus-4.7",
-                          display_name="Opus 4.7 (online)",
+        return [ModelInfo(model_id="cohere/north-mini-code:free",
+                          display_name="North Mini (online)",
                           context_length=200000)]
 
     from server.adapters.openai_compat import OpenAICompatAdapter
     monkeypatch.setattr(OpenAICompatAdapter, "list_models", _list_models)
+
+    async def _rec_catalog(token, base_url):
+        return []
+
+    monkeypatch.setattr(mc, "fetch_cline_catalog", _rec_catalog)
 
     async def _no_pricing(base_url, timeout=None):
         class _R:
@@ -237,6 +256,104 @@ async def test_cline_refresh_online_model_wins_over_seed(tmp_path, monkeypatch):
     async with Session() as db:
         rows = {m.model_id: m for m in (await db.execute(
             select(Model).where(Model.provider_id == pid))).scalars().all()}
-    assert rows["anthropic/claude-opus-4.7"].display_name == "Opus 4.7 (online)"
-    assert rows["anthropic/claude-opus-4.7"].context_length == 200000
+    assert rows["cohere/north-mini-code:free"].display_name == "North Mini (online)"
+    assert rows["cohere/north-mini-code:free"].context_length == 200000
+    await engine.dispose()
+
+
+# ── 可用集合判据（2026-10-19「pass 分组不能用的都删掉」）───────────
+
+def test_cline_model_usable_predicate():
+    from server.core.model_catalog import cline_model_usable
+    # 订阅专有 / 官方免费 / 公共 :free 可用
+    assert cline_model_usable("cline-pass/kimi-k3") is True
+    assert cline_model_usable("cline-free/solar-mini4") is True
+    assert cline_model_usable("cohere/north-mini-code:free") is True
+    # 按量计费公共目录（余额 $0 → 402）不可用
+    assert cline_model_usable("anthropic/claude-opus-4.7") is False
+    assert cline_model_usable("openai/gpt-5.1") is False
+    assert cline_model_usable("deepseek/deepseek-v4.1-flash-1017") is False
+    # cline-cloud 实测 403 not supported
+    assert cline_model_usable("cline-cloud/deepseek-v4.1-flash") is False
+    # 区域封锁条目
+    assert cline_model_usable("cline-pass/muse-spark-1.3-contributor") is False
+    assert cline_model_usable("") is False
+
+
+def test_is_cline_provider_matches_both_channels():
+    from types import SimpleNamespace
+    from server.core.model_catalog import is_cline_provider
+    assert is_cline_provider(SimpleNamespace(base_url="https://api.cline.bot/api/v1")) is True
+    assert is_cline_provider(SimpleNamespace(
+        base_url="https://api.cline.bot/api/v1/chat/completions")) is True
+    assert is_cline_provider(SimpleNamespace(base_url="https://api.openai.com/v1")) is False
+    assert is_cline_provider(SimpleNamespace(base_url=None)) is False
+
+
+@pytest.mark.asyncio
+async def test_cline_pass_api_key_refresh_keeps_only_usable(tmp_path, monkeypatch):
+    """ClinePass（api_key 渠道）刷新同样只保留订阅/免费模型（公共目录 402 全删）。"""
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/cp.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all,
+                            tables=[Provider.__table__, Model.__table__,
+                                    ModelRefreshLog.__table__, RequestLog.__table__])
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    from server.models.api_key import ApiKey
+    from server.models.model_api_key import ModelApiKey
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all,
+                            tables=[ApiKey.__table__, ModelApiKey.__table__])
+    async with Session() as db:
+        p = Provider(name="Cline Pass", base_url="https://api.cline.bot/api/v1",
+                     api_type="openai_compat", credential_type="api_key", enabled=True)
+        db.add(p)
+        await db.commit()
+        pid = p.id
+        db.add(ApiKey(provider_id=pid, key_encrypted="enc:sk", key_prefix="sk_", is_active=True))
+        await db.commit()
+
+    from server.core import model_catalog as mc
+
+    async def _list_models(self, api_key, base_url, extra_headers=None):
+        return [ModelInfo(model_id="anthropic/claude-haiku-4.5", display_name="Haiku"),
+                ModelInfo(model_id="nvidia/nemotron-3.5-super-vl:free", display_name="Nemotron Free")]
+
+    from server.adapters.openai_compat import OpenAICompatAdapter
+    monkeypatch.setattr(OpenAICompatAdapter, "list_models", _list_models)
+
+    async def _rec_catalog(token, base_url):
+        return [ModelInfo(model_id="cline-pass/kimi-k3", display_name="Kimi K3 (Pass)")]
+
+    monkeypatch.setattr(mc, "fetch_cline_catalog", _rec_catalog)
+
+    async def _no_pricing(base_url, timeout=None):
+        class _R:
+            pricing = {}
+            source_url = ""
+            error = ""
+        return _R()
+
+    monkeypatch.setattr(mc, "fetch_provider_pricing", _no_pricing)
+
+    class _Crypto:
+        @staticmethod
+        def decrypt(_enc):
+            return "sk-fake"
+
+    class _KM:
+        _crypto = _Crypto()
+
+    cat = mc.ModelCatalog()
+    async with Session() as db:
+        p = await db.get(Provider, pid)
+        r = await cat.refresh_models_from_provider(db, p, _KM())
+        assert "error" not in r, r
+
+    async with Session() as db:
+        rows = {m.model_id for m in (await db.execute(
+            select(Model).where(Model.provider_id == pid))).scalars().all()}
+    assert "cline-pass/kimi-k3" in rows
+    assert "nvidia/nemotron-3.5-super-vl:free" in rows
+    assert "anthropic/claude-haiku-4.5" not in rows
     await engine.dispose()
