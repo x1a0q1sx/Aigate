@@ -689,3 +689,56 @@
 - 踩坑：`asyncio.CancelledError` 在 py3.8+ 是 BaseException，测试替身 `isinstance(item, Exception)` 接不住（TypeError "not iterable"），替身判据要用 BaseException；`asyncio.run` 会吞掉顶层 CancelledError，断言得在协程内捕获。
 
 **边界提醒**：流式已输出内容后报错是唯一无法重试的场景（无法回滚）；充值后想恢复「额度错误也重试」再改 `is_retryable_error`。
+
+---
+
+## Session 33（2026-10-20）—— Qoder 国内版接入 + OAuth 站点显式化
+
+**用户反馈**：「我在前端没看到国内 Qoder 和国际 Qoder 的区分啊，oauth 只能看到
+Qoder 我也不知道这是国内还是国外」。核实：站内确实只有国际版一条 provider，
+名称 `Qoder` 未标站点；国内版（qoder.cn）此前只做了调研，没有接。
+
+**新增 `qoder_cn` OAuth provider（账号与国际版互不相通）**
+- 协议来源（逐字段核对，2026-10-20）：
+  - `@qodercn-ai/qoderclicn` 1.1.74 产物：`client_id=e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb`、
+    `openapi.qoder.com.cn`、`gateway.qoder.com.cn`、`Cosy-ClientType=5`、
+    `selectAccounts` / `deviceToken/poll` / `deviceToken/refresh` / `sash/*` 路径。
+  - `@magpie-community/opencode-qoder-auth` 0.2.21 的 `SITES["qoder-cn"]`：
+    `deviceChat=true`（CN CLI 始终在 device token 上聊天，不换 job token）、
+    无 `redirect_uri`、CN 目录档位 = ultimate/performance/efficient/lite。
+  - 端点探活：`qoder.cn/device/selectAccounts` 302→登录页；`openapi.qoder.com.cn`
+    的 userinfo/usage 401（存在需鉴权）；`gateway.qoder.com.cn/algo/...` 403（需签名）。
+- 实现：
+  - `qoder_sign.py` 新增 `QODER_SITES` 表（qoder / qoder_cn）+ `qoder_site()`、
+    `qoder_openapi_base()`、`qoder_site_from_base_url()`；`chat_url` /
+    `model_list_url` / `qoder_inference_base` 全部接受 site。
+  - `QoderAdapter` 从 `base_url` 判站点（适配器只拿得到 base_url），
+    chat / 模型目录 / PAT 兑换 / token meta 全部按站点走；
+    `_token_meta(site)` 读对应 provider_code 的连接（CN 读 qoder_cn，不能读 qoder）。
+  - `oauth_client.start_qoder_device`：CN 登录链接追加 `client_id`（国际版保持原样）；
+    `_poll_qoder_device` 本来就走注册表 token_url/userinfo_url，天然双站。
+  - 补上 **`_refresh_device_token` 实现**（此前 `_do_refresh` 引用了一个不存在的
+    方法，`device_code_only` 分支一旦启用就 AttributeError）：POST
+    `{openapi}/api/v1/deviceToken/refresh`，refresh token 一次性轮换必须立刻落库，
+    401/403 才判死、5xx/429 保留重试；`qoder_cn` 用 `refresh_style=device_token`。
+  - 额度查询 `_qoder_usage(token, site)`；`_dispatch` 按 `qoder_cn` 选 CN 主机；
+    plan 名称区分「Qoder …」/「Qoder CN …」。
+  - 签到：`CHECKIN_CAPABILITIES["qoder_cn"]=True`，分发按 provider_code 选
+    `openapi.qoder.com.cn`；补充 CN 说明（设备身份头同样必需）。
+  - 倍率来源标注：国际版 `qoder`、国内版 `qoder_cn`（模型页可区分）。
+- **前端**：
+  - OAuth 卡片显示 **Qoder (International)** / **Qoder CN（国内版）**（此前只有 Qoder）；
+    设备流提示语注明两站账号互不相通、确认打开的是哪个域名。
+  - 签到页 `PLATFORM_LABELS` 区分；服务商目录新增 `qoder_cn` 条目；
+    muse 导入弹窗新增「本机脚本铸 key」指引（回应「Muse 替代方案」问题）。
+- **测试**：新增 6 项（CN 注册表 / 站点 URL / CN 登录带 client_id / 额度主机 /
+  签到主机 / plan 前缀）+ 更新 8 项既有替身签名；全量 **1229 全绿**；前端 build 通过。
+- **部署**：`2901683` → 服务器 pull + `npm run build`（`index-COj5xOR5.js`）+
+  `pm2 restart aigate`；health 200；注册表 API 已返回两条 Qoder（名称/端点各自正确），
+  生产实调 `start_qoder_device('qoder_cn')` 生成带 client_id 的 qoder.cn 链接。
+- ⚠️ **未实证**：CN 账号的真实登录批准与推理（需要国内 Qoder 账号）；
+  首条连接建立后观察 `last_error` 与模型刷新结果即可确认。
+
+**Muse 替代方案（回答用户第二问）**：已实现 `scripts/muse_login.py`（本机同出口
+设备码登录 → 打印 `LLM|…` key → OAuth 页「导入 Token」）；不存在网页 cookie 导出等
+其他登录方式（Meta 只提供 RFC 8628 设备码 + 铸 key，6 个成熟实现已逐字段核对）。
