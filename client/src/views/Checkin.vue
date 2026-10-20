@@ -296,7 +296,8 @@ import QuotaPanel from '../components/QuotaPanel.vue'
 const PLATFORM_LABELS = {
   codebuddy_cn: 'CodeBuddy CN (腾讯)',
   codebuddy_intl: 'CodeBuddy (International)',
-  qoder: 'Qoder',
+  qoder: 'Qoder (International)',
+  qoder_cn: 'Qoder CN（国内版）',
   u1s1: 'u1s1 (有一说一)',
   lobsterai: 'LobsterAI (有道)',
   codearts: 'CodeArts Agent (华为)',

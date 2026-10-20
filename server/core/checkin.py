@@ -64,6 +64,9 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
     # 保持 True：活动随时可能开，预检能如实反映状态（inactive ≠ 不支持）。
     "codebuddy_intl": True,
     "qoder": True,
+    # Qoder CN（qoder.cn）：与国内版同协议族（/sash/ 端点 + 桌面身份头），
+    # 端点走 openapi.qoder.com.cn；账号与国际版互不相通。
+    "qoder_cn": True,
     "lobsterai": True,          # 三步协议（slot → context → check_in），+100 积分/天
     "codearts": True,           # 四步协议（账户类型 → delivery → claim → confirm）
     "trae": True,               # 两步：status 预检 → claim → 补查 status，+150 credits/天
@@ -85,6 +88,7 @@ CHECKIN_CAPABILITIES: Dict[str, Optional[bool]] = {
 CHECKIN_NOTES: Dict[str, str] = {
     "codebuddy_intl": "上游端点与活动框架都在，但本期未给国际版开放活动（active=false、claim 返回 10001）。活动开启后本页会自动签到，无需改动。",
     "qoder": "每日领取要求桌面端身份头（Cosy-ClientType '10' + Cosy-Machine 成对头，config.yaml qoder.machine_token/machine_type，取自桌面端 %APPDATA%\\Qoder\\SharedClientCache\\cache\\machine_token.json 的 token/type）。未配置时服务端只下发 VIEW_DETAILS，看不到可领的每日 100 Credits。",
+    "qoder_cn": "Qoder 国内版（qoder.cn）签到：与国际版同协议族，但端点走 openapi.qoder.com.cn；设备身份头（config.yaml qoder.machine_token/machine_type）同样必需，未配置时上游只下发 VIEW_DETAILS。",
     "u1s1": "打卡只能在 u1s1 官网仪表盘完成（需网页会话 + 人机验证）；但其打卡包由上游在每次登录时自动发放 —— AIGate 重新连接该账号即等于打卡。下方额度区可查看打卡包余额。",
     "freebuff": "Freebuff 的「连续天数」由**当天是否用模型**推导（官方语义：用一次即打卡），上游无领取端点，无需也无法在此签到；额度区显示 Freebucks 余额。",
     "trae": "CN 区 deepseek-v4-flash 走加密信封（未实现），其余模型正常；签到与模型调用互不影响。",
@@ -694,8 +698,9 @@ async def claim_for_provider(provider_code: str, token: str) -> ClaimOutcome:
     try:
         if provider_code in _CODEBUDDY_PRODUCTS:
             return await _claim_codebuddy(token, provider_code)
-        if provider_code == "qoder":
-            return await _claim_qoder(token)
+        if provider_code in ("qoder", "qoder_cn"):
+            from server.core.qoder_sign import qoder_openapi_base
+            return await _claim_qoder(token, qoder_openapi_base(provider_code))
         if provider_code == "lobsterai":
             return await _claim_lobsterai(token)
         if provider_code == "codearts":

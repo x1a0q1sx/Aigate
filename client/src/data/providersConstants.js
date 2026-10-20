@@ -149,7 +149,7 @@ export const FREE_TIER_PROVIDERS = [
   },
   {
     "id": "qoder",
-    "name": "Qoder",
+    "name": "Qoder (International)",
     "alias": "qd",
     "color": "#EC4899",
     "icon": "water_drop",
@@ -351,6 +351,16 @@ export const OAUTH_PROVIDERS = [
     "icon": "psychology",
     "website": "https://chat.qwen.ai",
     "baseUrl": "https://portal.qwen.ai/v1/chat/completions",
+    "authModes": []
+  },
+  {
+    "id": "qoder_cn",
+    "name": "Qoder CN（国内版）",
+    "alias": "qdcn",
+    "color": "#EC4899",
+    "icon": "water_drop",
+    "website": "https://qoder.cn",
+    "baseUrl": "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation",
     "authModes": []
   },
   {

@@ -87,7 +87,7 @@
 
     <p class="foot-tip text-xs">
       提示：连接成功后系统自动登记服务商（服务商列表即可见，credential_type=oauth），在服务商页刷新模型后即可路由流量。
-      「查询余额」覆盖 claude_code / codex / github_copilot / antigravity / codebuddy 国服与国际服 / qoder / u1s1
+      「查询余额」覆盖 claude_code / codex / github_copilot / antigravity / codebuddy 国服与国际服 / qoder 国际版与国内版 / u1s1
       （对齐 9router 的 usage 支持范围；其余服务商上游没有公开额度接口）。
     </p>
 
@@ -111,6 +111,12 @@
           <input v-model="importModal.owner" />
         </div>
       </div>
+      <p v-if="importModal.provider_code === 'muse'" class="text-xs muted" style="margin-bottom:8px;line-height:1.6">
+        若设备流页面报「Sign-in failed / Token exchange failed」（Meta 在浏览器侧拒绝本次授权），
+        可在**本机**同一网络出口运行
+        <code>python scripts/muse_login.py --proxy &lt;本机代理&gt;</code>
+        铸出 <code>LLM|…</code> key 后粘贴到这里（会自动按 30 天有效期保存）。
+      </p>
       <p v-if="importModal.error" class="alert alert-error text-sm">{{ importModal.error }}</p>
       <template #footer>
         <button class="btn btn-outline" @click="importModal.show = false">取消</button>

@@ -343,6 +343,26 @@ def test_qoder_zero_quota_explained_not_silent(monkeypatch):
     assert _qoder_plan_name({"qoderUsage": {"userType": "personal_professional_trial"}}) == "Qoder 个人专业版试用"
     assert _qoder_plan_name({"qoderUsage": {"userType": "weird_unknown"}}) == "Qoder weird_unknown"
     assert _qoder_plan_name({}) == "Qoder"
+    assert _qoder_plan_name({}, "Qoder CN") == "Qoder CN"
+
+
+def test_qoder_cn_usage_hits_cn_hosts(monkeypatch):
+    """国内版额度必须打 openapi.qoder.com.cn（账号与国际版互不相通）。
+
+    回归背景：额度/推理端点在重构前写死 .sh 域名，CN 账号拿 token 打国际
+    接口恒 401 —— 用户侧表现为「已连接但查不到余额 / 模型全失败」。
+    """
+    calls = []
+    _patch(monkeypatch, calls, [(200, {
+        "displayMode": "qoder",
+        "qoderUsage": {"userType": "personal_standard",
+                       "userQuota": {"total": 600, "used": 100, "remaining": 500}},
+    })])
+    r = asyncio.run(_qoder_usage("dt-cn", "qoder_cn"))
+    assert calls[0]["url"].startswith("https://openapi.qoder.com.cn/")
+    assert calls[0]["url"].endswith("/sash/api/v2/me/usage")
+    assert r["plan"] == "Qoder CN 个人标准版"
+    assert r["quotas"]["套餐额度"]["remaining"] == 500
 
 
 # ── u1s1 ────────────────────────────────────────────

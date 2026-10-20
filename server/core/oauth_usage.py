@@ -686,7 +686,7 @@ def _qoder_sane_reset(iso: Optional[str]) -> Optional[str]:
     return iso
 
 
-def _qoder_parse_sash(body: dict) -> dict:
+def _qoder_parse_sash(body: dict, label: str = "Qoder") -> dict:
     """解析 /sash/api/v2/me/usage 响应（Jet-Hub 抓包实测协议，2026-09）。
 
     余额不只在 userQuota：**签到所得积分落在 addOnQuota（资源包）**——实测
@@ -714,13 +714,13 @@ def _qoder_parse_sash(body: dict) -> dict:
     for item in (u.get("dedicatedResourcePackages") or []):
         if isinstance(item, dict):
             _pkg(item.get("name") or item.get("id") or "专用资源包", item, reset_at)
-    return {"plan": _qoder_plan_name(body), "quotas": quotas,
+    return {"plan": _qoder_plan_name(body, label), "quotas": quotas,
             "extra": {"total_usage_pct": _num(u.get("totalUsagePercentage")),
                       "is_quota_exceeded": bool(u.get("isQuotaExceeded")),
                       "note": _qoder_note(body)}}
 
 
-def _qoder_parse_legacy(body: dict) -> dict:
+def _qoder_parse_legacy(body: dict, label: str = "Qoder") -> dict:
     """旧端点 /api/v2/quota/usage 的解析（2026-09 仍在线，作回退；不下发资源包层）。"""
     uq = body.get("userQuota") or {}
     oq = body.get("orgResourcePackage") or {}
@@ -738,7 +738,7 @@ def _qoder_parse_legacy(body: dict) -> dict:
             "remaining": _num(oq.get("remaining")), "unit": oq.get("unit") or "credits",
             "reset_at": reset_at, "unlimited": False,
         }
-    return {"plan": _qoder_plan_name(body), "quotas": quotas,
+    return {"plan": _qoder_plan_name(body, label), "quotas": quotas,
             "extra": {"total_usage_pct": _num(body.get("totalUsagePercentage")),
                       "is_quota_exceeded": bool(body.get("isQuotaExceeded")),
                       "note": _qoder_note(body)}}
@@ -754,13 +754,16 @@ _QODER_USER_TYPES = {
 }
 
 
-def _qoder_plan_name(body: dict) -> str:
-    """`userType` → 「Qoder 个人标准版」；未知值原样透传（不臆造档位）。"""
+def _qoder_plan_name(body: dict, label: str = "Qoder") -> str:
+    """`userType` → 「Qoder 个人标准版」；未知值原样透传（不臆造档位）。
+
+    label 区分站点：国内版传 "Qoder CN"，面板上「Qoder CN 个人标准版」一眼可辨。
+    """
     u = body.get("qoderUsage") if isinstance(body.get("qoderUsage"), dict) else body
     ut = str((u or {}).get("userType") or "").strip()
     if not ut:
-        return "Qoder"
-    return "Qoder " + (_QODER_USER_TYPES.get(ut) or ut)
+        return label
+    return label + " " + (_QODER_USER_TYPES.get(ut) or ut)
 
 
 def _qoder_note(body: dict) -> str:
@@ -799,15 +802,22 @@ def _qoder_note(body: dict) -> str:
     return "Qoder 上游未返回任何额度条目（可能是企业版账号不展示数字，或响应形状已变）"
 
 
-async def _qoder_usage(token: str) -> dict:
+async def _qoder_usage(token: str, site: str = "qoder") -> dict:
     """Qoder 余额：主走 /sash/api/v2/me/usage（与签到同协议族），旧端点兜底。
 
     sash 端点只需 4 个头、**不需要 COSY/WASM 签名**（同签到端点，
     2026-09-24 生产实测 200）；旧端点看不到资源包层，只在 sash 不可用时兜底。
+
+    site: "qoder"（国际版 openapi.qoder.sh）/ "qoder_cn"（国内版
+    openapi.qoder.com.cn）——两站账号互不相通，端点必须跟着连接走，
+    否则国内账号拿 token 打国际接口恒 401。
     """
+    from server.core.qoder_sign import qoder_openapi_base
+    base = qoder_openapi_base(site)
+    _site_label = "Qoder CN" if site == "qoder_cn" else "Qoder"
     if token.startswith("pt-"):
         ex = await _post_json(
-            "https://openapi.qoder.sh/api/v1/jobToken/exchange",
+            f"{base}/api/v1/jobToken/exchange",
             {"Content-Type": "application/json", "Accept": "application/json",
              "User-Agent": "qodercli/1.0.0"},
             {"personal_token": token},
@@ -818,31 +828,31 @@ async def _qoder_usage(token: str) -> dict:
     if not token:
         return {"quotas": {}, "message": "Qoder 无可用于额度查询的凭证"}
     r = await _get_json(
-        "https://openapi.qoder.sh/sash/api/v2/me/usage",
+        f"{base}/sash/api/v2/me/usage",
         {"Authorization": f"Bearer {token}", "Accept": "application/json",
          "Cosy-ClientType": "5", "User-Agent": "Qoder"})
     if r.is_success:
         body = r.json() if r.content else {}
         if body.get("displayMode") == "enterprise":
             # 企业版不下发额度数字，只有外部用量链接（报 0 会误导用户以为没额度）
-            return {"plan": "Qoder 企业版", "quotas": {},
+            return {"plan": f"{_site_label} 企业版", "quotas": {},
                     "message": "企业版账号不提供额度数字（仅提供外部用量链接）"}
-        out = _qoder_parse_sash(body)
+        out = _qoder_parse_sash(body, _site_label)
         if out["quotas"]:
             return out
         # 形状异常（无任何条目）→ 旧端点再试一次，两路都空才报错
-    r2 = await _get_json("https://openapi.qoder.sh/api/v2/quota/usage",
+    r2 = await _get_json(f"{base}/api/v2/quota/usage",
                          {"Authorization": f"Bearer {token}", "Accept": "application/json"})
     if not r2.is_success:
-        return {"quotas": {}, "message": f"Qoder 已连接，额度接口返回 {r2.status_code}"}
+        return {"quotas": {}, "message": f"{_site_label} 已连接，额度接口返回 {r2.status_code}"}
     legacy = r2.json() if r2.content else {}
-    out = _qoder_parse_legacy(legacy)
+    out = _qoder_parse_legacy(legacy, _site_label)
     if out["quotas"]:
         return out
     # 两个端点都拿不到条目：把上游原始形态里读到的「全 0」解释清楚（用户看到
     # 0/0 第一反应是「查坏了」，实为账号没有套餐额度）。
     note = _qoder_note(legacy)
-    return {"plan": _qoder_plan_name(legacy), "quotas": {},
+    return {"plan": _qoder_plan_name(legacy, _site_label), "quotas": {},
             "message": note or "Qoder 额度响应无任何条目（响应形状可能已变）"}
 
 
@@ -1265,8 +1275,8 @@ async def _dispatch(provider_code: str, token: str) -> dict:
         return await _codebuddy_usage(token, "https://copilot.tencent.com/v2/chat/completions")
     if provider_code == "codebuddy_intl":
         return await _codebuddy_usage(token, "https://www.codebuddy.ai/v2/chat/completions")
-    if provider_code == "qoder":
-        return await _qoder_usage(token)
+    if provider_code in ("qoder", "qoder_cn"):
+        return await _qoder_usage(token, provider_code)
     if provider_code == "u1s1":
         return await _u1s1_usage(token)
     if provider_code == "lobsterai":

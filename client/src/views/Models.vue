@@ -118,7 +118,7 @@
                   <span class="badge" :class="ratioClass(m)" :title="ratioTitle(m)">{{ formatRatio(m) }}</span>
                   <span class="text-xs text-muted" style="margin-left: 4px">倍率</span>
                   <div v-if="m.price_ratio_source" class="text-xs text-muted">
-                    {{ { qoder: '在线目录', codebuddy: '在线倍率', provider: '上游声明', manual: '手动' }[m.price_ratio_source] || m.price_ratio_source }}
+                    {{ { qoder: '在线目录', qoder_cn: '在线目录(CN)', codebuddy: '在线倍率', provider: '上游声明', manual: '手动' }[m.price_ratio_source] || m.price_ratio_source }}
                   </div>
                 </div>
                 <template v-else>
@@ -723,6 +723,7 @@ export default {
     },
     ratioTitle(m) {
       const src = { qoder: 'Qoder 在线目录 price_factor',
+                    qoder_cn: 'Qoder CN 在线目录 price_factor',
                     codebuddy: 'CodeBuddy 在线配置 /v3/config 的 models[].credits',
                     provider: '上游目录声明', manual: '手动设置' }[m.price_ratio_source] || ''
       return `倍率（credit multiplier）${src ? '· 来源: ' + src : ''}`

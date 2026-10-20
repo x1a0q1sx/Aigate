@@ -914,7 +914,7 @@ export default {
         ...p,
         code: p.id,
         api_base_url: p.baseUrl,
-        use_pkce: !['codebuddy_cn', 'kimchi', 'qoder'].includes(p.id),
+        use_pkce: !['codebuddy_cn', 'kimchi', 'qoder', 'qoder_cn'].includes(p.id),
         extra_params: {},
       }))
     },

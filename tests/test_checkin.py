@@ -272,6 +272,26 @@ def test_qoder_claim_success(monkeypatch):
     assert calls[1]["url"].endswith("/campaigns/c1/claim")
 
 
+def test_qoder_cn_claim_hits_cn_hosts(monkeypatch):
+    """国内版签到必须打 openapi.qoder.com.cn（账号与国际版互不相通）。
+
+    回归背景：签到分发曾把 base 写死国际端点，CN 账号 userid 在 qoder.cn，
+    打 .sh 只会 401 → 用户看到「已连接但签到失败」。
+    """
+    from server.core.checkin import claim_for_provider
+    calls = []
+    _patch(monkeypatch, calls, [
+        _q_campaigns([_claimable()]),
+        (200, {"grantId": "g1", "status": "CLAIMED", "replayed": False,
+               "benefit": {"kind": "CREDITS", "amount": 100}}, None),
+    ])
+    out = asyncio.run(claim_for_provider("qoder_cn", "dt-cn"))
+    assert out.kind == "claimed"
+    assert out.credit == 100
+    assert calls[0]["url"].startswith("https://openapi.qoder.com.cn/sash/")
+    assert calls[1]["url"].startswith("https://openapi.qoder.com.cn/sash/")
+
+
 def test_qoder_replayed_is_already_claimed_not_credit(monkeypatch):
     """重复领取返回 HTTP 200 + replayed=true 且无 benefit —— 只看状态码会误报 +100。"""
     from server.core.checkin import claim_for_provider

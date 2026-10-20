@@ -290,9 +290,11 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
     #   → 轮询 openapi.qoder.sh/api/v1/deviceToken/poll?nonce&verifier（202/404=pending，
     #   200 带 dt- token）→ userinfo 补 uid/email → scope 列存 COSY 签名所需元数据。
     # device token 约 30 天；upstream refresh 对本流返回 403 → refresh_style=none。
+    # ⚠️ 名称显式带 (International)：站内还有 qoder_cn（qoder.cn），两站账号互不
+    #    相通，只写「Qoder」用户分不清连的是哪边（2026-10-20 用户反馈）。
     "qoder": OAuthProviderConfig(
         code="qoder",
-        name="Qoder",
+        name="Qoder (International)",
         client_id="",
         client_secret="",
         authorize_url="",
@@ -307,6 +309,7 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
         extra_params={
             "auth_mode": "qoder_device",
             "refresh_style": "none",
+            "site": "qoder",
             "login_url": "https://qoder.com/device/selectAccounts",
             "userinfo_url": "https://openapi.qoder.sh/api/v1/userinfo",
             "quota_usage_url": "https://openapi.qoder.sh/api/v2/quota/usage",
@@ -325,7 +328,47 @@ _OAUTH_REGISTRY: Dict[str, OAuthProviderConfig] = {
             ("dmodel", "DeepSeek-V4-Pro"), ("dfmodel", "DeepSeek-V4-Flash"),
             ("mmodel", "MiniMax-M3"),
         ),
-        notes="Qoder 设备流（30 天 token）+ COSY 签名推理（api3.qoder.sh）",
+        notes="Qoder 国际版（qoder.com）— 设备流（30 天 token）+ COSY 签名推理（api3.qoder.sh）",
+    ),
+    # ── Qoder CN（qoder.cn，阿里云或手机号登录） ──
+    # 与国际版**账号体系完全独立**（同一邮箱也可能只在一边注册）。协议同构，但：
+    #   - 登录页 qoder.cn/device/selectAccounts，必须带国内 CLI 的 client_id
+    #     （@qodercn-ai/qoderclicn 产物内常量），且 CLI 不传 redirect_uri；
+    #   - 账号接口 openapi.qoder.com.cn，推理网关 gateway.qoder.com.cn；
+    #   - **device token 直接当聊天 token**（CN CLI 不换 job token，
+    #     见 magpie opencode-qoder-auth 的 deviceChat 语义）；
+    #   - 支持 /api/v1/deviceToken/refresh 续期（refresh_style=device_token）。
+    # 来源：@qodercn-ai/qoderclicn 1.1.74 产物 + @magpie-community/opencode-qoder-auth
+    # 0.2.21 的 SITES 定义（2026-10-20 逐字段核对）。
+    "qoder_cn": OAuthProviderConfig(
+        code="qoder_cn",
+        name="Qoder CN（国内版）",
+        client_id="e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+        client_secret="",
+        authorize_url="",
+        token_url="https://openapi.qoder.com.cn/api/v1/deviceToken/poll",
+        refresh_url="",
+        redirect_uri="",
+        scope="",
+        use_pkce=False,
+        refresh_lead_seconds=24 * 3600,
+        api_base_url="https://gateway.qoder.com.cn/algo/api/v2",
+        adapter_api_type="qoder",
+        extra_params={
+            "auth_mode": "qoder_device",
+            "refresh_style": "device_token",
+            "site": "qoder_cn",
+            "login_url": "https://qoder.cn/device/selectAccounts",
+            "userinfo_url": "https://openapi.qoder.com.cn/api/v1/userinfo",
+            "quota_usage_url": "https://openapi.qoder.com.cn/api/v2/quota/usage",
+        },
+        static_models=_seed(
+            # CN 目录按客户端版本下发，种子只兜底（在线目录优先）
+            ("ultimate", "Ultimate"), ("performance", "Performance"),
+            ("efficient", "Efficient"), ("lite", "Lite"),
+        ),
+        notes="Qoder 国内版（qoder.cn）— 设备流 + COSY 签名推理（gateway.qoder.com.cn）；"
+              "账号与国际版互不相通",
     ),
     # ── CodeBuddy CN（腾讯 copilot.tencent.com） ──
     # 流程（对齐 9router codebuddy-cn provider 实测）：

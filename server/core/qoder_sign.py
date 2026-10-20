@@ -25,6 +25,12 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 # ── 端点 ─────────────────────────────────────────────
+# Qoder 是**两个独立站点**（账号互不相通，协议同构）：
+#   - qoder     国际版：qoder.com / openapi.qoder.sh / api3.qoder.sh
+#   - qoder_cn  国内版：qoder.cn / openapi.qoder.com.cn / gateway.qoder.com.cn
+# 国内版协议取自 @qodercn-ai/qoderclicn 1.1.74 产物（sign-in 页 / 账号接口 /
+# 网关三件套），并与 @magpie-community/opencode-qoder-auth 0.2.21 的 SITES
+# 定义逐字段对齐；CN 的 device token 直接当聊天 token 用（CLI 不换 job token）。
 QODER_OPENAPI_BASE = "https://openapi.qoder.sh"
 QODER_CENTER_BASE = "https://center.qoder.sh"
 QODER_CHAT_BASE = "https://api3.qoder.sh"
@@ -43,6 +49,52 @@ QODER_CHAT_URL_ENCODED = (
     f"{QODER_CHAT_BASE}/algo{QODER_CHAT_SIG_PATH}"
     "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 )
+
+# 站点表：site 键即 OAuth provider_code（qoder / qoder_cn）
+QODER_SITES: dict = {
+    "qoder": {
+        "openapi": "https://openapi.qoder.sh",
+        "chat": "https://api3.qoder.sh",
+        "chat_alt": "https://api2.qoder.sh",
+        "login": "https://qoder.com/device/selectAccounts",
+        # 国际版登录页当前不校验 client_id（现行设备流一直没带，勿改以免回归）
+        "client_id": "",
+        "redirect_uri": "",
+        "label": "Qoder",
+    },
+    "qoder_cn": {
+        "openapi": "https://openapi.qoder.com.cn",
+        "chat": "https://gateway.qoder.com.cn",
+        "chat_alt": "https://gateway.qoder.com.cn",
+        "login": "https://qoder.cn/device/selectAccounts",
+        # 国内版 CLI 生产 client id（@qodercn-ai/qoderclicn 产物内常量），
+        # 登录页需要它；CLI 不传 redirect_uri，这里同样不传。
+        "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+        "redirect_uri": "",
+        "label": "Qoder CN",
+    },
+}
+
+
+def qoder_site(site: str = "qoder") -> dict:
+    """取站点配置；未知值回退国际版（永不让配置错误打断推理）。"""
+    return QODER_SITES.get(str(site or "").strip() or "qoder") or QODER_SITES["qoder"]
+
+
+def qoder_openapi_base(site: str = "qoder") -> str:
+    return qoder_site(site)["openapi"]
+
+
+def qoder_site_from_base_url(base_url: str) -> str:
+    """按服务商 base_url 判站点（适配器只拿得到 base_url，拿不到 provider 行）。
+
+    CN 的推理网关是 gateway.qoder.com.cn，国际版是 api2/api3.qoder.sh；
+    判据用域名后缀而不是精确 URL，容忍用户手填路径差异。
+    """
+    b = str(base_url or "").lower()
+    if "qoder.com.cn" in b or "qoder.cn" in b:
+        return "qoder_cn"
+    return "qoder"
 
 # ── 指纹常量（上游签名校验依赖，勿改） ─────────────────
 # ⚠️ 模型目录**按客户端版本下发**（2026-10-17 实测）：
@@ -65,21 +117,24 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 -----END PUBLIC KEY-----"""
 
 
-def qoder_inference_base(token: str) -> str:
-    """jt- 流量走 api2，dt-/pt- 换出的其它 token 默认 api3。"""
+def qoder_inference_base(token: str, site: str = "qoder") -> str:
+    """jt- 流量走 api2，dt-/pt- 换出的其它 token 默认 api3；CN 固定走网关。"""
+    s = qoder_site(site)
     t = token or ""
+    if s["chat"] == s["chat_alt"]:
+        return s["chat"]
     if not t.startswith("pt-") and t.startswith("jt-"):
-        return QODER_CHAT_BASE_ALT
-    return QODER_CHAT_BASE
+        return s["chat_alt"]
+    return s["chat"]
 
 
-def model_list_url(token: str) -> str:
-    base = qoder_inference_base(token)
+def model_list_url(token: str, site: str = "qoder") -> str:
+    base = qoder_inference_base(token, site)
     return f"{base}/algo{QODER_MODEL_LIST_SIG_PATH}"
 
 
-def chat_url(token: str) -> str:
-    base = qoder_inference_base(token)
+def chat_url(token: str, site: str = "qoder") -> str:
+    base = qoder_inference_base(token, site)
     return (f"{base}/algo{QODER_CHAT_SIG_PATH}"
             "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
 

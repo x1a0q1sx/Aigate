@@ -1008,8 +1008,11 @@ class OAuthClient:
             # CodeArts：DPoP 换新 AK/SK/SecurityToken（一次性轮换，必须串行 —— 本
             # 调用点已被 refresh_token() 的 Single Flight 包住）
             return await self._refresh_codearts(db, provider, existing, refresh_plain)
-        # ── Qoder device_token ──
-        if provider_code == "qoder" and (provider.extra_params or {}).get("device_code_only"):
+        # ── Qoder device_token（CN CLI 语义：device token 就是聊天 token） ──
+        # refresh_style=device_token 是显式声明（qoder_cn）；国际版保留旧的
+        # device_code_only 开关兼容（历史配置）。
+        if _style == "device_token" or (
+                provider_code == "qoder" and (provider.extra_params or {}).get("device_code_only")):
             return await self._refresh_device_token(db, provider, existing, refresh_plain)
         refresh_url = provider.refresh_url or provider.token_url
         post_data = {
@@ -1505,10 +1508,12 @@ class OAuthClient:
     # ── Qoder 设备流（本地 PKCE+nonce，轮询 deviceToken/poll 收 dt- token） ──
     async def start_qoder_device(self, provider_code: str, db: AsyncSession,
                                  owner: str = "__default") -> dict:
-        """对齐 9router QoderService.initiateDeviceFlow：
+        """Qoder 设备流（国际版 qoder.com / 国内版 qoder.cn 同协议）。
+
         1) 本地生成 PKCE(S256) verifier/challenge + nonce + machine_id
-        2) 用户浏览器打开 qoder.com/device/selectAccounts?challenge&nonce&machine_id
-        3) 后台轮询 openapi.qoder.sh/api/v1/deviceToken/poll（202/404=pending）
+        2) 用户浏览器打开 {site}/device/selectAccounts?challenge&nonce&machine_id
+           （CN 额外带国内 CLI 的 client_id，见注册表 extra_params/`client_id`）
+        3) 后台轮询 {openapi}/api/v1/deviceToken/poll（202/404=pending）
         4) 批准后收 {token: dt-…, user_id, expires_at} → userinfo 补邮箱 → 落库
            （scope 列存 COSY 签名所需 JSON 元数据）
         """
@@ -1530,10 +1535,14 @@ class OAuthClient:
                 f"{ep.get('login_url')}?challenge={challenge}"
                 f"&challenge_method=S256&machine_id={machine_id}&nonce={nonce}"
             )
+            # CN 登录页要求 client_id（国内 CLI 生产值）；国际版现行流程不带，保持原样
+            if provider.client_id:
+                login_url += f"&client_id={provider.client_id}"
             asyncio.create_task(self._poll_qoder_device(
                 provider_code, nonce, verifier, machine_id, owner))
             return {"state": nonce, "login_url": login_url,
-                    "poll_interval_ms": 2000, "owner": owner}
+                    "poll_interval_ms": 2000, "owner": owner,
+                    "site": ep.get("site") or "qoder"}
         except Exception as e:
             return {"error": f"start_qoder_device exception: {e}"}
 
@@ -1659,6 +1668,57 @@ class OAuthClient:
             return True, "ok"
         except Exception as e:
             return False, f"refresh_cline exception: {e}"
+
+    # ── Qoder device token 续期（CN CLI 用；国际版 device_code_only 路径复用） ──
+    async def _refresh_device_token(
+        self, db: AsyncSession, provider: OAuthProviderConfig,
+        existing: OAuthToken, refresh_plain: str,
+    ) -> Tuple[bool, str]:
+        """POST {openapi}/api/v1/deviceToken/refresh {refresh_token} → 新 dt- 对。
+
+        ⚠️ refresh token **一次性轮换**：上游每次刷新都返回新的 refresh_token，
+        必须立刻落库（下次用旧的必 401）。失败分级照 P1-15：仅 401/403 判死，
+        5xx/429 只记 last_error 保留重试机会。
+        来源：@magpie-community/opencode-qoder-auth 的 refreshDevice()。
+        """
+        ep = provider.extra_params or {}
+        site = str(ep.get("site") or "qoder")
+        from server.core.qoder_sign import qoder_openapi_base
+        url = f"{qoder_openapi_base(site)}/api/v1/deviceToken/refresh"
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(url, json={"refresh_token": refresh_plain},
+                                         headers={"Content-Type": "application/json",
+                                                  "Accept": "application/json"})
+            if resp.status_code >= 400:
+                err = resp.text[:300]
+                existing.last_error = err
+                if _refresh_credential_dead(resp.status_code, err):
+                    existing.is_active = False
+                await db.commit()
+                return False, f"device token refresh HTTP {resp.status_code}: {err}"
+            body = resp.json() or {}
+            access = str(body.get("token") or body.get("device_token") or "")
+            new_refresh = str(body.get("refresh_token") or "")
+            if not access:
+                existing.last_error = "device token refresh: empty token"
+                await db.commit()
+                return False, "device token refresh: empty token in response"
+            tok = {
+                "access_token": access,
+                "refresh_token": new_refresh or refresh_plain,
+                "expires_in": max(3600, int(
+                    self._qoder_parse_expiry(body.get("expires_at"),
+                                             body.get("expires_in")) - time.time())),
+                "token_type": "Bearer",
+                # scope 保留签名元数据（uid/machine_id/email/name）——丢了推理必失败
+                "scope": existing.scope or "",
+            }
+            await self._save_token(db, provider.code, existing.owner, tok,
+                                   update_existing=existing)
+            return True, "ok"
+        except Exception as e:
+            return False, f"refresh_device_token exception: {e}"
 
     # ── CodeBuddy CN 专属 device_poll 流程：首次登录 ──
     async def start_device_poll(

@@ -29,8 +29,8 @@ import httpx
 
 from server.adapters.base_adapter import (BaseAdapter, HealthResult, ModelInfo)
 from server.core.qoder_sign import (
-    QODER_JOB_TOKEN_EXCHANGE_URL, QODER_USERINFO_URL,
     build_cosy_headers, chat_url, model_list_url, qoder_encode_body,
+    qoder_site_from_base_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -268,26 +268,33 @@ def _estimate_prompt_tokens(system: str, messages: list, tools: list) -> int:
 # ── 适配器 ──────────────────────────────────────────
 
 class QoderAdapter(BaseAdapter):
-    """Qoder dt-/jt-/pt- 凭证 → COSY 签名 agent_chat_generation 代理。"""
+    """Qoder dt-/jt-/pt- 凭证 → COSY 签名 agent_chat_generation 代理。
+
+    同一套协议服务**两个独立站点**（账号互不相通）：
+    - qoder      国际版：api3.qoder.sh / openapi.qoder.sh
+    - qoder_cn   国内版：gateway.qoder.com.cn / openapi.qoder.com.cn
+    站点由服务商 base_url 判定（`qoder_site_from_base_url`）——适配器只拿得到
+    base_url，因此**不能**再写死 .sh 域名，否则国内账号会打到国际网关（401）。
+    """
 
     def __init__(self, timeout: Optional[int] = None):
         self._connect_timeout = 30.0
         self._read_timeout = float(timeout) if timeout else 300.0
 
     # ── 凭证解析 ─────────────────────────────────────
-    async def _resolve_credentials(self, api_key: str) -> tuple:
+    async def _resolve_credentials(self, api_key: str, site: str = "qoder") -> tuple:
         """→ (token, creds_dict)。PAT(pt-) 先换 job token；dt- 从连接 meta 补 uid。"""
         token = (api_key or "").strip()
         if token.startswith("pt-"):
             job = _PAT_JOBS.get(token)
             if not job or job["exp"] - time.time() * 1000 < 5 * 60 * 1000:
-                job = await self._exchange_pat(token)
+                job = await self._exchange_pat(token, site)
                 _PAT_JOBS[token] = job
             return job["token"], {
                 "user_id": job["uid"], "auth_token": job["token"],
                 "name": "", "email": "", "machine_id": "",
             }
-        meta = await self._token_meta()
+        meta = await self._token_meta(site)
         uid = str(meta.get("uid") or "")
         if not uid:
             raise RuntimeError("qoder 凭证缺少 user_id（请重新连接 Qoder 账号）")
@@ -298,11 +305,13 @@ class QoderAdapter(BaseAdapter):
         }
 
     @staticmethod
-    async def _exchange_pat(pat: str) -> dict:
+    async def _exchange_pat(pat: str, site: str = "qoder") -> dict:
+        from server.core.qoder_sign import qoder_openapi_base
+        base = qoder_openapi_base(site)
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 r = await client.post(
-                    QODER_JOB_TOKEN_EXCHANGE_URL,
+                    f"{base}/api/v1/jobToken/exchange",
                     json={"personal_token": pat},
                     headers={"Content-Type": "application/json",
                              "Accept": "application/json",
@@ -324,7 +333,7 @@ class QoderAdapter(BaseAdapter):
             uid = ""
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    ur = await client.get(QODER_USERINFO_URL, headers={
+                    ur = await client.get(f"{base}/api/v1/userinfo", headers={
                         "Authorization": f"Bearer {jt}", "Accept": "application/json",
                         "User-Agent": "Go-http-client/2.0"})
                 if ur.is_success:
@@ -337,20 +346,25 @@ class QoderAdapter(BaseAdapter):
             raise RuntimeError(f"qoder PAT exchange network error: {e}")
 
     @staticmethod
-    async def _token_meta() -> dict:
-        """读 qoder 连接记录里 scope 列存的签名元数据（uid/machine_id/email/name）。"""
+    async def _token_meta(site: str = "qoder") -> dict:
+        """读连接记录 scope 列存的签名元数据（uid/machine_id/email/name）。
+
+        ⚠️ provider_code 必须跟站点一致：国内版连接存在 qoder_cn 行下，
+        读 qoder 行会拿到另一账号（或空）→ 签名 uid 与实际 token 不匹配。
+        """
         from server.db import AsyncSessionLocal
         from server.core.oauth_client import get_oauth_client
         async with AsyncSessionLocal() as db:
-            return await get_oauth_client().get_token_meta("qoder", db)
+            return await get_oauth_client().get_token_meta(site, db)
 
     # ── 模型目录 ─────────────────────────────────────
-    def _cache_key(self, creds: dict) -> str:
+    def _cache_key(self, creds: dict, site: str = "qoder") -> str:
         seed = creds.get("user_id") or creds.get("auth_token") or "anon"
-        return hashlib.sha256(f"qoder:{seed}".encode()).hexdigest()[:24]
+        return hashlib.sha256(f"qoder:{site}:{seed}".encode()).hexdigest()[:24]
 
-    async def _catalog(self, creds: dict, force: bool = False) -> Optional[dict]:
-        key = self._cache_key(creds)
+    async def _catalog(self, creds: dict, force: bool = False,
+                       site: str = "qoder") -> Optional[dict]:
+        key = self._cache_key(creds, site)
         now = time.monotonic()
         hit = _CATALOG.get(key)
         if hit and hit[0] > now and not force:
@@ -362,7 +376,7 @@ class QoderAdapter(BaseAdapter):
             return await asyncio.shield(inflight)
 
         async def _fetch():
-            url = model_list_url(creds["auth_token"])
+            url = model_list_url(creds["auth_token"], site)
             headers = {"Accept": "application/json", "Accept-Encoding": "identity",
                        **build_cosy_headers(b"", url, creds)}
             try:
@@ -398,9 +412,10 @@ class QoderAdapter(BaseAdapter):
             if _INFLIGHT.get(key) is task:
                 _INFLIGHT.pop(key, None)
 
-    async def _model_config(self, creds: dict, qoder_key: str) -> dict:
+    async def _model_config(self, creds: dict, qoder_key: str,
+                            site: str = "qoder") -> dict:
         for force in (False, True):
-            cat = await self._catalog(creds, force=force)
+            cat = await self._catalog(creds, force=force, site=site)
             cfg = (cat or {}).get("raw_configs", {}).get(qoder_key)
             if cfg:
                 return {**cfg, "key": qoder_key}
@@ -603,8 +618,9 @@ class QoderAdapter(BaseAdapter):
         qoder_key = str(body.get("model") or "auto")
         if qoder_key.startswith("qoder/"):
             qoder_key = qoder_key[len("qoder/"):]
-        token, creds = await self._resolve_credentials(api_key)
-        model_config = await self._model_config(creds, qoder_key)
+        site = qoder_site_from_base_url(base_url)
+        token, creds = await self._resolve_credentials(api_key, site)
+        model_config = await self._model_config(creds, qoder_key, site)
         payload = self._build_payload(body, qoder_key, model_config, creds)
         plain = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
@@ -614,7 +630,7 @@ class QoderAdapter(BaseAdapter):
             # ⚠️ 每轮都要重新编码+签名：排队重试时旧 Cosy-Date/requestId 已过期，
             # 复用会被 CDN 直接拒（签名含时间戳与 requestId）
             encoded = qoder_encode_body(plain)
-            url = chat_url(creds["auth_token"])
+            url = chat_url(creds["auth_token"], site)
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "text/event-stream",
@@ -760,8 +776,9 @@ class QoderAdapter(BaseAdapter):
 
     # ── 模型目录 ─────────────────────────────────────
     async def list_models(self, api_key, base_url, extra_headers=None) -> List[ModelInfo]:
-        token, creds = await self._resolve_credentials(api_key)
-        cat = await self._catalog(creds, force=False)
+        site = qoder_site_from_base_url(base_url)
+        token, creds = await self._resolve_credentials(api_key, site)
+        cat = await self._catalog(creds, force=False, site=site)
         if not cat:
             raise RuntimeError("qoder 模型目录拉取失败（检查连接/网络）")
         out = []
@@ -796,8 +813,9 @@ class QoderAdapter(BaseAdapter):
                            extra_headers=None, timeout: int = 10) -> HealthResult:
         start = time.time()
         try:
-            token, creds = await self._resolve_credentials(api_key)
-            cat = await self._catalog(creds)
+            site = qoder_site_from_base_url(base_url)
+            token, creds = await self._resolve_credentials(api_key, site)
+            cat = await self._catalog(creds, site=site)
             if cat is None:
                 return HealthResult(status="unhealthy",
                                     latency_ms=(time.time() - start) * 1000,

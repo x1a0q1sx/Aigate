@@ -224,11 +224,11 @@ def _patch_stream(monkeypatch, lines, status=200):
 def _ready_adapter(monkeypatch):
     a = QoderAdapter()
 
-    async def fake_resolve(api_key):
+    async def fake_resolve(api_key, site="qoder"):
         return "dt-1", {"user_id": "u1", "auth_token": "dt-1",
                         "name": "", "email": "", "machine_id": "m"}
 
-    async def fake_cfg(creds, key):
+    async def fake_cfg(creds, key, site="qoder"):
         return _cfg(key=key)
 
     monkeypatch.setattr(a, "_resolve_credentials", fake_resolve)
@@ -310,8 +310,58 @@ def test_qoder_registry_profile():
     assert p.extra_params["refresh_style"] == "none"
     assert p.adapter_api_type == "qoder"
     assert p.token_url == "https://openapi.qoder.sh/api/v1/deviceToken/poll"
+    # 名称显式带 International：站内还有 qoder_cn，只写 Qoder 用户分不清
+    assert p.name == "Qoder (International)"
     ids = [m["model_id"] for m in p.static_models]
     assert "auto" in ids and "qmodel_38max" in ids
+
+
+def test_qoder_cn_registry_profile():
+    """国内版是独立 provider（账号互不相通），端点/站点标记必须齐全。"""
+    p = get_oauth_provider("qoder_cn")
+    assert p is not None
+    assert p.name == "Qoder CN（国内版）"
+    ep = p.extra_params or {}
+    assert ep["auth_mode"] == "qoder_device"
+    assert ep["site"] == "qoder_cn"
+    assert ep["refresh_style"] == "device_token"
+    assert p.token_url == "https://openapi.qoder.com.cn/api/v1/deviceToken/poll"
+    assert p.api_base_url == "https://gateway.qoder.com.cn/algo/api/v2"
+    assert p.client_id == "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb"
+    assert p.adapter_api_type == "qoder"
+
+
+def test_qoder_site_urls():
+    """站点路由：CN 的聊天/目录端点必须落在 gateway.qoder.com.cn。"""
+    assert qs.chat_url("dt-x", "qoder_cn").startswith("https://gateway.qoder.com.cn/algo/")
+    assert qs.model_list_url("dt-x", "qoder_cn").startswith("https://gateway.qoder.com.cn/algo/")
+    assert qs.chat_url("dt-x", "qoder").startswith("https://api3.qoder.sh/algo/")
+    # jt- 国际版走 api2；CN 无 api2 分支，固定网关
+    assert qs.qoder_inference_base("jt-1", "qoder") == "https://api2.qoder.sh"
+    assert qs.qoder_inference_base("jt-1", "qoder_cn") == "https://gateway.qoder.com.cn"
+    # base_url → site 判定（适配器只有 base_url）
+    assert qs.qoder_site_from_base_url("https://gateway.qoder.com.cn/algo/api/v2") == "qoder_cn"
+    assert qs.qoder_site_from_base_url("https://api3.qoder.sh/algo/api/v2") == "qoder"
+    assert qs.qoder_site_from_base_url("") == "qoder"
+
+
+def test_qoder_cn_start_returns_cn_login_url(monkeypatch):
+    """CN 登录链接必须带国内 CLI 的 client_id（国际版不带，保持原样）。"""
+    import server.core.oauth_client as oc
+    client = oc.OAuthClient()
+
+    async def fake_poll(*a, **k):
+        return None
+
+    monkeypatch.setattr(client, "_poll_qoder_device", fake_poll)
+    r = asyncio.run(client.start_qoder_device("qoder_cn", None))
+    assert r["login_url"].startswith("https://qoder.cn/device/selectAccounts?challenge=")
+    assert "client_id=e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb" in r["login_url"]
+    assert r["site"] == "qoder_cn"
+
+    r2 = asyncio.run(client.start_qoder_device("qoder", None))
+    assert r2["login_url"].startswith("https://qoder.com/device/selectAccounts?challenge=")
+    assert "client_id=" not in r2["login_url"]
 
 
 def test_qoder_poll_flow(monkeypatch):

@@ -1117,7 +1117,10 @@ class ModelCatalog:
                     existing_model.price_ratio = model_info.price_ratio
                     # 来源标注：Qoder 在线目录 / CodeBuddy 静态表 / 其它上游自声明
                     if provider.api_type == "qoder":
-                        _new_src = "qoder"
+                        # CN 与国际版目录同构但账号独立：来源标注带上站点，
+                        # 模型页可据此区分倍率来自哪一边
+                        _new_src = ("qoder_cn" if "qoder.com.cn" in str(getattr(provider, "base_url", "") or "")
+                                    else "qoder")
                     elif str(getattr(provider, "oauth_code", "") or "").startswith("codebuddy"):
                         _new_src = "codebuddy"
                     else:
@@ -1204,7 +1207,8 @@ class ModelCatalog:
                     # v4.4 倍率（订阅制上游）
                     price_ratio=model_info.price_ratio,
                     price_ratio_source=(
-                        ("qoder" if provider.api_type == "qoder" else
+                        (("qoder_cn" if "qoder.com.cn" in str(getattr(provider, "base_url", "") or "") else "qoder")
+                         if provider.api_type == "qoder" else
                          "codebuddy" if str(getattr(provider, "oauth_code", "") or "").startswith("codebuddy")
                          else "provider")
                         if model_info.price_ratio is not None else ""),

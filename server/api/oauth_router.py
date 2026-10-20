@@ -216,7 +216,9 @@ async def start_oauth_authorize(provider_code: str, request: Request,
             "state": r["state"],
             "login_url": r["login_url"],
             "poll_interval_ms": r["poll_interval_ms"],
-            "message": "请在新窗口登录 Qoder 并选择账号，批准后系统会自动收取 device token（约 30 天有效）",
+            "message": (f"请在新窗口登录 {provider.name} 并选择账号"
+                        "（国内版与国际版账号互不相通，确认打开的是 qoder.cn 还是 qoder.com），"
+                        "批准后系统会自动收取 device token（约 30 天有效）"),
         }
     # ── LobsterAI：portal 回调锁死 127.0.0.1 → 手动粘贴回调 URL 模式 ────
     if (provider.extra_params or {}).get("auth_mode") == "lobsterai":
