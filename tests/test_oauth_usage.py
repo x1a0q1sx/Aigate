@@ -298,6 +298,53 @@ def test_qoder_pat_exchanges_first(monkeypatch):
     assert r["quotas"]["套餐额度"]["remaining"] == 599
 
 
+def test_qoder_plan_name_from_user_type(monkeypatch):
+    """userType 是机器串 → 面板显示人类可读套餐名（2026-10-20 用户反馈）。"""
+    calls = []
+    _patch(monkeypatch, calls, [(200, {
+        "displayMode": "qoder",
+        "qoderUsage": {"userType": "personal_standard",
+                       "userQuota": {"total": 600, "used": 1, "remaining": 599}},
+    })])
+    r = asyncio.run(_qoder_usage("dt-abc"))
+    assert r["plan"] == "Qoder 个人标准版"
+
+
+def test_qoder_zero_quota_explained_not_silent(monkeypatch):
+    """全 0 + isQuotaExceeded：两端点都空 → 如实说明「账号没有套餐额度」。
+
+    生产实测 Free 账号就是这个形态（userQuota 0/0/0 + expiresAt 哨兵），
+    旧实现只回「响应形状可能已变」，用户看到 0/0 会以为额度查询坏了。
+    """
+    from server.core.oauth_usage import _qoder_note, _qoder_plan_name
+    calls = []
+    body = {
+        "userType": "personal_standard",
+        "isQuotaExceeded": True,
+        "upgradeUrl": "https://qoder.com/pricing?client=qoder",
+        "userQuota": {"total": 0, "used": 0, "remaining": 0, "unit": "credits"},
+        "expiresAt": 253402214400000,
+    }
+    # 两端点都返回同一份「全 0」体（sash 解析出空条目 → 回退 legacy 也空）
+    _patch(monkeypatch, calls, [(200, body), (200, body)])
+    r = asyncio.run(_qoder_usage("dt-abc"))
+    # ⚠️ 现状：userQuota 键存在即会被解析成一行「套餐额度 0/0」——这正是用户
+    # 看到「0/0 credits」的来源。note 把原因讲清楚（比删掉这一行更诚实）。
+    assert r["quotas"]["套餐额度"]["total"] == 0
+    assert "尚未开通套餐额度" in r["extra"]["note"]
+    assert "从没有过" in r["extra"]["note"]
+    assert "https://qoder.com/pricing" in r["extra"]["note"]
+    assert r["plan"] == "Qoder 个人标准版"
+
+    # 有真实数据（total>0）时不该出现这段解释
+    assert _qoder_note({"userQuota": {"total": 600, "used": 0, "remaining": 600}}) == ""
+    # 无 isQuotaExceeded 且全 0 → 另一套说明（形状异常）
+    assert "未返回任何额度条目" in _qoder_note({"userQuota": {"total": 0, "used": 0, "remaining": 0}})
+    assert _qoder_plan_name({"qoderUsage": {"userType": "personal_professional_trial"}}) == "Qoder 个人专业版试用"
+    assert _qoder_plan_name({"qoderUsage": {"userType": "weird_unknown"}}) == "Qoder weird_unknown"
+    assert _qoder_plan_name({}) == "Qoder"
+
+
 # ── u1s1 ────────────────────────────────────────────
 def test_u1s1_me_balance(monkeypatch):
     calls = []

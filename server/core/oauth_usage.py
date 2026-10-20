@@ -714,9 +714,10 @@ def _qoder_parse_sash(body: dict) -> dict:
     for item in (u.get("dedicatedResourcePackages") or []):
         if isinstance(item, dict):
             _pkg(item.get("name") or item.get("id") or "专用资源包", item, reset_at)
-    return {"plan": "Qoder", "quotas": quotas,
+    return {"plan": _qoder_plan_name(body), "quotas": quotas,
             "extra": {"total_usage_pct": _num(u.get("totalUsagePercentage")),
-                      "is_quota_exceeded": bool(u.get("isQuotaExceeded"))}}
+                      "is_quota_exceeded": bool(u.get("isQuotaExceeded")),
+                      "note": _qoder_note(body)}}
 
 
 def _qoder_parse_legacy(body: dict) -> dict:
@@ -737,9 +738,56 @@ def _qoder_parse_legacy(body: dict) -> dict:
             "remaining": _num(oq.get("remaining")), "unit": oq.get("unit") or "credits",
             "reset_at": reset_at, "unlimited": False,
         }
-    return {"plan": "Qoder", "quotas": quotas,
+    return {"plan": _qoder_plan_name(body), "quotas": quotas,
             "extra": {"total_usage_pct": _num(body.get("totalUsagePercentage")),
-                      "is_quota_exceeded": bool(body.get("isQuotaExceeded"))}}
+                      "is_quota_exceeded": bool(body.get("isQuotaExceeded")),
+                      "note": _qoder_note(body)}}
+
+
+# Qoder 账号档位 → 人类可读套餐名（上游 userType 是机器串，裸显示没意义）
+_QODER_USER_TYPES = {
+    "personal_standard": "个人标准版",
+    "personal_professional": "个人专业版",
+    "personal_professional_trial": "个人专业版试用",
+    "personal_free": "个人免费版",
+    "enterprise": "企业版",
+}
+
+
+def _qoder_plan_name(body: dict) -> str:
+    """`userType` → 「Qoder 个人标准版」；未知值原样透传（不臆造档位）。"""
+    u = body.get("qoderUsage") if isinstance(body.get("qoderUsage"), dict) else body
+    ut = str((u or {}).get("userType") or "").strip()
+    if not ut:
+        return "Qoder"
+    return "Qoder " + (_QODER_USER_TYPES.get(ut) or ut)
+
+
+def _qoder_note(body: dict) -> str:
+    """额度全 0 时给一句如实说明（2026-10-20 生产实测 Free 账号形态）。
+
+    上游：`userType=personal_standard` + `isQuotaExceeded=true` +
+    `userQuota.total/used/remaining=0` + `expiresAt=253402214400000`（哨兵）。
+    语义是「这个账号从来没有过套餐额度」——**不是**「有额度但用光了」
+    （后者特征是 total>0 而 remaining=0）。误把前者显示成 0/0 会让用户以为
+    额度查询坏了。给 note 让面板显示「未开通/未购买套餐」，并附升级链接。
+    """
+    u = body.get("qoderUsage") if isinstance(body.get("qoderUsage"), dict) else body
+    if not isinstance(u, dict):
+        return ""
+    uq = u.get("userQuota") if isinstance(u.get("userQuota"), dict) else {}
+    aq = u.get("addOnQuota") if isinstance(u.get("addOnQuota"), dict) else {}
+    total = _num(uq.get("total")) + _num(aq.get("total"))
+    remaining = _num(uq.get("remaining")) + _num(aq.get("remaining"))
+    used = _num(uq.get("used")) + _num(aq.get("used"))
+    if total > 0 or remaining > 0 or used > 0:
+        return ""                      # 有真实数据 → 不解释
+    if bool(u.get("isQuotaExceeded")):
+        link = str(u.get("upgradeUrl") or body.get("upgradeUrl") or "").strip()
+        return ("该 Qoder 账号尚未开通套餐额度（上游返回 isQuotaExceeded 且 total/remaining 均为 0，"
+                "属于「从没有过额度」而非「已用完」）——新账号需在官网领取/购买套餐后才有 credits"
+                + (f"：{link}" if link.startswith("http") else ""))
+    return "Qoder 上游未返回任何额度条目（可能是企业版账号不展示数字，或响应形状已变）"
 
 
 async def _qoder_usage(token: str) -> dict:
@@ -768,7 +816,7 @@ async def _qoder_usage(token: str) -> dict:
         body = r.json() if r.content else {}
         if body.get("displayMode") == "enterprise":
             # 企业版不下发额度数字，只有外部用量链接（报 0 会误导用户以为没额度）
-            return {"plan": "Qoder", "quotas": {},
+            return {"plan": "Qoder 企业版", "quotas": {},
                     "message": "企业版账号不提供额度数字（仅提供外部用量链接）"}
         out = _qoder_parse_sash(body)
         if out["quotas"]:
@@ -778,10 +826,15 @@ async def _qoder_usage(token: str) -> dict:
                          {"Authorization": f"Bearer {token}", "Accept": "application/json"})
     if not r2.is_success:
         return {"quotas": {}, "message": f"Qoder 已连接，额度接口返回 {r2.status_code}"}
-    out = _qoder_parse_legacy(r2.json() if r2.content else {})
+    legacy = r2.json() if r2.content else {}
+    out = _qoder_parse_legacy(legacy)
     if out["quotas"]:
         return out
-    return {"quotas": {}, "message": "Qoder 额度响应无任何条目（响应形状可能已变）"}
+    # 两个端点都拿不到条目：把上游原始形态里读到的「全 0」解释清楚（用户看到
+    # 0/0 第一反应是「查坏了」，实为账号没有套餐额度）。
+    note = _qoder_note(legacy)
+    return {"plan": _qoder_plan_name(legacy), "quotas": {},
+            "message": note or "Qoder 额度响应无任何条目（响应形状可能已变）"}
 
 
 async def _u1s1_usage(token: str) -> dict:

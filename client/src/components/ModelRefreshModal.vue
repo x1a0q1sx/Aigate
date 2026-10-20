@@ -6,85 +6,88 @@
         <h3>{{ result.error ? '模型刷新失败' : '模型刷新完成' }}</h3>
       </div>
 
-      <!-- 错误 -->
-      <div v-if="result.error" class="rf-error">{{ result.error }}</div>
+      <!-- 整体滚动区：汇总/失败列表/明细一起滚动，不再只让明细单独滚 -->
+      <div class="rf-body">
+        <!-- 错误 -->
+        <div v-if="result.error" class="rf-error">{{ result.error }}</div>
 
-      <!-- 汇总 -->
-      <div class="rf-summary" v-if="!result.error">
-        <span class="rf-chip rf-added">新增 {{ result.added }}</span>
-        <span class="rf-chip rf-updated">更新 {{ result.updated }}</span>
-        <span class="rf-chip rf-removed" v-if="result.removed > 0">删除 {{ result.removed }}</span>
-        <span class="rf-chip">共 {{ result.total }} 个</span>
-        <span class="rf-chip" v-if="result.pricing_updated">价格 {{ result.pricing_updated }}</span>
-        <span class="rf-chip" v-if="result.metric_updated">成功率 {{ result.metric_updated }}</span>
-        <span class="rf-chip rf-failed" v-if="result.failed_details && result.failed_details.length">
-          失败/超时 {{ result.failed_details.length }}
-        </span>
-        <span class="rf-chip" v-if="result.duration_ms">耗时 {{ (result.duration_ms / 1000).toFixed(1) }}s</span>
-      </div>
-
-      <!-- 失败/超时的服务商（并发刷新的关键反馈 + 就地禁用） -->
-      <div class="rf-section" v-if="result.failed_details && result.failed_details.length">
-        <div class="rf-section-title failed">
-          ⏱️ 失败/超时（{{ result.failed_details.length }} 个，已跳过不等待）
-          <button v-if="failedUndisabled.length > 1" class="btn btn-outline btn-xs rf-disable-all"
-                  :disabled="disablingAll" @click="disableAllFailed">
-            {{ disablingAll ? '禁用中...' : `全部禁用（${failedUndisabled.length}）` }}
-          </button>
+        <!-- 汇总 -->
+        <div class="rf-summary" v-if="!result.error">
+          <span class="rf-chip rf-added">新增 {{ result.added }}</span>
+          <span class="rf-chip rf-updated">更新 {{ result.updated }}</span>
+          <span class="rf-chip rf-removed" v-if="result.removed > 0">删除 {{ result.removed }}</span>
+          <span class="rf-chip">共 {{ result.total }} 个</span>
+          <span class="rf-chip" v-if="result.pricing_updated">价格 {{ result.pricing_updated }}</span>
+          <span class="rf-chip" v-if="result.metric_updated">成功率 {{ result.metric_updated }}</span>
+          <span class="rf-chip rf-failed" v-if="result.failed_details && result.failed_details.length">
+            失败/超时 {{ result.failed_details.length }}
+          </span>
+          <span class="rf-chip" v-if="result.duration_ms">耗时 {{ (result.duration_ms / 1000).toFixed(1) }}s</span>
         </div>
-        <div class="rf-provider" v-for="p in result.failed_details" :key="'f'+p.provider_id">
-          <div class="rf-provider-row">
-            <div class="rf-provider-name">{{ p.provider_name }}</div>
-            <span v-if="isDisabled(p.provider_id)" class="rf-disabled-tag">已禁用</span>
-            <button v-else class="btn btn-danger btn-xs"
-                    :disabled="disablingId === p.provider_id || disablingAll"
-                    @click="disableProvider(p)">
-              {{ disablingId === p.provider_id ? '禁用中...' : '禁用' }}
+
+        <!-- 失败/超时的服务商（并发刷新的关键反馈 + 就地禁用） -->
+        <div class="rf-section" v-if="result.failed_details && result.failed_details.length">
+          <div class="rf-section-title failed">
+            ⏱️ 失败/超时（{{ result.failed_details.length }} 个，已跳过不等待）
+            <button v-if="failedUndisabled.length > 1" class="btn btn-outline btn-xs rf-disable-all"
+                    :disabled="disablingAll" @click="disableAllFailed">
+              {{ disablingAll ? '禁用中...' : `全部禁用（${failedUndisabled.length}）` }}
             </button>
           </div>
-          <div class="rf-fail-err">{{ p.error }}</div>
-        </div>
-      </div>
-
-      <!-- 可点击展开的下拉按钮 -->
-      <button class="rf-toggle" v-if="!result.error" @click="showDetails = !showDetails">
-        <span>{{ showDetails ? '收起详情' : '查看新增/删除明细' }}</span>
-        <span class="rf-caret" :class="{ open: showDetails }">▾</span>
-      </button>
-
-      <!-- 展开区 -->
-      <div v-if="showDetails && !result.error" class="rf-details">
-        <!-- 新增 -->
-        <div class="rf-section" v-if="result.added_details && result.added_details.length">
-          <div class="rf-section-title added">🟢 新增模型（{{ totalAdded }}）</div>
-          <div class="rf-provider" v-for="p in result.added_details" :key="'a'+p.provider_id">
-            <div class="rf-provider-name">{{ p.provider_name }}</div>
-            <ul class="rf-model-list">
-              <li v-for="(m, i) in p.models" :key="i">
-                <span class="rf-m-name">{{ m.display_name }}</span>
-                <span class="rf-m-id" v-if="m.display_name !== m.model_id">{{ m.model_id }}</span>
-              </li>
-            </ul>
+          <div class="rf-provider" v-for="p in result.failed_details" :key="'f'+p.provider_id">
+            <div class="rf-provider-row">
+              <div class="rf-provider-name">{{ p.provider_name }}</div>
+              <span v-if="isDisabled(p.provider_id)" class="rf-disabled-tag">已禁用</span>
+              <button v-else class="btn btn-danger btn-xs"
+                      :disabled="disablingId === p.provider_id || disablingAll"
+                      @click="disableProvider(p)">
+                {{ disablingId === p.provider_id ? '禁用中...' : '禁用' }}
+              </button>
+            </div>
+            <div class="rf-fail-err">{{ p.error }}</div>
           </div>
         </div>
 
-        <!-- 删除 -->
-        <div class="rf-section" v-if="result.removed_details && result.removed_details.length">
-          <div class="rf-section-title removed">🔴 删除模型（{{ totalRemoved }}）</div>
-          <div class="rf-provider" v-for="p in result.removed_details" :key="'r'+p.provider_id">
-            <div class="rf-provider-name">{{ p.provider_name }}</div>
-            <ul class="rf-model-list">
-              <li v-for="(m, i) in p.models" :key="i">
-                <span class="rf-m-name">{{ m.display_name }}</span>
-                <span class="rf-m-id" v-if="m.display_name !== m.model_id">{{ m.model_id }}</span>
-              </li>
-            </ul>
-          </div>
-        </div>
+        <!-- 可点击展开的下拉按钮 -->
+        <button class="rf-toggle" v-if="!result.error" @click="showDetails = !showDetails">
+          <span>{{ showDetails ? '收起详情' : '查看新增/删除明细' }}</span>
+          <span class="rf-caret" :class="{ open: showDetails }">▾</span>
+        </button>
 
-        <!-- 空 -->
-        <div class="rf-empty" v-if="!(result.added_details && result.added_details.length) && !(result.removed_details && result.removed_details.length)">
-          本次刷新无新增/删除的模型
+        <!-- 展开区 -->
+        <div v-if="showDetails && !result.error" class="rf-details">
+          <!-- 新增 -->
+          <div class="rf-section" v-if="result.added_details && result.added_details.length">
+            <div class="rf-section-title added">🟢 新增模型（{{ totalAdded }}）</div>
+            <div class="rf-provider" v-for="p in result.added_details" :key="'a'+p.provider_id">
+              <div class="rf-provider-name">{{ p.provider_name }}</div>
+              <ul class="rf-model-list">
+                <li v-for="(m, i) in p.models" :key="i">
+                  <span class="rf-m-name">{{ m.display_name }}</span>
+                  <span class="rf-m-id" v-if="m.display_name !== m.model_id">{{ m.model_id }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 删除 -->
+          <div class="rf-section" v-if="result.removed_details && result.removed_details.length">
+            <div class="rf-section-title removed">🔴 删除模型（{{ totalRemoved }}）</div>
+            <div class="rf-provider" v-for="p in result.removed_details" :key="'r'+p.provider_id">
+              <div class="rf-provider-name">{{ p.provider_name }}</div>
+              <ul class="rf-model-list">
+                <li v-for="(m, i) in p.models" :key="i">
+                  <span class="rf-m-name">{{ m.display_name }}</span>
+                  <span class="rf-m-id" v-if="m.display_name !== m.model_id">{{ m.model_id }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+
+          <!-- 空 -->
+          <div class="rf-empty" v-if="!(result.added_details && result.added_details.length) && !(result.removed_details && result.removed_details.length)">
+            本次刷新无新增/删除的模型
+          </div>
         </div>
       </div>
 
@@ -174,11 +177,19 @@ export default {
   max-width: min(560px, 92vw);
   width: 92vw;
 }
+/* 汇总 + 失败列表 + 明细统一滚动（原来只有 .rf-details 单独滚，内容一多就只剩一条缝） */
+.rf-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
 .rf-head {
   display: flex;
   align-items: center;
   gap: 10px;
   margin-bottom: 14px;
+  flex-shrink: 0;
 }
 .rf-head h3 {
   margin: 0;
@@ -255,8 +266,6 @@ export default {
 
 .rf-details {
   margin-top: 14px;
-  max-height: 50vh;
-  overflow-y: auto;
   border-top: 1px solid var(--border-soft);
   padding-top: 12px;
 }
