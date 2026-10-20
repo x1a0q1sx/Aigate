@@ -606,3 +606,64 @@
 
 **部署**：后端 + 前端都有改动 → 服务器 pull + `npm run build`（`index-CNW2D1d2.js`）+
 `pm2 restart aigate`；health 200；`/admin` 已引用新 bundle。
+
+---
+
+## Session 31（2026-10-20）
+
+**1. Cline 分组只保留「能用」的模型（用户任务：「pass 分组不能用的都删掉」）**
+
+- 现象：用户选 `Cline Pass/deepseek/deepseek-v4.1-flash-1017` → 402
+  `insufficient_credits`（余额 $0）；`Cline Pass` 分组 469 条模型几乎全废。
+- 生产逐条实测（provider 102 的 sk_ key，同账号 usr-01KYRQMZZ97G8Z3XDMTX05Q57B）：
+  - `cline-pass/*` 14/15 可用（`muse-spark-1.3-contributor` 403「not available in your region」）
+  - `cline-free/*` 3/4 可用（同上 muse-spark 403）；`cline-free/minimax-m3.1-flash` 200
+  - 公共目录 `*:free` 17 条基本可用（`thinkingmachines/inkling*:free` 为 OpenRouter
+    免费池日限额 429，属瞬态）
+  - 其余公共目录（anthropic/openai/google/qwen/z-ai/mistral/x-ai/cohere/deepseek 全族）
+    **一律 402**（Cline Credits 余额 0）
+  - `cline-cloud/*` 403「This request is not supported」
+- 修复（`model_catalog.py`）：
+  - 新增 `is_cline_provider()` / `cline_model_usable()`：Cline 渠道（api.cline.bot，
+    OAuth 与 ClinePass api_key 共用）刷新时只保留 `cline-pass/*`、`cline-free/*`、
+    公共 `:free`；`_CLINE_REGION_BLOCKED` 排除区域封锁条目。
+  - OAuth 分支：并集官方 recommended-models 后过滤；种子补订阅模型时同样过滤。
+  - api_key 分支（ClinePass）：并入 recommended-models 后过滤；**推荐目录拉不到时
+    本次刷新不增不删**（绝不用 471 条按量计费死模型顶替）。
+- 生产结果：provider 102 **469 → 35**（removed 452，added 18）；provider 85（OAuth）
+  **490 → 35**（removed 458，added 3）；二次刷新 added=0/removed=0（幂等）。
+  抽验 200：`cline-free/minimax-m3.1-flash`、`cline-pass/deepseek-v4.1-flash-1017`、
+  `cline-pass/mimo-v2.6-pro`、`cline-free/solar-mini4`。
+- 测试：`test_cline_pass.py` 重写刷新用例 + 新增判据/渠道识别/api_key 渠道用例；
+  全量 **1194 全绿**。
+- 备注：账号充值后若要恢复按量计费模型，改 `cline_model_usable` 即可（刷新幂等，
+  删除的条目会被重新加回）。
+
+**2. 连接池耗尽事故（2026-10-19 15:48 → 2026-10-20 上午）**
+
+- 现象：仪表盘/全部 DB 请求 `HTTP 503 database_pool_timeout`
+  「gateway busy: database connection pool exhausted」；持续约 9 小时。
+- 取证：`request_logs` 最后一条写入停在 **2026-10-19 15:48:49**；33 行 `pending`
+  未收尾（IP 全 127.0.0.1，模型 `CodeBuddy (International)/deepseek-v4.1-flash` ×32、
+  `CodeBuddy CN/step-5-preview` ×1）；日志显示这些流式请求单条 15–46s，
+  15:48 起新请求 503；`QueuePool limit of size 20 overflow 10` 反复出现
+  （含 `/admin/api/dashboard`、usage prewarm loop）。DB 文件本身无锁
+  （外部 `begin immediate` 写入 0.00s 成功）→ **是进程内连接被占满，不是 SQLite 锁**。
+- 定位：护栏（exception_guard）只保证「失败得体面」（503 短 JSON + 日志限流），
+  不保证「服务恢复」；被占住的 30 条连接在进程内不归还，池永久枯竭。
+  另发现**融合流（run_fusion）全程握着请求级 db 会话**（流式期间独占一条连接）。
+- 修复：
+  - 新增 `server/core/pool_watchdog.py`：每 30s 采样 `engine.pool.checkedout()`，
+    持续满额 ≥120s → `engine.dispose()` 重建连接池（在途连接随归还作废），
+    服务自愈不再依赖人工重启；一次自愈后 300s 冷却；纯函数 `decide_action` 可测。
+  - `v1_router._fusion_job`：融合取数结束立刻 `_release_db`（日志/决策各自独立会话）。
+  - `exception_guard`：池超时日志追加 `[pool checkedout=N/M]`，
+    下次一眼区分「池泄漏」与「真并发峰值」。
+  - 运维：`pm2 restart aigate` 恢复（health 200；33 行 pending 启动流程自动收尾）。
+- 未完成：**持有连接的根因未完全锁定**（事故请求走的是直连流式路径，该路径已在
+  上游调用前 `_release_db`）。看门狗兜住「不再宕 9 小时」，但下一次若再现，
+  看门狗日志的 `checkedout=N/M` + 触发频率可用于继续定位；必要时对
+  直连流式 + CodeBuddy Intl（force_stream 聚合）做并发复现实验。
+- 测试：新增 `tests/test_pool_watchdog.py`（6 项）；全量 **1194 全绿**。
+- 部署：`4b70f9c`（池加固）+ `d0f6dc2`（Cline 过滤）；pull → `pm2 restart aigate`；
+  启动日志含「连接池看门狗已启动」；自检 `v4b70f9c providers=77 models=3460`。
