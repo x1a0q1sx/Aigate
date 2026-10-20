@@ -121,9 +121,21 @@ class ExceptionGuardMiddleware:
         self.stats["by_type"][name] = self.stats["by_type"].get(name, 0) + 1
         path = scope.get("path", "?")
         head = "\n".join(traceback.format_exc().splitlines()[:_TB_HEAD_LINES])
+        # 连接池超时是「池被占满」的判定信号：附上池实时占用，便于定位持有者
+        # （2026-10-19 事故：只看 503 文案无法判断是池泄漏还是真并发峰值）
+        extra = ""
+        try:
+            import sqlalchemy.exc as _se
+            if isinstance(exc, _se.TimeoutError):
+                from server.core.pool_watchdog import pool_state
+                from server.db import engine as _engine
+                _co, _cap = pool_state(_engine)
+                extra = f" [pool checkedout={_co}/{_cap}]"
+        except Exception:
+            pass
         suppressed = _log_limited(
             f"{name}:{path}",
-            f"unhandled {name} on {path}: {str(exc)[:_MSG_MAX]}\n{head}",
+            f"unhandled {name} on {path}{extra}: {str(exc)[:_MSG_MAX]}\n{head}",
         )
         if suppressed:
             self.stats["suppressed_logs"] += 1

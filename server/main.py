@@ -425,6 +425,11 @@ async def lifespan(app: FastAPI):
     # 多账号额度预热（按积分最近到期选号的数据来源；请求路径只读缓存）
     start_oauth_usage_prewarm()
     print("✓ OAuth 多账号额度预热已启动（300s 扫一次，仅多账号 provider）")
+    # 连接池看门狗：池被长期占满（2026-10-19 事故：并发流吃满 20+10 且不归还，
+    # 全站 503 达 9 小时）→ 持续满额 120s 自动 engine.dispose() 重建连接池自愈
+    from server.core.pool_watchdog import start_pool_watchdog
+    start_pool_watchdog()
+    print("✓ 连接池看门狗已启动（30s 采样，持续满额 120s 自动重建连接池）")
     # 存量 OAuth 连接回填服务商（自动登记上线前的旧连接补建，幂等）
     import asyncio as _aio
 
@@ -598,6 +603,11 @@ async def lifespan(app: FastAPI):
         await stop_log_queue()
     except Exception as e:
         logger.warning("log queue shutdown: %s", e)
+    try:
+        from server.core.pool_watchdog import stop_pool_watchdog
+        await stop_pool_watchdog()
+    except Exception as e:
+        logger.warning("pool watchdog shutdown: %s", e)
     await engine.dispose()
     print("\n✓ AIGate 已关闭")
 # 创建 FastAPI 应用
