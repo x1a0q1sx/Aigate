@@ -764,24 +764,33 @@ def _qoder_plan_name(body: dict) -> str:
 
 
 def _qoder_note(body: dict) -> str:
-    """额度全 0 时给一句如实说明（2026-10-20 生产实测 Free 账号形态）。
+    """额度形状的如实说明（2026-10-20 生产实测两种形态）。
 
-    上游：`userType=personal_standard` + `isQuotaExceeded=true` +
-    `userQuota.total/used/remaining=0` + `expiresAt=253402214400000`（哨兵）。
-    语义是「这个账号从来没有过套餐额度」——**不是**「有额度但用光了」
-    （后者特征是 total>0 而 remaining=0）。误把前者显示成 0/0 会让用户以为
-    额度查询坏了。给 note 让面板显示「未开通/未购买套餐」，并附升级链接。
+    形态 A（本机账号）：`userQuota 0/0/0` + `addOnQuota 100/100` ——
+    套餐没买（或试用结束），但签到/活动送的资源包还有 100。面板上
+    「套餐额度 0/0」单独看很像「余额查询坏了」，必须解释清楚。
+    形态 B：两个包全 0 + `isQuotaExceeded=true` + `expiresAt` 9999 哨兵 ——
+    语义是「这个账号从来没有过额度」，**不是**「有额度但用光了」
+    （后者特征是 total>0 而 remaining=0）。
     """
     u = body.get("qoderUsage") if isinstance(body.get("qoderUsage"), dict) else body
     if not isinstance(u, dict):
         return ""
     uq = u.get("userQuota") if isinstance(u.get("userQuota"), dict) else {}
     aq = u.get("addOnQuota") if isinstance(u.get("addOnQuota"), dict) else {}
-    total = _num(uq.get("total")) + _num(aq.get("total"))
-    remaining = _num(uq.get("remaining")) + _num(aq.get("remaining"))
+    u_total, u_rem = _num(uq.get("total")), _num(uq.get("remaining"))
+    a_total, a_rem = _num(aq.get("total")), _num(aq.get("remaining"))
+    total = u_total + a_total
+    remaining = u_rem + a_rem
     used = _num(uq.get("used")) + _num(aq.get("used"))
-    if total > 0 or remaining > 0 or used > 0:
-        return ""                      # 有真实数据 → 不解释
+    if remaining > 0:
+        # 有余额：只有「套餐 0 + 资源包有」这种反差形态需要解释
+        if u_total == 0 and a_rem > 0:
+            return ("套餐额度为 0 表示该账号未购买/未开通套餐（不是查询失败）；"
+                    f"可用的 {int(a_rem)} credits 来自签到/活动赠送的资源包")
+        return ""
+    if total > 0 or used > 0:
+        return "额度已用完"          # 真·耗尽（total>0 且 remaining=0）
     if bool(u.get("isQuotaExceeded")):
         link = str(u.get("upgradeUrl") or body.get("upgradeUrl") or "").strip()
         return ("该 Qoder 账号尚未开通套餐额度（上游返回 isQuotaExceeded 且 total/remaining 均为 0，"
