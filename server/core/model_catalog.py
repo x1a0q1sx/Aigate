@@ -1174,6 +1174,11 @@ class ModelCatalog:
                     existing_model.price_ratio_source = _new_src
                     if model_info.price_ratio == 0.0:
                         existing_model.is_free = True
+                # 倍率 0 恒等于免费：种子补的别名（如 hy4-preview-f）不在在线倍率表里，
+                # 目录也没有 credits → 上面会按 is_free=False 写入，留下「倍率 0 却标付费」
+                # 的矛盾（生产 2026-10-20 实证）。价格语义只有一条：0 = 免费。
+                if existing_model.price_ratio == 0.0:
+                    existing_model.is_free = True
                 # v4.6 促销元数据快照：上游有则更新；上游无则保留既有（促销下线由
                 # 上游目录移除字段体现，本地保留最后一次快照不至于静默消失——展示层
                 # 会按 active 判断是否还在进行）。

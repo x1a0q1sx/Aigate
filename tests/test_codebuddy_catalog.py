@@ -319,6 +319,66 @@ async def test_refresh_union_catalog_with_seed(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_zero_ratio_alias_marked_free(tmp_path, monkeypatch):
+    """种子补的别名（不在在线倍率表、目录无 credits）倍率 0 → 必须标免费。
+
+    生产实证（2026-10-20）：hy4-preview-f 是种子别名，目录里没有它、在线倍率表
+    也没有 → is_free 被刷成 False，但 price_ratio 仍是 0.0（历史值）——
+    模型页就出现「倍率 免费 却标付费」的矛盾。
+    """
+    engine, Session, pid = await _setup(tmp_path)
+    async with Session() as db:
+        p = await db.get(Provider, pid)
+        p.credential_type = "oauth"
+        p.oauth_code = "codebuddy_cn"
+        await db.commit()
+        # 预置一条历史值：倍率 0 但被标付费（真实生产状态）
+        db.add(Model(provider_id=pid, model_id="hy4-preview-f", display_name="Hy4-Preview-F",
+                     input_price=0, output_price=0, is_free=False,
+                     auto_enabled=False, enabled=True, supports_streaming=True,
+                     context_length=4096, price_ratio=0.0,
+                     price_ratio_source="codebuddy"))
+        await db.commit()
+
+    from server.core import oauth_client as oc_mod
+    from server.core import model_catalog as mc
+
+    class _TokClient:
+        async def pick_access_token(self, code, session, owner="__default"):
+            return "tok"
+
+    monkeypatch.setattr(oc_mod, "get_oauth_client", lambda: _TokClient())
+
+    async def _catalog(token, base_url):
+        return [ModelInfo(model_id="hy3", display_name="Hy3")]
+
+    async def _ratios(token, base_url):
+        return {"hy3": 0.0}      # hy4-preview-f 不在在线倍率表里
+
+    async def _no_pricing(base_url, timeout=None):
+        class _R:
+            pricing = {}
+            source_url = ""
+            error = ""
+        return _R()
+
+    monkeypatch.setattr(mc, "fetch_codebuddy_catalog", _catalog)
+    monkeypatch.setattr(mc, "fetch_codebuddy_ratios", _ratios)
+    monkeypatch.setattr(mc, "fetch_provider_pricing", _no_pricing)
+
+    async with Session() as db:
+        p = await db.get(Provider, pid)
+        await ModelCatalog().refresh_models_from_provider(db, p, None)
+
+    async with Session() as db:
+        row = (await db.execute(
+            select(Model).where(Model.provider_id == pid,
+                                Model.model_id == "hy4-preview-f"))).scalar_one()
+        assert row.price_ratio == 0.0
+        assert row.is_free is True, "倍率 0 必须标免费（否则模型页显示矛盾）"
+
+
+@pytest.mark.asyncio
 async def test_refresh_seed_fallback_when_catalog_empty(tmp_path, monkeypatch):
     """两端点全挂 → 仍回退静态种子（list_source=seed，流程不回归）。"""
     engine, Session, pid = await _setup(tmp_path)
