@@ -307,3 +307,64 @@ class TestResponseSchema:
         r = ModelsRefreshResponse(added=0, updated=0, total=0)
         assert r.failed_details == []
         assert r.duration_ms == 0
+
+
+class TestManualRefreshProviderScope:
+    """全量刷新必须覆盖 OAuth 服务商（2026-10-20 生产实证）。
+
+    旧实现 `Provider JOIN ApiKey` 只捞得到 api_key 服务商 —— OAuth 连接
+    （CodeBuddy / Qoder / Cline / LobsterAI…）在 api_keys 表里没有行，
+    于是「刷新模型列表」永远跳过它们，上游上了新模型点全量刷新也看不到。
+    """
+
+    @pytest.mark.asyncio
+    async def test_manual_refresh_includes_oauth_provider(self, tmp_path):
+        from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+        from server.api import admin_router as ar
+        from server.models.base import Base
+        from server.models.provider import Provider
+        from server.models.api_key import ApiKey
+        from server.models.model import Model
+        from server.models.model_refresh_log import ModelRefreshLog
+        from server.models.request_log import RequestLog
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/s.db")
+        tables = [Provider.__table__, ApiKey.__table__, Model.__table__,
+                  ModelRefreshLog.__table__, RequestLog.__table__]
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all, tables=tables)
+        Session = async_sessionmaker(engine, expire_on_commit=False)
+        seen = []
+
+        async def fake_refresh(session, provider, key_manager, trigger="manual"):
+            seen.append(provider.name)
+            return {"added": 0, "updated": 0, "total": 0, "removed": 0,
+                    "pricing_updated": 0, "metric_updated": 0}
+
+        orig = ar._model_catalog.refresh_models_from_provider
+        ar._model_catalog.refresh_models_from_provider = fake_refresh
+        try:
+            async with Session() as db:
+                keyed = Provider(name="api-key-provider", base_url="https://x.invalid/v1",
+                                 api_type="openai_compat", credential_type="api_key", enabled=True)
+                oauth = Provider(name="cb", base_url="https://www.codebuddy.ai/v2/chat/completions",
+                                 api_type="openai_compat", credential_type="oauth",
+                                 oauth_code="codebuddy_intl", enabled=True)
+                free = Provider(name="oc", base_url="https://x.invalid/v1",
+                                api_type="openai_compat", credential_type="free_tier",
+                                oauth_code="opencode", enabled=True)
+                oauth_off = Provider(name="off-oauth", base_url="https://x.invalid/v1",
+                                     api_type="openai_compat", credential_type="oauth",
+                                     oauth_code="cline", enabled=False)
+                db.add_all([keyed, oauth, free, oauth_off])
+                await db.commit()
+                db.add(ApiKey(provider_id=keyed.id, key_encrypted="enc"))
+                await db.commit()
+                await ar.refresh_models(None, "manual", db)
+            assert "api-key-provider" in seen
+            assert "cb" in seen, "OAuth 服务商必须进全量刷新"
+            assert "oc" in seen, "free_tier 服务商必须进全量刷新"
+            assert "off-oauth" not in seen, "已禁用的服务商不该被全量刷新打上游"
+        finally:
+            ar._model_catalog.refresh_models_from_provider = orig
+            await engine.dispose()

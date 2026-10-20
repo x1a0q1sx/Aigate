@@ -124,6 +124,46 @@ _CODEBUDDY_DELISTED_IDS = frozenset({
 # 将来若要支持：在 provider_quirks 的 CodeBuddy 方言里对该模型注入默认 effort。
 _CODEBUDDY_NEEDS_EFFORT_IDS = frozenset({"glm-5.0-turbo"})
 
+# 目录条目 tags 里的活动徽标（2026-10-20 生产实测，CN scoped 端点）：
+#   "badge:限时免费:#FF0000" / "badge:夜间免费:#FF0000" / "badge:夜间折扣:#1E90FF"
+#   "badge:独家限免:#009273"
+# 旧实现只把 tags 用于过滤生图模型，徽标信息全丢 → 模型页只能看到 credits 数字，
+# 用户看不出「这个模型现在为什么免费/什么时候免费」。这里转成与 Qoder 同构的
+# promotion 元数据（模型页展示 + 一键套用为生效时段）。
+_CODEBUDDY_BADGE_PREFIX = "badge:"
+# 夜间类活动的时段（官方公告：Hy4 preview 每晚 23:00-08:00 不计积分，UTC+8）。
+# 只有徽标文字含「夜间」时才挂这个窗口——白天免费的活动不该被套成时段限制。
+_CODEBUDDY_NIGHT_WINDOW = ("23:00", "08:00")
+
+
+def _codebuddy_badge_promotion(badges) -> Optional[dict]:
+    """tags 里的 `badge:xxx[:#color]` → promotion 元数据；无徽标返回 None。
+
+    ⚠️ 徽标只是**展示/套用提示**，不参与计费与路由：免费与否由 credits 决定。
+    """
+    labels = []
+    for b in badges or []:
+        raw = str(b)
+        if not raw.startswith(_CODEBUDDY_BADGE_PREFIX):
+            continue
+        # 形式是 badge:文案:#RRGGBB —— 只取文案，颜色对展示无意义
+        label = raw[len(_CODEBUDDY_BADGE_PREFIX):].split(":", 1)[0].strip()
+        if label:
+            labels.append(label)
+    if not labels:
+        return None
+    label = labels[0]
+    promo = {
+        "active": True,
+        "badge": {"zh": label},
+        "description": {"zh": f"CodeBuddy 上游活动：{label}"},
+        "timezone": "Asia/Shanghai",
+        "source": "codebuddy_tags",
+    }
+    if "夜间" in label:
+        promo["window_start"], promo["window_end"] = _CODEBUDDY_NIGHT_WINDOW
+    return promo
+
 
 def parse_codebuddy_credits(text) -> Optional[float]:
     """'x0.17 credits' / 'x0.00' / '0.5x' / 0.17 → float；无法解析返回 None。
@@ -232,10 +272,14 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
     # 注意：True 只是「允许客户端传 effort」；网关默认请求不带该参数，
     # 不会改变既有可用模型的请求形态。
     sup_effort = True if isinstance(m.get("reasoning"), dict) else None
+    # credits 是目录自带的权威倍率（"x0.00" / "x0.17 credits"）。这里先落一遍，
+    # 让「倍率拉取失败但目录成功」时仍能标出免费模型；fetch_codebuddy_ratios 的
+    # overlay 后跑，值相同、以它为准。
+    ratio = parse_codebuddy_credits(m.get("credits"))
     return ModelInfo(
         model_id=mid,
         display_name=m.get("name") or mid,
-        is_free=False,
+        is_free=(ratio == 0.0),
         input_price=0.0,
         output_price=0.0,
         supports_streaming=True,
@@ -246,6 +290,8 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
         max_output_tokens=max_out,
         supports_vision=supports_images,
         supports_reasoning_effort=sup_effort,
+        price_ratio=ratio,
+        promotion=_codebuddy_badge_promotion(tags),
     )
 
 

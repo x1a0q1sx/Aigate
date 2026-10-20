@@ -37,14 +37,51 @@ _LIMIT_TEXT_MARKERS = (
     "usage exceeds frequency limit",
 )
 
+# Qoder 每日用量上限（2026-10-20 生产实证，HTTP 403）：
+#   {"code":"110","message":"Billing daily count exceeded"}
+# Qoder 官方 CLI 把 110 映射为 todayUsageLimitExceeded（今日用量上限），
+# 其余额度码：112 个人积分耗尽 / 114 试用账号超限 / 115 免费用户额度 /
+# 116·117 团队积分耗尽 / 118 个人积分耗尽 / 119 免费模型上限 / 122 计费组上限。
+# 这里只认「今日用量」这一条：它是唯一会自然恢复（次日）的限额；
+# 其余是余额/订阅问题，按余额耗尽（固定短冷却）处理更合适。
+_QODER_DAILY_CODE_RE = re.compile(r'"code"\s*:\s*"?110"?(?!\d)')
+_QODER_DAILY_MARKERS = (
+    "billing daily count exceeded",
+)
+
+
+def is_qoder_daily_limit_text(error) -> bool:
+    """是否为 Qoder「今日用量上限」（HTTP 403，2026-10-20 生产实证）。
+
+    报文：{"code":"110","message":"Billing daily count exceeded"}
+    官方 CLI 的错误码表把 110 映射为 todayUsageLimitExceeded（今日用量上限）。
+
+    ⚠️ 与 CodeBuddy 6004 的**粒度不同**：6004 上游明说「您也可以切换其他模型」，
+    是 (账号×模型) 限额；Qoder 110 没有任何可切换模型的语义、也不带重置时间，
+    是**账号级**今日计数 → 调用方（oauth_client.note_request_result）按账号冷却
+    到次日 00:00 UTC+8 处理，而不是逐模型记限额（那会对每个模型各撞一次 403）。
+
+    110 是 Qoder 自己的码，不能无条件按「每日限额」处理（别家也可能用 110）：
+    必须同时出现 Qoder 上下文（错误文本含 qoder）或该英文文案才命中。
+    """
+    text = str(error or "")
+    if not text:
+        return False
+    low = text.lower()
+    if any(m in low for m in _QODER_DAILY_MARKERS):
+        return True
+    return bool(_QODER_DAILY_CODE_RE.search(text)) and "qoder" in low
+
 
 def is_daily_limit_text(error) -> bool:
-    """错误文本是否为上游「每日限额」提示（(账号×模型) 粒度，自带重置时间）。
+    """错误文本是否为上游「每日限额」提示。
 
     命中任一即真：
-      - 结构化 code 6004（CN/Intl 同码，最可靠）；
+      - 结构化 code 6004（CodeBuddy CN/Intl 同码，(账号×模型) 粒度）；
       - 中文文案「您的使用量已超出频率限制」；
-      - 英文文案「usage exceeds frequency limit」。
+      - 英文文案「usage exceeds frequency limit」；
+      - Qoder code 110 / "Billing daily count exceeded"（**账号级**，无时间戳；
+        实际记账分支见 oauth_client.note_request_result）。
     `14003 too many requests` 不命中（无上述特征）——它是瞬时频率限流。"""
     text = str(error or "")
     if not text:
@@ -52,7 +89,9 @@ def is_daily_limit_text(error) -> bool:
     if _DAILY_LIMIT_CODE_RE.search(text):
         return True
     low = text.lower()
-    return any(m in text or m in low for m in _LIMIT_TEXT_MARKERS)
+    if any(m in text or m in low for m in _LIMIT_TEXT_MARKERS):
+        return True
+    return is_qoder_daily_limit_text(text)
 
 
 # ── 解析：从文案里抽出重置时间点 ────────────────────────────────────────
@@ -103,11 +142,22 @@ def daily_limit_reset_or_default(error, default_seconds: int = 3600) -> datetime
 
     兜底上限也受调用方（note_request_result）的封顶约束。
     余额耗尽（402，无重置时间）由调用方传 default_seconds=1800（30 分钟，
-    与 cline2api 的 402 冷却策略一致）——充值后最多半小时自动重试。"""
+    与 cline2api 的 402 冷却策略一致）——充值后最多半小时自动重试。
+    Qoder「Billing daily count exceeded」虽无时间戳，但语义是**每日**计数：
+    按次日 00:00（UTC+8）冷却，而不是 1 小时后盲目重试（每天多烧 23 次必败请求）。"""
     got = parse_daily_limit_reset(error)
     if got is not None:
         return got
+    if is_qoder_daily_limit_text(error):
+        return next_utc8_midnight()
     return datetime.utcnow() + timedelta(seconds=max(60, int(default_seconds or 3600)))
+
+
+def next_utc8_midnight() -> datetime:
+    """下一个 UTC+8 零点（返回 naive UTC）。已过当天零点则取次日。"""
+    utc8_now = datetime.utcnow() + timedelta(hours=8)
+    nxt = (utc8_now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return nxt - timedelta(hours=8)
 
 
 # 网关内部生成的「全部账号该模型额度用完」错误前缀（credential_resolver）

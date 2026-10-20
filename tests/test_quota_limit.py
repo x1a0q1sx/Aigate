@@ -131,6 +131,42 @@ def test_daily_limit_reset_or_default_fallback():
     assert 3500 < delta <= 3600
 
 
+# ── 2b) Qoder 110「Billing daily count exceeded」（2026-10-20 生产实证） ──
+
+_QODER_110 = ('upstream_call_failed: RuntimeError: qoder upstream status 403: '
+              '{"code":"110","message":"Billing daily count exceeded"}')
+
+
+def test_qoder_110_recognized_as_daily_limit():
+    """403 + code 110 = 今日用量上限（官方 CLI 的 todayUsageLimitExceeded）。"""
+    from server.core.quota_limit import is_daily_limit_text, is_quota_related_error
+    assert is_daily_limit_text(_QODER_110)
+    assert is_quota_related_error(_QODER_110)
+    # 裸文案（无 qoder 上下文）也认：这是 Qoder 专属英文句式
+    assert is_daily_limit_text('{"code":"110","message":"Billing daily count exceeded"}')
+    assert is_daily_limit_text("Billing daily count exceeded")
+
+
+def test_qoder_110_requires_qoder_context_or_known_text():
+    """110 不是全球统一码：别家的 110 不能当成每日限额（误封其他模型）。"""
+    from server.core.quota_limit import is_daily_limit_text
+    assert not is_daily_limit_text('{"code":"110","message":"invalid parameter"}')
+    assert not is_daily_limit_text('{"code":110,"message":"something else"}')
+    # Qoder 的其他额度码（112 个人积分耗尽 / 114 试用超限）不是每日限额
+    assert not is_daily_limit_text('qoder upstream status 403: {"code":"112","message":"credits drained"}')
+    assert not is_daily_limit_text('qoder upstream status 403: {"code":"114","message":"free trial accounts exceeded"}')
+
+
+def test_qoder_110_reset_is_next_utc8_midnight():
+    """无时间戳，但语义是每日计数 → 冷却到次日 00:00（UTC+8），不是 1 小时后。"""
+    from server.core.quota_limit import daily_limit_reset_or_default
+    got = daily_limit_reset_or_default(_QODER_110, default_seconds=3600)
+    utc8 = got + timedelta(hours=8)
+    assert (utc8.hour, utc8.minute, utc8.second) == (0, 0, 0)
+    delta = (got - datetime.utcnow()).total_seconds()
+    assert 0 < delta <= 24 * 3600
+
+
 # ── 3) 记账：note_request_result 写限额记录而非账号冷却 ──────────
 
 async def _db(tmp_path, tables):
@@ -252,6 +288,68 @@ async def test_note_without_model_id_keeps_old_cooldown_semantics(tmp_path, monk
             assert tok.fail_count == 1 and tok.cooldown_until is not None
     finally:
         oc._ACCOUNT_DIRTY.discard(("codebuddy_cn", "acct-a"))
+        await engine.dispose()
+
+
+# ── 3b) Qoder 110 记账：账号级（上游没有「可切换其他模型」语义） ──────────
+
+@pytest.mark.asyncio
+async def test_qoder_110_cools_account_until_next_utc8_midnight(tmp_path, monkeypatch):
+    """Qoder「Billing daily count exceeded」→ **账号冷却**到次日 00:00 UTC+8。
+
+    不能记成 (账号×模型)：Qoder 的 110 是账号级今日用量上限，按模型记会让
+    自动路由对该账号的每个模型各撞一次 403。
+    """
+    import server.core.oauth_client as oc
+    from server.core.oauth_client import get_oauth_client
+    engine, Session = await _setup(tmp_path)
+    async with Session() as db:
+        db.add_all([
+            OAuthToken(provider_code="qoder", owner="q-acct-a",
+                       access_token_enc="enc-tok-qa", is_active=True),
+        ])
+        await db.commit()
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    monkeypatch.setattr("server.db.AsyncSessionLocal", Session)
+    try:
+        await client.note_request_result("qoder", "q-acct-a", ok=False,
+                                         status_code=403, error=_QODER_110,
+                                         model_id="ultimate", provider_id=84)
+        async with Session() as db:
+            tok = (await db.execute(
+                select(OAuthToken).where(OAuthToken.provider_code == "qoder"))).scalar_one()
+            assert tok.cooldown_until is not None
+            utc8 = tok.cooldown_until + timedelta(hours=8)
+            assert (utc8.hour, utc8.minute, utc8.second) == (0, 0, 0)
+            # 不写 (账号×模型) 限额记录（那是 CodeBuddy 6004 的语义）
+            assert (await db.execute(select(QuotaLimit))).scalars().all() == []
+    finally:
+        oc._ACCOUNT_DIRTY.discard(("qoder", "q-acct-a"))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_qoder_cooling_cooldown_survives_selection(tmp_path, monkeypatch):
+    """冷却到次日零点的账号在自动选号时被跳过（另一账号顶上）。"""
+    from server.core.oauth_client import get_oauth_client
+    engine, Session = await _setup(tmp_path)
+    async with Session() as db:
+        db.add_all([
+            OAuthToken(provider_code="qoder", owner="acct-cool",
+                       access_token_enc="enc-a", is_active=True,
+                       cooldown_until=datetime.utcnow() + timedelta(hours=6)),
+            OAuthToken(provider_code="qoder", owner="acct-ok",
+                       access_token_enc="enc-b", is_active=True),
+        ])
+        await db.commit()
+    client = get_oauth_client()
+    monkeypatch.setattr(client, "_crypto", _FakeCrypto())
+    try:
+        async with Session() as db:
+            got = await client.pick_access_token_ex("qoder", db, model_id="ultimate")
+            assert got[0] == "acct-ok"
+    finally:
         await engine.dispose()
 
 

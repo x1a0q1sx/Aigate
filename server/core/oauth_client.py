@@ -2122,6 +2122,16 @@ class OAuthClient:
                 return
             _ACCOUNT_DIRTY.discard(mark)
         else:
+            # Qoder「Billing daily count exceeded」（HTTP 403 code 110）：**账号级**
+            # 今日用量上限（官方 CLI 映射 todayUsageLimitExceeded；报文没有「可切换
+            # 其他模型」语义，也不带重置时间）→ 账号冷却到次日 00:00 UTC+8。
+            # 不能走下面的 (账号×模型) 分支：那会按模型逐个撞 403，白烧 N 次往返。
+            from server.core.quota_limit import is_qoder_daily_limit_text, next_utc8_midnight
+            if is_qoder_daily_limit_text(error):
+                _ACCOUNT_DIRTY.add(mark)
+                await self._record_account_cooldown_until(
+                    provider_code, owner, next_utc8_midnight())
+                return
             # 每日限额（CodeBuddy CN/Intl 等，报文自带重置时间）：(账号×模型) 粒度，
             # 只记限额记录 + 到点自动失效；账号本身不冷却（其他模型仍可用）。
             # 也置脏标记：该账号下次在**同一模型**上成功时把限额记录清掉
@@ -2183,6 +2193,56 @@ class OAuthClient:
                     provider_code, owner, secs, fc, status_code, risk)
         except Exception as e:
             logger.debug("note_request_result failed: %s", e)
+
+    async def _record_account_cooldown_until(self, provider_code: str, owner: str,
+                                             until: datetime) -> None:
+        """把账号冷却设到指定时间点（Qoder 账号级每日用量上限用）。
+
+        与 _record_quota_limit 的区别：限额是**账号级**的（上游文案没有「可切换
+        其他模型」语义），所以写 cooldown_until 而不是 (账号×模型) 记录——
+        自动选号会直接跳过该账号，换号/次日零点自动恢复。
+        同一上游账号挂在多条连接名下时，同身份的所有连接一起冷却（与限额记录
+        的身份扩散一致，否则换个连接名继续打同一个已超限账号）。"""
+        try:
+            from server.db import AsyncSessionLocal
+            _owners = [owner]
+            try:
+                async with AsyncSessionLocal() as _idb:
+                    _rows = (await _idb.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.provider_code == provider_code,
+                            OAuthToken.is_active == True,  # noqa: E712
+                        ))).scalars().all()
+                _ids = {}
+                for _r in _rows:
+                    try:
+                        _tok = self._crypto.decrypt(_r.access_token_enc) if _r.access_token_enc else ""
+                    except Exception:
+                        _tok = ""
+                    _ids[_r.owner] = token_identity(_tok) if _tok else None
+                _me = _ids.get(owner)
+                if _me:
+                    _owners = [o for o, ident in _ids.items() if ident == _me] or [owner]
+            except Exception:
+                _owners = [owner]
+            async with AsyncSessionLocal() as db:
+                for _own in _owners:
+                    row = (await db.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.provider_code == provider_code,
+                            OAuthToken.owner == _own,
+                        ).limit(1)
+                    )).scalar_one_or_none()
+                    if row is None:
+                        continue
+                    # 只延长不缩短：并发/多条错误不该把冷却改早
+                    if not row.cooldown_until or until > row.cooldown_until:
+                        row.cooldown_until = until
+                await db.commit()
+            logger.info("oauth account cooldown: %s/%s until %s UTC (daily usage limit)",
+                        provider_code, owner, until.isoformat())
+        except Exception as e:
+            logger.debug("_record_account_cooldown_until failed: %s", e)
 
     async def _record_quota_limit(self, provider_code: str, owner: str, model_id: str,
                                   error: str, provider_id: Optional[int] = None,

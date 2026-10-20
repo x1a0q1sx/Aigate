@@ -1401,9 +1401,26 @@ async def refresh_models(
         )
         providers = list(result.scalars().all())
     else:
-        # 手动刷新所有有密钥的 provider
+        # 手动刷新：有密钥的 api_key 服务商 ∪ 凭 OAuth 连接 / 内置执行器鉴权的服务商。
+        # 旧实现只 JOIN api_keys —— OAuth 服务商（CodeBuddy / Qoder / Cline / LobsterAI…）
+        # 根本没有 api_keys 行，于是「刷新模型列表」永远跳过它们：上游上了新模型
+        # （如 CodeBuddy 重新放出免费模型）点全量刷新也看不到，只有单服务商刷新才生效
+        # （2026-10-20 生产实证：全量刷新日志里 60+ 个服务商独缺 CodeBuddy CN/Intl）。
+        # 已禁用的服务商不刷新（与定时刷新一致），避免对停用账号白打上游。
+        from sqlalchemy import or_, and_
         result = await db.execute(
-            select(Provider).join(ApiKey, Provider.id == ApiKey.provider_id).distinct()
+            select(Provider).where(
+                or_(
+                    Provider.id.in_(select(ApiKey.provider_id).distinct()),
+                    and_(
+                        Provider.enabled.is_(True),
+                        or_(
+                            Provider.credential_type.in_(("oauth", "free_tier")),
+                            Provider.api_type == "atomcode",
+                        ),
+                    ),
+                )
+            ).order_by(Provider.id)
         )
         providers = list(result.scalars().all())
 

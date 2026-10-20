@@ -124,7 +124,9 @@ def _is_billing_block(inner) -> bool:
         return False
     if _parse_queue_signal(inner) is not None:
         return False   # 排队 ≠ 计费拦截（见 _parse_queue_signal）
-    return bool(re.search(r'"code"\s*:\s*"(112|10605)"', inner)) or \
+    # 112=个人积分耗尽 / 110=今日用量上限（2026-10-20 实证 Billing daily count exceeded，
+    # 官方 CLI 映射 todayUsageLimitExceeded）/ 10605=通用额度拦截
+    return bool(re.search(r'"code"\s*:\s*"(110|112|10605)"', inner)) or \
         "pricingurl" in inner.lower()
 
 
@@ -703,9 +705,16 @@ class QoderAdapter(BaseAdapter):
                                     qsig.get("modelKey") or qoder_key, qsig.get("queueType"),
                                     queue_tries, retry_after, queue_budget)
                                 break   # 跳出流读取 → 外层重签重试
-                            # ② 计费/额度拦截：首帧直接抛错走回退（换模型）
+                            # ② 计费/额度拦截：首帧直接抛错走回退（换模型/换账号）
                             if first_frame and _is_billing_block(inner):
-                                raise RuntimeError(f"qoder 计费/额度拦截：{inner[:200]}")
+                                _blabel = ""
+                                if '"110"' in inner or "Billing daily count exceeded" in inner:
+                                    _blabel = ("该账号今日用量已达上限（Billing daily count exceeded），"
+                                               "次日 00:00（UTC+8）恢复")
+                                elif '"112"' in inner:
+                                    _blabel = "该账号积分/额度已耗尽（code 112）"
+                                raise RuntimeError(
+                                    f"qoder 计费/额度拦截{'（' + _blabel + '）' if _blabel else ''}：{inner[:200]}")
                             for c in co.flush():
                                 yield c
                             yield {"error": f"qoder upstream status {status_val}: {inner[:200]}"}

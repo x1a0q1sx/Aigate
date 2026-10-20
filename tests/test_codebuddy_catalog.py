@@ -205,6 +205,35 @@ class TestFetchCatalog:
         mi2 = _codebuddy_entry_to_info(_entry("m2"))
         assert mi2.supports_reasoning_effort is None
 
+    def test_credits_decide_free_and_ratio(self):
+        """目录自带的 credits 就是权威倍率——x0.00 必须标免费（2026-10-20 实测）。"""
+        assert _codebuddy_entry_to_info(_entry("free", credits="x0.00")).is_free is True
+        assert _codebuddy_entry_to_info(_entry("f2", credits="x0.00 credits")).price_ratio == 0.0
+        paid = _codebuddy_entry_to_info(_entry("paid", credits="x0.79 credits"))
+        assert paid.is_free is False and paid.price_ratio == 0.79
+        # 无 credits → 倍率未知（None），绝不能猜 0 = 免费
+        unknown = _codebuddy_entry_to_info(_entry("n/a"))
+        assert unknown.price_ratio is None and unknown.is_free is False
+
+    def test_badge_tags_become_promotion(self):
+        """tags 里的 badge:限时免费 / badge:夜间免费 → promotion 元数据（旧实现全丢）。"""
+        mi = _codebuddy_entry_to_info(_entry("step", credits="x0.00",
+                                             tags=["craft", "badge:独家限免:#009273"]))
+        assert mi.promotion is not None
+        assert mi.promotion["badge"]["zh"] == "独家限免"
+        assert mi.promotion["active"] is True
+        # 非夜间活动不挂时间窗（避免被一键套成「仅夜间可用」）
+        assert "window_start" not in mi.promotion
+
+        night = _codebuddy_entry_to_info(_entry("hy4", credits="x0.29",
+                                                tags=["badge:夜间免费:#FF0000"]))
+        assert night.promotion["window_start"] == "23:00"
+        assert night.promotion["window_end"] == "08:00"
+        assert night.promotion["timezone"] == "Asia/Shanghai"
+
+        # 没有 badge 标签 → 不臆造促销
+        assert _codebuddy_entry_to_info(_entry("plain", tags=["craft"])).promotion is None
+
 
 async def _setup(tmp_path):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/cb.db")
