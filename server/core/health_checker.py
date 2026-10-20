@@ -224,7 +224,7 @@ class HealthChecker:
             from server.core.free_providers import get_free_executor, resolve_free_code
             from server.schemas.chat import ChatCompletionRequest
             free_code = resolve_free_code(provider.name, getattr(provider, "oauth_code", None))
-            exec_ = get_free_executor(free_code) if free_code else None
+            exec_ = get_free_executor(free_code, wrap=False) if free_code else None
             if not exec_:
                 return HealthResult(
                     status="unhealthy", latency_ms=0,

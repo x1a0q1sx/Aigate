@@ -355,6 +355,9 @@ export default {
   updateDroolGuard: (data) => apiPut('/admin/api/drool-guard', data),
   getRace: () => apiGet('/admin/api/race'),
   updateRace: (data) => apiPut('/admin/api/race', data),
+  // 失败自动重试：模型请求出错后先不返回报错、原样重试一次（2026-10-20）
+  getRetry: () => apiGet('/admin/api/retry'),
+  updateRetry: (data) => apiPut('/admin/api/retry', data),
   // 推理并发闸（过载保护，2026-10-15）
   getConcurrency: () => apiGet('/admin/api/concurrency'),
   updateConcurrency: (data) => apiPut('/admin/api/concurrency', data),

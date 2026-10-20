@@ -667,3 +667,25 @@
 - 测试：新增 `tests/test_pool_watchdog.py`（6 项）；全量 **1194 全绿**。
 - 部署：`4b70f9c`（池加固）+ `d0f6dc2`（Cline 过滤）；pull → `pm2 restart aigate`；
   启动日志含「连接池看门狗已启动」；自检 `v4b70f9c providers=77 models=3460`。
+
+---
+
+## Session 32（2026-10-20）—— 失败自动重试（设置页开关）
+
+**需求**（用户原话）：「设置里加一个功能开关，开启后自动重试，对一个模型请求出错后，自动重试一次，先不返回报错，如果两次都报错，再返回报错。关闭后保持现状不动。」
+
+**实现**：
+- 新增 `server/core/adapter_retry.py`：`RetryingAdapter` / `RetryingFreeExecutor` 代理 + `wrap_adapter` / `wrap_free_executor`，只包「推理调用」（chat_completion / stream_chat_completion）：
+  - 非流式：失败 → 等 `delay_seconds` → 原样重试一次；第二次失败的异常带 `_aigate_retry_exhausted=True`。
+  - 流式：**实质内容出现前**失败才重试（元数据 chunk 先缓冲、重试时丢弃，客户端无感）；已输出正文/思考/工具调用后无法回滚，直接抛出。
+  - 不重试：取消、4xx（408/425/429 除外）、上下文超限、额度/余额耗尽、每日限额——重试必然同样失败。
+  - 嵌套抑制：代理只包外层对象，适配器内部 `chat_completion → self.stream_chat_completion` 自调用仍是原始适配器，不会变成 4 次上游调用。
+- 接线：`model_catalog.create_adapter_for_provider`（拆 `_build_adapter` + 包装，`timeout` 非空的**后台刷新**不包装）、`free_providers.get_free_executor(wrap=True)`（健康探测/模型列表传 `wrap=False`）。
+- `v1_router._retry_budget_for`：异常带 exhausted 标记 → 返回 0，与既有「同 key 瞬态重试/连接类预算 2」**不叠加**（否则一次请求被重试 3~6 次）。
+- 配置 `retry: {enabled: false, delay_seconds: 1.0}`（默认关；热改生效，无需重启）；管理 API `GET/PUT /admin/api/retry`（返回运行统计 wrapped/retried/recovered/exhausted/skipped）；设置页新增「失败自动重试」卡片。
+- 覆盖面：/v1 直连、auto、combo（流式/非流式）、playground、fusion、Anthropic/Responses/Gemini 转译入口（都经统一工厂）；**媒体生成与 embeddings/images 透传不在内**（非幂等且贵，刻意不自动重试）。
+
+**测试**：新增 `tests/test_adapter_retry.py`（27 项）+ `tests/test_frontend_retry_toggle.py`（4 项）；全量 **1222 全绿**。
+- 踩坑：`asyncio.CancelledError` 在 py3.8+ 是 BaseException，测试替身 `isinstance(item, Exception)` 接不住（TypeError "not iterable"），替身判据要用 BaseException；`asyncio.run` 会吞掉顶层 CancelledError，断言得在协程内捕获。
+
+**边界提醒**：流式已输出内容后报错是唯一无法重试的场景（无法回滚）；充值后想恢复「额度错误也重试」再改 `is_retryable_error`。

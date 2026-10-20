@@ -100,6 +100,12 @@ race:
   enabled: true
   no_content_seconds: 15
 
+# 失败自动重试：模型请求出错后先不返回报错、原样重试一次；两次都失败才返回错误。
+# 流式仅在尚未输出正文前重试（已输出内容无法回滚）；4xx/上下文超限/额度耗尽/每日限额/取消不重试。
+retry:
+  enabled: false
+  delay_seconds: 1.0
+
 # Qoder 签到/积分（/sash/ 端点）的请求身份。
 # ⚠️ campaigns 对请求头敏感（Jet-Hub 消融 + AIGate 生产复现）：
 #   - sash_client_type 必须是桌面身份 '10'（CLI '5' 恒拿空活动列表）；

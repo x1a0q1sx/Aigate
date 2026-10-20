@@ -220,6 +220,30 @@
     <section class="settings-card">
       <div class="card-head">
         <div>
+          <h2>失败自动重试</h2>
+          <p>对一个模型的上游请求出错时，先不把错误返回给客户端，等一会儿后原样重试一次；两次都失败才返回错误。
+            流式请求只在尚未输出正文/思考/工具调用前重试（已输出内容无法回滚，重试会重复输出）。
+            参数/鉴权类的 4xx、上下文超限、额度或余额耗尽、每日限额、请求取消不重试（重试也必然失败）。</p>
+        </div>
+        <span class="status-pill" :class="retry.enabled ? 'ok' : 'muted'">{{ retry.enabled ? '已启用' : '未启用' }}</span>
+      </div>
+      <div class="notify-grid">
+        <label class="checkbox-label"><input type="checkbox" v-model="retry.enabled" /> 请求失败后自动重试一次</label>
+      </div>
+      <div class="notify-fields">
+        <label>重试前等待（秒）<input v-model.number="retry.delay_seconds" type="number" min="0" max="30" step="0.5" /></label>
+      </div>
+      <p v-if="retry.stats" class="hint" style="font-size: 12px; color: var(--text-muted);">
+        已包装调用 {{ retry.stats.wrapped || 0 }} · 重试 {{ retry.stats.retried || 0 }} · 重试成功 {{ retry.stats.recovered || 0 }} · 两次都失败 {{ retry.stats.exhausted || 0 }} · 未重试（确定性错误）{{ retry.stats.skipped || 0 }}
+      </p>
+      <div class="update-actions" style="margin-top: 12px;">
+        <button class="btn btn-primary btn-sm" @click="saveRetry" :disabled="retrySaving">{{ retrySaving ? '保存中...' : '保存' }}</button>
+      </div>
+    </section>
+
+    <section class="settings-card">
+      <div class="card-head">
+        <div>
           <h2>推理并发闸（过载保护）</h2>
           <p>所有生成类入口（chat/messages/responses/Gemini 生成）合计在途请求上限：超出后在入口短暂等待，仍拿不到名额则快速失败 503（带 Retry-After，客户端可直接重试）。防止突发洪峰打满数据库连接池导致整体变慢/崩溃（2026-10-15 事故配套）。</p>
         </div>
@@ -386,6 +410,8 @@ export default {
       droolSaving: false,
       race: { enabled: true, no_content_seconds: 15 },
       raceSaving: false,
+      retry: { enabled: false, delay_seconds: 1, stats: null },
+      retrySaving: false,
       conc: { enabled: true, max_inflight: 128, acquire_timeout_seconds: 15, stats: null },
       concSaving: false,
       mr: {
@@ -517,7 +543,7 @@ print(resp.choices[0].message.content)`,
     async load() {
       this.loading = true
       try {
-        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadConc(), this.loadModelRefresh(), this.loadOpenCode()])
+        await Promise.all([this.loadStatus(), this.loadBackups(), this.loadDbBackups(), this.loadNotify(), this.loadCache(), this.loadDrool(), this.loadRace(), this.loadRetry(), this.loadConc(), this.loadModelRefresh(), this.loadOpenCode()])
         // 接入信息卡：密钥掩码（明文按需揭示，见 toggleKey）
         api.getAIGateKey(false).then((d) => { this.keyMeta = d || null }).catch(() => {})
       } finally {
@@ -643,6 +669,24 @@ print(resp.choices[0].message.content)`,
       } catch (e) {
         toast.error('保存失败: ' + e.message)
       } finally { this.raceSaving = false }
+    },
+    async loadRetry() {
+      try { this.retry = { ...this.retry, ...(await api.getRetry()) } }
+      catch (e) { /* ignore */ }
+    },
+    async saveRetry() {
+      this.retrySaving = true
+      try {
+        const r = await api.updateRetry({
+          enabled: this.retry.enabled,
+          delay_seconds: this.retry.delay_seconds,
+        })
+        this.retry = { ...this.retry, ...r }
+        toast.success('失败自动重试配置已保存')
+        await this.loadRetry()
+      } catch (e) {
+        toast.error('保存失败: ' + e.message)
+      } finally { this.retrySaving = false }
     },
     async loadConc() {
       try { this.conc = { ...this.conc, ...(await api.getConcurrency()) } }

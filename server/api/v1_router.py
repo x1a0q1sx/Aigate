@@ -323,7 +323,13 @@ _FAST_CONN_ERRORS = (httpx.ConnectError, httpx.ProxyError)
 
 
 def _retry_budget_for(e: BaseException) -> int:
-    """本次故障允许的额外重试次数（1=原样重试一次，2=两次）。"""
+    """本次故障允许的额外重试次数（1=原样重试一次，2=两次）。
+
+    适配器层「失败自动重试」已用尽时（异常带 _aigate_retry_exhausted 标记）
+    返回 0：那次上游调用已经原样重试过一遍，这里不再叠加，否则一次请求会被
+    重试 3~6 次（见 server/core/adapter_retry.py）。"""
+    if getattr(e, "_aigate_retry_exhausted", False):
+        return 0
     if isinstance(e, _FAST_CONN_ERRORS):
         return 2
     return 1

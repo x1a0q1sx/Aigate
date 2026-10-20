@@ -171,6 +171,23 @@ class RaceConfig(BaseModel):
     enabled: bool = True
     no_content_seconds: int = 15
 
+class RetryConfig(BaseModel):
+    """失败自动重试（2026-10-20 用户需求）。
+
+    开启后：对一个模型的上游请求失败时**先不把错误返回给客户端**，原样重试一次；
+    两次都失败才返回错误。默认关闭 = 完全保持原有行为。
+
+    边界（都写在 server/core/adapter_retry.py 顶部）：
+    - 非流式：失败 → 等 delay_seconds → 原样重试一次；
+    - 流式：仅在尚未吐出任何实质内容（正文/思考/工具调用）前重试，
+      已输出内容后重试会造成重复输出，直接返回错误；
+    - 确定性失败不重试：参数/鉴权 4xx、上下文超限、额度或余额耗尽、每日限额、
+      请求取消。这些重试也必然失败，只会让用户多等一轮。
+    - 与既有「同 key 瞬态重试」不叠加（用尽后 _retry_budget_for 归零）。
+    """
+    enabled: bool = False
+    delay_seconds: float = 1.0   # 重试前等待（秒）；0 = 立即重试
+
 class ConcurrencyConfig(BaseModel):
     """推理入口全局并发闸（过载保护，2026-10-15）。
 
@@ -305,6 +322,7 @@ class Config(BaseModel):
     adapters: AdaptersConfig = Field(default_factory=AdaptersConfig)
     drool_guard: DroolGuardConfig = Field(default_factory=DroolGuardConfig)
     race: RaceConfig = Field(default_factory=RaceConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
     concurrency: ConcurrencyConfig = Field(default_factory=ConcurrencyConfig)
     checkin: CheckinConfig = Field(default_factory=CheckinConfig)
     growth: GrowthConfig = Field(default_factory=GrowthConfig)

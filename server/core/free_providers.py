@@ -448,9 +448,17 @@ class FreeProviderExecutor:
 _EXECUTORS: Dict[str, FreeProviderExecutor] = {}
 
 
-def get_free_executor(code: str) -> Optional[FreeProviderExecutor]:
+def get_free_executor(code: str, wrap: bool = True) -> Optional[FreeProviderExecutor]:
+    """取 free provider 执行器（单例）。
+
+    wrap=False 用于健康探测等后台请求：那类调用不应套用推理侧的
+    「失败自动重试」开关（见 server/core/adapter_retry.py）。"""
     if code not in _FREE_PROVIDERS_META:
         return None
     if code not in _EXECUTORS:
         _EXECUTORS[code] = FreeProviderExecutor(code)
-    return _EXECUTORS[code]
+    ex = _EXECUTORS[code]
+    if not wrap:
+        return ex
+    from server.core.adapter_retry import wrap_free_executor
+    return wrap_free_executor(ex)

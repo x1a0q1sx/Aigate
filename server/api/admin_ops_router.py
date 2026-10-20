@@ -374,6 +374,38 @@ async def put_race_config(body: RaceModel):
     return cfg.model_dump()
 
 
+# ─────────────────────────── 失败自动重试 ───────────────────────────
+# 用户需求（2026-10-20）：对一个模型请求出错后不先返回报错，自动原样重试一次；
+# 两次都失败才返回错误。默认关闭 = 保持现状。确定性失败（4xx/上下文/额度）不重试。
+# 实现在适配器层（core/adapter_retry.py），覆盖 /v1 直连、auto、combo、playground。
+
+class RetryModel(BaseModel):
+    enabled: Optional[bool] = None
+    delay_seconds: Optional[float] = None
+
+
+@router.get("/retry")
+async def get_retry_config():
+    from server.config import get_config
+    from server.core.adapter_retry import get_retry_stats
+    cfg = get_config().retry
+    return {**cfg.model_dump(), "stats": get_retry_stats()}
+
+
+@router.put("/retry")
+async def put_retry_config(body: RetryModel):
+    from server.config import get_config, save_config
+    cfg = get_config().retry
+    for k, v in body.model_dump(exclude_unset=True).items():
+        if v is None:
+            continue
+        if k == "delay_seconds":
+            v = max(0.0, min(30.0, float(v)))
+        setattr(cfg, k, v)
+    save_config()
+    return cfg.model_dump()
+
+
 # ─────────────────────────── 推理并发闸（过载保护）───────────────────────────
 # 背景：2026-10-15 生产事故——同机客户端 81 条并发流式请求打满 DB 连接池
 # （QueuePool timeout 30s，94% 请求 500）。本闸给生成类入口设全局在途上限，

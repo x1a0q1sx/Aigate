@@ -439,9 +439,8 @@ def get_builtin_pricing(model_id: str) -> Optional[dict]:
     if not candidates:
         return None
     return BUILTIN_PRICING[max(candidates, key=len)]
-def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) -> BaseAdapter:
-    """根据 api_type 创建适配器。
-    timeout 为可选项：传入时覆盖适配器默认超时（用于刷新模型等后台网络请求）。"""
+def _build_adapter(api_type: str, timeout: Optional[int] = None) -> BaseAdapter:
+    """按 api_type 构造原始适配器（不套用重试包装）。"""
     if api_type in ("anthropic", "claude_code"):
         return AnthropicAdapter(timeout=timeout) if timeout else AnthropicAdapter()
     elif api_type == "github":
@@ -471,6 +470,18 @@ def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) ->
         return FreebuffAdapter(timeout=timeout) if timeout else FreebuffAdapter()
     else:
         return OpenAICompatAdapter(timeout=timeout) if timeout else OpenAICompatAdapter()
+
+
+def create_adapter_for_provider(api_type: str, timeout: Optional[int] = None) -> BaseAdapter:
+    """根据 api_type 创建适配器。
+
+    timeout 为可选项：传入时覆盖适配器默认超时（用于刷新模型等后台网络请求）；
+    这类后台调用（模型刷新/定价拉取）不套用「失败自动重试」——那是推理请求的
+    设置项，见 server/core/adapter_retry.py。推理路径（timeout 为 None）在开关
+    打开时会被包装成「失败原样重试一次」的代理。"""
+    adapter = _build_adapter(api_type, timeout)
+    from server.core.adapter_retry import wrap_adapter
+    return wrap_adapter(adapter, timeout=timeout)
 class ModelCatalog:
     """模型目录服务"""
     def __init__(self):
@@ -752,7 +763,7 @@ class ModelCatalog:
             # mimo-free 无端点，保留手动管理）
             from server.core.free_providers import get_free_executor, resolve_free_code
             free_code = resolve_free_code(provider.name, getattr(provider, "oauth_code", None))
-            exec_ = get_free_executor(free_code) if free_code else None
+            exec_ = get_free_executor(free_code, wrap=False) if free_code else None
             if exec_ is not None:
                 try:
                     fetched_ids = await exec_.list_models()
