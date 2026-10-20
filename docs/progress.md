@@ -742,3 +742,79 @@ Qoder 我也不知道这是国内还是国外」。核实：站内确实只有�
 **Muse 替代方案（回答用户第二问）**：已实现 `scripts/muse_login.py`（本机同出口
 设备码登录 → 打印 `LLM|…` key → OAuth 页「导入 Token」）；不存在网页 cookie 导出等
 其他登录方式（Meta 只提供 RFC 8628 设备码 + 铸 key，6 个成熟实现已逐字段核对）。
+
+## Session 34（2026-10-20）—— Qoder 每日用量识别 + 全量刷新漏 OAuth 服务商
+
+三条用户反馈，两个真 bug + 一处展示矛盾。
+
+### 1) Qoder「Billing daily count exceeded」未被识别为限额
+
+生产报错原文：
+
+```
+upstream_call_failed: RuntimeError: qoder upstream status 403:
+{"code":"110","message":"Billing daily count exceeded"}
+```
+
+- **判据来源**：本机 `@qoder-ai/qodercli` bundle 的错误码表明确
+  `case "110": return Rs.todayUsageLimitExceeded`，且 `J2r()` 里
+  `A.includes("Billing daily count exceeded") → todayUsageLimitExceeded`；
+  同一个 set 里还有 112 个人积分耗尽 / 114 试用超限 / 115 免费额度 /
+  116·117 团队积分 / 118 个人积分 / 119 免费模型 / 122 计费组上限。
+- **此前行为**：`core/quota_limit.py` 只认 CodeBuddy 的 `6004` 和那两条中英文案，
+  这条 403 被当普通故障 → 模型进冷却（罚错对象）、账号不进账（下次继续撞）。
+- **修复**：`is_qoder_daily_limit_text()` 认 `code 110`（**必须**同时有 qoder 上下文
+  或 "Billing daily count exceeded" 文案：110 不是全球统一码）+ 新英文案 marker。
+- **粒度与 CodeBuddy 不同**：6004 上游明说「您也可以切换其他模型」= (账号×模型)；
+  Qoder 110 没有任何可切换语义、也没有重置时间 = **账号级**今日计数。
+  故 `oauth_client.note_request_result` 走新分支 `_record_account_cooldown_until()`
+  → 账号冷却到**次日 00:00 UTC+8**（`quota_limit.next_utc8_midnight()`），
+  自动选号直接换账号；同 JWT 身份的多条连接一起冷却（防换连接名重打）。
+  若按 (账号×模型) 记，自动路由会对该账号的每个模型各撞一次 403。
+- `qoder_adapter._is_billing_block` 补 `code 110`（此前只认 112/10605）→ 首帧就
+  快速失败换候选，不必等流读完；错误文案点明「该账号今日用量已达上限，次日 00:00
+  （UTC+8）恢复」/「积分已耗尽（code 112）」。
+
+### 2) CodeBuddy「有免费模型但刷新后列表不变」
+
+- **根因**：`POST /admin/api/models/refresh`（不传 provider_id 的全量刷新）用的 SQL 是
+  `Provider JOIN ApiKey` —— OAuth 服务商在 `api_keys` 表**没有行**，所以 CodeBuddy
+  CN/Intl、Qoder、Cline、LobsterAI、free_tier 全部被跳过。生产实证：今天 13:13 那轮
+  全量刷新日志有 60+ 个服务商，**独缺 82/87**；只有单独点服务商行的刷新按钮才生效。
+- **修复**：改为 `有密钥的服务商 ∪ (启用 且 credential_type ∈ oauth/free_tier 或
+  api_type=atomcode)`；已禁用的仍不刷新。生产实测全量刷新覆盖数 → 76，OAuth 命中
+  CodeBuddy CN/Intl、Qoder、Qoder CN、Cline、Cline Pass、LobsterAI。
+- 单刷 CodeBuddy 后立刻拉到新模型：CN `mimo-v2.6-pro`、`minimax-m3.1-flash`；
+  Intl `minimax-m3.1-flash`。
+
+### 3) CodeBuddy 目录的 credits / 活动徽标此前全丢
+
+`_codebuddy_entry_to_info()` 过去只拿 `tags` 过滤生图模型，`credits` 和
+`badge:限时免费/夜间免费/夜间折扣/独家限免` 都没解析：
+
+- `credits` → `price_ratio` / `is_free`（`x0.00` 即免费）。此前一律 `is_free=False`，
+  要等倍率 overlay 才修正；overlay 拿不到时（如种子别名 `hy4-preview-f` 不在在线
+  倍率表）就会留下「倍率 0 却标付费」的矛盾 → 补一条不变式：**倍率 0 恒标免费**。
+- `badge:xxx:#RRGGBB` → `promotion` 元数据（与 Qoder 同构），模型页展示 + 一键套用为
+  生效时段；只有文案含「夜间」的才挂 23:00-08:00 UTC+8 窗口（白天免费活动不该被
+  套成时段限制）。生产已落库：hy3=限时免费、step-5-preview=独家限免、
+  hy4-preview=夜间免费、glm-5.2=夜间折扣。
+
+### 测试 / 部署
+
+- 新增：Qoder 110 识别（含反例：别家 110、Qoder 112/114）、次零点换算、
+  账号级冷却落库、冷却账号被选号跳过、全量刷新覆盖 OAuth/free_tier/跳过禁用、
+  credits→免费、badge→promotion、倍率 0 恒免费。全量 **1238 全绿**。
+- 提交 `6281601` + `7abf6ab`（已 push）。
+- **部署走补丁**：服务器 `git pull` 全部出口 TLS 失败
+  （`gnutls_handshake() failed` / `GnuTLS recv error -110`，7890/7891/7897/10889/10890
+  全试过）→ 本地 `git format-patch` + `scp` + 服务器 `git am`。
+  服务器提交号 `a5677f2` / `a75928b`（内容与远端一致，只是哈希不同）；
+  下次网络恢复后建议 `git fetch && git reset --hard origin/main` 对齐。
+- 生产验证：health 200；`is_daily_limit_text`/`next_utc8_midnight` 行为正确；
+  全量刷新覆盖 76 个服务商且包含全部 OAuth；CodeBuddy 两站模型/免费标记/促销已刷新。
+
+### 顺带留意（未处理）
+
+- 目录里 `mimo-v2.6-pro` / `minimax-m3.1-flash` 的 promotion 是 JSON `null`
+  （模型页正常，只是一键套用无窗口可用）。
