@@ -297,6 +297,15 @@ class ImportedTokenPayload(BaseModel):
     owner: str = "__default"
 
 
+def _is_muse_static_key(token: str) -> bool:
+    """muse 的静态推理 key：设备流铸的 `LLM|…`，或控制台创建的 `LLM_<id>_<secret>`。
+
+    两种前缀只是签发渠道不同（订阅 vs 按量），鉴权都是 `Authorization: Bearer`，
+    且都没有 refresh token —— 按长期凭证落库，别交给重铸调度器。"""
+    t = (token or "").strip()
+    return t.startswith("LLM|") or t.startswith("LLM_")
+
+
 @router.post("/import-token")
 async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depends(get_db)):
     """
@@ -316,10 +325,11 @@ async def import_oauth_token(data: ImportedTokenPayload, db: AsyncSession = Depe
         "token_type": "Bearer",
         "scope": data.scope or "",
     }
-    # muse 导入的是铸好的静态 LLM| key（本机 scripts/muse_login.py 产出）。
-    # 前端导入框默认 3600 秒会让它在 1 小时后触发「重铸」——但没有 OAuth token，
-    # 重铸必失败。按上游语义直接给 30 天（与设备流落库一致）。
-    if (data.provider_code == "muse" and data.access_token.startswith("LLM|")
+    # muse 导入的都是**静态** key，没有配套 OAuth token，无法重铸：
+    #   - `LLM|…`：官方 CLI / 本机 scripts/muse_login.py 设备流铸出（订阅计费）
+    #   - `LLM_…`：dev.meta.ai 控制台「API keys」页直接创建（按量计费）
+    # 前端导入框默认 3600 秒会让它在 1 小时后触发一次注定失败的重铸 → 直接给 30 天。
+    if (data.provider_code == "muse" and _is_muse_static_key(data.access_token)
             and not data.refresh_token):
         tok["expires_in"] = max(tok["expires_in"], 30 * 86400)
     client = get_oauth_client()

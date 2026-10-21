@@ -14,6 +14,15 @@ hermes-muse-code 等能登录的本地 CLI 一致），然后把铸出的 key �
 
 用法
 ----
+    python scripts/muse_login.py --proxy http://127.0.0.1:7897 --browser chrome
+
+`--browser` 是关键：用系统默认浏览器打开时它**未必走同一个代理**（Windows 的
+「系统代理」常常是关的、浏览器插件也可能改路由），于是申请端与批准端出口国家
+不同，页面照样报 “Sign-in failed”。指定 `--browser chrome|edge|firefox` 后，
+脚本会用 `--proxy-server` / 临时 profile 显式把**同一个代理**注入浏览器，
+保证两端同一出口。
+
+其它用法：
     python scripts/muse_login.py                       # 直连（本机已能访问 auth.meta.com）
     python scripts/muse_login.py --proxy http://127.0.0.1:7897
     python scripts/muse_login.py --no-browser          # 只打印链接，自己复制到浏览器
@@ -87,10 +96,86 @@ def _post_json(opener, url: str, payload: dict, access: str):
     return _request(opener, url, json.dumps(payload).encode(), headers)
 
 
+def _open_in_browser(kind: str, url: str, proxy: str) -> bool:
+    """用指定浏览器打开 url，并把 proxy 显式注入该浏览器（不依赖系统代理）。
+
+    为什么不能只靠 webbrowser.open：Windows 的系统代理经常是关的，Firefox 还
+    可能被 FoxyProxy 一类插件改路由 —— 浏览器从另一个国家出口点「批准」，Meta
+    就会报 “Sign-in failed / Token exchange failed”。这里用浏览器自己的
+    命令行开关强制同一出口，和申请设备码用同一台机器同一个 IP。
+    """
+    import shutil
+    import subprocess
+
+    hostport = ""
+    if proxy:
+        p = urllib.parse.urlparse(proxy if "//" in proxy else f"http://{proxy}")
+        if p.hostname and p.port:
+            hostport = f"{p.hostname}:{p.port}"
+
+    kind = (kind or "").lower()
+    if kind in ("chrome", "edge"):
+        exe_name = "chrome.exe" if kind == "chrome" else "msedge.exe"
+        cands = [
+            rf"C:\Program Files\Google\Chrome\Application\{exe_name}",
+            rf"C:\Program Files (x86)\Google\Chrome\Application\{exe_name}",
+            rf"C:\Program Files (x86)\Microsoft\Edge\Application\{exe_name}",
+            rf"C:\Program Files\Microsoft\Edge\Application\{exe_name}",
+        ]
+        exe = next((c for c in cands if os.path.exists(c)), shutil.which(exe_name))
+        if not exe:
+            print(f"   找不到 {exe_name}，退回系统默认浏览器")
+            return False
+        # 独立 profile：不受用户既有扩展（改路由的代理插件）和已登录会话影响
+        prof = os.path.join(tempfile.gettempdir(), f"muse_{kind}_profile")
+        os.makedirs(prof, exist_ok=True)
+        cmd = [exe, f"--user-data-dir={prof}", "--no-first-run",
+               "--no-default-browser-check"]
+        if hostport:
+            cmd.append(f"--proxy-server=http://{hostport}")
+            cmd.append("--proxy-bypass-list=<-loopback>")
+        cmd.append(url)
+        subprocess.Popen(cmd)
+        return True
+
+    if kind == "firefox":
+        cands = [r"C:\Program Files\Mozilla Firefox\firefox.exe",
+                 r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"]
+        exe = next((c for c in cands if os.path.exists(c)), shutil.which("firefox"))
+        if not exe:
+            print("   找不到 firefox，退回系统默认浏览器")
+            return False
+        prof = os.path.join(tempfile.gettempdir(), "muse_ff_profile")
+        os.makedirs(prof, exist_ok=True)
+        prefs = ['user_pref("browser.shell.checkDefaultBrowser", false);']
+        if hostport:
+            p = urllib.parse.urlparse(f"//{hostport}")
+            prefs = [
+                'user_pref("network.proxy.type", 1);',
+                f'user_pref("network.proxy.http", "{p.hostname}");',
+                f'user_pref("network.proxy.http_port", {p.port});',
+                f'user_pref("network.proxy.ssl", "{p.hostname}");',
+                f'user_pref("network.proxy.ssl_port", {p.port});',
+                'user_pref("network.proxy.share_proxy_settings", true);',
+                'user_pref("network.proxy.no_proxies_on", "");',
+                'user_pref("network.trr.mode", 0);',
+            ] + prefs
+        with open(os.path.join(prof, "user.js"), "w", encoding="utf-8") as f:
+            f.write("\n".join(prefs) + "\n")
+        subprocess.Popen([exe, "-no-remote", "-profile", prof, url])
+        return True
+
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Meta Muse Code 本机设备码登录")
     ap.add_argument("--proxy", default="", help="代理地址，如 http://127.0.0.1:7897")
     ap.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    ap.add_argument("--browser", default="",
+                    choices=["", "chrome", "edge", "firefox"],
+                    help="用哪个浏览器打开批准页（会把同一个代理注入该浏览器，"
+                         "保证申请与批准同出口）")
     args = ap.parse_args()
 
     opener = _opener(args.proxy.strip())
@@ -120,10 +205,16 @@ def main() -> int:
     except Exception:
         pass
     if not args.no_browser:
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+        opened = False
+        if args.browser:
+            opened = _open_in_browser(args.browser, url, args.proxy.strip())
+            if not opened:
+                print("   （改用系统默认浏览器打开 —— 若它不走同一代理，批准会失败）")
+        if not opened:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
 
     print("③ 等待批准…", flush=True)
     deadline = time.time() + expires_in

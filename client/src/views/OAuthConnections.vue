@@ -112,10 +112,16 @@
         </div>
       </div>
       <p v-if="importModal.provider_code === 'muse'" class="text-xs muted" style="margin-bottom:8px;line-height:1.6">
-        若设备流页面报「Sign-in failed / Token exchange failed」（Meta 在浏览器侧拒绝本次授权），
-        可在**本机**同一网络出口运行
-        <code>python scripts/muse_login.py --proxy &lt;本机代理&gt;</code>
-        铸出 <code>LLM|…</code> key 后粘贴到这里（会自动按 30 天有效期保存）。
+        设备流页面报「Sign-in failed / Token exchange failed」时（Meta 在浏览器侧拒绝本次授权），
+        有两条替代路：
+        <br />① <strong>控制台建 key（最省事）</strong>：浏览器打开
+        <a href="https://dev.meta.ai/" target="_blank" rel="noreferrer">dev.meta.ai</a>
+        →「API keys」→ Create API key，把 <code>LLM_…</code> 粘到这里。
+        这条路按 token 计费，不含订阅专属模型。
+        <br />② <strong>本机同出口铸 key</strong>：运行
+        <code>python scripts/muse_login.py --proxy &lt;本机代理&gt; --browser chrome</code>
+        （<code>--browser</code> 会把同一个代理注入浏览器，保证申请与批准同出口），
+        铸出 <code>LLM|…</code> 后粘贴。两种 key 都按 30 天有效期保存。
       </p>
       <p v-if="importModal.error" class="alert alert-error text-sm">{{ importModal.error }}</p>
       <template #footer>

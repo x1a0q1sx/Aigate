@@ -655,6 +655,49 @@ async def test_muse_key_saved_with_static_credential_ttl(monkeypatch):
     assert saved["tok"]["expires_in"] == 30 * 86400
 
 
+# ── 静态 key 的两种前缀（设备流 LLM| / 控制台 LLM_）────────
+
+def test_is_muse_static_key_accepts_both_prefixes():
+    """设备流铸 `LLM|…`，dev.meta.ai 控制台创建 `LLM_<id>_<secret>`（2026-10 文档口径）。
+
+    两者都是无 refresh token 的静态凭证；只要漏认一种，导入后 1 小时就会被
+    重铸调度器判过期（没有 OAuth token，重铸必失败）。"""
+    from server.api.oauth_router import _is_muse_static_key
+    assert _is_muse_static_key("LLM|abc123")
+    assert _is_muse_static_key("LLM_1607358788850350_nx9secret")
+    assert _is_muse_static_key("  LLM|abc  ")      # 前后空白不影响判定
+    for bad in ("", None, "sk-abc", "LLM", "llm_123", "Bearer LLM_x"):
+        assert not _is_muse_static_key(bad)
+
+
+@pytest.mark.asyncio
+async def test_import_muse_dashboard_key_gets_static_ttl(tmp_path, monkeypatch):
+    """控制台按量 key 走「导入 Token」：与设备流 key 一样给 30 天，不进重铸。"""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+    from server.models.base import Base
+    from server.models.oauth_token import OAuthToken
+    from server.api import oauth_router as orr
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/muse_imp.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all, tables=[OAuthToken.__table__])
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(orr, "get_oauth_client", lambda: OAuthClient(crypto=FakeCrypto()))
+    try:
+        async with Session() as db:
+            payload = orr.ImportedTokenPayload(
+                provider_code="muse", access_token="LLM_1607358788850350_secret",
+                owner="__default")
+            await orr.import_oauth_token(payload, db)
+            row = (await db.execute(select(OAuthToken))).scalars().one()
+        assert row.refresh_token_enc is None
+        # 30 天（留 1 小时余量给落库耗时）
+        assert row.expires_at - datetime.utcnow() > timedelta(days=29)
+    finally:
+        await engine.dispose()
+
+
 # ── 适配器：Responses wire + Muse 指纹 ────────────────────
 
 def _req(model="muse-spark-1.3", **kw):
