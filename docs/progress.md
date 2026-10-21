@@ -818,3 +818,47 @@ upstream_call_failed: RuntimeError: qoder upstream status 403:
 
 - 目录里 `mimo-v2.6-pro` / `minimax-m3.1-flash` 的 promotion 是 JSON `null`
   （模型页正常，只是一键套用无窗口可用）。
+
+## Session 35（2026-10-21）「按服务商用量」里的 (unknown)（已删除）
+
+用户问：分析页「按服务商用量」一直有一条 `(unknown)（已删除）`，什么情况。
+
+### 结论：不是服务商被删，是聚合把两类孤行混成了一个桶
+
+生产取证（7 天窗口）：该桶 **26464 行**，全部 `routed_provider` 与
+`routed_provider_id` **双 NULL**：
+
+| error_type | 行数 | 说明 |
+|---|---|---|
+| `interrupted` | 22908 | pending 行被清扫成「request did not complete」，99% 是 10-15 连接池事故窗口 |
+| `route_error` | 3858 | 路由阶段就失败（如 `quota_limited: deepseek-v4.1-flash`），从未选中服务商 |
+| `upstream_error` / `auth_failed` / null | 223 | 同上 |
+
+token 合计 **0**（会话 83310 等 11 条 success 行也无 token）。即：这些请求根本
+没走到任何服务商，日志里连名称都没有，与「服务商删除/改名」毫无关系。
+
+### 修复
+
+- `core/provider_usage.py`：`provider_id is None` 的行按**有无名称**分两类，
+  新增字段 `orphan_kind`：
+  - `"unattributed"` — 双 NULL，显示 `(未归属)`；
+  - `"deleted"` — 有名称但 providers 表里没有，保留原名称 + 前端「（已删除）」。
+- `Analytics.vue`：按 `orphan_kind` 分别标注；`unattributed` 行隐藏「看日志」
+  （按空名称筛选没有意义）。
+- 测试 +3：未归属不标已删除、两类孤行不合并、deleted 桶保留名称。全量 **1240 绿**；
+  前端 build 通过。
+
+### 部署
+
+- 提交 `41724d1`，本地经 `socks5h://127.0.0.1:10889` 推送成功
+  （7897 报 `TLS connect error: unexpected eof`，7890 连不上）。
+- 服务器 `fetch origin main` + `cherry-pick` → `892d42a`；`npm run build`；
+  `pm2 restart aigate`；health 200。
+- 生产验证：`/admin/api/analytics/by-provider` 返回
+  `{'provider_name': '(未归属)', 'orphan_kind': 'unattributed', ...}`，其余行
+  `orphan_kind: None`；7 天聚合只剩这一个孤行桶（无 deleted 桶）。
+
+### 遗留观察
+
+- 10-15 那波 `interrupted`（15212 行）来自连接池耗尽事故窗口，属历史数据，未回填清理。
+- 若后续真出现 `deleted` 桶，说明有服务商被删但历史日志仍在——那是正常的保留行为。
