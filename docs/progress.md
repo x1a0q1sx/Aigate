@@ -935,3 +935,37 @@ muse 目前**仍无可用连接**，需用户二选一：
 
 `LLM|` 是订阅计费的唯一官方路径；若两者都拿不到，说明该账号被 Meta 门户侧拒
 （地区/托管账号），非本项目可解。
+
+---
+
+## Session 36 追加：Meta 的「额度」是三个互不相通的池子
+
+用户问 dashboard 上「免费版每周限额 10月22日重置 / 已使用 0% / 额外的使用额度从不过期 /
+剩余 40 亿个词元」该怎么用、要登录还是要 key。查证结论：
+
+| 池子 | 位置 | 凭证 | 计费 |
+|---|---|---|---|
+| **消费级 Muse 应用**（muse.ai：邮件/订票/购物/日程） | muse.ai → Settings → General → Usage | 无 API key（网页登录态） | 每周免费额度 + 「额外额度」（邀请码兑换，从不过期） |
+| **Model API**（开发者，api.meta.ai/v1） | dev.meta.ai → API keys | `LLM_<id>_<secret>` | **纯按量计费**，需绑支付方式；免费额度是**美元**（`$X.XX`）不是词元 |
+| **Muse Code 订阅** | 设备流 / CLI onboarding | `LLM|<id>|<secret>` | 订阅套餐（月度固定价），有 `subscription_usage` 流事件 |
+
+证据：
+- 官方文档**全文（`dev.meta.ai/llms.txt` 索引的 154 篇）零处**提到免费层、周额度、
+  "4 billion tokens"；`pricing-rate-limits` 只说 "pay-as-you-go … no minimums"。
+- 控制台 JS bundle 里的免费额度状态机是 `free_untouched` / `free_partial` +
+  `grant_minor_units` / `remaining_minor_units`，格式化函数 `"$"+(e/100).toFixed(2)`
+  ——**免费额度以美元计价**，不是词元；且不存在 `weekly` 字符串或额度重置 UI。
+- `muse-code/subscriptions` 原文：「The subscription applies to the Muse Code API key that is
+  automatically connected in the Muse Code CLI onboarding process. **Any additional API keys
+  you create under your Meta Model API account will be billed through pay-as-you-go.**」
+- GitHub `meta-model-cookbook#36`（2026-09-20）：「A payment method is required before any API
+  request — no trial path.」
+- 消费级 Muse 的中文实测文（CSDN 2026-09-30）记录的界面布局与本例**逐字一致**
+  （「免费版」+「额外的使用额度」两块、兑换额度进额外块、与周期额度分开）；多家媒体口径
+  免费层 = 每周 1 亿 token，邀请码 = 10 亿 token/次（40 亿 ≈ 4 次兑换，**属推断**，无官方出处）。
+
+**结论：那 40 亿词元属于消费级 Muse 应用，任何 API key（`LLM_` 或 `LLM|`）都消费不到**——
+`LLM_` 只会烧按量计费余额，`LLM|` 只走订阅套餐计量。三者互不相通。
+
+**给用户的判定法**：发一个最小请求后刷新该面板看百分比是否变化；同时看地址栏——
+若在 `muse.ai`（设置→通用→使用情况）就是消费级额度，与 API 无关。
