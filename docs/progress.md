@@ -862,3 +862,76 @@ token 合计 **0**（会话 83310 等 11 条 success 行也无 token）。即：
 
 - 10-15 那波 `interrupted`（15212 行）来自连接池耗尽事故窗口，属历史数据，未回填清理。
 - 若后续真出现 `deleted` 桶，说明有服务商被删但历史日志仍在——那是正常的保留行为。
+
+---
+
+## Session 36（2026-10-21）muse「Sign-in failed」第三条出路 + 控制台 key 支持
+
+### 现象
+
+用户再次报 muse 设备流页面报 `Sign-in failed / Token exchange failed. Please try again.`
+生产 `oauth_tokens` 表**一条 muse 行都没有** —— 历史上所有尝试都停在浏览器批准之前。
+
+### 取证（本机实测，推翻/修正了此前两条假设）
+
+| 项 | 实测结果 |
+|---|---|
+| 系统代理 | `ProxyEnable=0`（**关闭**），`ProxyServer` 残留 `127.0.0.1:10890` |
+| 本机 Clash TUN | `enable: false` |
+| 默认浏览器 | Firefox（`FirefoxURL`），profile 内装 **FoxyProxy** |
+| 7897 出口 | 美国 23.172.200.85（San Jose） |
+| 10890 出口 | **中国** 182.254.147.87（等于服务器直连） |
+| 本机 Clash 规则 | `meta.com` / `meta.ai` → **META-REGION 组**，当前新加坡 |
+
+**关键修正**：本机 Clash 本身对 meta 域名已有定向规则（新加坡），所以「服务器走
+日本 vs 浏览器走中国大陆」的早期判断不完整 —— 真正的问题是**系统代理关闭 + TUN 关闭**
+时 Firefox 直连中国大陆出口，浏览器根本没有走那条规则。
+
+无头 Chrome 经 7897 渲染批准页，正常显示 Meta 登录表单（中文界面、手机/邮箱/
+Facebook/Google/GitHub 入口），**没有** `Sign-in failed`、没有 `unsupportedbrowser`。
+结论：页面加载没问题，失败发生在「登录后点批准」那一刻 —— 与上游
+CLIProxyAPI #6242 的判读一致（Meta 门户侧拒绝，非请求参数问题）。
+
+### 新增路径：控制台直接建 key（绕开设备流）
+
+官方文档 `dev.meta.ai/docs/authentication` 明确写：
+
+> Create and manage keys in the **Model API dashboard**: Log in and open the API keys
+> tab. Click **Create API key** … API keys start with **`LLM_`**, followed by a numeric
+> ID and the secret, separated by underscores.
+
+即：**dashboard 创建的 key 前缀是 `LLM_`（下划线），而设备流铸造的是 `LLM|`（竖线）**。
+两者鉴权方式相同（`Authorization: Bearer` → `api.meta.ai/v1`），但计费口径不同：
+
+- `LLM|…`（设备流）= 订阅计量（Muse Code 套餐）
+- `LLM_…`（控制台）= **按量计费（PAYG）**，且拿不到订阅专属模型
+  （如 `muse-wonder-full-1.0*` 属 Power/Max 订阅档，PAYG key 会 `model_not_found`）
+
+### 修复
+
+1. `server/api/oauth_router.py`：新增 `_is_muse_static_key()`，`LLM|` 与 `LLM_`
+   都按无 refresh token 的**静态凭证**落 30 天。此前只认 `LLM|` → 控制台 key
+   导入后按 3600s 落库，1 小时后触发一次注定失败的重铸。
+2. `scripts/muse_login.py`：新增 `--browser chrome|edge|firefox`，用浏览器自身开关
+   （Chrome `--proxy-server` + 独立 profile / Firefox 临时 profile 写 `user.js`）
+   把**同一个代理**注入浏览器，绕开「系统代理关闭」「FoxyProxy 改路由」两个坑。
+3. `OAuthConnections.vue`：muse 导入框文案改为两条出路（控制台建 key / 本机同出口铸 key）。
+4. 测试 +2（两种前缀都识别；控制台 key 导入落 30 天）。全量 **1242 绿**。
+
+### 部署
+
+- 提交 `eb40176`，经 `socks5h://127.0.0.1:10889` 推送（一次成功）。
+- 服务器 `cherry-pick` → `502d524`；`npm run build`（`index-DYW3jYRZ.js`）；
+  `pm2 restart aigate`；health 200。
+
+### 待用户执行
+
+muse 目前**仍无可用连接**，需用户二选一：
+
+- **控制台建 key**：浏览器打开 `https://dev.meta.ai/` → API keys → Create API key
+  → 复制 `LLM_…` → AIGate「导入 Token」。（按量计费；需账号已开通计费）
+- **本机同出口铸 key**：`python scripts/muse_login.py --proxy http://127.0.0.1:7897 --browser chrome`
+  → 在弹出的 Chrome 里用**个人** Meta 账号批准 → 打印 `LLM|…` → 导入。
+
+`LLM|` 是订阅计费的唯一官方路径；若两者都拿不到，说明该账号被 Meta 门户侧拒
+（地区/托管账号），非本项目可解。
