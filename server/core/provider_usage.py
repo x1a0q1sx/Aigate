@@ -8,9 +8,17 @@
   - headroom 每日限额统计不到真实用量 → 保留额度形同虚设（功能性缺陷）
 
 这里统一按「id 优先、名称兜底」聚合：先加载 providers 名称→id 映射，把只有名称的
-历史行归到正确服务商；名称对不上任何服务商（已删除/改名）才落 `provider_id=None`
-的 "(unknown)" 桶。健康检查行与 pending（在途）行不计入——前者不是业务调用，
+历史行归到正确服务商。健康检查行与 pending（在途）行不计入——前者不是业务调用，
 后者尚未确定服务商且会在完成时原位更新，提前计入会虚增。
+
+`provider_id=None` 的行有两种截然不同的来历，用 `orphan_kind` 区分（2026-10-21）：
+  - `"unattributed"`：日志里连服务商**名称**都没有——请求在路由/拿到上游之前就
+    结束了（route_error、pending 超时被清扫成 interrupted 等）。生产上它每日占
+    几百行（10-20 实测 725 行），其中 99% 是 interrupted 且 0 token。
+  - `"deleted"`：日志里写了名称，但当前 providers 表里找不到——服务商确实被删除
+    或改名了，保留原名称便于排查。
+此前两者共用 "(unknown)" 一个桶，前端统一标注「（已删除）」，把大量**路由前失败**
+的请求误报成「服务商已删除」，误导排查方向。
 """
 from __future__ import annotations
 from datetime import datetime
@@ -33,8 +41,11 @@ async def aggregate_usage_by_provider(
     """按服务商聚合 [since, until] 窗口内的请求数 / token / 成本。
 
     返回按 token 降序的列表：
-      [{"provider_id": int|None, "provider_name": str,
+      [{"provider_id": int|None, "provider_name": str, "orphan_kind": str|None,
         "requests": int, "tokens": int, "cost_usd": float}, ...]
+
+    orphan_kind: 已归属服务商的行为 None；`provider_id is None` 的行是
+    "deleted"（服务商已删除/改名）或 "unattributed"（路由前就失败，无名称）。
 
     provider_names: 可选的 {id: name} 预加载缓存（批量调用时避免重复查询）。
     """
@@ -67,13 +78,18 @@ async def aggregate_usage_by_provider(
     merged: Dict[object, Dict] = {}
     for pid, pname, reqs, toks, cost in rows:
         rid = pid if pid is not None else name_to_id.get(pname or "")
-        # 无 id 且名称也匹配不到（服务商已删除）→ 归入 unknown 桶，但保留原始名称
+        # 无 id 且名称也匹配不到 → 未归属桶；按有无名称区分「压根没路由到」与「已删除」
         key = ("id", rid) if rid is not None else ("name", pname or "")
         item = merged.get(key)
         if item is None:
-            display = provider_names.get(rid, pname) if rid is not None else (pname or "(unknown)")
-            # 已删除服务商（匹配不到 id）优先显示日志里的名称，便于排查
-            item = merged[key] = {"provider_id": rid, "provider_name": display or "(unknown)",
+            if rid is not None:
+                display, kind = provider_names.get(rid, pname), None
+            elif pname:
+                display, kind = pname, "deleted"   # 有名称但表里没有：删了/改名了
+            else:
+                display, kind = "(未归属)", "unattributed"  # 路由前就结束，无从归属
+            item = merged[key] = {"provider_id": rid, "provider_name": display or "(未归属)",
+                                  "orphan_kind": kind,
                                   "requests": 0, "tokens": 0, "cost_usd": 0.0}
         item["requests"] += int(reqs or 0)
         item["tokens"] += int(toks or 0)

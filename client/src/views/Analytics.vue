@@ -97,8 +97,10 @@
           <tr v-for="p in providerData" :key="p.provider_id || p.provider_name">
             <td style="font-weight: 600;">
               {{ p.provider_name }}
-              <span v-if="!p.provider_id" class="muted"
+              <span v-if="p.orphan_kind === 'deleted'" class="muted"
                     title="服务商已删除或改名，仅按日志中的名称归集">（已删除）</span>
+              <span v-else-if="p.orphan_kind === 'unattributed'" class="muted"
+                    title="请求在选定服务商之前就结束了（路由失败 / 在途中断 / 未产生用量），日志里没有服务商名称，无从归属">（未归属）</span>
             </td>
             <td>{{ formatNum(p.requests) }}</td>
             <td>{{ formatTokens(p.tokens) }}</td>
@@ -107,7 +109,10 @@
               <span class="muted">{{ p.share_pct }}%</span>
             </td>
             <td>${{ p.cost_usd.toFixed(4) }}</td>
-            <td><button class="btn btn-outline btn-sm" @click="seeLogs(p.provider_name)">看日志</button></td>
+            <td>
+              <button v-if="p.orphan_kind !== 'unattributed'" class="btn btn-outline btn-sm"
+                      @click="seeLogs(p.provider_name)">看日志</button>
+            </td>
           </tr>
         </tbody>
       </table>

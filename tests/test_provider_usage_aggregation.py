@@ -128,7 +128,65 @@ async def test_deleted_provider_kept_as_unknown_bucket(tmp_path):
         assert len(items) == 1
         assert items[0]["provider_id"] is None
         assert items[0]["provider_name"] == "已删除的站"  # 保留名称便于排查
+        assert items[0]["orphan_kind"] == "deleted"
         assert items[0]["tokens"] == 77
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unattributed_rows_not_labelled_deleted(tmp_path):
+    """路由前就失败的请求（日志里连服务商名称都没有）不能被标成「已删除」。
+
+    2026-10-21 用户报的现象：分析页「按服务商用量」一直挂着一条 (unknown)（已删除）。
+    生产取证：那 2.7 万行全是 `routed_provider`/`routed_provider_id` 双 NULL 的
+    route_error / interrupted 行（99% 无 token），与服务商删除无关。
+    """
+    engine, Session = await _setup(tmp_path)
+    try:
+        async with Session() as db:
+            db.add_all([
+                _log(routed_provider=None, routed_provider_id=None, status="error",
+                     error_type="interrupted",
+                     error_msg="request did not complete (gateway restarted or log lost)"),
+                _log(routed_provider=None, routed_provider_id=None, status="error",
+                     error_type="route_error", error_msg="quota_limited: ..."),
+            ])
+            await db.commit()
+
+        from server.core.provider_usage import aggregate_usage_by_provider
+        async with Session() as db:
+            items = await aggregate_usage_by_provider(
+                db, since=datetime.utcnow() - timedelta(hours=1))
+        assert len(items) == 1
+        assert items[0]["provider_id"] is None
+        assert items[0]["orphan_kind"] == "unattributed"   # 不是 "deleted"
+        assert items[0]["provider_name"] == "(未归属)"
+        assert items[0]["requests"] == 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unattributed_and_deleted_are_separate_buckets(tmp_path):
+    """两种孤行必须分成两行，不能合并成同一个 (unknown) 桶。"""
+    engine, Session = await _setup(tmp_path)
+    try:
+        async with Session() as db:
+            db.add(_log(routed_provider="已删除的站", routed_provider_id=None,
+                        prompt_tokens=50, completion_tokens=0))
+            db.add(_log(routed_provider=None, routed_provider_id=None, status="error",
+                        error_type="route_error"))
+            await db.commit()
+
+        from server.core.provider_usage import aggregate_usage_by_provider
+        async with Session() as db:
+            items = await aggregate_usage_by_provider(
+                db, since=datetime.utcnow() - timedelta(hours=1))
+        by_kind = {it["orphan_kind"]: it for it in items}
+        assert set(by_kind) == {"deleted", "unattributed"}
+        assert by_kind["deleted"]["provider_name"] == "已删除的站"
+        assert by_kind["unattributed"]["provider_name"] == "(未归属)"
     finally:
         await engine.dispose()
 
