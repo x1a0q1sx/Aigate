@@ -969,3 +969,84 @@ muse 目前**仍无可用连接**，需用户二选一：
 
 **给用户的判定法**：发一个最小请求后刷新该面板看百分比是否变化；同时看地址栏——
 若在 `muse.ai`（设置→通用→使用情况）就是消费级额度，与 API 无关。
+
+---
+
+## Session 37（2026-10-22）CodeBuddy 国际版活动盘点：没有夜间错峰活动
+
+**问题**：国内版有「夜间免费 / 夜间折扣」这类定时活动，国际版有没有？
+
+### 结论
+
+**国际版没有夜间/错峰活动，而且国际版连「活动徽标」这份数据都不下发。**
+
+### 证据（生产实测，两站同一账号体系、同一探针）
+
+1. **活动徽标只存在于 CN scoped 端点**（`/console/enterprises/personal/models`）：
+
+   | 站点 | scoped | /v3/config |
+   |---|---|---|
+   | codebuddy_cn | 200，34 条 | 200，35 条 |
+   | codebuddy_intl | **500** | 200，21 条 |
+
+   CN scoped 的四个徽标（原样）：
+   `hy3 = badge:限时免费`、`hy4-preview = badge:夜间免费`、
+   `glm-5.2 = badge:夜间折扣`、`step-5-preview = badge:独家限免`。
+
+2. **国际版 scoped 的 500 不是请求形态问题**——试了 7 种变体（baseline / `?agent=cli` /
+   IDE UA / 去掉 `X-Domain` / `X-Domain` 改 copilot.tencent.com / `Accept: */*` /
+   加 `X-Lang: en`），**全部 500**；同一组变体打 CN 全部 200 且徽标一致。
+   → 该端点在 Intl 侧未部署/未开放，与鉴权、头、参数无关。
+
+3. **国际版 `/v3/config` 的模型条目里根本没有 `tags` 字段**（CN 有）。国际版
+   `model_all_keys` = `credits/descriptionEn/descriptionZh/id/isDefault/maxAllowedSize/
+   maxInputTokens/maxOutputTokens/name/supportsImages/supportsToolCall/temperature/vendor`
+   ——无 tags，所以即便想解析徽标也无从解析。
+
+4. **计费接口（`/v2/billing/meter/get-user-resource`）的额度包对照，最能说明问题**：
+   - CN 账号 58 个包：57 个「CodeBuddy个人版国内运营裂变包」+ 1 个「个人体验版」；
+     裂变包里有大量 **每日 09:05 自动下发**的 100 credits 包（运营活动痕迹）。
+   - Intl 账号 **只有 1 个包**：「Free Plan Subscription」，100 credits，2026-10 月周期。
+     → 国际版账户拿不到任何日包/活动包。
+
+5. **官方文档侧（子代理全量核查 codebuddy.ai / workbuddy.ai 文档站）**：
+   夜间免费、错峰、23:00-08:00 在全站零命中。国际版唯一带「限时」字样的运营活动是
+   **「Daily Active Bonus」**——按天不按小时，且条款明确限定
+   「Buddy AI **international site** individual plan users」，Free 30 credits/天、
+   Pro 50 credits/天，**必须在客户端（WorkBuddy/CodeBuddy 客户端）发起对话才算**，
+   「Conversations or tasks initiated on the web are not counted」。
+
+### 国际版实际有的活动（官方文档一手）
+
+| 活动 | 内容 | 出处 |
+|---|---|---|
+| 新用户注册赠积分 | 首次登录 250 credits，有效期 14 天 | `/docs/ide/Account/Subscription` |
+| 7 天 Pro 免费试用 | 500 credits / 7 天，需绑卡并开自动续费，限从未订阅过的用户 | 同上 |
+| 每日活跃奖励（限时） | Free 30 / Pro 50 credits 每天，客户端内发起对话触发，次日自动到账 | 同上 + `/docs/ide/Account/pricing` |
+| Free 版促销期全功能 | 促销期内全模型可选、补全不限、自动任务上限 99 | `/docs/ide/Account/pricing` |
+| 首月 $7 | 连续包月新用户首月 $7（仅 WorkBuddy 文档载明） | `/docs/zh/workbuddy/Subscription` |
+| 老用户保价 | 2026-08-07 前已开自动续费的 Pro 保留 $9.95/月 | `/docs/ide/Account/Subscription` |
+
+套餐只有 **Free / Pro / Team** 三档（无 Pro+/Max）：Free $0 = 100 credits/月；
+Pro $10/月或 $96/年 = 1000+1000 credits/月；Team $40/座/月。
+
+### 国际版端点存在但活动未开放（项目既有实测，本次复核一致）
+
+- 签到：`codebuddy_intl` 预检 `active=false`、claim 返回 `10001`（`server/core/checkin.py`）。
+- 成长中心：`buddy: null`、`buddies: []`、`travel.config: {}`（`docs/findings-workdaddy-features.md`）。
+- 结论：**框架两站共用，活动按站点独立开关，国际版目前基本没开。**
+
+### 两版关系
+
+CN 与国际版是两套 SSO 域（`www.codebuddy.cn` vs `www.codebuddy.ai`）、两套目录、
+两套倍率表、两套计费账号。没有任何官方页面明文说积分互通，但端点隔离 + 活动条款
+限定 "international site" + 本次计费包对照（CN 58 包 vs Intl 1 包）三条独立证据
+指向**运营活动各自独立**。
+
+### 工程含义
+
+- 现有的 `_codebuddy_badge_promotion()` 只对 CN 生效是**符合上游事实**的，不是 bug：
+  国际版上游压根不提供徽标。模型页国际版无活动徽章属正常。
+- 若将来国际版开放 scoped 端点，徽标解析会自动生效（代码路径已通用，
+  `fetch_codebuddy_catalog` 对两站同一套逻辑），无需改动。
+- ⚠️ 探针脚本为一次性排查工具，已删除；若需复现，按本文档的端点与 header 重写即可。
