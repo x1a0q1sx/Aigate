@@ -15,12 +15,15 @@
             <option value="success">成功</option>
             <option value="error">失败</option>
           </select>
-          <select v-model="providerFilter" @change="loadPage(1)" style="width: auto;">
-            <option value="">全部服务商</option>
-            <option v-for="p in logProviders" :key="p" :value="p">{{ p }}</option>
-          </select>
-          <button class="btn btn-outline btn-sm" @click="exportLogs('csv')" title="导出近 7 天请求日志（CSV）">导出 CSV</button>
-          <button class="btn btn-outline btn-sm" @click="exportLogs('json')" title="导出近 7 天请求日志（JSON）">导出 JSON</button>
+          <SearchFilter v-model="providerFilter" label="服务商" :options="logProviders"
+                        placeholder="全部服务商（可搜索）" empty-text="无匹配服务商" @change="loadPage(1)" />
+          <!-- 模型/账号是请求日志专有维度：模型刷新日志（log_type=refresh）没有这两列 -->
+          <SearchFilter v-if="filterLogType !== 'refresh'" v-model="modelFilter" label="模型" :options="logModels"
+                        placeholder="全部模型（可搜索）" empty-text="无匹配模型" @change="loadPage(1)" />
+          <SearchFilter v-if="filterLogType !== 'refresh'" v-model="accountFilter" label="账号" :options="logAccounts"
+                        placeholder="全部账号（可搜索）" empty-text="无匹配账号" @change="loadPage(1)" />
+          <button class="btn btn-outline btn-sm" @click="exportLogs('csv')" title="导出近 7 天请求日志（CSV，跟随当前筛选）">导出 CSV</button>
+          <button class="btn btn-outline btn-sm" @click="exportLogs('json')" title="导出近 7 天请求日志（JSON，跟随当前筛选）">导出 JSON</button>
           <button class="btn btn-outline btn-sm" style="color: var(--warning);"
                   title="清零归档后保留的累计统计（实时日志统计保留）" @click="resetSummary">重置统计数据</button>
         </div>
@@ -413,6 +416,7 @@
 <script>
 import api from '../api.js'
 import toast from '../toast.js'
+import SearchFilter from './SearchFilter.vue'
 
 function safeParseJSON(str) {
   if (!str) return null
@@ -423,6 +427,7 @@ function safeParseJSON(str) {
 // 对外接口：prop filterProvider（由父级「看日志」联动）；方法 reload()。
 export default {
   name: 'LogsPanel',
+  components: { SearchFilter },
   props: {
     filterProvider: { type: String, default: '' },
   },
@@ -436,6 +441,8 @@ export default {
       filterStatus: '',
       filterLogType: '',
       providerFilter: '',
+      modelFilter: '',
+      accountFilter: '',
       detailRow: null,
       errExpanded: false,   // 错误信息的展开/收起（长错误默认折叠）
       detailLoading: false,
@@ -443,6 +450,8 @@ export default {
       archiveBusy: false,
       lastArchive: null,
       logProviders: [],
+      logModels: [],
+      logAccounts: [],
     }
   },
   watch: {
@@ -450,10 +459,17 @@ export default {
       this.providerFilter = v
       this.loadPage(1)
     },
+    filterLogType(v) {
+      // 切到「模型刷新」时模型/账号筛选不再适用，清零避免残留条件把结果筛空
+      if (v === 'refresh') {
+        this.modelFilter = ''
+        this.accountFilter = ''
+      }
+    },
   },
   mounted() {
     this.loadPage(1)
-    this.loadLogProviders()
+    this.loadLogFilters()
     this.loadArchives()
     // 有「待响应」行时自动轮询当前页（3s），全部落定后自动停
     this._pollTimer = setInterval(async () => {
@@ -617,7 +633,13 @@ export default {
       return this.loadPage(this.page)
     },
     setProviderFilter(name) {
-      this.providerFilter = name
+      this.setFilters({ provider: name })
+    },
+    /** 一次性设置多路筛选（服务商 / 模型 / 账号），未传的维度置空 = 全部 */
+    setFilters(f = {}) {
+      this.providerFilter = f.provider || ''
+      this.modelFilter = f.model || ''
+      this.accountFilter = f.account || ''
       this.loadPage(1)
     },
     async loadPage(p) {
@@ -628,6 +650,8 @@ export default {
       if (this.filterLogType) params.log_type = this.filterLogType
       if (this.filterStatus) params.status = this.filterStatus
       if (this.providerFilter) params.provider = this.providerFilter
+      if (this.modelFilter) params.model = this.modelFilter
+      if (this.accountFilter) params.account = this.accountFilter
       try {
         const data = await api.getLogs(params)
         this.items = data.items || []
@@ -644,7 +668,13 @@ export default {
     },
     async exportLogs(format) {
       try {
-        await api.exportLogs({ format, hours: 168, status: this.filterStatus || '', provider: this.providerFilter || '' })
+        await api.exportLogs({
+          format, hours: 168,
+          status: this.filterStatus || '',
+          provider: this.providerFilter || '',
+          model: this.modelFilter || '',
+          account: this.accountFilter || '',
+        })
         toast.success('导出已开始下载')
       } catch (e) { toast.error('导出失败: ' + e.message) }
     },
@@ -656,8 +686,16 @@ export default {
         toast.success('统计数据已重置')
       } catch (e) { toast.error('重置失败: ' + e.message) }
     },
-    loadLogProviders() {
-      api.getLogProviders().then(d => { this.logProviders = (d && d.providers) || [] }).catch(() => {})
+    loadLogFilters() {
+      // 三路筛选候选值来自日志实际出现过的值（服务端去重），避免选了必然 0 条的死选项
+      api.getLogFilters().then((d) => {
+        this.logProviders = (d && d.providers) || []
+        this.logModels = (d && d.models) || []
+        this.logAccounts = (d && d.accounts) || []
+      }).catch(() => {
+        // 兜底：老后端没有 /logs/filters 时退回只取服务商列表
+        api.getLogProviders().then(d => { this.logProviders = (d && d.providers) || [] }).catch(() => {})
+      })
     },
     // 模型刷新行的悬停摘要：新增/移除的模型名清单
     refreshChangesTitle(r) {

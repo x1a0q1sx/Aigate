@@ -3,7 +3,7 @@
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
       <div>
         <h1>分析 📊</h1>
-        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、请求日志、趋势、按服务商用量与失败分析</p>
+        <p style="color: var(--gray-500); font-size: 14px; margin-top: 4px;">范围统计、请求日志、趋势、用量分析与失败分析</p>
       </div>
       <div style="display: flex; align-items: center; gap: 14px;">
         <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--gray-500); cursor: pointer;" :title="diagVerbose ? '全量输出所有诊断阶段（控制台日志会变多）' : '仅输出关键里程碑，关闭多余日志'">
@@ -76,16 +76,26 @@
       <p v-else style="text-align: center; padding: 16px; color: var(--gray-500); font-size: 13px;">当前范围暂无趋势数据</p>
     </div>
 
-    <!-- ④ 按服务商用量（跟随范围） -->
+    <!-- ④ 用量分析（跟随范围；可按服务商 / 服务商×模型 / 服务商×账号 切换视角） -->
     <div class="card" style="margin-top: 20px;" v-if="providerData.length">
       <div class="usage-header" style="margin-bottom: 12px;">
-        <h2>按服务商用量</h2>
-        <span class="muted">{{ providerData.length }} 家 · 共 {{ formatTokens(providerTotal) }} tokens</span>
+        <h2>用量分析</h2>
+        <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+          <div class="dim-switch" role="group" aria-label="用量视角">
+            <button v-for="d in dimensionOptions" :key="d.v" class="dim-btn"
+                    :class="{active: usageDimension === d.v}" :title="d.hint"
+                    @click="setDimension(d.v)">{{ d.t }}</button>
+          </div>
+          <button v-if="usageDimension !== 'provider'" class="btn btn-outline btn-sm"
+                  @click="toggleExpandAll">{{ allExpanded ? '收起全部' : '展开全部' }}</button>
+          <span class="muted">{{ usageSummary }}</span>
+        </div>
       </div>
       <table>
         <thead>
           <tr>
-            <th>服务商</th>
+            <th>{{ usageDimension === 'provider_model' ? '服务商 / 模型'
+                  : usageDimension === 'provider_account' ? '服务商 / 账号' : '服务商' }}</th>
             <th>请求</th>
             <th>Token</th>
             <th style="min-width: 170px;">占比</th>
@@ -94,24 +104,32 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="p in providerData" :key="p.provider_id || p.provider_name">
-            <td style="font-weight: 600;">
-              {{ p.provider_name }}
-              <span v-if="p.orphan_kind === 'deleted'" class="muted"
-                    title="服务商已删除或改名，仅按日志中的名称归集">（已删除）</span>
-              <span v-else-if="p.orphan_kind === 'unattributed'" class="muted"
-                    title="请求在选定服务商之前就结束了（路由失败 / 在途中断 / 未产生用量），日志里没有服务商名称，无从归属">（未归属）</span>
+          <tr v-for="r in usageRows" :key="r.key" :class="{ 'usage-sub': r.kind === 'sub' }">
+            <td :style="r.kind === 'sub' ? 'padding-left: 30px;' : 'font-weight: 600;'">
+              <template v-if="r.kind === 'provider'">
+                <button v-if="r.children.length" class="expand-caret" :title="isExpanded(r.key) ? '收起' : '展开细分'"
+                        @click="toggleExpand(r.key)">{{ isExpanded(r.key) ? '▾' : '▸' }}</button>
+                {{ r.row.provider_name }}
+                <span v-if="r.row.orphan_kind === 'deleted'" class="muted"
+                      title="服务商已删除或改名，仅按日志中的名称归集">（已删除）</span>
+                <span v-else-if="r.row.orphan_kind === 'unattributed'" class="muted"
+                      title="请求在选定服务商之前就结束了（路由失败 / 在途中断 / 未产生用量），日志里没有服务商名称，无从归属">（未归属）</span>
+                <span v-if="r.children.length" class="muted" style="margin-left: 6px;">{{ r.children.length }} 项</span>
+              </template>
+              <template v-else>
+                <span style="font-family: monospace; font-size: 12px;">{{ r.subLabel }}</span>
+              </template>
             </td>
-            <td>{{ formatNum(p.requests) }}</td>
-            <td>{{ formatTokens(p.tokens) }}</td>
+            <td>{{ formatNum(r.row.requests) }}</td>
+            <td>{{ formatTokens(r.row.tokens) }}</td>
             <td>
-              <div class="bar"><div class="bar-fill" :style="{width: p.share_pct + '%'}"></div></div>
-              <span class="muted">{{ p.share_pct }}%</span>
+              <div class="bar"><div class="bar-fill" :style="{width: sharePct(r.row) + '%'}"></div></div>
+              <span class="muted">{{ sharePct(r.row) }}%</span>
             </td>
-            <td>${{ p.cost_usd.toFixed(4) }}</td>
+            <td>${{ r.row.cost_usd.toFixed(4) }}</td>
             <td>
-              <button v-if="p.orphan_kind !== 'unattributed'" class="btn btn-outline btn-sm"
-                      @click="seeLogs(p.provider_name)">看日志</button>
+              <button v-if="r.row.orphan_kind !== 'unattributed'" class="btn btn-outline btn-sm"
+                      @click="seeLogs(r)">看日志</button>
             </td>
           </tr>
         </tbody>
@@ -204,6 +222,8 @@ export default {
       trendData: [],
       trendBucket: 'day',
       providerData: [],
+      usageDimension: 'provider',   // provider | provider_model | provider_account
+      usageCollapsed: {},           // 分组默认展开；这里只记「被用户收起」的 key
       failures: null,
       failuresHours: 24,    // 默认近 24h；范围变化时按 range.hours 换算覆盖
       diagVerbose: false,
@@ -213,11 +233,77 @@ export default {
         { v: 'week', t: '周' },
         { v: 'month', t: '月' },
       ],
+      dimensionOptions: [
+        { v: 'provider', t: '按服务商', hint: '只看每家服务商的合计用量' },
+        { v: 'provider_model', t: '按服务商-模型', hint: '展开看每家服务商下各实际路由模型的用量' },
+        { v: 'provider_account', t: '按服务商-账号', hint: '展开看每家服务商下各 OAuth 账号的用量' },
+      ],
     }
   },
   computed: {
     providerTotal() {
       return (this.providerData || []).reduce((s, p) => s + (p.tokens || 0), 0)
+    },
+    // 模型/账号视角：把扁平的 (服务商, 子项) 行按服务商分组
+    usageGroups() {
+      const groups = new Map()
+      for (const it of this.providerData || []) {
+        const gk = it.provider_id != null ? `id:${it.provider_id}` : `name:${it.provider_name}`
+        let g = groups.get(gk)
+        if (!g) {
+          g = {
+            key: gk, kind: 'provider', children: [],
+            row: {
+              provider_id: it.provider_id, provider_name: it.provider_name,
+              orphan_kind: it.orphan_kind, requests: 0, tokens: 0, cost_usd: 0,
+            },
+          }
+          groups.set(gk, g)
+        }
+        g.row.requests += it.requests || 0
+        g.row.tokens += it.tokens || 0
+        g.row.cost_usd += it.cost_usd || 0
+        const sub = this.usageDimension === 'provider_model' ? it.model : it.account
+        g.children.push({
+          key: `${gk}|${sub || ''}`,
+          kind: 'sub',
+          row: it,
+          parentKey: gk,
+          // null 表示这批请求没记录账号/模型（非 OAuth 服务商、或路由前就失败）
+          subLabel: sub || '（未记录）',
+        })
+      }
+      // 服务端已按 token 降序，这里按分组合计重排（分组后顺序可能变化）
+      const list = Array.from(groups.values())
+      for (const g of list) g.row.cost_usd = +g.row.cost_usd.toFixed(4)
+      list.sort((a, b) => b.row.tokens - a.row.tokens)
+      return list
+    },
+    usageRows() {
+      if (this.usageDimension === 'provider') {
+        return (this.providerData || []).map((p, i) => ({
+          key: p.provider_id != null ? `id:${p.provider_id}` : `name:${p.provider_name}:${i}`,
+          kind: 'provider', row: p, children: [],
+        }))
+      }
+      const out = []
+      for (const g of this.usageGroups) {
+        out.push(g)
+        if (!this.usageCollapsed[g.key]) out.push(...g.children)
+      }
+      return out
+    },
+    allExpanded() {
+      return this.usageGroups.length > 0 && this.usageGroups.every((g) => !this.usageCollapsed[g.key])
+    },
+    usageSummary() {
+      const tokens = this.formatTokens(this.providerTotal)
+      if (this.usageDimension === 'provider') {
+        return `${this.providerData.length} 家 · 共 ${tokens} tokens`
+      }
+      const n = this.usageGroups.length
+      const items = (this.providerData || []).length
+      return `${n} 家 / ${items} 项 · 共 ${tokens} tokens`
     },
   },
   mounted() {
@@ -262,17 +348,50 @@ export default {
     async loadByProvider() {
       if (!this.range) return
       try {
-        const d = await api.getAnalyticsByProvider({ start: this.range.start, end: this.range.end })
+        const d = await api.getAnalyticsByProvider({
+          start: this.range.start, end: this.range.end, dimension: this.usageDimension,
+        })
         this.providerData = d.providers || []
       } catch (e) { console.error('by-provider load failed', e) }
+    },
+    setDimension(d) {
+      if (this.usageDimension === d) return
+      this.usageDimension = d
+      this.usageCollapsed = {}
+      this.loadByProvider()
+    },
+    isExpanded(key) {
+      return !this.usageCollapsed[key]
+    },
+    toggleExpand(key) {
+      this.usageCollapsed = { ...this.usageCollapsed, [key]: !this.usageCollapsed[key] }
+    },
+    toggleExpandAll() {
+      if (this.allExpanded) {
+        const next = {}
+        for (const g of this.usageGroups) next[g.key] = true
+        this.usageCollapsed = next
+      } else {
+        this.usageCollapsed = {}
+      }
+    },
+    sharePct(row) {
+      if (row && row.share_pct != null) return row.share_pct
+      return Math.round(((row.tokens || 0) / (this.providerTotal || 1)) * 1000) / 10
     },
     async loadFailures() {
       try { this.failures = await api.getFailures(this.failuresHours) }
       catch (e) { console.error('failures load failed', e) }
     },
-    seeLogs(name) {
+    seeLogs(r) {
       if (!this.$refs.logs) return
-      this.$refs.logs.setProviderFilter(name)
+      // 点「看日志」把当前视角的筛选条件一并带过去：服务商名始终带上，
+      // 模型/账号视角再叠加对应的子项，否则看日志只会得到该服务商的全部记录。
+      const row = r.row || r
+      const f = { provider: row.provider_name || '' }
+      if (this.usageDimension === 'provider_model') f.model = row.model || ''
+      else if (this.usageDimension === 'provider_account') f.account = row.account || ''
+      this.$refs.logs.setFilters(f)
       // 日志区已移至本表上方：滚动过去让用户看到筛选结果
       this.$refs.logs.$el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
     },
@@ -340,4 +459,21 @@ export default {
 .bar { height: 8px; background: var(--border-soft); border-radius: 4px; overflow: hidden; display: inline-block; width: 120px; vertical-align: middle; margin-right: 8px; }
 .bar-fill { height: 100%; background: linear-gradient(90deg, #3b82f6, #10b981); border-radius: 4px; transition: width 0.3s ease; }
 .btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+
+/* 视角切换（分段控件） */
+.dim-switch { display: inline-flex; border: 1px solid var(--border-medium); border-radius: var(--radius-md); overflow: hidden; }
+.dim-btn {
+  border: none; background: transparent; cursor: pointer; padding: 5px 11px;
+  font-size: var(--text-sm); color: var(--text-muted); white-space: nowrap;
+}
+.dim-btn + .dim-btn { border-left: 1px solid var(--border-medium); }
+.dim-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+.dim-btn.active { background: var(--primary); color: #fff; }
+/* 二级行（模型/账号）视觉降级，避免和所属服务商抢视线 */
+.usage-sub td { background: rgba(148, 163, 184, 0.06); font-size: 13px; }
+.expand-caret {
+  border: none; background: transparent; cursor: pointer; padding: 0 4px 0 0;
+  color: var(--text-muted); font-size: 12px;
+}
+.expand-caret:hover { color: var(--text-primary); }
 </style>

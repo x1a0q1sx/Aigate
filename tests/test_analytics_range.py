@@ -199,3 +199,72 @@ async def test_by_provider_start_end(tmp_path):
         assert alpha["tokens"] == 160
     finally:
         await engine.dispose()
+
+
+# ── by-provider: 三视角（2026-10-20） ─────────────────────
+
+@pytest.mark.asyncio
+async def test_by_provider_dimension_model_and_account(tmp_path):
+    """三种视角：服务商 / 服务商×模型 / 服务商×账号（模型、账号各自成行）"""
+    engine, Session = await _setup(tmp_path)
+    try:
+        async with Session() as db:
+            # 同一服务商下 2 个模型、2 个账号，另有 1 条无账号（非 OAuth 路径）
+            db.add(_log(created_at=datetime(2026, 9, 28, 8, 0), routed_provider="Alpha",
+                        routed_model="m1", routed_account="a@x.com",
+                        prompt_tokens=100, completion_tokens=0))
+            db.add(_log(created_at=datetime(2026, 9, 28, 9, 0), routed_provider="Alpha",
+                        routed_model="m1", routed_account="b@x.com",
+                        prompt_tokens=50, completion_tokens=0))
+            db.add(_log(created_at=datetime(2026, 9, 28, 10, 0), routed_provider="Alpha",
+                        routed_model="m2", routed_account="a@x.com",
+                        prompt_tokens=10, completion_tokens=0))
+            db.add(_log(created_at=datetime(2026, 9, 28, 11, 0), routed_provider="Beta",
+                        routed_model="m3", prompt_tokens=7, completion_tokens=0))
+            await db.commit()
+
+            base = dict(start="2026-09-28", end="2026-09-28", db=db)
+            by_prov = await admin_routing.analytics_by_provider(dimension="provider", **base)
+            by_model = await admin_routing.analytics_by_provider(dimension="provider_model", **base)
+            by_acct = await admin_routing.analytics_by_provider(dimension="provider_account", **base)
+
+        # 服务商视角：只有 2 行，Alpha 汇总 160 token
+        assert {p["provider_name"] for p in by_prov["providers"]} == {"Alpha", "Beta"}
+        alpha = next(p for p in by_prov["providers"] if p["provider_name"] == "Alpha")
+        assert alpha["tokens"] == 160 and alpha["requests"] == 3
+        assert by_prov["dimension"] == "provider"
+
+        # 模型视角：Alpha×m1 合并两条（150），Alpha×m2 一条，Beta×m3 一条
+        rows = {(r["provider_name"], r["model"]): r for r in by_model["providers"]}
+        assert len(rows) == 3
+        assert rows[("Alpha", "m1")]["tokens"] == 150
+        assert rows[("Alpha", "m1")]["requests"] == 2
+        assert rows[("Alpha", "m2")]["tokens"] == 10
+        assert rows[("Beta", "m3")]["tokens"] == 7
+        assert sum(r["share_pct"] for r in by_model["providers"]) == pytest.approx(100, abs=0.5)
+
+        # 账号视角：Alpha×a@x.com 合并两条（110），b@x.com 一条；Beta 无账号 → account=None
+        acct = {(r["provider_name"], r["account"]): r for r in by_acct["providers"]}
+        assert acct[("Alpha", "a@x.com")]["tokens"] == 110
+        assert acct[("Alpha", "b@x.com")]["tokens"] == 50
+        assert acct[("Beta", None)]["tokens"] == 7
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_by_provider_unknown_dimension_falls_back(tmp_path):
+    """未知视角不应报错/注入 SQL，退回服务商视角（headroom 等旧调用零影响）"""
+    engine, Session = await _setup(tmp_path)
+    try:
+        async with Session() as db:
+            db.add(_log(created_at=datetime(2026, 9, 28, 8, 0), routed_provider="Alpha",
+                        routed_model="m1", prompt_tokens=5, completion_tokens=0))
+            await db.commit()
+            res = await admin_routing.analytics_by_provider(
+                start="2026-09-28", end="2026-09-28", dimension="bogus", db=db)
+        # 直接调函数时 Query 约束不生效，聚合层按白名单退回 provider
+        assert res["providers"][0]["provider_name"] == "Alpha"
+        assert "model" not in res["providers"][0]
+    finally:
+        await engine.dispose()

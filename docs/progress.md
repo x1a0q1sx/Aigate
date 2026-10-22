@@ -1050,3 +1050,57 @@ CN 与国际版是两套 SSO 域（`www.codebuddy.cn` vs `www.codebuddy.ai`）�
 - 若将来国际版开放 scoped 端点，徽标解析会自动生效（代码路径已通用，
   `fetch_codebuddy_catalog` 对两站同一套逻辑），无需改动。
 - ⚠️ 探针脚本为一次性排查工具，已删除；若需复现，按本文档的端点与 header 重写即可。
+
+## Session 38（2026-10-22）分析页：日志三路可搜索筛选 + 用量分析多视角
+
+用户需求两件事：①请求日志的「全部服务商」要能输入搜索，模型和账号也要能筛且能搜；
+②「按服务商用量」改名为「用量分析」，可选 服务商 / 服务商-模型 / 服务商-账号 三种视角。
+
+### 后端
+
+- `server/core/provider_usage.py`：新增 `aggregate_usage(dimension=...)`，支持
+  `provider`（原行为）/ `provider_model` / `provider_account`；未知值按白名单退回
+  `provider`。`aggregate_usage_by_provider()` 保留为薄包装，headroom 与服务商详情页
+  零改动。模型视角取 **`routed_model`（实际路由模型）**，不是 `requested_model`
+  （后者多为 `auto`，分组没有意义）。非 OAuth 服务商的账号为 `None`。
+- `/admin/api/analytics/by-provider` 加 `dimension` 参数（Query pattern 约束），
+  响应新增 `dimension` 回显，键仍是 `providers`（前端与服务商页无需改结构）。
+- `/admin/api/logs` 新增 `model` / `account` 筛选（`ilike` 子串 + 忽略大小写）；
+  `_logs_total_key()` 同步纳入这两个维度，否则换条件会命中上一个条件的 total 缓存。
+  ⚠️ 这两个参数是直接函数调用场景下可能拿到 `Query` 默认对象，判断必须
+  `isinstance(x, str)`，不能只写 `if model:`（测试就踩了这个坑）。
+- 新增 `GET /admin/api/logs/filters`：返回日志里实际出现过的 providers / models /
+  accounts（去重排序），候选值天然没有「选了必然 0 条」的死选项。
+- `/admin/api/logs/export` 同步支持 `model` / `account`，输出字段新增 `routed_account`。
+
+### 修了一个既有 bug：日志导出一直是 422
+
+`admin_routing` 的 `/logs/{log_id}` 注册在 `admin_ops` 的 `/logs/export` **之前**，
+Starlette 按注册顺序匹配 → `export` 被当作整数 id → 422 `int_parsing`。
+线上「导出 CSV / JSON」按钮此前点下去根本拿不到文件（用 curl 实测确认）。
+修复：路径改成 `/logs/{log_id:int}`。回归测试锁死：
+源码必须含 `{log_id:int}`、且不得含无转换器版本。
+
+### 前端
+
+- 新组件 `client/src/components/SearchFilter.vue`：可输入即筛（300ms 防抖），
+  候选列表只作提示，允许自由输入（服务端子串匹配），带清除按钮与键盘上下选择。
+  与既有 `SearchSelect` 的分工写进组件注释：后者是「必须命中候选」的选择器。
+- `LogsPanel.vue`：服务商 / 模型 / 账号三路换成 SearchFilter，切换「模型刷新」
+  日志类型时自动清空模型与账号（该类型没有这两列）；导出跟随当前三路筛选。
+  `setFilters()` 一次设多路，`setProviderFilter()` 保留为薄包装。
+- `Analytics.vue`：卡片改名「用量分析」，右上角分段控件切三视角；模型/账号视角
+  按服务商分组，组行显示合计 + 「N 项」，子行缩进淡化，支持单组折叠与展开/收起全部；
+  「看日志」按当前视角把服务商 + 子项一起带进日志筛选（此前只带服务商）。
+
+### 验证
+
+- 全量 1252 通过（新增 `tests/test_log_filters.py` 7 条 + `test_analytics_range.py`
+  2 条维度用例 + 前端视角断言）。
+- 本机起 uvicorn + 造 400 条日志的真实界面验证：三视角行数/分组正确
+  （provider 3 行、模型 10 行含 7 子项、账号 4 项且非 OAuth 显示「（未记录）」）、
+  搜 `kimi` 得 59 条、点子项「看日志」带出 `Qoder`+`qwen3.5-max` 共 74 条、
+  收起全部 3 行 / 展开 10 行、导出 CSV 有下载事件无报错。
+- ⚠️ 自动化点击 `.dim-btn` 与 `SearchFilter` 输入框时 Playwright 的 role/placeholder
+  定位会超时（元素实际可见、未被遮挡），改用坐标点击或原生 setter + `input` 事件即可——
+  这是 IAB 自动化的已知脾气，不代表组件有问题。

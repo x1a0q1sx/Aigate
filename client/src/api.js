@@ -216,11 +216,14 @@ export default {
     if (params.page_size) qs.append('page_size', params.page_size)
     if (params.status) qs.append('status', params.status)
     if (params.provider) qs.append('provider', params.provider)
+    if (params.model) qs.append('model', params.model)
+    if (params.account) qs.append('account', params.account)
     if (params.log_type) qs.append('log_type', params.log_type)
     return apiGet(`/admin/api/logs?${qs.toString()}`)
   },
   getLogDetail: (id, full = false) => apiGet(`/admin/api/logs/${id}${full ? '?full=1' : ''}`),
   getLogProviders: () => apiGet('/admin/api/logs/providers'),
+  getLogFilters: () => apiGet('/admin/api/logs/filters'),
   getAnalyticsSummary: () => apiGet('/admin/api/analytics/summary'),
   resetAnalyticsSummary: () => apiPost('/admin/api/analytics/summary/reset', {}),
   // 日志归档
@@ -267,6 +270,7 @@ export default {
     const qs = new URLSearchParams()
     if (params.start) qs.append('start', params.start)
     if (params.end) qs.append('end', params.end)
+    if (params.dimension) qs.append('dimension', params.dimension)
     const s = qs.toString()
     return apiGet(`/admin/api/analytics/by-provider${s ? '?' + s : ''}`)
   },

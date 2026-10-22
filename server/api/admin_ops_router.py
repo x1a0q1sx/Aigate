@@ -245,19 +245,30 @@ async def export_logs(
     hours: int = Query(168, ge=1, le=24 * 90),
     status: Optional[str] = None,
     provider: Optional[str] = None,
+    model: Optional[str] = None,
+    account: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """按当前筛选导出请求日志（近 N 小时，上限 50000 行）"""
+    """按当前筛选导出请求日志（近 N 小时，上限 50000 行）
+
+    model / account 与服务商一同跟随日志筛选（子串匹配），保证导出与屏幕
+    上看到的筛选结果一致。
+    """
     since = datetime.utcnow() - timedelta(hours=hours)
     conds = [RequestLog.created_at >= since, RequestLog.is_health_check.is_(False)]
     if status:
         conds.append(RequestLog.status == status)
     if provider:
         conds.append(RequestLog.routed_provider == provider)
+    if model:
+        conds.append(RequestLog.routed_model.ilike(f"%{model.strip()}%"))
+    if account:
+        conds.append(RequestLog.routed_account.ilike(f"%{account.strip()}%"))
     rows = (await db.execute(
         select(RequestLog).where(*conds).order_by(desc(RequestLog.id)).limit(50000)
     )).scalars().all()
     fields = ["id", "created_at", "requested_model", "routed_provider", "routed_model",
+              "routed_account",
               "status", "media_type", "http_status", "latency_ms", "ttft_ms",
               "prompt_tokens", "completion_tokens", "cache_read_tokens", "cache_write_tokens",
               "estimated_cost_usd", "error_type", "error_msg", "fallback_count",

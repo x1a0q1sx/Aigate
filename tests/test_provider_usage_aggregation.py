@@ -555,7 +555,22 @@ def test_frontend_detail_modal_matches_by_name_fallback():
 
 
 def test_frontend_analytics_shows_provider_count():
+    """用量分析卡片：家数/总量 + 孤立桶标注。
+
+    2026-10-20 起卡片支持三视角切换，家数文案改由 usageSummary 计算属性给出，
+    所以这里断言文案片段而不是整段模板表达式。
+    """
     from pathlib import Path
     src = Path("client/src/views/Analytics.vue").read_text(encoding="utf-8")
-    assert "providerData.length }} 家" in src
+    assert "providerData.length" in src
+    assert "家 / " in src
     assert "（已删除）" in src
+
+
+def test_frontend_usage_analysis_has_three_dimensions():
+    """用量分析必须能按 服务商 / 服务商-模型 / 服务商-账号 三种视角查看。"""
+    from pathlib import Path
+    src = Path("client/src/views/Analytics.vue").read_text(encoding="utf-8")
+    for dim in ("provider", "provider_model", "provider_account"):
+        assert f"v: '{dim}'" in src
+    assert "dimension: this.usageDimension" in src

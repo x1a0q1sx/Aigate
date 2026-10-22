@@ -298,7 +298,29 @@ async def list_log_providers(db: AsyncSession = Depends(get_db)):
     )).scalars().all()
     return {"providers": [r for r in rows if r]}
 
-@router.get("/logs/{log_id}")
+
+@router.get("/logs/filters")
+async def list_log_filters(db: AsyncSession = Depends(get_db)):
+    """日志筛选可选值：服务商名 / 路由模型 / OAuth 账号（均去重排序）。
+
+    供分析页三路可搜索筛选器填充候选；数据来自 request_logs 实际出现过的值，
+    这样筛选项天然只包含「有日志」的项，不会出现选了必然 0 条的死选项。
+    """
+    async def _distinct(col):
+        rows = (await db.execute(
+            select(col).where(col.isnot(None)).group_by(col).order_by(col)
+        )).scalars().all()
+        return [r for r in rows if r]
+
+    return {
+        "providers": await _distinct(RequestLog.routed_provider),
+        "models": await _distinct(RequestLog.routed_model),
+        "accounts": await _distinct(RequestLog.routed_account),
+    }
+
+# 路径限定为整数：否则 `/logs/export`（admin_ops 的导出端点）会被本路由先匹配，
+# "export" 转 int 失败 → 422。之前导出功能一直打不通就是这个原因。
+@router.get("/logs/{log_id:int}")
 async def get_log(log_id: int, full: bool = Query(False, description="true 返回完整 body；默认超过 160KB 截断（详情弹窗快速打开）"), db: AsyncSession = Depends(get_db)):
     row = await db.get(RequestLog, log_id)
     if not row:
@@ -422,8 +444,9 @@ from sqlalchemy import func
 _logs_total_cache = {"data": None, "ts": 0, "key": None}
 _LOGS_TOTAL_TTL = 30  # 秒
 
-def _logs_total_key(status: Optional[str], provider: Optional[str]) -> str:
-    return f"{status or ''}|{provider or ''}"
+def _logs_total_key(status: Optional[str], provider: Optional[str],
+                    model: Optional[str] = None, account: Optional[str] = None) -> str:
+    return f"{status or ''}|{provider or ''}|{model or ''}|{account or ''}"
 
 @router.get("/logs")
 async def list_request_logs(
@@ -431,6 +454,8 @@ async def list_request_logs(
     page_size: int = Query(10, ge=1, le=100),
     status: Optional[str] = None,
     provider: Optional[str] = None,
+    model: Optional[str] = Query(None, description="路由模型（routed_model）子串匹配，忽略大小写"),
+    account: Optional[str] = Query(None, description="OAuth 账号（routed_account）子串匹配，忽略大小写"),
     log_type: Optional[str] = Query(None, pattern="^(request|refresh)$"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -499,9 +524,18 @@ async def list_request_logs(
     if provider:
         base_q = base_q.where(RequestLog.routed_provider == provider)
         count_q = count_q.where(RequestLog.routed_provider == provider)
+    if isinstance(model, str) and model.strip():
+        # 子串匹配：日志行的 routed_model 是完整 model_id，用户通常只记得片段
+        pat = f"%{model.strip()}%"
+        base_q = base_q.where(RequestLog.routed_model.ilike(pat))
+        count_q = count_q.where(RequestLog.routed_model.ilike(pat))
+    if isinstance(account, str) and account.strip():
+        pat = f"%{account.strip()}%"
+        base_q = base_q.where(RequestLog.routed_account.ilike(pat))
+        count_q = count_q.where(RequestLog.routed_account.ilike(pat))
     # 方案B：total 缓存（30s TTL），翻页复用，省掉每次全表 COUNT
     now = _time.time()
-    ck = _logs_total_key(status, provider)
+    ck = _logs_total_key(status, provider, model, account)
     if _logs_total_cache["data"] is not None and _logs_total_cache["key"] == ck and (now - _logs_total_cache["ts"]) < _LOGS_TOTAL_TTL:
         total = _logs_total_cache["data"]
     else:
@@ -801,22 +835,28 @@ async def analytics_trend(
 async def analytics_by_provider(
     start: Optional[str] = Query(None, description="起始时间（UTC），默认今日零点"),
     end: Optional[str] = Query(None, description="结束时间（含）"),
+    dimension: str = Query("provider", pattern="^(provider|provider_model|provider_account)$",
+                           description="聚合视角：服务商 / 服务商×模型 / 服务商×账号"),
     db: AsyncSession = Depends(get_db),
 ):
-    """按服务商拆分窗口用量（请求 / Token / 成本 / 占比%）
+    """按指定视角拆分窗口用量（请求 / Token / 成本 / 占比%）
 
-    统一走 `aggregate_usage_by_provider`：按 id 优先、名称兜底聚合。
+    统一走 `aggregate_usage`：按 id 优先、名称兜底聚合。
     此前直接 `WHERE routed_provider_id IS NOT NULL`，把只写了名称的历史行
     （直连流式等路径，生产实测占当日 95%）整行丢弃 → 面板显示不全（2026-09-24 修）。
+
+    dimension（2026-10-20）：provider=仅服务商（默认，headroom 与服务商页沿用）；
+    provider_model=服务商×实际路由模型；provider_account=服务商×OAuth 账号。
+    响应键始终为 `providers`，模型/账号视角的每项多带 `model` / `account` 字段。
     """
     start_dt = _parse_dt_param(start) or datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     end_dt = _parse_dt_param(end, end_of_day=True)
-    from server.core.provider_usage import aggregate_usage_by_provider
-    items = await aggregate_usage_by_provider(db, since=start_dt, until=end_dt)
+    from server.core.provider_usage import aggregate_usage
+    items = await aggregate_usage(db, since=start_dt, until=end_dt, dimension=dimension)
     total_tokens = sum(it["tokens"] for it in items)
     for it in items:
         it["share_pct"] = round(it["tokens"] / (total_tokens or 1) * 100, 1)
-    return {"total_tokens": total_tokens, "providers": items}
+    return {"total_tokens": total_tokens, "dimension": dimension, "providers": items}
 
 
 # ===================== 智力静态 CRUD =====================
