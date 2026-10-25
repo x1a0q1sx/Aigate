@@ -2047,26 +2047,59 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     # ─── 日志写入辅助（提前定义到 try 之前，避免 free_tier / oauth 早期 miss 兜底 _write_log 未绑定） ───
     # P1-19: _route_result 不做默认参数（def 时求值冻结为 None，后续赋值不可见 →
     # routed_provider/model 恒 NULL）。route_result 在外层函数体赋值，闭包运行时读取即为最新值。
-    async def _write_log(status, resp_dict, latency_ms, error_msg=None, *, _conversation_id=conversation_id, _request=request, _raw_request=raw_request):
+    async def _write_log(status, resp_dict, latency_ms, error_msg=None, *,
+                         _conversation_id=conversation_id, _request=request, _raw_request=raw_request,
+                         ttft_ms=None, usage_snapshot=None, output_text=""):
+        """落一条 Playground 请求日志。
+
+        usage_snapshot：流式路径用——chunk 里没有整包 usage 可拿（resp_dict=None），
+        但流式 usage 是**累计值**，逐块保存最后一份即可还原 token 用量。
+        output_text：上游漏报 completion 时按实际输出文本粗估（与 /v1 同口径）。
+        """
         _route_result = route_result
         try:
             from server.db import AsyncSessionLocal as _LogSession
-            usage = resp_dict.get("usage", {}) if resp_dict else {}
-            pt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
-            ct = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+            from server.core.usage_normalize import normalize_usage as _nu_fn
+            from server.api.v1_router import _extract_cache_tokens as _ect, _segmented_cost as _seg_cost
+            usage = (usage_snapshot if usage_snapshot is not None
+                     else (resp_dict.get("usage", {}) if resp_dict else {}))
+            nu = _nu_fn(usage or {})
+            pt, ct = nu.prompt_tokens, nu.completion_tokens
+            try:
+                from server.api.v1_router import _sanitize_token_counts as _sanitize
+                pt, ct = _sanitize(_request, pt, ct, output_text or "")
+            except Exception:
+                pass
+            _crd, _cwt = _ect(usage or {})
+            ok = (_route_result is not None and getattr(_route_result, "success", False))
+            _mdl = getattr(_route_result.model, "model_id", None) if ok else None
+            cost = 0.0
+            if status == "success" and ok and (pt or ct or _crd or _cwt):
+                try:
+                    cost = _seg_cost({
+                        "input_price": float(getattr(_route_result.model, "input_price", 0) or 0),
+                        "output_price": float(getattr(_route_result.model, "output_price", 0) or 0),
+                        "cache_read_input_price": float(getattr(_route_result.model, "cache_read_input_price", 0) or 0),
+                        "cache_write_input_price": float(getattr(_route_result.model, "cache_write_input_price", 0) or 0),
+                    }, pt, ct, _crd, _cwt)
+                except Exception:
+                    cost = 0.0
             req_s = _json_mod.dumps(_request.model_dump(), ensure_ascii=False)
             resp_s = _json_mod.dumps(resp_dict, ensure_ascii=False)[:100000] if resp_dict else None
             async with _LogSession() as _ldb:
                 await write_log(_ldb,
                     conversation_id=_conversation_id, requested_model=_request.model,
-                    routed_provider=_route_result.provider.name if (_route_result and _route_result.success) else None,
+                    routed_provider=_route_result.provider.name if ok else None,
                     # 主键必须一起写：分析页「按服务商用量」/headroom 按 routed_provider_id 聚合
-                    routed_provider_id=getattr(_route_result.provider, "id", None) if (_route_result and _route_result.success) else None,
-                    routed_model=_route_result.model.model_id if (_route_result and _route_result.success) else None,
-                    routed_account=getattr(_route_result, "account", None) if (_route_result and _route_result.success) else None,
-                    status=status, latency_ms=latency_ms,
+                    routed_provider_id=getattr(_route_result.provider, "id", None) if ok else None,
+                    routed_model=_mdl,
+                    routed_account=getattr(_route_result, "account", None) if ok else None,
+                    status=status, latency_ms=latency_ms, ttft_ms=ttft_ms,
                     prompt_tokens=int(pt) if pt else 0,
                     completion_tokens=int(ct) if ct else 0,
+                    cache_read_tokens=_crd or None,
+                    cache_write_tokens=_cwt or None,
+                    estimated_cost_usd=cost,
                     fallback_count=_route_result.fallback_count if _route_result else 0,
                     user_ip=_raw_request.client.host if _raw_request.client else None,
                     error_type="upstream_error" if error_msg else None,
@@ -2074,8 +2107,11 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                     request_body=req_s, response_body=resp_s,
                     **_proxy_log_fields(),
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            # 静默吞掉会让「Playground 请求不出现在日志页」永不可见（2026-10-25 实证：
+            # 流式成功路径完全没有日志调用点，日志页/统计全缺）。至少留一行可查。
+            logger.warning("playground log write failed: %s: %s",
+                           type(e).__name__, str(e)[:300])
 
     if not is_auto:
         if "/" in request.model:
@@ -2107,23 +2143,46 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
             if free_exec:
                 free_req = request.model_copy(update={"model": model.model_id})
                 _send_dur = lambda: int((time.time() - _send_time) * 1000)
+                # 归因：free_tier 分支此前从不设 route_result → 日志 routed_provider/id 恒 NULL，
+                # 分析页「按服务商用量」把这批请求全丢进 (未归属) 桶（2026-10-25 实证）。
+                from server.core.auto_router import RouteResult as _FreeRouteResult
+                route_result = _FreeRouteResult(
+                    success=True, model=model, provider=provider,
+                    api_key="", adapter=None, fallback_count=0,
+                )
+                _free_label = f"{provider.name}/{model.model_id}"
                 if data.stream:
                     async def _playground_free_stream():
+                        _fs_usage, _fs_ttft, _fs_parts = {}, None, []
                         try:
                             async for ck in free_exec.execute_stream(free_req):
-                                yield _format_sse_chunk(ck, f"{provider.name}/{model.model_id}")
+                                if _fs_ttft is None:
+                                    _fs_ttft = _send_dur()
+                                if isinstance(ck, dict):
+                                    u = ck.get("usage")
+                                    if isinstance(u, dict) and u:
+                                        _fs_usage = u
+                                    for ch in (ck.get("choices") or []):
+                                        d = (ch or {}).get("delta") or {}
+                                        if isinstance(d.get("content"), str):
+                                            _fs_parts.append(d["content"])
+                                yield _format_sse_chunk(ck, _free_label)
                             yield b"data: [DONE]\n\n"
-                            await _write_log("success", None, _send_dur())
+                            await _write_log("success", None, _send_dur(), ttft_ms=_fs_ttft,
+                                             usage_snapshot=_fs_usage,
+                                             output_text="".join(_fs_parts))
                         except Exception as e:
                             _pg_err = err_text(e)[:300]
-                            yield _format_sse_chunk({"error": f"free_provider_stream_failed: {_pg_err}"}, f"{provider.name}/{model.model_id}")
+                            yield _format_sse_chunk({"error": f"free_provider_stream_failed: {_pg_err}"}, _free_label)
                             yield b"data: [DONE]\n\n"
-                            await _write_log("error", None, _send_dur(), _pg_err[:500])
+                            await _write_log("error", None, _send_dur(), _pg_err[:500],
+                                             ttft_ms=_fs_ttft, usage_snapshot=_fs_usage,
+                                             output_text="".join(_fs_parts))
                     return StreamingResponse(_playground_free_stream(), media_type="text/event-stream")
                 try:
                     upstream_result = await free_exec.execute_non_stream(free_req)
                     if isinstance(upstream_result, dict) and "model" in upstream_result:
-                        upstream_result["model"] = f"{provider.name}/{model.model_id}"
+                        upstream_result["model"] = _free_label
                     await _write_log("success", upstream_result, _send_dur())
                     return upstream_result
                 except Exception as e:
@@ -2248,12 +2307,37 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
     if data.stream:
         async def wrap_stream():
             resp_dict = None
+            # 流式 usage 是累计值：逐块取最后一份即可还原本次用量（上游通常只在末块给）
+            _usage_snap = {}
+            _ttft_ms = None
+            _out_parts = []
             try:
                 async for chunk in route_result.adapter.stream_chat_completion(
                     upstream_request, route_result.api_key, route_result.provider.base_url, extra_headers
                 ):
+                    if _ttft_ms is None:
+                        _ttft_ms = int((time.time() - _send_time) * 1000)
+                    if isinstance(chunk, dict):
+                        u = chunk.get("usage")
+                        if isinstance(u, dict) and u:
+                            _usage_snap = u
+                        for ch in (chunk.get("choices") or []):
+                            d = (ch or {}).get("delta") or {}
+                            if isinstance(d.get("content"), str):
+                                _out_parts.append(d["content"])
+                            if isinstance(d.get("reasoning_content"), str):
+                                _out_parts.append(d["reasoning_content"])
+                            for tc in (d.get("tool_calls") or []):
+                                a = ((tc or {}).get("function") or {}).get("arguments")
+                                if isinstance(a, str):
+                                    _out_parts.append(a)
                     yield _format_sse_chunk(chunk, model_id_full)
                 await _note_pg_account(True)   # OAuth 多账号：流正常走完 → 清账号冷却
+                # 成功路径必须落日志：此前这里没有调用点，Playground 流式请求
+                # （前端每次都发 stream=true）在日志页/统计里完全不存在（2026-10-25 实证）。
+                await _write_log("success", None, int((time.time() - _send_time)*1000),
+                                 ttft_ms=_ttft_ms, usage_snapshot=_usage_snap,
+                                 output_text="".join(_out_parts))
             except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.ConnectError) as e:
                 from server.api.v1_router import _api_error as _api_error_fn
                 from server.core.error_text import credit_exhausted_hint as _credit_hint
@@ -2262,7 +2346,9 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 _hint = _credit_hint(str(e))
                 _msg = f"upstream_stream_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
                 yield _format_sse_chunk(_api_error_fn(_msg), model_id_full)
-                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
+                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500],
+                                 ttft_ms=_ttft_ms, usage_snapshot=_usage_snap,
+                                 output_text="".join(_out_parts))
             except Exception as e:
                 # 适配器自抛的业务错误（SessionError / RuntimeError 等）也必须变成
                 # SSE error 事件：否则异常穿透生成器 → 前端只看到流中断，原因丢失。
@@ -2274,7 +2360,9 @@ async def playground_chat(data: PlaygroundRequest, raw_request: Request, db: Asy
                 _hint = _credit_hint(str(e))
                 _msg = f"upstream_stream_failed: {_pg_err}" + (f"\n{_hint}" if _hint else "")
                 yield _format_sse_chunk(_api_error_fn(_msg), model_id_full)
-                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500])
+                await _write_log("error", resp_dict, int((time.time() - _send_time)*1000), _pg_err[:500],
+                                 ttft_ms=_ttft_ms, usage_snapshot=_usage_snap,
+                                 output_text="".join(_out_parts))
             yield b"data: [DONE]\n\n"
         return StreamingResponse(wrap_stream(), media_type="text/event-stream")
 
