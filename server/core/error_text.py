@@ -74,16 +74,55 @@ def _proxy_suffix() -> str:
         return ""
 
 
+# 上游「封号」判据（code 11140）。与 11128 的区别是**文案**而非 code：
+#   11128 msg="request illegal" + displayMsg="Request blocked. Please send it again"
+#         → 头族/请求形态问题，补头或换号可解，冷却一段时间有意义；
+#   11140 msg="request illegal" + displayMsg="Your account has been restricted
+#         due to unusual activity / 账号存在异常行为，已被限制使用"
+#         → 上游明确说账号被封，只有人工申诉能解，任何自动重试都是白烧请求。
+# 只比 msg 会把两者混为一类（都叫 request illegal），必须看 displayMsg。
+_BANNED_MARKERS = (
+    "account has been restricted",
+    "account is restricted",
+    "account has been suspended",
+    "account has been banned",
+    "账号存在异常行为",
+    "账号已被限制使用",
+    "帳號存在異常行為",
+)
+
+
+def is_account_banned_text(error) -> bool:
+    """错误文本是否为上游「账号已被封禁 / 限制使用」（终态，自动重试无意义）。
+
+    2026-10-25 生产取证（codebuddy_intl 两账号 60 次）：
+        HTTP 403 {"code":11140,"msg":"request illegal",
+                  "displayMsg":{"en":"Your account has been restricted due to
+                  unusual activity","zh":"账号存在异常行为，已被限制使用"}}
+    与 11128（同样 msg=request illegal，但 displayMsg 是 "Request blocked.
+    Please send it again"）必须分开：11128 是请求形态/头族问题，11140 是账号终态。
+    判定以 displayMsg 的中英文案为主，并接受 code 11140 兜底（生产 60/60 样本
+    都带 restricted 文案；带上 code 是为了防短形态截断把 displayMsg 切掉）。"""
+    text = str(error or "").lower()
+    if any(m in text for m in _BANNED_MARKERS):
+        return True
+    return '"code":11140' in text.replace(" ", "") or '"code": 11140' in text
+
+
 def is_risk_block_text(error) -> bool:
     """错误文本是否为上游「账号级风控拦截」。
 
     CodeBuddy 国际版 11128 是同一风控的多个文案变体（request illegal / 请求被拦截 /
     没通过渠道校验）；2026-10-16 实测：同 payload 换账号 12/12 通过、被拦账号 9/9 全败
     ——与请求内容无关，语义=「这个账号被上游拉黑」，冷却换号才有用。
-    供 is_account_worthy_error 资格闸与账号冷却时长分档共用。"""
+    供 is_account_worthy_error 资格闸与账号冷却时长分档共用。
+
+    注意：封号（is_account_banned_text）**也**命中本函数（文案里同样有
+    "request illegal"），调用方需先判封号——冷却分档就是按这个顺序写的。"""
     text = str(error or "").lower()
     return any(m in text for m in (
-        '"code":11128', "request illegal", "没通过渠道校验", "渠道校验"))
+        '"code":11128', '"code":11140', "request illegal",
+        "没通过渠道校验", "渠道校验")) or is_account_banned_text(text)
 
 
 def credit_exhausted_hint(error) -> str:

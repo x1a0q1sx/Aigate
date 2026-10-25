@@ -1104,3 +1104,82 @@ Starlette 按注册顺序匹配 → `export` 被当作整数 id → 422 `int_par
 - ⚠️ 自动化点击 `.dim-btn` 与 `SearchFilter` 输入框时 Playwright 的 role/placeholder
   定位会超时（元素实际可见、未被遮挡），改用坐标点击或原生 setter + `input` 事件即可——
   这是 IAB 自动化的已知脾气，不代表组件有问题。
+
+## Session 39（2026-10-25）OAuth 账号封禁自动识别 + 连接页展示
+
+用户原话：「codebuddy国际版被封了，帮我做成自动识别的，封了后就直接在OAuth那显示哪个被封了」
+
+### 关键取证（生产库 request_logs，21 天，2864 条 CodeBuddy 失败）
+
+封号的真实报文（codebuddy_intl，**60 次**、两账号）：
+
+```
+HTTP 403 {"code":11140,"msg":"request illegal",
+  "displayMsg":{"en":"Your account has been restricted due to unusual activity",
+                "zh":"账号存在异常行为，已被限制使用"}}
+```
+
+**它和既有的 11128 风控拦截共用 `msg="request illegal"`**，只能靠 displayMsg 区分：
+
+| code | HTTP | displayMsg | 含义 | 处置 |
+|---|---|---|---|---|
+| 11128 | 400 | Request blocked. Please send it again | 请求形态/头族问题 | 30 分钟冷却，换号可解 |
+| 11140 | 403 | Your account has been restricted… | **账号终态** | 永久跳过，只能重登/申诉 |
+| 6004 | 429 | 使用量超限 + 自带重置时间 | 每日限额 | (账号×模型) 限额 |
+| 14003 | 429 | Model busy | 瞬时限流 | 短冷却 |
+
+改前：11140 被 `is_risk_block_text` 的 `"request illegal"` 命中 → 当风控冷却 30 分钟 →
+1h 后重试再失败。生产 `oauth_tokens.fail_count`：x1a0q1sx@gmail.com=21、
+1355386364@qq.com=41（纯白烧的上游往返）。
+
+### 后端
+
+- `error_text.py`：新增 `is_account_banned_text()`，判据是 displayMsg 中英文案
+  （account has been restricted / 账号存在异常行为…），并接受 `code:11140` 兜底
+  （防短形态截断把 displayMsg 切掉）。`is_risk_block_text` 扩容纳入 11140，
+  资格闸不变（封号也该进账号级记账）。
+- `models/oauth_token.py` + `db.py`：新增 `banned_at` / `banned_reason` 两列
+  （幂等 `ALTER TABLE`，老库自动补）。
+- `oauth_client.py`：
+  - `note_request_result` 在**冷却分支之前**判封号 → 走 `_record_account_banned`
+    （写 banned_at/banned_reason、清 cooldown_until、按 token 身份扩散到同账号全部连接）。
+  - `_rank_auto_rows` 排序键首位插 `banned` 位；`pick_access_token_ex` 直接剔除封禁行
+    （全封 → 返回 None，不再拿必败的号去撞）。点名分支也本地拒绝。
+  - `_save_token` 解除封禁的条件是 **`update_existing is None`**（= 人工重新登录）。
+    ⚠️ 不能无条件清：所有自动刷新路径都传 `update_existing=existing`，无条件清会让
+    例行刷新每几十分钟把封标擦掉，封禁识别形同失效。
+  - 抽出 `_identity_owners()`，`_record_account_cooldown_until` / `_record_quota_limit`
+    两处重复的身份扩散逻辑改用它。
+  - `list_connections` 输出 `banned_at` / `banned_reason`。
+- `credential_resolver.py`：选号失败时区分「全部封禁 / 点名账号封禁」，
+  给出 `account_banned:` 前缀的可读报错，自动路由据此换服务商。
+- `oauth_router.py`：`PATCH /connections/{id}` 加 `banned` 字段（人工兜底，恢复时
+  连带清冷却与 fail_count）；刷新调度器跳过封禁账号；`GET /connections/{id}/usage`
+  查额度时若上游也报封禁，顺手回写账号状态（用户点一次「查询余额」就能发现）。
+- `oauth_usage.py`：`_codebuddy_usage` 的 401/403 分支区分封禁与凭证过期。
+
+### 前端
+
+`OAuthConnections.vue`：`connStatus` **封禁优先于一切**（冷却/过期会自动恢复，封禁不会）；
+新增 `.conn-banned` 行（红色底、`已封禁` 标签、上游中文原因、`N 天前判定`、恢复按钮），
+悬停显示完整说明；`setBanned()` 走 PATCH。
+
+### 验证
+
+- 新增 `tests/test_account_ban.py` 16 条；全量 **1266 通过**（原 1252）。
+- 临时库（3 个 Intl 账号：封禁/冷却/正常）+ 真 uvicorn + 真浏览器：
+  ① 接口返回 `banned_at`/`banned_reason` 正确；② 用生产原文调 `note_account_result`
+  自动落库并打日志 `oauth account BANNED: …`；③ 界面正确渲染「已封禁 + 原因 + 2 天前判定」，
+  冷却账号仍是「冷却中」、正常账号「正常」；④ 点「恢复」后 DB 三字段（banned_at/
+  banned_reason/fail_count）全清、界面立刻回「正常」，冷却账号的 fail_count=3 不受影响；
+  ⑤ 全封禁时自动模式报「所有账号均已被上游封禁」、点名模式报「账号已被上游封禁」。
+- ⚠️ IAB 的 `getByRole(...).click()` 对该页 button 会超时（元素可见、count()=1），
+  与 Session 38 记录的同款脾气；改用 `cua.click({x,y})` 坐标点击可正常触发。
+  截图接口本次也报 `screenshot surface preparation timed out`，DOM 快照足以确认渲染。
+
+### 运维提醒（与本次需求无关但当场发现）
+
+**生产服务器磁盘 100% 满**（40G 用尽），会直接导致数据库写入失败。已清理
+pip/npm/apt/journal 缓存释放 488M。剩余可清理项（**属其他项目，未擅自动**）：
+系统临时目录 2.0G（artex/recon/eiam 等临时产物）、`data/archives` 3.0G（日志归档，
+按天 gzip，可删旧）、`data/backups` 1.3G、服务器家目录下的 `artex_deploy` 5.9G。

@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from server.db import AsyncSessionLocal
 from server.models.oauth_token import OAuthToken
 from server.core.crypto_service import get_crypto_service, CryptoService
-from server.core.error_text import is_risk_block_text
+from server.core.error_text import is_risk_block_text, is_account_banned_text
 from server.core.quota_limit import is_daily_limit_text, is_credit_exhausted_text
 from server.core.oauth_registry import OAuthProviderConfig, get_oauth_provider
 
@@ -87,6 +87,26 @@ def status_from_error_text(text) -> Optional[int]:
 
 def _now_utc() -> datetime:
     return datetime.utcnow()
+
+
+def _banned_reason_text(error) -> str:
+    """封号错误文本 → 落库展示用的简短原因（≤500，owner/banned_reason 列宽）。
+
+    优先取上游 displayMsg 的中文文案（"账号存在异常行为，已被限制使用"），
+    这样 OAuth 连接页能直接显示上游原话；取不到退回原始错误文本前 300 字。"""
+    text = str(error or "").strip()
+    if not text:
+        return "上游判定账号已被限制使用"
+    try:
+        m = re.search(r'"zh"\s*:\s*"([^"]+)"', text)
+        if m and m.group(1).strip():
+            return m.group(1).strip()[:500]
+        m = re.search(r'"en"\s*:\s*"([^"]+)"', text)
+        if m and m.group(1).strip():
+            return m.group(1).strip()[:500]
+    except Exception:
+        pass
+    return text[:500]
 
 
 def _force_proxy_kwargs() -> dict:
@@ -1974,8 +1994,11 @@ class OAuthClient:
             tier, earliest, neg_rem = quota_rank_key(usage)
             load = (account_balancer.account_load_key(provider_code, row.owner)
                     if balancing else (0, 0.0))
-            ranked.append((cooling, tier, load, earliest, neg_rem, pref, row.id, row))
-        ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5], t[6]))
+            # 封禁排最末（banned 位在日常冷却/额度之前）：即便全部账号都封了，
+            # 也只会在最后兜底被取到，而不是排到健康账号前面
+            banned = 1 if getattr(row, "banned_at", None) else 0
+            ranked.append((banned, cooling, tier, load, earliest, neg_rem, pref, row.id, row))
+        ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]))
         return ranked
 
     async def _row_token_ready(self, db: AsyncSession, provider_code: str, row) -> Optional[str]:
@@ -2032,6 +2055,12 @@ class OAuthClient:
             row = await self._get_token_record(db, provider_code, owner)
             if not row or not row.is_active:
                 return None
+            # 点名账号已封禁 → 本地直接拒绝（不白烧一次必败的上游往返）。
+            # 由调用方给出「账号已被封禁」的明确报错。
+            if getattr(row, "banned_at", None):
+                logger.info("oauth %s/%s: account banned, local reject (explicit owner)",
+                            provider_code, owner)
+                return None
             token = await self._row_token_ready(db, provider_code, row)
             if not token:
                 return None
@@ -2071,12 +2100,20 @@ class OAuthClient:
             except Exception:
                 limited = {}
             if limited:
-                ranked = [t for t in ranked if t[7].owner not in limited]
+                ranked = [t for t in ranked if t[8].owner not in limited]
                 if not ranked:
                     logger.info("oauth %s: all accounts quota-limited for %s until %s",
                                 provider_code, model_id, min(limited.values()))
                     return None
-        for _cool, _tier, _load, _earliest, _neg, _pref, _rid, row in ranked:
+        # 封禁账号已在排序里排到最后；这里直接剔除。全部被封 → 返回 None
+        # （拿一个必定失败的号去撞只会白烧一次上游往返，调用方会给出封禁报错）。
+        healthy = [t for t in ranked if not getattr(t[8], "banned_at", None)]
+        if not healthy:
+            logger.info("oauth %s: all %d accounts banned",
+                        provider_code, len(ranked))
+            return None
+        ranked = healthy
+        for _banned, _cool, _tier, _load, _earliest, _neg, _pref, _rid, row in ranked:
             token = await self._row_token_ready(db, provider_code, row)
             if token:
                 # 该行有 DB 残留状态（如重启前写入的冷却）→ 本次若成功应能清掉：
@@ -2113,7 +2150,11 @@ class OAuthClient:
 
         model_id：本次请求的模型（裸 id）。带它且错误文案命中「每日限额」时
         （见 core/quota_limit.py）**不走账号冷却**，而是记 (账号×模型) 限额记录
-        ——该账号的其他模型不受影响，避免整号冷却误伤。"""
+        ——该账号的其他模型不受影响，避免整号冷却误伤。
+
+        账号封禁（上游终态，见 error_text.is_account_banned_text）单独写
+        banned_at/banned_reason：与冷却不同，封禁**不会自动到期**，选号永久跳过，
+        只有重新登录成功（_save_token 清标记）或人工恢复才解除。"""
         if not provider_code or not owner:
             return
         mark = (provider_code, owner)
@@ -2122,6 +2163,13 @@ class OAuthClient:
                 return
             _ACCOUNT_DIRTY.discard(mark)
         else:
+            # 上游明确封号（CodeBuddy 11140「账号存在异常行为，已被限制使用」等）：
+            # 终态，冷却多久都没用 —— 记持久封禁标记并直接返回，不再进冷却计时
+            # （否则 1h 后又会拿这个号去试，生产实测两个号累积 21/41 次无效请求）。
+            if is_account_banned_text(error):
+                _ACCOUNT_DIRTY.add(mark)
+                await self._record_account_banned(provider_code, owner, error, provider_id)
+                return
             # Qoder「Billing daily count exceeded」（HTTP 403 code 110）：**账号级**
             # 今日用量上限（官方 CLI 映射 todayUsageLimitExceeded；报文没有「可切换
             # 其他模型」语义，也不带重置时间）→ 账号冷却到次日 00:00 UTC+8。
@@ -2194,6 +2242,70 @@ class OAuthClient:
         except Exception as e:
             logger.debug("note_request_result failed: %s", e)
 
+    async def _identity_owners(self, provider_code: str, owner: str) -> list:
+        """同上游身份的所有连接名（owner 列表，含自己）。
+
+        同一邮箱/手机号历史上可能重复登录出多条连接（`__default` + `account-2`）——
+        上游的冷却/限额/封禁都是**账号级**的，必须落到同身份的全部连接上，否则
+        自动选号会换个连接名继续打同一个账号。身份取不到（非 JWT）时只返回自己。"""
+        try:
+            from server.db import AsyncSessionLocal
+            async with AsyncSessionLocal() as _idb:
+                _rows = (await _idb.execute(
+                    select(OAuthToken).where(
+                        OAuthToken.provider_code == provider_code,
+                        OAuthToken.is_active == True,  # noqa: E712
+                    ))).scalars().all()
+            _ids = {}
+            for _r in _rows:
+                try:
+                    _tok = self._crypto.decrypt(_r.access_token_enc) if _r.access_token_enc else ""
+                except Exception:
+                    _tok = ""
+                _ids[_r.owner] = token_identity(_tok) if _tok else None
+            _me = _ids.get(owner)
+            if _me:
+                return [o for o, ident in _ids.items() if ident == _me] or [owner]
+        except Exception:
+            pass
+        return [owner]
+
+    async def _record_account_banned(self, provider_code: str, owner: str,
+                                     error: str, provider_id: Optional[int] = None) -> None:
+        """记录账号级封禁（上游终态：账号被封 / 限制使用）。
+
+        与冷却的区别：封禁**没有到期时间**，选号永久跳过该账号，只有重新登录
+        （_save_token 清标记）或人工恢复才解除。生产实测（2026-10-25）：CodeBuddy
+        国际版 11140 被当成 30 分钟风控冷却，1h 后重试再失败，两号累积 21/41 次
+        无效请求 —— 封号识别出来就该立刻停止拿它试。
+
+        同身份扩散：同一上游账号可能挂多条连接，全都置封禁（否则换名继续打）。"""
+        try:
+            from server.db import AsyncSessionLocal
+            owners = await self._identity_owners(provider_code, owner)
+            note = _banned_reason_text(error)
+            async with AsyncSessionLocal() as db:
+                for _own in owners:
+                    row = (await db.execute(
+                        select(OAuthToken).where(
+                            OAuthToken.provider_code == provider_code,
+                            OAuthToken.owner == _own,
+                        ).limit(1)
+                    )).scalar_one_or_none()
+                    if row is None:
+                        continue
+                    # 首次封禁时间保留（重复报错不刷新时间点）
+                    if not row.banned_at:
+                        row.banned_at = _now_utc()
+                    row.banned_reason = note
+                    # 清掉冷却：封禁优先级更高，留着冷却只会让界面同时显示两种状态
+                    row.cooldown_until = None
+                await db.commit()
+            logger.warning("oauth account BANNED: %s/%s (%s) — %s",
+                           provider_code, owner, ",".join(owners), note)
+        except Exception as e:
+            logger.debug("_record_account_banned failed: %s", e)
+
     async def _record_account_cooldown_until(self, provider_code: str, owner: str,
                                              until: datetime) -> None:
         """把账号冷却设到指定时间点（Qoder 账号级每日用量上限用）。
@@ -2205,26 +2317,7 @@ class OAuthClient:
         的身份扩散一致，否则换个连接名继续打同一个已超限账号）。"""
         try:
             from server.db import AsyncSessionLocal
-            _owners = [owner]
-            try:
-                async with AsyncSessionLocal() as _idb:
-                    _rows = (await _idb.execute(
-                        select(OAuthToken).where(
-                            OAuthToken.provider_code == provider_code,
-                            OAuthToken.is_active == True,  # noqa: E712
-                        ))).scalars().all()
-                _ids = {}
-                for _r in _rows:
-                    try:
-                        _tok = self._crypto.decrypt(_r.access_token_enc) if _r.access_token_enc else ""
-                    except Exception:
-                        _tok = ""
-                    _ids[_r.owner] = token_identity(_tok) if _tok else None
-                _me = _ids.get(owner)
-                if _me:
-                    _owners = [o for o, ident in _ids.items() if ident == _me] or [owner]
-            except Exception:
-                _owners = [owner]
+            _owners = await self._identity_owners(provider_code, owner)
             async with AsyncSessionLocal() as db:
                 for _own in _owners:
                     row = (await db.execute(
@@ -2263,26 +2356,7 @@ class OAuthClient:
             note = (str(error or "").strip()[:500]) or ""
             from server.db import AsyncSessionLocal
             # 解析同身份的其他连接（token_identity 只读 JWT payload，不验签）
-            _owners = [owner]
-            try:
-                async with AsyncSessionLocal() as _idb:
-                    _rows = (await _idb.execute(
-                        select(OAuthToken).where(
-                            OAuthToken.provider_code == provider_code,
-                            OAuthToken.is_active == True,  # noqa: E712
-                        ))).scalars().all()
-                _ids = {}
-                for _r in _rows:
-                    try:
-                        _tok = self._crypto.decrypt(_r.access_token_enc) if _r.access_token_enc else ""
-                    except Exception:
-                        _tok = ""
-                    _ids[_r.owner] = token_identity(_tok) if _tok else None
-                _me = _ids.get(owner)
-                if _me:
-                    _owners = [o for o, ident in _ids.items() if ident == _me] or [owner]
-            except Exception:
-                _owners = [owner]
+            _owners = await self._identity_owners(provider_code, owner)
             for _try in range(2):
                 try:
                     async with AsyncSessionLocal() as db:
@@ -2440,6 +2514,16 @@ class OAuthClient:
             row.is_active = True
             row.last_refreshed_at = now
             row.last_error = ""
+            # 解除封禁标记**只认人工重新登录**（update_existing 为空 = 登录/重连入口；
+            # 所有自动刷新路径都会传 update_existing=existing）。
+            # 若在这里无条件清，自动刷新每几十分钟就会把封标擦掉 → 再次拿被封的号
+            # 去撞 11140，等于封禁识别失效。重新登录成功说明用户已在上游重新走通
+            # 授权；若账号其实仍在封，下一次推理请求会再次置位。
+            if getattr(row, "banned_at", None) and update_existing is None:
+                logger.info("oauth %s/%s: banned flag cleared by re-login",
+                            provider_code, owner)
+                row.banned_at = None
+                row.banned_reason = ""
         else:
             row = OAuthToken(
                 provider_code=provider_code, owner=owner,
@@ -2545,6 +2629,9 @@ class OAuthClient:
                 "last_error": row.last_error,
                 "cooldown_until": row.cooldown_until.isoformat() + "Z" if getattr(row, "cooldown_until", None) else None,
                 "fail_count": int(getattr(row, "fail_count", 0) or 0),
+                # 上游封禁（终态）：前端据此显示「已封禁」+ 原因，不再显示冷却
+                "banned_at": row.banned_at.isoformat() + "Z" if getattr(row, "banned_at", None) else None,
+                "banned_reason": getattr(row, "banned_reason", "") or "",
                 "quota_limits": _qmap.get((row.provider_code, row.owner), []),
             })
         return out

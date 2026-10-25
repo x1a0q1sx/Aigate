@@ -31,6 +31,10 @@ class OAuthToken(Base):
     # 账号级冷却（多账号路由：某账号 429/鉴权失败后短期跳过它，路由自动换号）
     cooldown_until = Column(DateTime, nullable=True)
     fail_count = Column(Integer, default=0)
+    # 账号级封禁（上游终态：账号被封/限制使用）。banned_at 非空即封禁：
+    # 选号直接跳过、不再消耗请求去试探；重新登录成功或手动恢复才清空。
+    banned_at = Column(DateTime, nullable=True)
+    banned_reason = Column(String(500), default="")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

@@ -190,6 +190,28 @@ async def resolve_credential_async(provider, model, db: AsyncSession) -> Resolve
                                         f"account(s); resets at {_latest.isoformat()}Z")
                     except Exception:
                         pass
+                # 区分「账号被封禁」：给用户明确原因，自动路由据此换服务商/模型
+                # （封禁是终态，重试同一服务商的其它账号也已无意义）
+                if _err.endswith("not connected"):
+                    try:
+                        from sqlalchemy import select as _sel
+                        from server.models.oauth_token import OAuthToken as _OT
+                        _rows = (await db.execute(_sel(_OT).where(
+                            _OT.provider_code == oauth_code,
+                            _OT.is_active == True))).scalars().all()  # noqa: E712
+                        _banned = [r for r in _rows if getattr(r, "banned_at", None)]
+                        if owner != "__default":
+                            _mine = [r for r in _banned if r.owner == owner]
+                            if _mine:
+                                _err = (f"account_banned: OAuth 账号 '{owner}' 已被上游封禁"
+                                        f"（{(_mine[0].banned_reason or '账号存在异常行为')[:120]}），"
+                                        f"请重新登录或更换账号")
+                        elif _rows and len(_banned) == len(_rows):
+                            _err = (f"account_banned: OAuth provider '{oauth_code}' 的所有账号"
+                                    f"均已被上游封禁（{(_banned[0].banned_reason or '账号存在异常行为')[:120]}），"
+                                    f"请重新登录或新增账号")
+                    except Exception:
+                        pass
                 rc.error = _err
                 return rc
             rc.account, token = got[0], got[1]

@@ -22,6 +22,8 @@ from typing import Optional
 
 import httpx
 
+from server.core.error_text import is_account_banned_text
+
 logger = logging.getLogger(__name__)
 
 USAGE_TTL_SECONDS = 300
@@ -210,6 +212,16 @@ async def _post_json(url: str, headers: dict, json_body, content=None):
 
 
 # ── 各家 handler ─────────────────────────────────────────────
+
+def _banned_display(body: str) -> str:
+    """封号报文 → 展示用文案（优先上游中文原话，取不到给英文，再退回截断原文）。"""
+    import re as _re
+    for pat in (r'"zh"\s*:\s*"([^"]+)"', r'"en"\s*:\s*"([^"]+)"'):
+        m = _re.search(pat, body or "")
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return (body or "").strip()[:120] or "账号存在异常行为"
+
 
 async def _claude_code_usage(token: str) -> dict:
     """Anthropic oauth usage：five_hour/seven_day/seven_day_X/limits[]."""
@@ -467,6 +479,16 @@ async def _codebuddy_usage(token: str, base_url: str) -> dict:
     billing_url = base_url.rsplit("/v2/", 1)[0] + "/v2/billing/meter/get-user-resource"
     r = await _post_json(billing_url, headers, None, content=b"{}")
     if r.status_code in (401, 403):
+        # 封禁账号连额度接口也 403，但报文带 code 11140 +「账号存在异常行为」。
+        # 与普通凭证过区分开：前者重登也没用，连接页要明确告诉用户是封禁。
+        body = ""
+        try:
+            body = r.text[:1000]
+        except Exception:
+            pass
+        if is_account_banned_text(body):
+            return {"quotas": {}, "banned": True,
+                    "message": f"账号已被上游封禁：{_banned_display(body)}"}
         return {"quotas": {}, "message": "CodeBuddy 凭证无效或已过期"}
     if not r.is_success:
         return {"quotas": {}, "message": f"CodeBuddy 额度接口错误（{r.status_code}）"}

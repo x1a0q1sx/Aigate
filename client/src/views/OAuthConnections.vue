@@ -50,6 +50,17 @@
               <button class="btn btn-ghost btn-xs danger-text" @click="removeConn(c)">断开</button>
             </span>
           </template>
+          <!-- 上游封禁（终态）：显示原因 + 恢复入口。自动识别命中后立刻出现，
+               用户不必自己去猜「为什么这个号一直失败」。 -->
+          <div v-if="c.banned_at" class="conn-banned text-xs" :title="bannedTitle(c)">
+            <AppIcon name="alert" :size="11" />
+            <span class="conn-banned-tag">已封禁</span>
+            <span class="conn-banned-reason">{{ c.banned_reason || '账号已被上游限制使用' }}</span>
+            <span class="muted">{{ bannedSince(c) }}</span>
+            <button class="btn btn-ghost btn-xs" @click="setBanned(c, false)" :disabled="busyConn === c.id">
+              恢复
+            </button>
+          </div>
           <div v-if="c.last_error" class="conn-error text-xs" :title="c.last_error">最后错误：{{ c.last_error.slice(0, 120) }}</div>
           <div v-if="(c.quota_limits || []).length" class="conn-error text-xs" style="color:#2b8aef"
                :title="quotaLimitsTitle(c)">
@@ -244,6 +255,8 @@ export default {
       return { label: '浏览器授权', cls: 'badge-neutral' }
     },
     connStatus(c) {
+      // 封禁优先于其它一切状态：冷却/过期都会自动恢复，封禁不会
+      if (c.banned_at) return { label: '已封禁', cls: 'badge-error' }
       if (!c.is_active) return { label: '已停用', cls: 'badge-error' }
       if (c.cooldown_until && new Date(c.cooldown_until).getTime() > Date.now()) {
         // 账号级冷却（多账号路由失败后自动跳过该号，到期自动恢复）
@@ -476,6 +489,37 @@ export default {
         this.busyConn = null
       }
     },
+    // 手动置位/解除封禁（自动识别之外的兜底：申诉成功后可恢复）
+    async setBanned(c, banned) {
+      this.busyConn = c.id
+      try {
+        await api.updateOAuthConnection(c.id, { banned })
+        await this.load()
+        toast.success(banned ? `已标记「${c.owner}」为封禁（不再参与路由）`
+                             : `已恢复「${c.owner}」，重新参与路由`)
+      } catch (e) {
+        toast.error((banned ? '标记' : '恢复') + '失败：' + e.message)
+      } finally {
+        this.busyConn = null
+      }
+    },
+    // 封禁时间：显示「N 天前被限制」，让用户判断是否值得申诉
+    bannedSince(c) {
+      if (!c.banned_at) return ''
+      const ms = Date.now() - new Date(c.banned_at).getTime()
+      if (ms < 0) return ''
+      const h = Math.floor(ms / 3600000)
+      if (h < 1) return '刚刚判定'
+      if (h < 24) return `${h} 小时前判定`
+      return `${Math.floor(h / 24)} 天前判定`
+    },
+    bannedTitle(c) {
+      const at = c.banned_at ? new Date(c.banned_at).toLocaleString('zh-CN', { hour12: false }) : ''
+      return `上游判定该账号已被封禁/限制使用${at ? '（' + at + '）' : ''}：\n`
+        + (c.banned_reason || '账号存在异常行为')
+        + '\n\n封禁期间该账号不参与路由，也不会被自动重试。\n'
+        + '若已申诉成功或确认误判，点「恢复」重新启用。'
+    },
     async removeConn(c) {
       if (!confirm(`确认断开 ${c.provider_code}（owner=${c.owner}）的连接？token 将被删除。`)) return
       try {
@@ -560,6 +604,28 @@ export default {
 .conn-error {
   width: 100%;
   color: #f87171;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 上游封禁：醒目但不同于普通错误（普通错误会自动恢复，封禁不会） */
+.conn-banned {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm, 4px);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #f87171;
+}
+.conn-banned-tag { font-weight: 700; }
+.conn-banned-reason {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-primary, #e6edf7);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

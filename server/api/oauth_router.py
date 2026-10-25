@@ -427,6 +427,15 @@ async def connection_usage(connection_id: int, force: bool = False,
     from server.core.oauth_client import get_oauth_client
     token = get_oauth_client()._crypto.decrypt(row.access_token_enc)
     result = await get_connection_usage(row.provider_code, token, force=force)
+    # 额度接口也报封禁（CodeBuddy 11140）→ 顺手回写账号状态：用户点一次
+    # 「查询余额」就能把账号标记出来，不必等下一次推理请求撞上。
+    if result.get("banned") and not getattr(row, "banned_at", None):
+        try:
+            await get_oauth_client()._record_account_banned(
+                row.provider_code, row.owner,
+                result.get("message") or "账号已被上游封禁")
+        except Exception:
+            pass
     return {**result, "connection_id": row.id, "owner": row.owner}
 
 
@@ -455,6 +464,8 @@ async def delete_connection(connection_id: int, db: AsyncSession = Depends(get_d
 class ConnectionUpdate(BaseModel):
     owner: Optional[str] = None      # 账号显示名（同服务商下唯一，用于区分多账号）
     is_active: Optional[bool] = None
+    # 手动解除/置位封禁（自动识别之外的兜底：申诉成功后用户可在这里恢复）
+    banned: Optional[bool] = None
 
 @router.patch("/connections/{connection_id}")
 async def update_connection(connection_id: int, payload: ConnectionUpdate,
@@ -487,13 +498,27 @@ async def update_connection(connection_id: int, payload: ConnectionUpdate,
             row.owner = new_owner
     if payload.is_active is not None:
         row.is_active = bool(payload.is_active)
+    if payload.banned is not None:
+        # 人工兜底：封禁是上游终态，自动识别写在 note_request_result；
+        # 申诉成功/确认误判时用户可在这里手动解除（解除后正常参与选号）。
+        if payload.banned:
+            from datetime import datetime as _dt
+            row.banned_at = row.banned_at or _dt.utcnow()
+            row.banned_reason = row.banned_reason or "手动标记为已封禁"
+        else:
+            row.banned_at = None
+            row.banned_reason = ""
+            row.fail_count = 0
+            row.cooldown_until = None
     await db.commit()
     # 改名影响凭证拾取（owner 是寻址键），清掉 in-flight 锁避免旧键残留
     try:
         get_oauth_client()._flight_locks.pop(f"{row.provider_code}::{row.owner}", None)
     except Exception:
         pass
-    return {"ok": True, "id": row.id, "owner": row.owner, "is_active": row.is_active}
+    return {"ok": True, "id": row.id, "owner": row.owner, "is_active": row.is_active,
+            "banned_at": row.banned_at.isoformat() + "Z" if row.banned_at else None,
+            "banned_reason": row.banned_reason or ""}
 
 
 # ── 调度器：主动刷新即将到期的 token ──────────────────────────────
@@ -514,6 +539,10 @@ async def _refresh_scheduler_loop():
                 for row in rows:
                     provider = get_oauth_provider(row.provider_code)
                     if not provider:
+                        continue
+                    # 封禁账号不刷新：token 本身可能仍有效，刷新只会白打上游端点
+                    # （封禁靠重新登录或人工恢复解除，见 _save_token / PATCH 接口）
+                    if getattr(row, "banned_at", None):
                         continue
                     lead = provider.refresh_lead_seconds
                     if row.expires_at and now >= (row.expires_at - timedelta(seconds=lead)):
