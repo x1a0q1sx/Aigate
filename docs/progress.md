@@ -1207,3 +1207,60 @@ OAuth refresh failed lobsterai/__default:
 - 下线后调度器（只扫 `is_active=True`）自然不再重试，日志刷屏同步消失。
 
 测试补 3 条（LobsterAI 识别 / 刷新记账三分支 / 7 处分支统一守卫），全量 **1271 通过**。
+
+## Session 40（2026-10-25）Playground 请求在日志页完全看不到 —— 流式成功路径从未写日志
+
+**用户反馈**：「playground 请求我在日志分析界面看不到」。
+
+### 取证（生产 A/B 实测，非推断）
+
+同一模型 `Cline Pass/cline-pass/kimi-k3`（24h 内零其它流量，避免并发干扰），
+用同一个管理会话分别打流式与非流式各一次：
+
+| 请求 | HTTP | 响应体 | 落库行数 |
+|---|---|---|---|
+| `stream: true` | 200 | `data: {...chunk...}` + `[DONE]` | **0** |
+| `stream: false` | 200 | 完整 JSON | 1（success，带 token/延迟） |
+
+修复后同口径复测：**流式 1 行**（`latency 7250 / ttft 5721 / 96+21 tokens`），
+非流式 1 行；`GET /admin/api/logs` 两条都能查到。
+
+### 根因
+
+`playground_chat` 的流式分支只有两条 `except` 里的 `_write_log("error", ...)`，
+**成功路径完全没有日志调用点**。而前端 Playground 每个请求都是流式
+（`Playground.vue: this.streamRun(run, {..., stream: true})`）——
+所以只要模型调通，这次调用在日志页 / 统计分析 / 按服务商用量里彻底不存在；
+**只有失败的 Playground 请求才留痕**，这就是「看不到」的直接原因。
+
+顺带两个同源缺陷：
+
+1. **free_tier 分支从不设 `route_result`** → `routed_provider` 与
+   `routed_provider_id` 恒为 NULL，该批请求全部落进分析页的「(未归属)」桶
+   （对照 Session 38 之后的 `orphan_kind=unattributed`）。
+2. `_write_log` 的异常分支是裸 `except Exception: pass`，写失败无任何痕迹。
+
+### 修复
+
+- 流式成功/失败都落日志：从 chunk 里取 **usage 累计值**（流式上游通常只在末块给，
+  `resp_dict` 为 None 拿不到整包）、首字延迟 `ttft_ms`、缓存读写、估算成本；
+  上游漏报 completion 时用已输出的正文/思考/工具参数文本粗估（与 `/v1` 同口径）。
+- `_write_log` 统一走 `usage_normalize` + `_extract_cache_tokens` +
+  `_segmented_cost`，与 `/v1` 的统计口径一致（此前只取 prompt/completion 两个裸字段，
+  缓存与成本恒 0）。
+- free_tier 分支补 `RouteResult(model=..., provider=...)`，让归因与用量聚合正常。
+- `_write_log` 异常改为 `logger.warning`，写失败可见。
+
+### 测试
+
+新增 `tests/test_playground_stream_logging.py`（6 条）锁死：
+流式成功必须落日志且字段齐全（provider / provider_id / 缓存读 / ttft / 成本）、
+非流式不回归、流式失败仍落日志、free_tier 流式必须归因、以及两条源码守卫
+（防止有人把成功路径的 `_write_log` 删回去 / 把 warning 改回 pass）。
+全量 **1277 通过**。
+
+### 部署
+
+本地 `f4b3703` → 生产 `80b761e`（服务器 GitHub 直连 TLS 反复失败，
+按既有约定改走 `format-patch + scp + git am -3 --keep-cr`）。`pm2 restart aigate`
+后实测通过。纯后端改动，无需重建前端。
