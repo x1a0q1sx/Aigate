@@ -1183,3 +1183,27 @@ HTTP 403 {"code":11140,"msg":"request illegal",
 pip/npm/apt/journal 缓存释放 488M。剩余可清理项（**属其他项目，未擅自动**）：
 系统临时目录 2.0G（artex/recon/eiam 等临时产物）、`data/archives` 3.0G（日志归档，
 按天 gzip，可删旧）、`data/backups` 1.3G、服务器家目录下的 `artex_deploy` 5.9G。
+
+### 追加：LobsterAI 同类终态（部署时从 pm2 错误日志发现）
+
+部署重启后 `aigate-error.log` 每 60s 刷一条：
+
+```
+OAuth refresh failed lobsterai/__default:
+  refresh HTTP 403: {"code":40302,"message":"账号已被禁用","data":null}
+```
+
+取证：该 token 已于 10-22 过期，刷新端点一直回「账号已被禁用」，而刷新调度器
+**只按 `is_active` 过滤、不认封禁语义**，于是每分钟重打一次注定失败的端点。
+
+修法（同一次提交内）：
+- `_BANNED_MARKERS` 补 `账号已被禁用` / `帳號已被禁用`；
+- 新增 `_note_refresh_failure()`，把 7 处刷新失败分支（generic / codebuddy /
+  lobsterai / cline / trae / codearts / device_token）统一收口：封号 → 置
+  banned 标记 + 下线；其余按原 P1-15 语义只下线。之前每处各写一遍
+  `_refresh_credential_dead` 判断，漏判就是这样产生的。
+- `_banned_reason_text()` 增加上游 `"message"` 字段来源（LobsterAI 没有 displayMsg），
+  且只接受本身带封禁语义的文案，避免把普通错误说明当原因落库。
+- 下线后调度器（只扫 `is_active=True`）自然不再重试，日志刷屏同步消失。
+
+测试补 3 条（LobsterAI 识别 / 刷新记账三分支 / 7 处分支统一守卫），全量 **1271 通过**。

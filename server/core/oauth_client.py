@@ -90,20 +90,26 @@ def _now_utc() -> datetime:
 
 
 def _banned_reason_text(error) -> str:
-    """封号错误文本 → 落库展示用的简短原因（≤500，owner/banned_reason 列宽）。
+    """封号错误文本 → 落库展示用的简短原因（≤500，banned_reason 列宽）。
 
-    优先取上游 displayMsg 的中文文案（"账号存在异常行为，已被限制使用"），
-    这样 OAuth 连接页能直接显示上游原话；取不到退回原始错误文本前 300 字。"""
+    取上游**原话**，让 OAuth 连接页直接显示封禁原因。三家形态不同，按优先级：
+      1) CodeBuddy 的 displayMsg: {"zh": "账号存在异常行为，已被限制使用", "en": ...}
+      2) LobsterAI / 常见网关的 message: "账号已被禁用"
+      3) 都取不到 → 原文截断（不能返回空，界面要能看出为什么被封）
+    """
     text = str(error or "").strip()
     if not text:
         return "上游判定账号已被限制使用"
+    from server.core.error_text import is_account_banned_text
     try:
-        m = re.search(r'"zh"\s*:\s*"([^"]+)"', text)
-        if m and m.group(1).strip():
-            return m.group(1).strip()[:500]
-        m = re.search(r'"en"\s*:\s*"([^"]+)"', text)
-        if m and m.group(1).strip():
-            return m.group(1).strip()[:500]
+        for pat in (r'"zh"\s*:\s*"([^"]+)"', r'"en"\s*:\s*"([^"]+)"',
+                    r'"message"\s*:\s*"([^"]+)"'):
+            m = re.search(pat, text)
+            if not (m and m.group(1).strip()):
+                continue
+            val = m.group(1).strip()
+            if is_account_banned_text(val):
+                return val[:500]
     except Exception:
         pass
     return text[:500]
@@ -142,9 +148,12 @@ def _refresh_credential_dead(status_code: int, error_text: str = "") -> bool:
     """True = refresh token 确实失效（应下线）；False = 临时故障（保留 active 待重试）。
 
     规则：401 恒为失效；400 需带 invalid_grant 类语义标记；
-    429/5xx/网络错误一律视为临时（保留下线机会）。
+    429/5xx/网络错误一律视为临时（保留下线机会）；上游封号也视为终态
+    （见 is_account_banned_text —— 账号禁用了，refresh token 再新也没用）。
     """
     text = (error_text or "").lower()
+    if is_account_banned_text(text):
+        return True
     if status_code == 401:
         return True
     if status_code == 400:
@@ -154,6 +163,25 @@ def _refresh_credential_dead(status_code: int, error_text: str = "") -> bool:
         return any(m in text for m in _DEAD_CREDENTIAL_MARKERS)
     # 429 限流、5xx 上游故障、其它 → 临时
     return False
+
+
+def _note_refresh_failure(row, status_code: int, err: str) -> None:
+    """refresh 失败统一记账（7 处刷新分支共用，避免各自漏判）。
+
+    - 封号（CodeBuddy 11140 / LobsterAI 40302「账号已被禁用」等）：写 banned 标记
+      并下线。不下线的话 60s 一轮的刷新调度器会一直重打一个注定失败的端点，
+      生产实测 LobsterAI 就是这样每 60 秒刷一次日志。
+    - 其余凭证失效：仅下线（沿用既有语义）。
+    """
+    row.last_error = (err or "")[:500]
+    if is_account_banned_text(err):
+        if not getattr(row, "banned_at", None):
+            row.banned_at = _now_utc()
+        row.banned_reason = _banned_reason_text(err)[:500]
+        row.is_active = False
+        return
+    if _refresh_credential_dead(status_code, err):
+        row.is_active = False
 
 
 # ── 凭证身份（防止 A 账号的 token 覆盖 B 账号的连接）──────────────
@@ -575,9 +603,7 @@ class OAuthClient:
         }
         new_cred, err = await lb.refresh_token(cred)
         if not new_cred:
-            existing.last_error = err[:300]
-            if _refresh_credential_dead(0, err):
-                existing.is_active = False
+            _note_refresh_failure(existing, 0, err)
             await db.commit()
             return False, err
         # 身份字段沿用旧值（latest_keyfrom 刻意不更新）；uid/nickname 保留
@@ -1049,9 +1075,7 @@ class OAuthClient:
             err = resp.text[:300]
             # P1-15: 只有「凭证真的失效」才永久下线；5xx/429/网络抖动只记错误，
             # 否则上游一次抖动就把连接判死刑、须人工重登。
-            existing.last_error = err
-            if _refresh_credential_dead(resp.status_code, err):
-                existing.is_active = False
+            _note_refresh_failure(existing, resp.status_code, err)
             await db.commit()
             return False, f"refresh endpoint HTTP {resp.status_code}: {err}"
         try:
@@ -1084,19 +1108,15 @@ class OAuthClient:
             if resp.status_code >= 400:
                 err = resp.text[:300]
                 # P1-15: 同上——仅凭证失效才下线
-                existing.last_error = err
-                if _refresh_credential_dead(resp.status_code, err):
-                    existing.is_active = False
+                _note_refresh_failure(existing, resp.status_code, err)
                 await db.commit()
                 return False, f"http {resp.status_code}: {err}"
             data = resp.json()
             # 腾讯返回：{ "code": 0, "data": { "accessToken": "...", "refreshToken": "...", "expiresIn": 3600 } }
             if data.get("code") != 0 or not data.get("data", {}).get("accessToken"):
                 err = data.get("msg") or "no accessToken in response"
-                existing.last_error = err
                 # P1-15: 业务码非 0 也需甄别（限流/风控不该下线；refresh token 无效才下线）
-                if _refresh_credential_dead(200, f"{data.get('code')} {err}"):
-                    existing.is_active = False
+                _note_refresh_failure(existing, 200, f"{data.get('code')} {err}")
                 await db.commit()
                 return False, f"tencent code={data.get('code')}: {err}"
             tok_inner = data["data"]
@@ -1662,9 +1682,7 @@ class OAuthClient:
             if resp.status_code >= 400:
                 err = resp.text[:300]
                 # P1-15: 仅凭证失效才下线（429/5xx 抖动保留下次重试机会）
-                existing.last_error = err
-                if _refresh_credential_dead(resp.status_code, err):
-                    existing.is_active = False
+                _note_refresh_failure(existing, resp.status_code, err)
                 await db.commit()
                 return False, f"http {resp.status_code}: {err}"
             body = resp.json()
@@ -1672,9 +1690,7 @@ class OAuthClient:
             access = inner.get("accessToken")
             if not access:
                 err = body.get("message") or body.get("error") or "no accessToken in response"
-                existing.last_error = str(err)
-                if _refresh_credential_dead(200, str(err)):
-                    existing.is_active = False
+                _note_refresh_failure(existing, 200, str(err))
                 await db.commit()
                 return False, f"cline refresh: {err}"
             tok = {
@@ -1712,9 +1728,7 @@ class OAuthClient:
                                                   "Accept": "application/json"})
             if resp.status_code >= 400:
                 err = resp.text[:300]
-                existing.last_error = err
-                if _refresh_credential_dead(resp.status_code, err):
-                    existing.is_active = False
+                _note_refresh_failure(existing, resp.status_code, err)
                 await db.commit()
                 return False, f"device token refresh HTTP {resp.status_code}: {err}"
             body = resp.json() or {}

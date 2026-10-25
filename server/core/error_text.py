@@ -88,7 +88,9 @@ _BANNED_MARKERS = (
     "account has been banned",
     "账号存在异常行为",
     "账号已被限制使用",
+    "账号已被禁用",
     "帳號存在異常行為",
+    "帳號已被禁用",
 )
 
 

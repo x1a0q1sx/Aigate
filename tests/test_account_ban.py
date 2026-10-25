@@ -359,3 +359,54 @@ async def test_refresh_scheduler_skips_banned_guard():
     from server.api import oauth_router
     src = inspect.getsource(oauth_router._refresh_scheduler_loop)
     assert "banned_at" in src
+
+
+# ── 7) 其他服务商的同类终态（LobsterAI 40302「账号已被禁用」）──────
+
+LOBSTERAI_403 = 'refresh HTTP 403: {"code":40302,"message":"账号已被禁用","data":null}'
+
+
+def test_lobsterai_disabled_account_recognized():
+    """LobsterAI 刷新报 40302「账号已被禁用」= 同一类终态，必须一并识别。
+
+    生产实证（2026-10-25）：这条错误从 10-22 token 过期起持续出现，刷新调度器
+    每 60 秒重试一次，日志被它刷屏，而 OAuth 页完全看不出来。
+    """
+    from server.core.error_text import is_account_banned_text
+    assert is_account_banned_text(LOBSTERAI_403)
+    assert is_account_banned_text('{"code":40302,"message":"账号已被禁用","data":null}')
+    # 繁体变体
+    assert is_account_banned_text("帳號已被禁用")
+
+
+def test_refresh_failure_marks_ban_instead_of_retrying():
+    """刷新遇封号 → 置 banned 标记并下线（否则 60s 一轮刷新永远重打）。
+
+    非封号的凭证失效仍然只是下线（沿用 P1-15 语义），不被误标成封禁。
+    """
+    from server.core.oauth_client import _note_refresh_failure
+    from types import SimpleNamespace
+    row = SimpleNamespace(last_error="", banned_at=None, banned_reason="", is_active=True)
+    _note_refresh_failure(row, 403, LOBSTERAI_403)
+    assert row.banned_at is not None
+    assert row.banned_reason == "账号已被禁用"
+    assert row.is_active is False
+    assert row.last_error == LOBSTERAI_403
+
+    # 非封号的失效：下线但**不**标封禁
+    row2 = SimpleNamespace(last_error="", banned_at=None, banned_reason="", is_active=True)
+    _note_refresh_failure(row2, 401, '{"error":"invalid_grant"}')
+    assert row2.banned_at is None and row2.banned_reason == ""
+    assert row2.is_active is False
+
+    # 瞬时限流：既不下线也不标封禁
+    row3 = SimpleNamespace(last_error="", banned_at=None, banned_reason="", is_active=True)
+    _note_refresh_failure(row3, 429, '{"message":"too many requests"}')
+    assert row3.banned_at is None and row3.is_active is True
+
+
+def test_all_refresh_branches_use_unified_failure_recorder():
+    """7 处刷新分支必须都走 _note_refresh_failure，否则总有分支漏判封号。"""
+    from server.core import oauth_client as oc
+    src = inspect.getsource(oc)
+    assert src.count("_note_refresh_failure(") >= 8   # 1 定义 + ≥7 调用
