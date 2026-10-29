@@ -1420,3 +1420,28 @@ AIGate 不在官方支持清单（清单里是 ZCode/Claude Code/Codex/Cursor/Cl
 
 - 连接复用（模块级 httpx client）、排队预算提到 600s：本轮按用户选择未做，留有数据后再评估。
 - Qoder 适配器不读 `__proxy_force`（代理池对 Qoder 无效），属独立缺陷，待排期。
+
+### 七、⚠️ 部署受阻与重大环境发现（2026-10-29）
+
+按既有约定部署时发现：**`182.254.147.87`（`ssh Ali`）上 AIGate 已完全不存在**。
+
+核查证据：
+
+| 检查项 | 结果 |
+|---|---|
+| 服务目录（服务账号家目录下的 aigate） | **不存在** |
+| `pm2 list` | 只有 `pm2-logrotate`，**无 aigate 进程** |
+| `~/.pm2/dump.pm2` | **2 字节（空）** —— `pm2 save` 的进程清单已丢 |
+| `systemctl status aigate` | 单元文件仍在（`/etc/systemd/system/aigate.service`），但 **inactive (dead) 且 disabled** |
+| `journalctl -u aigate --since '7 days ago'` | **No entries** |
+| 全盘 `aigate.db` / `venv` / `start.py` | **均无命中** |
+| 8000 端口 | 被 `sshd` 占用（`users:(("sshd",pid=...,fd=7))`）= 只是个 **SSH 转发**，不是服务 |
+| 磁盘 | 20G/40G 已用（52%），非磁盘写满导致的删除 |
+
+这与 Session 40 记录的「生产 `80b761e` 在线」矛盾 —— 即在 Session 40 之后、本轮之前，
+该机上的 AIGate 部署被移除（目录、数据库、venv、pm2 清单、systemd 启用状态全无）。
+**原因未知，需要用户确认**（是否换机部署 / 被清理 / 迁到别处）。
+
+因此本轮代码改动**只落在 GitHub**（`47099f9`），**未部署到任何在线环境**。
+`aigate.service` 的 WorkingDirectory 指向该服务目录，说明它原本就装在那里；现在该路径为空 —— 若要从零恢复，需要代码 + `config.yaml`（含全部生产密钥，
+只在原机、不入仓库）+ `data/aigate.db` 三样，后两者若也随目录一起丢失则数据不可恢复。
