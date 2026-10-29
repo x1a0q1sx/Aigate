@@ -430,6 +430,41 @@ async def _stream_with_first_chunk_timeout(source, timeout_seconds: float):
         yield chunk
 
 
+async def _stream_with_idle_keepalive(source, interval: float = 0.0):
+    """在等待上游数据超过 interval 秒时补发 SSE 注释心跳（interval<=0 则直通）。
+
+    背景（2026-10-29）：Qoder 等上游在首个 token 之前会有数十秒静默（排队
+    10605 / 长上下文推理），这段时间网关对客户端零字节 —— 客户端或中间代理
+    的空闲超时会把连接掐断，表现为「卡死/反复重连」，而请求其实还在正常进行。
+
+    ⚠️ 这里**不能**用 asyncio.wait_for(anext(...))：超时会取消那个 task，而上游
+    anext 被取消等同于关掉底层 httpx 流，一次心跳就变成杀死整个请求。
+    正确做法是用 asyncio.wait 只「等一会儿看看」，超时后把同一个 task 留在
+    原处继续等，直到它真的产出数据。
+    """
+    if not interval or interval <= 0:
+        async for chunk in source:
+            yield chunk
+        return
+    iterator = source.__aiter__()
+    pending = None
+    while True:
+        if pending is None:
+            pending = asyncio.ensure_future(anext(iterator))
+        done, _ = await asyncio.wait({pending}, timeout=interval)
+        if not done:
+            # 上游尚未吐字：发一个 SSE 注释（规范允许，客户端忽略）
+            yield b": keepalive\n\n"
+            continue
+        try:
+            chunk = pending.result()
+        except StopAsyncIteration:
+            return
+        finally:
+            pending = None
+        yield chunk
+
+
 def _merge_oauth_headers(provider, base_headers=None):
     """Merge auth and per-provider routing metadata into outbound header hints."""
     eh = dict(base_headers) if base_headers else None
@@ -569,6 +604,11 @@ def _safe_header(val: str) -> str:
 
 def _format_sse_chunk(chunk: dict, model_id_full: str) -> bytes:
     """Serialize an OpenAI-compatible SSE chunk."""
+    # 适配器上报的上游状态（如 Qoder 排队）走 SSE 注释：客户端忽略、不产生正文，
+    # 但连接保持活跃，且看原始流的人能知道「在等什么、等了多久」。
+    _comment = chunk.get("__sse_comment") if isinstance(chunk, dict) else None
+    if _comment is not None:
+        return f": {str(_comment).replace(chr(10), ' ')}\n\n".encode("utf-8")
     if "model" in chunk:
         chunk = {**chunk, "model": model_id_full}
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
@@ -1712,6 +1752,11 @@ async def _chat_completions_impl(
     )
     http_status_code = 200
     _send_time = time.time()  # 提前设，级联路径也需要
+    try:
+        _idle_keepalive_seconds = float(
+            getattr(getattr(config, "stream", None), "idle_keepalive_seconds", 15) or 0)
+    except Exception:
+        _idle_keepalive_seconds = 15.0
     route_result: Optional[RouteResult] = None
     made_by_cascade = False  # 是否已由级联回退发起过实际请求
     is_auto = request.is_auto
@@ -2154,6 +2199,9 @@ async def _chat_completions_impl(
                         async for ck in ctx["gen"]:
                             if isinstance(ck, dict) and "error" in ck:
                                 raise RuntimeError(f"upstream_stream_error: {ck.get('error')}")
+                            if isinstance(ck, dict) and ck.get("__sse_comment") is not None:
+                                yield _format_sse_chunk(ck, mid_full)
+                                continue   # 上游状态注释：透传但不入日志缓冲
                             _cbuf.append(ck)
                             u = _stream_usage_dict(ck) if isinstance(ck, dict) else {}
                             if u:
@@ -2861,6 +2909,8 @@ async def _chat_completions_impl(
                         )
                     ctx["gen"] = gen
                     async for ck in _stream_with_first_chunk_timeout(gen, ctx["first_chunk_timeout"]):
+                        if isinstance(ck, dict) and ck.get("__sse_comment") is not None:
+                            continue   # 上游状态注释（排队等）：不参与缓冲与用量统计
                         if ctx["ttft_ms"] is None:
                             ctx["ttft_ms"] = int((time.time() - _send_time) * 1000)
                             ctx["attempt_ttft_ms"] = int((time.time() - ctx["start"]) * 1000)
@@ -2993,6 +3043,9 @@ async def _chat_completions_impl(
                 async for ck in ctx["gen"]:
                     if isinstance(ck, dict) and "error" in ck:
                         raise RuntimeError(f"upstream_stream_error: {str(ck.get('error', 'unknown'))[:200]}")
+                    if isinstance(ck, dict) and ck.get("__sse_comment") is not None:
+                        yield _format_sse_chunk(ck, mid_full)
+                        continue   # 上游状态注释：透传但不入日志缓冲与用量统计
                     ctx["buf"].append(ck)
                     u = _stream_usage_dict(ck)
                     if u:
@@ -3054,7 +3107,11 @@ async def _chat_completions_impl(
 
         # 连接池治理：外层 db 取数完成（生成器用独立会话），先归还再返回流
         await _release_db(db)
-        return StreamingResponse(cascade_stream(), media_type="text/event-stream")
+        # auto 级联里每个候选都可能在上游静默（排队/长上下文），同样补心跳
+        return StreamingResponse(
+            _stream_with_idle_keepalive(cascade_stream(), _idle_keepalive_seconds),
+            media_type="text/event-stream",
+        )
 
     else:
         # 非流式级联回退：完整业务请求内置于回退循环
@@ -3171,6 +3228,10 @@ async def _chat_completions_impl(
                         try:
                             _diag(conversation_id, "upstream_stream_start", _diag_start, provider=route_result.provider.name, model=route_result.model.model_id)
                             async for chunk in _attempt_gen:
+                                # 上游状态注释（Qoder 排队等）：直接透传，不算首字/不清缓冲
+                                if isinstance(chunk, dict) and chunk.get("__sse_comment") is not None:
+                                    yield _format_sse_chunk(chunk, model_id_full)
+                                    continue
                                 # 首字延迟：首个到达 chunk 距请求开始的时间
                                 if _stream_ttft_ms is None:
                                     _stream_ttft_ms = int((time.time() - _send_time) * 1000)
@@ -3352,7 +3413,12 @@ async def _chat_completions_impl(
                         pass
             # 连接池治理：外层 db 取数完成（wrap_stream 不依赖 db），先归还再返回流
             await _release_db(db)
-            response = StreamingResponse(wrap_stream(), media_type="text/event-stream")
+            # 上游首字前的静默期补 SSE 心跳（Qoder 排队/长上下文可达数十秒），
+            # 防客户端与中间代理因空闲掐断连接。默认 15s，0=关闭。
+            response = StreamingResponse(
+                _stream_with_idle_keepalive(wrap_stream(), _idle_keepalive_seconds),
+                media_type="text/event-stream",
+            )
         else:
             try:
                 # v3.5 同模型 key 内切换：首把失败则在同一模型归属 key 集合内换下一把重试

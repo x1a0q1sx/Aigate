@@ -704,6 +704,13 @@ class QoderAdapter(BaseAdapter):
                                     "qoder 排队中（%s, queueType=%s, 第 %d 次重试，等 %ds，剩余预算 %ds）",
                                     qsig.get("modelKey") or qoder_key, qsig.get("queueType"),
                                     queue_tries, retry_after, queue_budget)
+                                # 让排队对客户端可见：走 SSE 注释帧（不产生正文、不参与
+                                # 用量统计）。此前这里是纯静默 sleep，用户只能看到「卡死」，
+                                # 且本地首块超时/竞速会在 15-20s 判定它失败，反而加压队列。
+                                yield {"__sse_comment": (
+                                    f"qoder upstream queued: {qsig.get('modelKey') or qoder_key}"
+                                    f" wait {retry_after}s (retry {queue_tries}/"
+                                    f"{QODER_QUEUE_MAX_RETRIES}, budget left {queue_budget}s)")}
                                 break   # 跳出流读取 → 外层重签重试
                             # ② 计费/额度拦截：首帧直接抛错走回退（换模型/换账号）
                             if first_frame and _is_billing_block(inner):

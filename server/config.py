@@ -33,6 +33,14 @@ class AutoRouterConfig(BaseModel):
     # Interactive streamed auto routing must yield a useful response promptly.
     stream_first_chunk_timeout_seconds: int = 20
     stream_first_response_budget_seconds: int = 75
+
+
+class StreamConfig(BaseModel):
+    """SSE 流式通用行为。"""
+    # 上游首字前的静默期给客户端补 SSE 注释心跳（秒），0 = 关闭。
+    # Qoder 排队（10605）与长上下文推理可静默数十秒，此前这段时间零字节，
+    # 客户端/中间代理的空闲超时会掐断连接 → 表现为「卡死/反复重连」。
+    idle_keepalive_seconds: int = 15
 class RateLimitConfig(BaseModel):
     default_rpm: int = 60
     default_tpm: int = 100000
@@ -305,6 +313,7 @@ class Config(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     health_check: HealthCheckConfig = Field(default_factory=HealthCheckConfig)
     auto_router: AutoRouterConfig = Field(default_factory=AutoRouterConfig)
+    stream: StreamConfig = Field(default_factory=StreamConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     log_archive: LogArchiveConfig = Field(default_factory=LogArchiveConfig)

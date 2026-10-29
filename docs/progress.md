@@ -1264,3 +1264,159 @@ OAuth refresh failed lobsterai/__default:
 本地 `f4b3703` → 生产 `80b761e`（服务器 GitHub 直连 TLS 反复失败，
 按既有约定改走 `format-patch + scp + git am -3 --keep-cr`）。`pm2 restart aigate`
 后实测通过。纯后端改动，无需重建前端。
+
+---
+
+## Session 41（2026-10-29）Qoder 高延迟定性 + SSE 空闲心跳 / Muse 与 ZCode 接入路线澄清
+
+用户提问：「Qoder 似乎延迟都很高，看看 github 上的项目，是有优化还是怎样，怎么解决？
+Muse 也看下有没有别的方式？还有 Zcode 我也想能够接入。」
+
+### 一、Qoder 高延迟：三层归因（外部实证 + 本地代码核对）
+
+对标项目 **`shuishuipingan/qoder2api-hub`**（442★，2026-10-29 仍在更新，COSY 签名 +
+国际/国内双区反向网关，与 AIGate 做的事高度重合）。其 `docs/risk-control-and-queueing.md`
+第 7 节是对**官方客户端 `qoderclicn.exe` 的只读逆向结论**，这是本项目最有价值的输入。
+
+**第 1 层：上游排队是客观存在的（不是我们的 bug）**
+
+- 免费/低档模型高峰返回 `10605 + isQueued:true + retryAfterSeconds`（`RESOURCE_LIMIT`）。
+- 官方客户端的排队是**独立的轮询协议**（不是"失败后重试"）：
+  `GET /api/v2/service/ask/queue/status?requestSetId=&modelKey=&queueType=`，
+  每轮 `sleep(retryAfterSeconds)` 再查一次，连续 3 次失败才判致命，
+  **总等待上限默认 60 分钟**（`QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000`）。
+  状态以 `system/model_queue_status` 事件流式回给客户端，UI 显示「模型负载较高」。
+- 对照我们的实现：`QODER_QUEUE_MAX_RETRIES=6`、单次封顶 60s、**总预算仅 300s**
+  （`qoder_adapter.py:49-51`）。预算比官方短一个数量级。
+
+**第 2 层（真正的放大器，且在我们自己代码里）：本地超时与排队窗口错配**
+
+| 本地机制 | 阈值 | 位置 |
+|---|---|---|
+| auto 流式首块超时 | **20s** | `config.py` `stream_first_chunk_timeout_seconds` |
+| 竞速「无内容」判定 | **15s** | `config.py` `race.no_content_seconds` |
+| Qoder 单次排队窗口 | **30s**（实测倒计时 30→11） | 上游给的 `retryAfterSeconds` |
+
+即上游刚进入第一个排队窗口，我们本地已经判它"死"，触发回退或并行再发一条 Qoder 请求。
+参考项目把「排队失败后秒级重试」明确列为**反模式**（"直接放大队列压力，
+`retryAfterSeconds` 就是让你等"）。我们等于系统性踩了这一条。
+
+**第 3 层：零连接复用**（次因，但成本固定）
+
+`qoder_adapter.py` 每个请求、以及**每次排队重签重试**都 `async with httpx.AsyncClient(...)`
+新建客户端，退出即 close —— 无 keep-alive、无连接池、无 `http2=True`。
+排队重试 6 次 = 6 次 TCP+TLS 握手。参考项目用同步 `urllib` 同样没有连接池，
+所以这不是主要矛盾。另外 qoder 适配器**完全忽略 `__proxy_force`**（对比
+`openai_compat.py` / `codex_responses.py` 都有 `_proxy()`），代理池对 Qoder 无效。
+
+**第 4 层：静默期对客户端零字节**
+
+排队 `await asyncio.sleep(retry_after)` 期间不 yield 任何东西，客户端看到的是"卡死"，
+中间代理/客户端空闲超时会直接掐连接。
+
+### 二、本次实现（用户选定：心跳 + 排队可见）
+
+1. **通用 SSE 空闲心跳** `_stream_with_idle_keepalive()`（`v1_router.py`）。
+   - ⚠️ 关键陷阱：**不能**用 `asyncio.wait_for(anext(...))`。超时会 cancel 那个 task，
+     而上游 `anext` 被取消等同于关掉底层 httpx 流 —— 一次心跳就把整个请求杀死。
+     正确写法是 `asyncio.wait({pending}, timeout=...)`，超时后**把同一个 task 留在原处**
+     继续等，只额外 yield 一个 `: keepalive\n\n` 注释帧。
+   - 接到两条流式路径：直连（`wrap_stream`）与 auto 级联（`cascade_stream`）。
+   - 新配置 `stream.idle_keepalive_seconds`，默认 **15**，`0` = 关闭，可热改。
+2. **Qoder 排队可见**：排队等待时 yield `{"__sse_comment": "qoder upstream queued: ..."}`
+   （`qoder_adapter.py`），由 `_format_sse_chunk` 渲染成 SSE 注释帧。
+   新增 `__sse_comment` 通道后，在**四个消费点**统一处理：直连流、auto 候选内部、
+   auto 胜出转发、combo 转发。注释帧**透传给客户端但不入日志缓冲、不计 usage、
+   不算实质内容**（否则会在候选尚未真正输出时误锁候选、污染 completion 估算）。
+3. `config.py` 新增 `StreamConfig`，挂到 `Config.stream`（随现有热加载生效）。
+
+### 三、测试
+
+新增 `tests/test_stream_idle_keepalive.py`（**12 条**），重点锁死：
+- 静默期真的补心跳，且**一个 chunk 都不吞、顺序不变**；
+- **心跳不得取消上游**（用生成器内部记录 `CancelledError`/`GeneratorExit` 验证）——
+  这是最容易写错的一点，用 `wait_for` 的实现会被这条测试抓住；
+- 注释帧渲染成 `: ` 注释行、换行被压平、不算实质内容、不产生 usage、不计入输出文本；
+- 源码守卫：两条流式路径都必须接上包装器（漏一处就有一条路继续卡死）；
+- 配置项存在且默认值正确。
+全量 **1289 通过**（原 1277 + 12）。
+
+### 四、Muse：官方能力已变，设备流不再是唯一出路
+
+`dev.meta.ai/llms.txt` 可拉到完整官方文档。关键事实（均为官方原文）：
+
+- **Model API 同时提供三种协议**：`POST /v1/responses`（OpenAI Responses）、
+  `POST /v1/chat/completions`（OpenAI Chat）、`POST /v1/messages`
+  （**Anthropic Messages 兼容**）。三者同模型、同鉴权、同价。
+- 官方明确支持 **OpenAI SDK / Anthropic SDK / LangChain / LiteLLM**。
+- 鉴权只需 `Authorization: Bearer LLM_<id>_<secret>`（`dev.meta.ai` 控制台
+  “API keys” → Create API key 生成），**完全不需要设备流**。
+- 限流**按团队**（不按 key）：`muse-wonder-1.0` / `muse-spark-1.3` 均 3000 RPM、
+  4M TPM；contributor 变体 150 RPM。
+- 定价（Standard，每百万 token）：Wonder 输入 $4 / 输出 $20 / 缓存输入 $0.20；
+  Spark 输入 $1.25 / 输出 $4.25 / 缓存 $0.15；
+  **contributor 变体便宜约 10 倍**（Spark $0.10/$0.20）代价是内容可用于训练。
+- `muse-wonder-full` 只在 Muse Code 订阅里，Model API 拿不到
+  （把 `reasoning_effort` 设 `"max"` 也不会选中它）。
+
+交叉验证（两个独立成熟项目，结论一致）：
+
+- **`router-for-me/CLIProxyAPI`（56.9k★，2026-10-29 更新）**：`internal/auth/meta/meta.go`
+  实现了 RFC 8628 设备流，`client_id=1031625952748946`、
+  `User-Agent: muse-code/1.0.2`、form 参数、`authorization_pending`/`slow_down`
+  处理 —— **与 AIGate 现有实现逐字段一致**。这说明我们没写错，失败在 Meta 门户侧
+  （与既有记忆 `aigate-muse-meta-integration` 的定性一致）。
+  它同时提供 `meta-api-key` 配置项（直填 key，base_url 默认 `https://api.meta.ai/v1`），
+  即**双通道**：能登录就 OAuth，不能就填 key。
+- **`stricker67-ai/muse-openclaw`**：实证 `muse login`（浏览器 OAuth）落盘的
+  `auth.json` 里 `api_key` 形如 `LLM|<id>|<secret>`，**能直接当 bearer 打
+  `https://api.meta.ai/v1/chat/completions` 得 200**；而 `access_token`（`dca:` 前缀）
+  会 401。另给出两个实用踩点：`max_tokens` 太小（如 32）会因 reasoning 吃满而
+  返回空 content + `finish_reason:length`；Muse Code 默认走 contributor 档（会训练）。
+
+**结论**：AIGate 现有 muse 实现（设备流 → 铸 `LLM|` key → Responses wire）方向正确，
+`_is_muse_static_key` 也已同时识别 `LLM|` 与 `LLM_` 两种前缀，**代码无需改动即可
+承接控制台 key**。剩下的是"能不能拿到 key"，而不是"接不上"。本轮未改 Muse 代码。
+
+### 五、ZCode：可选「模拟客户端登录」，但有 ToS 风险
+
+参考 **`genevatrkassulkusc82-collab/zcode-proxy`**（24★）的实现，ZCode/GLM 有两条路：
+
+**路 A — OAuth 授权码登录**（它叫「模拟客户端登录」）：
+
+```
+授权  https://chat.z.ai/api/oauth/authorize   client_id=client_P8X5CMWmlaRO9gyO-KSqtg
+兑换  POST https://zcode.z.ai/api/v1/oauth/token   {"provider":"zai","code","redirect_uri","state"}
+      → data.token（Coding Plan JWT）+ data.zai{access_token,refresh_token}
+取 key POST https://api.z.ai/api/auth/z/login        {"token": accessToken} → 业务 token
+      GET  /api/biz/customer/getCustomerInfo           → 默认 organizationId / projectId
+      创建或复用名为 zcode-api-key 的 key → /copy/{key} → {key}.{secret}
+```
+
+两种回调模式：loopback（`http://127.0.0.1:{port}/oauth/callback`，需本机监听）
+与手动粘贴（`redirect_uri=https://zcode.z.ai/login`）。
+**这是纯 HTTP，可移植到 Python**，但 loopback 模式要求登录动作发生在本机/可达回调处。
+
+**路 B — 直接用 `x-api-key`**（无登录、无验证码）：
+`POST https://api.z.ai/api/anthropic/v1/messages`。
+这条路与 AIGate 现有的 `anthropic` 适配器**天然兼容**：
+`anthropic_adapter._build_url()` 对 `https://api.z.ai/api/anthropic`
+会拼成 `.../api/anthropic/v1/messages?beta=true`（正确），
+且对非 `api.anthropic.com` 的 base 会自动补 `Authorization: Bearer` 作为双保险。
+
+⚠️ **ToS 边界（官方原文）**：
+「GLM Coding Plan may only be used within officially supported tools and products.
+Users may not use their subscription benefits for tools or scenarios outside of this scope.
+Use in unsupported tools may result in restricted benefits.」
+处置手段为限流 / 冻结 / 封号，且**订阅一经购买不退款**；
+「Account sharing or multi-user access is prohibited」。
+AIGate 不在官方支持清单（清单里是 ZCode/Claude Code/Codex/Cursor/Cline/TRAE 等客户端）。
+另注：ZCode 对编程套餐请求会走 `/api/paas/c1f3a7e2/v2/client` 客户端签名握手
+（本地 bundle `zcode.cjs` 实证），参考网关项目普遍**不实现**该签名、只做 UA 指纹仿冒。
+
+**本轮未改 ZCode 相关代码**，仅固化技术路线与风险，待用户明确接受后再实施。
+
+### 六、未做/后续
+
+- 连接复用（模块级 httpx client）、排队预算提到 600s：本轮按用户选择未做，留有数据后再评估。
+- Qoder 适配器不读 `__proxy_force`（代理池对 Qoder 无效），属独立缺陷，待排期。
