@@ -1541,3 +1541,87 @@ xhigh/none/off）+ 垃圾值全部 200，唯一被拒的 `max` 报 **11133** 而
 - **待用户提供**：一条真实登录态下的 Bearer JWT（脱敏前后缀即可）→ 我打一发
   用户信息端点与消息端点各打一发，验证 token 寿命、响应体形状与轮询节奏，
   再决定是否立项。在此之前不动代码。
+
+## Session 43（2026-11-03）日志筛选不吃时间范围 + Cline Pass 137s ConnectError 相位超时
+
+### 一、bug：请求日志筛选永远是「全部时间」
+
+用户报：分析页顶部选了「今日 / 近 7 天」，日志区的**状态 / 服务商 / 模型 / 账号**
+筛选结果不随时间范围变化，筛出来的都是全部历史。
+
+取证（不是猜）—— 两头都没接上：
+
+1. `GET /admin/api/logs` **根本没有 start/end 参数**，前端也从不传。趋势/用量接口
+   一早就有 start/end，唯独日志列表漏了；
+2. `/logs/filters` 与 `/logs/providers` 是全表 `GROUP BY` 去重 —— 于是窄窗口里
+   根本没日志的服务商照样出现在候选里（选了必然 0 条）；
+3. 前端 `LogsPanel` 不接收 `range`：分析页的 range 只驱动趋势与用量卡片。
+
+### 二、实现（commit `ea5b75f`）
+
+- 后端新增 `_time_window_conds(start, end, col)` 与 `_log_window_conds(...)`，
+  复用既有 `_parse_dt_param` 宽松口径（带 Z / ±时区都吃，脏值当未提供、不 422）；
+- `/logs`（含 `log_type=refresh` 分支，用 `ModelRefreshLog.created_at`）、
+  `/logs/filters`、`/logs/providers` 统一吃窗口；
+- **`_logs_total_key` 加 window 段**：否则切窗口会命中旧 total，出现「列表 3 条 /
+  总数 900」错位（Session 38 同类教训）；
+- `/logs/export` 支持 start/end（给了就覆盖 hours）；顺手修掉 `api.js` 导出**静默丢弃
+  model / account** 的老问题（后端一直支持，导出文件与屏幕筛选对不上）；
+- 前端：`LogsPanel` 新增 `range` prop + watch（切范围回第 1 页重取 + 候选值同步刷新），
+  分析页 `<LogsPanel :range="range" />`；导出按钮文案改为「当前时间范围」。
+
+测试 `tests/test_logs_time_window.py`（11 条）：窗口生效、四路筛选与窗口叠加、
+total 缓存键、候选值收窄、刷新日志、脏参数兜底、导出跟随、前后端源码守卫。
+
+### 三、Cline Pass 那条 137.2s 的 ConnectError
+
+日志：`Cline Pass/cline-pass/deepseek-v4.1-flash-1017`、66k prompt / 0 completion、
+**137.2s**、`upstream_error`、`ConnectError: 连接被对端中断（TLS 握手/写入阶段被掐断）`、
+代理=⚪ 直连。
+
+定性三件事：
+
+1. **出口**：网关所在机器走 CN 家宽直连 `api.cline.bot`，TLS 被掐是常态 → 该服务商
+   应当开「走代理」（服务商页勾选，`__proxy_force` 已有全链路收口），这是**运营动作**，
+   代码无需改；
+2. **137s 的病根在本地**：适配器写的是 `httpx.AsyncClient(timeout=self.timeout)`，
+   httpx 把这一个数字同时当 connect / read / **write** / pool 四个相位 →
+   read=180s 合理，connect=180s 与 write=180s 等于「链路已死还要吊三分钟」；
+   大 body（长上下文）上传被掐时尤其明显。这期间 auto 回退 / 竞速 / 失败重试
+   全部被堵住（与 Session 41 Qoder 同源：本地判定要「比上游慢、比死连接快」）；
+3. **重试分类本来没问题**：`is_retryable_error` 对无状态码的 ConnectError 返回 True，
+   前提是 `retry.enabled` 打开；但重试救得了瞬时抖动，救不了「一直直连」的出口问题。
+
+修复（commit `10c1596`）：新增 `server/core/http_timeouts.phase_timeout()` ——
+read 保留原值，connect 30s / write 60s / pool 10s 封顶，原值更短时不放宽，脏值透传；
+接入 `openai_compat`（Cline 走这条）、`codex_responses`（muse 继承）、`github`、
+`anthropic` 四个对话适配器。测试 `tests/test_http_phase_timeout.py`（11 条，含
+源码守卫禁止再出现裸 `timeout=self.timeout`，以及不可路由地址在 connect 封顶内失败）。
+
+> ⚠️ 别忘了：`httpx.AsyncClient(timeout=N)` 的 N 会同时作用在四个相位上。
+> 流式适配器要的是「read 长、connect/write 短」，不是一个大数字兜全部。
+
+### 四、部署受阻（本轮无法自行部署）
+
+- 全量 1330 测试通过，前端 `npm run build` 通过；代码已推 GitHub（`10c1596`、`ea5b75f`）；
+- **网关跑在哪**：tailnet 节点 `d-server`（100.115.55.115，Windows）→ 它把 8000 反向
+  转发到腾讯云服务器 → 本机 b-workstation（100.69.115.123）用 SSH 隧道穿过去。
+  日志里 `user_ip=100.69.115.123` 正好是本机 tailnet 地址，实证了这条链；
+- **d-server 没有 SSH 服务**（22 端口超时，三个用户名都试过）→ 本会话无法远程
+  `git pull` / 重启；需要用户在该机上执行：
+  ① `git pull origin main`（后端+前端都改了）
+  ② `cd client && npm run build`
+  ③ 重启网关进程（后端改动必须重启，前端改动不需要）
+- **纠正 Session 41 的错误结论**：当时在腾讯云上找不到 AIGate，判定「生产机 AIGate
+  已不存在」——**错的**。那台只是中转，8000 的 LISTEN 属于 `sshd`（反向转发），
+  真实进程在 d-server。以后判断「生产在不在」要先看 8000 的持有者是不是 sshd。
+
+### 五、并行会话事故（重要工作约定）
+
+本轮工作期间另一条会话在同一工作树里开发 effort_guard，其提交 `4b117b7`
+**把工作树里我改的 `openai_compat.py`（6 处 phase_timeout）一并收走，却漏掉了
+未跟踪的新模块 `server/core/http_timeouts.py`** → main 与 origin 一度处于
+`ImportError` 状态（谁拉谁挂）。已由 `10c1596` 立刻补齐并推送。
+
+教训：**共享工作树下，新建模块要第一时间 `git add`**；提交前先 `git log`/`git status`
+确认 HEAD 没被并行会话推进，`git diff --cached --stat` 逐文件核对自己提交了什么。
