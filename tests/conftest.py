@@ -8,13 +8,18 @@ def _reset_oauth_balancer():
     """account_balancer 是进程全局态：滑窗计数会跨测试累积（同一进程 60s 内
     累计 pick 数达到 enter_requests 就把分流打开），逐测试重置保证确定性。
     同理由重置 _ACCOUNT_DIRTY（账号脏标记，跨测试残留会让成功路径意外查库）
-    与 _DEVICE_FLOW_STATUS（设备流终态，跨测试残留会让 device-status 用例互扰）。"""
+    与 _DEVICE_FLOW_STATUS（设备流终态，跨测试残留会让 device-status 用例互扰）。
+    effort_guard 的档位抑制表同理（进程级 TTL 缓存，跨测试残留会让后续测试
+    静默丢掉 reasoning_effort 出站字段）。"""
     from server.core import account_balancer
     from server.core import oauth_client as _oc
+    from server.core import effort_guard
     account_balancer.reset()
     _oc._ACCOUNT_DIRTY.clear()
     _oc._DEVICE_FLOW_STATUS.clear()
+    effort_guard.reset()
     yield
     account_balancer.reset()
     _oc._ACCOUNT_DIRTY.clear()
     _oc._DEVICE_FLOW_STATUS.clear()
+    effort_guard.reset()

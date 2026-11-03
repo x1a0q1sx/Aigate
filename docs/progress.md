@@ -1445,3 +1445,99 @@ AIGate 不在官方支持清单（清单里是 ZCode/Claude Code/Codex/Cursor/Cl
 因此本轮代码改动**只落在 GitHub**（`47099f9`），**未部署到任何在线环境**。
 `aigate.service` 的 WorkingDirectory 指向该服务目录，说明它原本就装在那里；现在该路径为空 —— 若要从零恢复，需要代码 + `config.yaml`（含全部生产密钥，
 只在原机、不入仓库）+ `data/aigate.db` 三样，后两者若也随目录一起丢失则数据不可恢复。
+
+---
+
+## Session 42（2026-10-29/11-03）：CodeBuddy 11150 自适应修复 + Today AI（todayai.cn）接入调研
+
+### 一、背景（承接 Session 41 排查结论）
+
+生产 2026-10-29 07:33:39，`CodeBuddy CN/hy4-preview`（账号 15944101987）400 code **11150**
+「the reasoning effort value is not supported by the current model」（extError.code=
+invalid_reasoning_effort）。白天复测：同一模型所有标准档位（minimal/low/medium/high/
+xhigh/none/off）+ 垃圾值全部 200，唯一被拒的 `max` 报 **11133** 而非 11150 →
+11150 是上游 **(模型 × 当前允许档位集合) 的动态校验**，失败时刻落在 hy4-preview
+「夜间免费 23:00-08:00」窗口内（假设未证伪，留待夜间复测）。
+
+网关侧三个真实缺陷本轮全部修掉。
+
+### 二、修复内容
+
+1. **新增 `server/core/effort_guard.py`**
+   - `is_reasoning_effort_rejection()`：识别 11150 / invalid_reasoning_effort 拒因
+     （文案 + 顶层 code 双判据，防截断）。
+   - `is_request_shape_error()`：形状错误集合（effort 拒因 + CodeBuddy 11133）——
+     语义=「请求发错了，模型是好的」。
+   - 进程内抑制表 `(host, model, effort) → TTL 1800s`：上游拒过一次的组合，
+     TTL 内直接不带该档位出站（省一次注定 400 的往返；到期自动重试探档位=自愈，
+     因为上游允许集合随时间/账号变）。`tests/conftest.py` 逐测试 reset（进程全局态）。
+
+2. **`server/adapters/openai_compat.py`：剥档位重试一次**
+   - `chat_completion` 拆出 `_chat_once`：捕获 `HTTPStatusError` → 命中 effort 拒因
+     → 剥 `reasoning_effort` + `reasoning_summary` 重发一次（非流式与 CodeBuddy
+     force_stream 聚合路径共用），其余 400 原样抛出。
+   - `stream_chat_completion` 拆出 `_stream_once`：仅在**尚未吐出任何 chunk** 时降级
+     重发（已吐内容绝不重发，防重复输出）。
+   - 出站前 `_apply_effort_suppression`：抑制期内直接不带档位。
+   - 与 `adapter_retry` 不冲突：形状错误仍判不可重试，降级发生在适配器内部。
+
+3. **`v1_router` 六处失败记账点全部加形状闸**
+   `is_request_shape_error` 豁免 mark_failure+mark_cooling（此前一次 11150 会把完全
+   健康的 hy4-preview 白冷却 30s×指数退避）：非流式 `_record_fail`、探测失败、组合
+   流式 on_fail、组合流式中途失败、组合非流式 on_fail、流式 `_record_fail`。
+   日志注记区分：形状错误落库写 `| request_shape_error`（不再显示冷却倒计时）。
+   账号级冷却本来就不认 400（`is_account_worthy_error` 只认 401/403/429/5xx/风控文案），
+   未动。
+
+4. **上游档位白名单（源头预防）**
+   - `model_catalog._codebuddy_entry_to_info` 解析目录 `reasoning.supportedEfforts`
+     / `defaultEffort` → `ModelInfo.supported_efforts/default_effort`（新增字段）。
+   - 落库进 `models.capabilities` JSON（该列此前完全空闲，**零迁移成本**；
+     manual 语义：上游声明则以最新目录为准，未声明不抹既有值）。
+   - `v1_router._without_unsupported_reasoning` 升级为两层：
+     ①模型不支持 effort → 整字段剥（原语义不变）；
+     ②有白名单 → 越界档位归一到 `defaultEffort`（无默认取中间档，再不行剥掉），
+     白名单内命中时**以上游拼写出站**（"HIGH"→"High"，防逐字节校验绊倒）；
+     none/off 未列入白名单时剥掉而非映射。
+   - 流式级联的 `_NS` 快照与 `cascade_db.refresh` 属性清单同步带上 `capabilities`。
+
+### 三、测试
+
+`tests/test_effort_guard.py` 19 条：guard 判据/抑制 TTL 往返/过期重试探、适配器剥档位
+重试（出站体断言 reasoning_effort+reasoning_summary 双双消失）、抑制期单次出站、
+11133 不降级、流式降级、白名单归一 6 组、源码守卫（冷却点带闸计数）。
+全量回归 **1308 passed** 零复发。
+
+### 四、部署状态
+
+⚠️ 承接 Session 41 的部署受阻结论（生产机 AIGate 已不存在、局域网实例 8000 经隧道但
+本机 22 端口不可达）：本轮改动**仅提交 GitHub，未部署**。夜间窗口复测（验证
+「hy4-preview 23:00-08:00 拒绝 effort」假设）同样待部署后进行。
+
+### 五、Today AI（todayai.cn）接入调研
+
+用户诉求：「我有额度，我想接入 ARTEX 用」。
+
+**结论：todayai.cn 不是 API 中转站**，是「Today」个人 AI 助理（App/网页/桌面）的
+网页端，Free/Pro/Ultra 订阅制，额度是**站内使用额度**，无官方开放 API、无 OpenAI
+兼容端点。协议栈取证（107 个 JS chunk 反编译 + 匿名探测）：
+
+| 组件 | 事实 |
+|---|---|
+| 站点 | `todayai.cn`，Next.js SPA；文案「懂你所想，为你先行的个人 AI 助理」；微信/Telegram 渠道、MCP 连接器、邀请好友重置额度 |
+| 鉴权 | `auth.todayai.cn` = Better Auth 标准 OAuth2/OIDC：authorization_code+PKCE(S256)、refresh_token、动态客户端注册**已关闭**（403 `Client registration is disabled`）；中国区邮箱/手机号直登被禁（`auth.email_sign_in_disabled`），实际走 App/微信类登录 |
+| 数据面 | `api.todayai.cn`，Bearer JWT（aud=`https://api.todayai.cn`，服务端 introspection 校验） |
+| 聊天协议 | **私有异步**：`POST /v1/messages`（`conversation_target_kind: main/new_task` + `client_message_id` + canonical parts）→ 返回 Task binding，回复经 `/v1/messages/batch`、`/v1/conversations/messages` 轮询取回；**无 SSE/WebSocket，无 `/v1/chat/completions`**（匿名探测全 401 同形态，端点不存在也不报 404） |
+| 模型 | 用户侧只有 `/v1/pricing/model-option`（PUT 选计划档位），不暴露模型 id 列表 |
+
+**接 ARTEX 的可行路径**（ARTEX 要的是 OpenAI 兼容 base_url+key）：
+- 不可行：直接填 todayai.cn 当 OpenAI 兼容服务商（协议完全不对）。
+- 可行 = AIGate 新建 Today 渠道（工程量与 muse 渠道相当）：
+  ① 登录取 token：无动态注册 → 只能借官方 SPA 的 redirect 流程或**人工从浏览器
+  devtools 拷 `Authorization: Bearer <jwt>`**（一次性验证最快）；
+  ② 新 adapter 实现 canonical 消息提交→轮询→聚合 OpenAI 响应；
+  ③ JWT 有效期与 refresh 路径待实测（Better Auth bearer 通常小时级，长跑需重新
+  走登录，自动化受限）。
+- **待用户提供**：一条真实登录态下的 Bearer JWT（脱敏前后缀即可）→ 我打一发
+  用户信息端点与消息端点各打一发，验证 token 寿命、响应体形状与轮询节奏，
+  再决定是否立项。在此之前不动代码。

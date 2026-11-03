@@ -9,6 +9,7 @@ import logging
 import httpx
 from typing import AsyncGenerator, List
 from dataclasses import dataclass
+from server.core.http_timeouts import phase_timeout
 from .base_adapter import BaseAdapter, ModelInfo, HealthResult
 from server.core.header_values import outbound_headers
 from server.core.model_capabilities import infer_reasoning_effort_support
@@ -16,9 +17,62 @@ from server.core.provider_quirks import (
     quirks_for, transform_payload, unwrap_response, auth_token_for,
     restore_tool_names_in_response, codebuddy_client_headers, cline_client_headers,
 )
+from server.core.effort_guard import (
+    is_reasoning_effort_rejection, is_suppressed, suppress,
+)
 from server.schemas.chat import ChatCompletionRequest, ChatCompletionResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _url_host(url: str) -> str:
+    """出站 URL 的 host（抑制表的维度之一）。"""
+    try:
+        from urllib.parse import urlparse
+        return (urlparse(url or "").hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _drop_reasoning_effort(payload: dict) -> dict:
+    """剥掉思考强度相关字段（上游拒绝该档位后重试用）。
+
+    `reasoning_summary` 是 CodeBuddy 方言随 effort 一起补的（见 provider_quirks），
+    剥 effort 时一并去掉——否则出站形态变成「没指定强度却要求思考摘要」。
+    """
+    p = dict(payload)
+    p.pop("reasoning_effort", None)
+    p.pop("reasoning_summary", None)
+    return p
+
+
+def _effort_downgrade(payload: dict, url: str, err: BaseException):
+    """上游以「该档位不支持」为由拒绝时，返回剥掉 effort 的 payload；否则 None。
+
+    顺带把 (host, 模型, 档位) 记入抑制表：同一组合在 TTL 内不再白跑一次注定 400
+    的往返（生产 2026-10-29 code 11150 取证，见 core/effort_guard.py）。
+    """
+    eff = payload.get("reasoning_effort")
+    if not eff:
+        return None
+    try:
+        body = getattr(getattr(err, "response", None), "text", "") or ""
+    except Exception:
+        body = ""
+    if not is_reasoning_effort_rejection(body or str(err)):
+        return None
+    suppress(_url_host(url), str(payload.get("model") or ""), str(eff))
+    logger.warning("上游拒绝 reasoning_effort=%s，剥掉该字段重试一次（%s）",
+                   eff, _url_host(url) or "?")
+    return _drop_reasoning_effort(payload)
+
+
+def _apply_effort_suppression(payload: dict, url: str) -> dict:
+    """抑制期内的档位直接不带出站（省一次注定失败的往返）。"""
+    eff = payload.get("reasoning_effort")
+    if eff and is_suppressed(_url_host(url), str(payload.get("model") or ""), str(eff)):
+        return _drop_reasoning_effort(payload)
+    return payload
 
 
 def _proxy_kwargs(*, force: bool = False) -> dict:
@@ -210,11 +264,24 @@ class OpenAICompatAdapter(BaseAdapter):
         headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST",
                                     payload=payload)
         payload = transform_payload(payload, q, tool_guard_enabled=tg_on)
+        # 抑制期内不再带该档位出站（省一次注定 400 的往返，见 core/effort_guard.py）
+        payload = _apply_effort_suppression(payload, url)
+        try:
+            return await self._chat_once(payload, url, headers, base_url, force_proxy, q, aliases)
+        except httpx.HTTPStatusError as e:
+            downgraded = _effort_downgrade(payload, url, e)
+            if downgraded is None:
+                raise
+            return await self._chat_once(downgraded, url, headers, base_url, force_proxy, q, aliases)
+
+    async def _chat_once(self, payload: dict, url: str, headers: dict, base_url: str,
+                         force_proxy: bool, q, aliases):
+        """发一次请求并归一响应（不含 effort 降级逻辑，由 chat_completion 调度）。"""
         if q and q.force_stream:
             # 流式专属上游（CodeBuddy 拒绝非流式，11101）：走 SSE 聚合成 JSON 回包
             return restore_tool_names_in_response(
                 await self._collect_stream(payload, url, headers, force_proxy), aliases)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(self.timeout), **self._proxy(base_url, force_proxy)) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
                 body = resp.text[:4000]
@@ -245,7 +312,7 @@ class OpenAICompatAdapter(BaseAdapter):
         content, reasoning = [], []
         tool_calls = {}   # index -> {"id","type","function":{"name","arguments"}}
         finish = None
-        async with httpx.AsyncClient(timeout=timeout or self.timeout, **self._proxy(url, force_proxy)) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(timeout or self.timeout), **self._proxy(url, force_proxy)) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
@@ -336,9 +403,32 @@ class OpenAICompatAdapter(BaseAdapter):
         headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="POST",
                                     payload=payload)
         payload = transform_payload(payload, q, tool_guard_enabled=tg_on)  # 流式专属/请求体形态方言
+        # 抑制期内不再带该档位出站（省一次注定 400 的往返，见 core/effort_guard.py）
+        payload = _apply_effort_suppression(payload, url)
+        emitted = False
+        downgraded = None
+        try:
+            async for ck in self._stream_once(payload, url, headers, base_url, force_proxy, aliases):
+                emitted = True
+                yield ck
+        except httpx.HTTPStatusError as e:
+            # 上游以「该档位不支持」拒掉整条流（此时尚未吐出任何内容）→ 剥 effort 重发
+            if emitted:
+                raise
+            downgraded = _effort_downgrade(payload, url, e)
+            if downgraded is None:
+                raise
+        if downgraded is None:
+            return
+        async for ck in self._stream_once(downgraded, url, headers, base_url, force_proxy, aliases):
+            yield ck
+
+    async def _stream_once(self, payload: dict, url: str, headers: dict, base_url: str,
+                           force_proxy: bool, aliases):
+        """发一次流式请求并透传 chunk（不含 effort 降级逻辑，由 stream_chat_completion 调度）。"""
         timeout_error = None
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
+            async with httpx.AsyncClient(timeout=phase_timeout(self.timeout), **self._proxy(base_url, force_proxy)) as client:
                 async with client.stream('POST', url, headers=headers, json=payload) as resp:
                     if resp.status_code >= 400:
                         body = (await resp.aread()).decode('utf-8', errors='replace')
@@ -391,7 +481,7 @@ class OpenAICompatAdapter(BaseAdapter):
         url = self._build_models_url(base_url)
         headers = self._get_headers(api_key, extra_headers, base_url, url=url, method="GET")
         force_proxy = bool((extra_headers or {}).get("__proxy_force"))
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(base_url, force_proxy)) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(self.timeout), **self._proxy(base_url, force_proxy)) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -476,7 +566,7 @@ class OpenAICompatAdapter(BaseAdapter):
                 return HealthResult(status="unhealthy", latency_ms=latency_ms,
                                     error_message=str(e)[:200])
         try:
-            async with httpx.AsyncClient(timeout=timeout, **self._proxy(base_url, force_proxy)) as client:
+            async with httpx.AsyncClient(timeout=phase_timeout(timeout), **self._proxy(base_url, force_proxy)) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:

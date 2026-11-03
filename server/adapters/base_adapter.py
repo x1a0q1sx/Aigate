@@ -27,6 +27,12 @@ class ModelInfo:
     # v4.6 上游促销元数据（Qoder 目录 promotion：错峰折扣窗口等）。仅展示/一键套用，
     # 不参与计费与路由；结构由上游原样透传。
     promotion: Optional[dict] = None
+    # v4.7 上游声明的思考强度白名单（CodeBuddy 目录 reasoning.supportedEfforts）与
+    # 默认档位（defaultEffort）。None=上游没声明（不做任何归一，行为不变）；
+    # 非空时 v1_router 把越界档位归一到 defaultEffort，避免 400 effort 拒因
+    # （生产 2026-10-29 code 11150，见 core/effort_guard.py）。
+    supported_efforts: Optional[list] = None
+    default_effort: Optional[str] = None
 @dataclass
 class HealthResult:
     status: str  # healthy / degraded / rate_limited / unhealthy

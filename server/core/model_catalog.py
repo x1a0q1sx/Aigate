@@ -271,7 +271,18 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
     # 的正面证据；其余保持 None（未知），由既有名称启发式兜底。
     # 注意：True 只是「允许客户端传 effort」；网关默认请求不带该参数，
     # 不会改变既有可用模型的请求形态。
-    sup_effort = True if isinstance(m.get("reasoning"), dict) else None
+    _reasoning = m.get("reasoning") if isinstance(m.get("reasoning"), dict) else {}
+    sup_effort = True if _reasoning else None
+    # v4.7 白名单：supportedEfforts 是上游**权威**的「这些档位我认」声明。此前整块
+    # 丢弃，导致客户端传越界档位直接 400（CodeBuddy 11150 / invalid_reasoning_effort，
+    # 2026-10-29 生产取证）。非空列表才落库；其余 None 表示「上游没声明」，不做归一。
+    _efforts = [str(e).strip() for e in (_reasoning.get("supportedEfforts") or [])
+                if isinstance(e, str) and str(e).strip()]
+    _default_effort = _reasoning.get("defaultEffort")
+    if not isinstance(_default_effort, str) or not _default_effort.strip():
+        _default_effort = None
+    else:
+        _default_effort = _default_effort.strip()
     # credits 是目录自带的权威倍率（"x0.00" / "x0.17 credits"）。这里先落一遍，
     # 让「倍率拉取失败但目录成功」时仍能标出免费模型；fetch_codebuddy_ratios 的
     # overlay 后跑，值相同、以它为准。
@@ -292,6 +303,8 @@ def _codebuddy_entry_to_info(m: dict) -> Optional[ModelInfo]:
         supports_reasoning_effort=sup_effort,
         price_ratio=ratio,
         promotion=_codebuddy_badge_promotion(tags),
+        supported_efforts=(_efforts or None),
+        default_effort=_default_effort,
     )
 
 
@@ -1143,6 +1156,16 @@ class ModelCatalog:
                 existing_model.supports_vision = model_info.supports_vision
                 if existing_model.supports_reasoning_effort is None and model_info.supports_reasoning_effort is not None:
                     existing_model.supports_reasoning_effort = model_info.supports_reasoning_effort
+                # v4.7 effort 白名单落库（capabilities JSON，无迁移成本）：
+                # 上游声明才写（None=上游没提，保留既有不抹掉）；但上游已声明时
+                # 以最新目录为准（允许集合是动态的，见 core/effort_guard.py）。
+                if model_info.supported_efforts or model_info.default_effort:
+                    _caps = dict(existing_model.capabilities or {})
+                    if model_info.supported_efforts:
+                        _caps["reasoning_efforts"] = list(model_info.supported_efforts)
+                    if model_info.default_effort:
+                        _caps["default_effort"] = model_info.default_effort
+                    existing_model.capabilities = _caps
                 # 窗口只在仍为默认（4096 且无来源标记）时补齐，用户手动改过的窗口不动
                 if existing_model.context_length == 4096 and model_info.context_length != 4096                         and not (existing_model.context_source or ""):
                     existing_model.context_length = model_info.context_length
@@ -1265,6 +1288,13 @@ class ModelCatalog:
                         if model_info.price_ratio is not None else ""),
                     # v4.6 上游促销元数据（Qoder 错峰折扣）：仅展示/一键套用
                     promotion=getattr(model_info, "promotion", None),
+                    # v4.7 effort 白名单（CodeBuddy reasoning.supportedEfforts/defaultEffort）
+                    capabilities={
+                        **({"reasoning_efforts": list(model_info.supported_efforts)}
+                           if model_info.supported_efforts else {}),
+                        **({"default_effort": model_info.default_effort}
+                           if model_info.default_effort else {}),
+                    } or None,
                     priority_boost=0,
                     auto_excluded=False
                 )

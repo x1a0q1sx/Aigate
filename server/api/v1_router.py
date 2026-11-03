@@ -45,6 +45,7 @@ from server.core.context_guard import (
 from server.config import get_config, save_config
 from server.core.error_text import err_text, combine_err_text
 from server.core.quota_limit import is_quota_related_error
+from server.core.effort_guard import is_request_shape_error
 
 
 def _combine_err(short, full) -> str:
@@ -970,8 +971,10 @@ async def _auto_route_with_runtime_fallback(ar, db, request, conversation_id):
             if _full != err_short:
                 _ent["error_detail"] = _full
             attempt_errors.append(_ent)
-            if ar.health_checker and not is_context_error(err_short):
-                # 上下文超限不是模型故障，不进冷却（请求体大小问题）
+            if (ar.health_checker and not is_context_error(err_short)
+                    and not is_request_shape_error(_full)):
+                # 上下文超限不是模型故障，不进冷却（请求体大小问题）；
+                # 请求形状错误（CodeBuddy 11150/11133）同理——换档位就好（2026-10-29）
                 ar.health_checker.mark_cooling(
                     candidate.model.id,
                     ar.config.cooling_period_seconds,
@@ -1115,9 +1118,13 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         if is_context_error(err_short) and candidate.model:
             await record_context_overflow(candidate.model.id, est_tokens)
         elif (cooling and ar.health_checker and candidate.model
-              and not is_quota_related_error(full_error or err_short)):
+              and not is_quota_related_error(full_error or err_short)
+              and not is_request_shape_error(full_error or err_short)):
             # 每日限额不是模型故障 → 不罚模型冷却（否则该模型被整体封锁，
             # 其他账号本可顶上；(账号×模型) 限额记录已精确管控，2026-10-16）
+            # 请求形状错误同理（CodeBuddy 11150/11133：effort 档位/参数不被当刻
+            # 允许集合接受）——换档位就好，模型本身是好的，冷却只会误伤
+            # （2026-10-29 生产取证：07:33 的 11150 白白冷却了 hy4-preview）。
             ar.health_checker.mark_failure(candidate.model.id)
             ar.health_checker.mark_cooling(
                 candidate.model.id,
@@ -1143,7 +1150,9 @@ async def _auto_request_with_cascade_fallback(ar, db, request, conversation_id, 
         cd_actual = min(cd_seconds * (2 ** max(fc - 1, 0)), 3600) if fc > 1 else cd_seconds
         cooldown_note = (" | daily_quota_exhausted"
                          if is_quota_related_error(full_error or err_short)
-                         else f" | cooldown={cd_actual}s fail#{fc}")
+                         else (" | request_shape_error"
+                               if is_request_shape_error(full_error or err_short)
+                               else f" | cooldown={cd_actual}s fail#{fc}"))
         try:
             import json as _j
             from server.db import AsyncSessionLocal as _LS
@@ -1537,10 +1546,47 @@ def _reasoning_effort_supported(model) -> bool:
 
 
 def _without_unsupported_reasoning(request, model):
-    """Some strict OpenAI-compatible upstreams reject reasoning_effort outright."""
-    if _reasoning_effort_supported(model):
+    """上游不接受 reasoning_effort 时剥掉；有白名单声明时把越界档位归一。
+
+    两层语义（2026-10-29 生产 code 11150 取证后补第二层）：
+    1. `supports_reasoning_effort=False`（显式列值或名称启发式）→ 整字段剥掉，
+       严格上游直接拒这个参数；
+    2. 上游目录声明了 `reasoning.supportedEfforts` 白名单（落库在 capabilities，
+       见 model_catalog._codebuddy_entry_to_info）→ 只把**越界档位**归一到
+       `defaultEffort`（无默认值时退到允许集合的中间档，再不行才剥）。
+       白名单内的档位原样放行——这是上游自己声明的合法集合，不动。
+    """
+    if not _reasoning_effort_supported(model):
+        return request.model_copy(update={"reasoning_effort": None, "reasoning": None})
+    _eff = getattr(request, "reasoning_effort", None)
+    if not _eff:
         return request
-    return request.model_copy(update={"reasoning_effort": None, "reasoning": None})
+    _caps = getattr(model, "capabilities", None)
+    _caps = _caps if isinstance(_caps, dict) else {}
+    _allowed_raw = _caps.get("reasoning_efforts")
+    if not (isinstance(_allowed_raw, list) and _allowed_raw):
+        return request
+    _allowed = [str(x).strip() for x in _allowed_raw if isinstance(x, str) and str(x).strip()]
+    if not _allowed:
+        return request
+    _by_lower = {a.lower(): a for a in _allowed}
+    _eff_norm = str(_eff).strip().lower()
+    if _eff_norm in _by_lower:
+        # 白名单命中：以**上游拼写**出站（客户端传 "HIGH"、上游写 "high" 时，
+        # 逐字节匹配的上游校验不该被大小写绊倒）
+        _canon = _by_lower[_eff_norm]
+        if _canon != _eff:
+            return request.model_copy(update={"reasoning_effort": _canon})
+        return request
+    # none/off = 客户端不要思考：上游白名单没列就剥掉，不映射到默认档
+    if _eff_norm in ("none", "off"):
+        return request.model_copy(update={"reasoning_effort": None})
+    # 越界档位：优先 defaultEffort，其次允许集合的中间档，最后剥掉
+    _default = _caps.get("default_effort")
+    if isinstance(_default, str) and _default.strip().lower() in _by_lower:
+        return request.model_copy(update={"reasoning_effort": _by_lower[_default.strip().lower()]})
+    _middle = _allowed[len(_allowed) // 2]
+    return request.model_copy(update={"reasoning_effort": _middle})
 
 
 async def _model_name_resolves(db: AsyncSession, name: str) -> bool:
@@ -2104,7 +2150,10 @@ async def _chat_completions_impl(
                         if is_context_error(et):
                             await record_context_overflow(ctx["mdl"].id, est_req_tokens)
                         elif (ar.health_checker and not _is_stream_content_validation_error(et)
-                              and not is_quota_related_error(_et_full)):
+                              and not is_quota_related_error(_et_full)
+                              and not is_request_shape_error(_et_full)):
+                            # 请求形状错误（CodeBuddy 11150/11133）也不罚冷却：换档位
+                            # 就好，模型是好的（2026-10-29 生产取证）
                             ar.health_checker.mark_failure(ctx["mdl"].id)
                             ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
                         # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
@@ -2248,13 +2297,16 @@ async def _chat_completions_impl(
                                           status="failed", attempt=st_attempt,
                                           latency_ms=int((time.time() - _start) * 1000),
                                           ttft_ms=_cb_attempt_ttft_ms, error=err_s)
+                        raw_err = _extract_error_body(se) or err_s
                         if is_context_error(err_s):
                             await record_context_overflow(_mdl.id, est_req_tokens)
                         elif (ar.health_checker and not _is_stream_content_validation_error(err_s)
-                              and not is_quota_related_error(err_s)):
+                              and not is_quota_related_error(err_s)
+                              and not is_request_shape_error(raw_err or err_s)):
+                            # 请求形状错误（CodeBuddy 11150/11133）不罚冷却；用全量原文
+                            # 判定（err_s 截到 200 字符，code 可能在截断边缘之外）
                             ar.health_checker.mark_failure(_mdl.id)
                             ar.health_checker.mark_cooling(_mdl.id, ar.config.cooling_period_seconds)
-                        raw_err = _extract_error_body(se) or err_s
                         yield _format_sse_chunk({"error": f"stream_mid_failure: {err_s}"}, mid_full)
                         yield b"data: [DONE]\n\n"
                         await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -2383,7 +2435,9 @@ async def _chat_completions_impl(
                 # 上下文超限 / 每日限额不是模型自身故障，不进冷却（限额该模型其他账号仍可用）
                 if is_context_error(et):
                     await record_context_overflow(ctx["model"].id, est_req_tokens)
-                elif ar.health_checker and not is_quota_related_error(et):
+                elif (ar.health_checker and not is_quota_related_error(et)
+                      and not is_request_shape_error(_combine_err(et, getattr(exc, "raw", None)))):
+                    # 请求形状错误（CodeBuddy 11150/11133）不罚冷却（2026-10-29）
                     ar.health_checker.mark_failure(ctx["model"].id)
                     ar.health_checker.mark_cooling(ctx["model"].id, ar.config.cooling_period_seconds)
                 # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题不算账号故障）
@@ -2827,7 +2881,7 @@ async def _chat_completions_impl(
                         _sel_reason = getattr(cand, "selection_reason", None)
                     try:
                         await cascade_db.refresh(_prov_obj, attribute_names=["name", "base_url", "headers", "credential_type", "oauth_code", "proxy_enabled"])
-                        await cascade_db.refresh(_mdl_obj, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort", "observed_context_limit", "input_modalities", "capability_source", "supports_vision"])
+                        await cascade_db.refresh(_mdl_obj, attribute_names=["id", "model_id", "request_overrides", "context_length", "supports_reasoning_effort", "observed_context_limit", "input_modalities", "capability_source", "supports_vision", "capabilities"])
                     except Exception:
                         pass
                     # v4.3 能力闸：combo 显式目标也过模态检查（auto 分支已在选举内过滤）
@@ -2842,7 +2896,8 @@ async def _chat_completions_impl(
                                   supports_reasoning_effort=getattr(_mdl_obj, "supports_reasoning_effort", None),
                                   context_length=int(getattr(_mdl_obj, "context_length", 0) or 0),
                                   observed_context_limit=int(getattr(_mdl_obj, "observed_context_limit", 0) or 0),
-                                  request_overrides=getattr(_mdl_obj, "request_overrides", None))
+                                  request_overrides=getattr(_mdl_obj, "request_overrides", None),
+                                  capabilities=getattr(_mdl_obj, "capabilities", None))
                     _prov_ns = _NS(name=_prov_obj.name, base_url=_prov_obj.base_url,
                                    headers=_prov_obj.headers, id=_prov_obj.id,
                                    credential_type=getattr(_prov_obj, "credential_type", "api_key"),
@@ -2957,6 +3012,7 @@ async def _chat_completions_impl(
                 # 每日限额不是模型故障，注记区分（该模型其他账号仍可用，2026-10-16）
                 _et_quota = (full_error or et or "")
                 _cd_note = ("daily_quota_exhausted" if is_quota_related_error(_et_quota)
+                            else "request_shape_error" if is_request_shape_error(_et_quota)
                             else f"cooldown={cd_actual}s fail#{fc}")
                 err_annotated = f"{full_error or et} | {_cd_note}"
                 await _write_stream_log(conversation_id, request, raw_request, "error",
@@ -2965,7 +3021,9 @@ async def _chat_completions_impl(
                     routed_provider_id=getattr(ctx["prov"], "id", None),
                     routed_account=ctx.get("account"))
                 if (cooling and ar.health_checker and not _is_stream_content_validation_error(et)
-                        and ctx["mdl"].id and not is_quota_related_error(_et_quota)):
+                        and ctx["mdl"].id and not is_quota_related_error(_et_quota)
+                        and not is_request_shape_error(_et_quota)):
+                    # 请求形状错误（CodeBuddy 11150/11133）不罚冷却（2026-10-29）
                     ar.health_checker.mark_failure(ctx["mdl"].id)
                     ar.health_checker.mark_cooling(ctx["mdl"].id, ar.config.cooling_period_seconds)
                 # OAuth 多账号：账号级冷却（上游拒了就该换号；内容问题/超限不算账号故障）
