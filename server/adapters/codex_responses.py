@@ -16,6 +16,7 @@ import httpx
 logger = logging.getLogger(__name__)
 
 from .base_adapter import BaseAdapter, HealthResult, ModelInfo
+from server.core.http_timeouts import phase_timeout
 from server.core.header_values import outbound_headers
 from server.schemas.chat import ChatCompletionRequest
 
@@ -571,7 +572,7 @@ class CodexResponsesAdapter(BaseAdapter):
         active_calls = {}
         saw_tool_call = False
 
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(self.timeout), **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             async with client.stream("POST", url, headers=headers, json=payload) as resp:
                 if resp.status_code >= 400:
                     body = (await resp.aread()).decode("utf-8", errors="replace")
@@ -779,7 +780,7 @@ class CodexResponsesAdapter(BaseAdapter):
         if not url:
             return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in self.BUILTIN_MODELS]
         headers = self._list_headers(api_key, extra_headers)
-        async with httpx.AsyncClient(timeout=self.timeout, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(self.timeout), **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code >= 400 and "backend-api/codex" in (base_url or ""):
                 return [ModelInfo(model_id=m, display_name=m, supports_streaming=True) for m in self.BUILTIN_MODELS]

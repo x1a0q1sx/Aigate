@@ -22,6 +22,7 @@ import platform
 from typing import AsyncGenerator, List, Optional, Any
 
 import httpx
+from server.core.http_timeouts import phase_timeout
 
 
 def _proxy_kwargs(*, force: bool = False) -> dict:
@@ -369,7 +370,7 @@ class AnthropicAdapter(BaseAdapter):
         headers = self._get_headers(api_key, eh, oauth=oauth, full_fingerprint=True)
         payload = self._build_payload(request, "", stream=False)
         created = int(time.time())
-        async with httpx.AsyncClient(timeout=self.timeout * 5, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
+        async with httpx.AsyncClient(timeout=phase_timeout(self.timeout * 5), **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
             resp = await client.post(url, headers=headers, json=payload)
             if resp.status_code >= 400:
                 raise httpx.HTTPStatusError(
@@ -629,7 +630,7 @@ class AnthropicAdapter(BaseAdapter):
         }
         start_time = time.time()
         try:
-            async with httpx.AsyncClient(timeout=timeout * 5, **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
+            async with httpx.AsyncClient(timeout=phase_timeout(timeout * 5), **self._proxy(bool((extra_headers or {}).get("__proxy_force")))) as client:
                 resp = await client.post(url, headers=headers, json=payload)
                 latency_ms = (time.time() - start_time) * 1000
                 if resp.status_code == 429:
