@@ -219,11 +219,25 @@ export default {
     if (params.model) qs.append('model', params.model)
     if (params.account) qs.append('account', params.account)
     if (params.log_type) qs.append('log_type', params.log_type)
+    // 时间窗跟随分析页选择的范围（UTC ISO）：不带的话筛选会跨全部历史
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
     return apiGet(`/admin/api/logs?${qs.toString()}`)
   },
   getLogDetail: (id, full = false) => apiGet(`/admin/api/logs/${id}${full ? '?full=1' : ''}`),
-  getLogProviders: () => apiGet('/admin/api/logs/providers'),
-  getLogFilters: () => apiGet('/admin/api/logs/filters'),
+  // 候选值同样按窗口取：只列该时间范围内真有日志的服务商/模型/账号
+  getLogProviders: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
+    return apiGet(`/admin/api/logs/providers?${qs.toString()}`)
+  },
+  getLogFilters: (params = {}) => {
+    const qs = new URLSearchParams()
+    if (params.start) qs.append('start', params.start)
+    if (params.end) qs.append('end', params.end)
+    return apiGet(`/admin/api/logs/filters?${qs.toString()}`)
+  },
   getAnalyticsSummary: () => apiGet('/admin/api/analytics/summary'),
   resetAnalyticsSummary: () => apiPost('/admin/api/analytics/summary/reset', {}),
   // 日志归档
@@ -345,9 +359,18 @@ export default {
   getLiveSummary: () => apiGet('/admin/api/live/summary'),
   // B5 日志导出
   exportLogs: (params = {}) => {
-    const qs = new URLSearchParams({ format: params.format || 'csv', hours: params.hours || 168 })
+    const q = { format: params.format || 'csv' }
+    // 有窗口就按窗口导（与分析页选择的范围一致）；否则退回 hours 老口径
+    if (params.start) q.start = params.start
+    if (params.end) q.end = params.end
+    if (!params.start && !params.end) q.hours = params.hours || 168
+    const qs = new URLSearchParams(q)
     if (params.status) qs.append('status', params.status)
     if (params.provider) qs.append('provider', params.provider)
+    // 此前只传 status/provider：模型/账号筛选在导出里被静默丢弃，
+    // 导出的文件与屏幕上看到的筛选结果对不上
+    if (params.model) qs.append('model', params.model)
+    if (params.account) qs.append('account', params.account)
     return apiDownload(`/admin/api/logs/export?${qs.toString()}`)
   },
   // D3 通知

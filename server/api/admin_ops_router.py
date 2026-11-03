@@ -247,15 +247,29 @@ async def export_logs(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     account: Optional[str] = None,
+    start: Optional[str] = Query(None, description="时间窗起点（UTC ISO，含）；传了就覆盖 hours"),
+    end: Optional[str] = Query(None, description="时间窗终点（UTC ISO，含）"),
     db: AsyncSession = Depends(get_db),
 ):
     """按当前筛选导出请求日志（近 N 小时，上限 50000 行）
 
     model / account 与服务商一同跟随日志筛选（子串匹配），保证导出与屏幕
     上看到的筛选结果一致。
+    start/end（2026-11-03）：传了就用它，导出的正是页面上选中的时间范围，
+    不再固定「近 7 天」。
     """
-    since = datetime.utcnow() - timedelta(hours=hours)
-    conds = [RequestLog.created_at >= since, RequestLog.is_health_check.is_(False)]
+    from server.api.admin_routing import _parse_dt_param
+    _s = _parse_dt_param(start)
+    _e = _parse_dt_param(end)
+    conds = [RequestLog.is_health_check.is_(False)]
+    if _s or _e:
+        if _s:
+            conds.append(RequestLog.created_at >= _s)
+        if _e:
+            conds.append(RequestLog.created_at <= _e)
+    else:
+        # 老口径兜底：没给窗口就按 hours
+        conds.append(RequestLog.created_at >= datetime.utcnow() - timedelta(hours=hours))
     if status:
         conds.append(RequestLog.status == status)
     if provider:

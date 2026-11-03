@@ -22,8 +22,8 @@
                         placeholder="全部模型（可搜索）" empty-text="无匹配模型" @change="loadPage(1)" />
           <SearchFilter v-if="filterLogType !== 'refresh'" v-model="accountFilter" label="账号" :options="logAccounts"
                         placeholder="全部账号（可搜索）" empty-text="无匹配账号" @change="loadPage(1)" />
-          <button class="btn btn-outline btn-sm" @click="exportLogs('csv')" title="导出近 7 天请求日志（CSV，跟随当前筛选）">导出 CSV</button>
-          <button class="btn btn-outline btn-sm" @click="exportLogs('json')" title="导出近 7 天请求日志（JSON，跟随当前筛选）">导出 JSON</button>
+          <button class="btn btn-outline btn-sm" @click="exportLogs('csv')" title="导出当前时间范围请求日志（CSV，跟随筛选与上方时间范围）">导出 CSV</button>
+          <button class="btn btn-outline btn-sm" @click="exportLogs('json')" title="导出当前时间范围请求日志（JSON，跟随筛选与上方时间范围）">导出 JSON</button>
           <button class="btn btn-outline btn-sm" style="color: var(--warning);"
                   title="清零归档后保留的累计统计（实时日志统计保留）" @click="resetSummary">重置统计数据</button>
         </div>
@@ -424,12 +424,15 @@ function safeParseJSON(str) {
 }
 
 // 请求日志 + 归档 + 详情弹窗：自 Analytics.vue 机械搬移（逻辑不动只搬家）。
-// 对外接口：prop filterProvider（由父级「看日志」联动）；方法 reload()。
+// 对外接口：prop filterProvider（由父级「看日志」联动）；prop range（分析页
+// 时间范围，2026-11-03 接上：此前日志列表/筛选候选/导出全走全部历史）。
 export default {
   name: 'LogsPanel',
   components: { SearchFilter },
   props: {
     filterProvider: { type: String, default: '' },
+    // {key,label,bucket,start,end,hours}，start/end 为 UTC ISO
+    range: { type: Object, default: null },
   },
   data() {
     return {
@@ -458,6 +461,11 @@ export default {
     filterProvider(v) {
       this.providerFilter = v
       this.loadPage(1)
+    },
+    range() {
+      // 分析页切时间范围：列表回到第 1 页重取，候选值也跟着窗口走
+      this.loadPage(1)
+      this.loadLogFilters()
     },
     filterLogType(v) {
       // 切到「模型刷新」时模型/账号筛选不再适用，清零避免残留条件把结果筛空
@@ -642,6 +650,11 @@ export default {
       this.accountFilter = f.account || ''
       this.loadPage(1)
     },
+    /** 当前时间窗（UTC ISO）：分析页没给 range 时为空 = 不限时间 */
+    logWindow() {
+      const r = this.range || {}
+      return { start: r.start || '', end: r.end || '' }
+    },
     async loadPage(p) {
       // 换页才同步跳转输入框；5s 自动刷新原位重载不动用户正在输入的内容
       if (p !== this.page) this.pageJump = p
@@ -652,6 +665,9 @@ export default {
       if (this.providerFilter) params.provider = this.providerFilter
       if (this.modelFilter) params.model = this.modelFilter
       if (this.accountFilter) params.account = this.accountFilter
+      const w = this.logWindow()
+      if (w.start) params.start = w.start
+      if (w.end) params.end = w.end
       try {
         const data = await api.getLogs(params)
         this.items = data.items || []
@@ -668,8 +684,11 @@ export default {
     },
     async exportLogs(format) {
       try {
+        const w = this.logWindow()
         await api.exportLogs({
-          format, hours: 168,
+          format,
+          // 跟随分析页时间范围；没有 range 才退回「近 7 天」
+          start: w.start, end: w.end, hours: 168,
           status: this.filterStatus || '',
           provider: this.providerFilter || '',
           model: this.modelFilter || '',
@@ -687,14 +706,16 @@ export default {
       } catch (e) { toast.error('重置失败: ' + e.message) }
     },
     loadLogFilters() {
-      // 三路筛选候选值来自日志实际出现过的值（服务端去重），避免选了必然 0 条的死选项
-      api.getLogFilters().then((d) => {
+      // 三路筛选候选值来自「当前时间窗内」日志实际出现过的值（服务端去重），
+      // 避免选了必然 0 条的死选项
+      const w = this.logWindow()
+      api.getLogFilters(w).then((d) => {
         this.logProviders = (d && d.providers) || []
         this.logModels = (d && d.models) || []
         this.logAccounts = (d && d.accounts) || []
       }).catch(() => {
         // 兜底：老后端没有 /logs/filters 时退回只取服务商列表
-        api.getLogProviders().then(d => { this.logProviders = (d && d.providers) || [] }).catch(() => {})
+        api.getLogProviders(w).then(d => { this.logProviders = (d && d.providers) || [] }).catch(() => {})
       })
     },
     // 模型刷新行的悬停摘要：新增/移除的模型名清单

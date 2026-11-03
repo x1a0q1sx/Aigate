@@ -60,7 +60,8 @@
 
     <!-- ② 请求日志 + 归档（折叠，均在 LogsPanel 内）——置顶于趋势之上（2026-10-12 用户偏好） -->
     <div style="margin-top: 20px;">
-      <LogsPanel ref="logs" />
+      <!-- range 必须下传：日志列表/筛选候选/导出都跟随上方时间范围（2026-11-03） -->
+      <LogsPanel ref="logs" :range="range" />
     </div>
 
     <!-- ③ 用量趋势（跟随范围 + 粒度可切换） -->

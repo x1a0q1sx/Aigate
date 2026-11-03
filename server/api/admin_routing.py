@@ -273,6 +273,32 @@ async def overall_ranking(limit: int = Query(500, ge=1, le=1000),
             "weights": weights,
         })
     return {"weights": weights, "ranking": out, "total_candidates": len(scores)}
+
+
+def _time_window_conds(start: Optional[str], end: Optional[str], col) -> list:
+    """时间窗 SQL 条件（request_logs 与 model_refresh_logs 共用）。"""
+    conds = []
+    s = _parse_dt_param(start)
+    e = _parse_dt_param(end)
+    if s:
+        conds.append(col >= s)
+    if e:
+        conds.append(col <= e)
+    return conds
+
+
+def _log_window_conds(start: Optional[str], end: Optional[str]) -> list:
+    """按分析页时间范围（UTC ISO）生成 request_logs 的筛选条件。
+
+    2026-11-03 修复：请求日志区的状态/服务商/模型/账号筛选此前只拼业务条件，
+    完全不带时间窗 —— 页面上选了「近 7 天」，筛出来的却是全部历史。这里把
+    窗口统一成 SQL 条件，列表、候选值、导出三处共用同一口径。
+    解析沿用 _parse_dt_param（带时区的 ISO 转 UTC；非法值当未提供，不报错）。
+    """
+    return [RequestLog.is_health_check.is_(False)] + _time_window_conds(
+        start, end, RequestLog.created_at)
+
+
 # ===================== 日志归档 — 归档文件列表（必须在 /logs/{log_id} 之前注册，否则 archives 会被当作 log_id） =====================
 @router.get("/logs/archives")
 async def list_archives():
@@ -288,11 +314,18 @@ async def list_archives():
 
 # 必须在 /logs/{log_id} 之前注册，否则 providers 会被当作 log_id
 @router.get("/logs/providers")
-async def list_log_providers(db: AsyncSession = Depends(get_db)):
-    """请求日志里出现过的服务商名（去重），供日志筛选下拉使用。"""
+async def list_log_providers(start: Optional[str] = None, end: Optional[str] = None,
+                             db: AsyncSession = Depends(get_db)):
+    """请求日志里出现过的服务商名（去重），供日志筛选下拉使用。
+
+    start/end（UTC）与 /logs 同口径：候选值只列「该时间窗内真有日志」的服务商，
+    否则分析页选了窗口内没有日志的服务商必然 0 条（2026-11-03 用户报的 bug）。
+    """
+    conds = _log_window_conds(start, end)
+    conds.append(RequestLog.routed_provider.isnot(None))
     rows = (await db.execute(
         select(RequestLog.routed_provider)
-        .where(RequestLog.routed_provider.isnot(None))
+        .where(*conds)
         .group_by(RequestLog.routed_provider)
         .order_by(RequestLog.routed_provider)
     )).scalars().all()
@@ -300,15 +333,20 @@ async def list_log_providers(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/logs/filters")
-async def list_log_filters(db: AsyncSession = Depends(get_db)):
+async def list_log_filters(start: Optional[str] = None, end: Optional[str] = None,
+                           db: AsyncSession = Depends(get_db)):
     """日志筛选可选值：服务商名 / 路由模型 / OAuth 账号（均去重排序）。
 
     供分析页三路可搜索筛选器填充候选；数据来自 request_logs 实际出现过的值，
     这样筛选项天然只包含「有日志」的项，不会出现选了必然 0 条的死选项。
+    start/end 与分析页时间范围同口径（2026-11-03）：候选值也只取该窗口内的，
+    否则切到「今日」仍会提示昨天才出现过的服务商。
     """
+    conds = _log_window_conds(start, end)
+
     async def _distinct(col):
         rows = (await db.execute(
-            select(col).where(col.isnot(None)).group_by(col).order_by(col)
+            select(col).where(col.isnot(None), *conds).group_by(col).order_by(col)
         )).scalars().all()
         return [r for r in rows if r]
 
@@ -445,8 +483,11 @@ _logs_total_cache = {"data": None, "ts": 0, "key": None}
 _LOGS_TOTAL_TTL = 30  # 秒
 
 def _logs_total_key(status: Optional[str], provider: Optional[str],
-                    model: Optional[str] = None, account: Optional[str] = None) -> str:
-    return f"{status or ''}|{provider or ''}|{model or ''}|{account or ''}"
+                    model: Optional[str] = None, account: Optional[str] = None,
+                    window: str = "") -> str:
+    # window 必须进 key：否则切到「今日」会命中「近 7 天」缓存的 total，
+    # 出现「列表是 3 条、总数写着 900」的错位（Session 38 同类教训）。
+    return f"{status or ''}|{provider or ''}|{model or ''}|{account or ''}|{window}"
 
 @router.get("/logs")
 async def list_request_logs(
@@ -456,14 +497,20 @@ async def list_request_logs(
     provider: Optional[str] = None,
     model: Optional[str] = Query(None, description="路由模型（routed_model）子串匹配，忽略大小写"),
     account: Optional[str] = Query(None, description="OAuth 账号（routed_account）子串匹配，忽略大小写"),
+    start: Optional[str] = Query(None, description="时间窗起点（UTC ISO，含），与分析页范围同口径"),
+    end: Optional[str] = Query(None, description="时间窗终点（UTC ISO，含）"),
     log_type: Optional[str] = Query(None, pattern="^(request|refresh)$"),
     db: AsyncSession = Depends(get_db),
 ):
+    _window_key = f"{start or ''}~{end or ''}"
     # ── 日志类型=模型刷新：查 model_refresh_logs（每次刷新落一行，含增删明细） ──
     if log_type == "refresh":
         from server.models.model_refresh_log import ModelRefreshLog
         base_q = select(ModelRefreshLog)
         count_q = select(func.count(ModelRefreshLog.id))
+        for _c in _time_window_conds(start, end, ModelRefreshLog.created_at):
+            base_q = base_q.where(_c)
+            count_q = count_q.where(_c)
         if status == "success":
             base_q = base_q.where(ModelRefreshLog.ok.is_(True))
             count_q = count_q.where(ModelRefreshLog.ok.is_(True))
@@ -514,10 +561,11 @@ async def list_request_logs(
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             } for r in rows],
         }
-    base_q = select(RequestLog).where(RequestLog.is_health_check.is_(False)).options(
+    _win = _log_window_conds(start, end)
+    base_q = select(RequestLog).where(*_win).options(
         defer(RequestLog.request_body), defer(RequestLog.response_body)
     )
-    count_q = select(func.count(RequestLog.id)).where(RequestLog.is_health_check.is_(False))
+    count_q = select(func.count(RequestLog.id)).where(*_win)
     if status:
         base_q = base_q.where(RequestLog.status == status)
         count_q = count_q.where(RequestLog.status == status)
@@ -535,7 +583,7 @@ async def list_request_logs(
         count_q = count_q.where(RequestLog.routed_account.ilike(pat))
     # 方案B：total 缓存（30s TTL），翻页复用，省掉每次全表 COUNT
     now = _time.time()
-    ck = _logs_total_key(status, provider, model, account)
+    ck = _logs_total_key(status, provider, model, account, _window_key)
     if _logs_total_cache["data"] is not None and _logs_total_cache["key"] == ck and (now - _logs_total_cache["ts"]) < _LOGS_TOTAL_TTL:
         total = _logs_total_cache["data"]
     else:
