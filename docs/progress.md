@@ -1673,3 +1673,33 @@ read 保留原值，connect 30s / write 60s / pool 10s 封顶，原值更短时�
 - D 机内存长期 **91% 占用**，重启后留意 OOM 风险。
 - 部署期间 D 曾整机失联约 40 分钟（tailnet 数据路径死、反向隧道 `-R 8000` 监听消失、
   2222 通道无 banner）——判断为睡眠/断网；恢复后自动接上。
+
+## Session 44 补充（2026-11-04，另一会话视角）：并行双部署 + 全量一致性核验
+
+- **事实：两个会话在同一时间窗内先后向 D 机部署了同一份 HEAD**——本会话 17:08 同步
+  16 个文件（f24a708→112c254 差集）、17:15 执行 `pm2 restart`；另一会话 17:18:30
+  同步 43 个文件并再次重启。两边源都是干净的 112c254 工作树，最终内容收敛一致，
+  **未造成损坏**，但属「事故未遂」：若任一方工作树带未提交改动，生产就会被混入。
+- **只读全量核验（本会话）**：D 机 `server/` 下 125 个 `.py` **全部与 HEAD 逐字节一致**
+  （含新模块 `effort_guard.py`、`http_timeouts.py`）；`client/dist` = HEAD 构建
+  （`assets/index-5YN-VJsg.js` 与本地 vite 输出同名同哈希）；`/health` 200；
+  启动日志无 Traceback/ImportError，生产 venv（Python 3.14.5）里
+  `from server.core import effort_guard, http_timeouts` 通过。
+- 本会话额外备份（相对 aigate 安装根目录）：`backups\pre-112c254-20261104.tar.gz`
+  （覆盖前 server/ + client/src）、`backups\dist-pre-112c254-20261104.tar.gz`（旧 dist）。
+- **文件传输方式**：D 上 Git Bash 的 `scp` 会退化成 `cp`（报 “Executing: cp --”），
+  Windows 原生 scp 又不认 `D:/...` 远端路径 → 可靠做法只有两条：
+  ① `tar -czf - <paths> | ssh d 'cmd /c "tar -xzf - -C <APP_HOME>"'`（`APP_HOME` = aigate 的 app 目录）；
+  ② base64 → `Set-Content` → `certutil -decode`（单个小文件/脚本时更好核）。
+- **哈希比对的坑**：`anthropic_adapter.py` 带 UTF-8 BOM，PowerShell `ReadAllText`
+  会剥 BOM 再哈希 → 与含 BOM 的本地哈希产生**假差异**；抓远端内容回本地 diff 又会
+  过 GBK 控制台变乱码。结论：跨机一致性只认哈希，且两侧必须用同一「是否含 BOM/CR」
+  口径。
+- **现场观察（待确认）**：从 Yang 的 SSH 会话执行 `pm2.cmd restart` 后，`pm2 list`
+  里 aigate 的 user 列由 `SYSTEM` 变为 `Yang`；另一会话记录称「pm2 守护进程 17:15:44
+  被重启过」，但同一时刻其余 pm2 应用 pid/uptime 未变，与该说法不符。后续重启请
+  在同一 Yang 会话里做，并核对 user 列与 `/health`。
+- **部署前必查（新约束）**：本仓库有多会话并行，动生产前先看 `backups/` 是否刚出现
+  新目录、`pm2 list` 重启计数是否刚变、`docs/progress.md` 最新一节是否已在讲同一目标。
+- 待办：23:00 后 hy4-preview effort 矩阵复测（夜间免费窗口假设）——需
+  `ssh -N -L 18600:127.0.0.1:8000 d` 隧道 + 一把网关 API key。
