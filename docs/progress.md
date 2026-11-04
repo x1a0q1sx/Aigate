@@ -1625,3 +1625,51 @@ read 保留原值，connect 30s / write 60s / pool 10s 封顶，原值更短时�
 
 教训：**共享工作树下，新建模块要第一时间 `git add`**；提交前先 `git log`/`git status`
 确认 HEAD 没被并行会话推进，`git diff --cached --stat` 逐文件核对自己提交了什么。
+
+## Session 44（2026-11-04）部署到 D 机（真实生产）——日志时间窗修复 + 相位超时上线
+
+### 一、D 机部署形态（首次实证，此前所有部署方式假设都是错的）
+
+- D 机 = 用户桌面 Windows（tailnet `d-server`），SSH 现在可直连：`ssh d`
+  （`~/.ssh/config`：`HostName 127.0.0.1`、`Port 12222` → 腾讯云 `2222` → D 的 `22`；
+  D 的 sshd 只听回环，靠 `ssh -R 2222:127.0.0.1:22` 反向接入）。
+- **`D:\services\aigate\app` 不是 git 仓库**（D 上根本没装 git）→ 部署只能是**文件同步**，
+  不存在 `git pull`。目录布局：`app`（代码）/`venv`（Python）/`data`/`logs`/`run`/`backups`/`config`。
+- 进程管理 = **PM2**（`pm2` 在 `D:\services\_shared\runtimes\node`）：
+  应用名 `aigate`，entry = `venv\Scripts\python.exe app\start.py`，cwd = `app`，fork 模式；
+  真正监听 8000 的是 `start.py` 拉起的 uvicorn 子进程。日志
+  `D:\services\_shared\logs\pm2\aigate.{out,err}.log`。
+- **对外入口是腾讯云 18000，不是 8000**：D 的隧道命令是
+  `-R 127.0.0.1:18000:127.0.0.1:8000`（同机还有 2299/18787/19100/13389/18080，
+  另一条隧道给 17890/17891/2222）。本机 `b-workstation` 用 `-L 18000` 穿过去，
+  `curl 127.0.0.1:18000/health` = 200 实证。
+- **启动耗时 65~100 秒**（"Waiting for application startup" 到 "startup complete"），
+  重启后 8 秒查 health 必然 FAIL，别误判。
+
+### 二、部署动作（与结果）
+
+- 版本定位：D 上代码基线 = **`81b211e`（10-22，Session 38）**，与 HEAD 比对
+  server 下 125 个 py：82 相同 / 41 有差异 / 2 缺失（`http_timeouts.py`、`effort_guard.py`），
+  **无远端私改**（每个差异文件都能对上真实历史 blob）→ 安全做法是同步全部 43 个文件。
+- 依赖零变化（`requirements.txt` 自 81b211e 未改）；DB 唯一结构差异是
+  `oauth_tokens.banned_at/banned_reason`，走 `init_db()` 的幂等加列迁移，自动补齐。
+- 手动备份 → 覆盖 43 文件 + 新 dist → `compileall` + 11 模块 import 冒烟
+  （`IMPORT_OK`）→ `pm2 restart aigate` → health 200。
+- 备份目录：`D:\services\aigate\backups\deploy-20261104-171830`（server/ 与 dist/ 全量）。
+- 校验：7 个关键文件 sha256 与 HEAD 一致（`model_catalog.py` 仅 CRLF↔LF 差异，内容相同）；
+  `http_timeouts`/`effort_guard` 的 pyc 已生成（运行时确实加载）；页面引用的
+  `assets/index-5YN-VJsg.js` = 本地新构建同名（Vite 内容哈希）；`/admin/api/logs` 与
+  `/admin/api/logs/providers` 返回 401（路由存在且鉴权正常）。
+
+### 三、踩坑与注意
+
+- **sftp 远端路径必须写 `/D:/services/...`**：`d:D:/...` 与 `D:/...` 都会
+  "No such file or directory"；`put -r` 目标目录已存在时会**再嵌一层**
+  （`server/server/`），部署脚本要按实际层级取源。
+- 通过 `ssh d "powershell -Command ..."` 传 `$_`/`$var` 会被本地 bash 吃掉 →
+  **一律写 .ps1 上传再 `-File` 执行**（长输出同理：脚本内 `Out-File`，sftp 取回）。
+- 重启后 aigate 从 `SYSTEM` 变成 **`Yang`** 用户（该机 pm2 守护进程在 17:15:44 已被重启过，
+  非本次操作导致）；env 变量随之变化，若后续出现环境相关异常先怀疑这一点。
+- D 机内存长期 **91% 占用**，重启后留意 OOM 风险。
+- 部署期间 D 曾整机失联约 40 分钟（tailnet 数据路径死、反向隧道 `-R 8000` 监听消失、
+  2222 通道无 banner）——判断为睡眠/断网；恢复后自动接上。
